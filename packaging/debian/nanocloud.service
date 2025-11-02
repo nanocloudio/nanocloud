@@ -1,0 +1,19 @@
+[Unit]
+Description=Nanocloud API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/nanocloud
+ExecStart=/bin/sh -c 'exec /usr/bin/nanocloud server --listen "$NANOCLOUD_LISTEN" $NANOCLOUD_EXTRA_ARGS'
+StandardOutput=append:/var/log/nanocloud.log
+StandardError=append:/var/log/nanocloud.log
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+KillMode=process
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target

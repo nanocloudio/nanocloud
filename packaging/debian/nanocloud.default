@@ -1,0 +1,9 @@
+# Overrides for the Nanocloud systemd service
+
+# Address for the Nanocloud API server to listen on.
+# Use host:port format, e.g. 0.0.0.0:6443 to listen on all interfaces.
+NANOCLOUD_LISTEN=127.0.0.1:6443
+
+# Additional flags to pass to `nanocloud server`.
+# Example: --log-level debug --data-dir /var/lib/nanocloud
+NANOCLOUD_EXTRA_ARGS=

@@ -1,0 +1,26 @@
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    configure)
+        LOG_FILE="/var/log/nanocloud.log"
+        if [ ! -f "${LOG_FILE}" ]; then
+            touch "${LOG_FILE}" || true
+        fi
+        chown root:adm "${LOG_FILE}" || true
+        chmod 0640 "${LOG_FILE}" || true
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+            systemctl enable nanocloud.service >/dev/null 2>&1 || true
+            if systemctl is-active --quiet nanocloud.service; then
+                systemctl restart nanocloud.service || systemctl start nanocloud.service || true
+            else
+                systemctl start nanocloud.service || true
+            fi
+        fi
+    ;;
+esac
+
+exit 0
