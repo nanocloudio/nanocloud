@@ -17,6 +17,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, PathBuf};
 
 /// Enum for supported configuration parameters
@@ -131,6 +132,20 @@ impl Config {
             return Err(format!("Directory '{}' must be empty", path.display()).into());
         }
 
+        if subpath.is_none() {
+            if let Some(mode) = self.desired_mode() {
+                let permissions = fs::Permissions::from_mode(mode);
+                if let Err(error) = fs::set_permissions(&path, permissions) {
+                    return Err(std::io::Error::other(format!(
+                        "Failed to set permissions on '{}': {}",
+                        path.display(),
+                        error
+                    ))
+                    .into());
+                }
+            }
+        }
+
         Ok(path)
     }
 
@@ -158,5 +173,15 @@ impl Config {
                 }
                 normalized
             })
+    }
+
+    fn desired_mode(&self) -> Option<u32> {
+        match self {
+            Config::Backup => Some(0o750),
+            Config::LockFile => None,
+            Config::Keyspace => Some(0o750),
+            Config::SecureAssets => Some(0o700),
+            Config::EncryptedVolumes => Some(0o700),
+        }
     }
 }

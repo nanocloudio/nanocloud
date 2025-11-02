@@ -1,0 +1,27 @@
+{
+  "deny": [
+    "mount",
+    "umount2",
+    "pivot_root",
+    "swapon",
+    "swapoff",
+    "reboot",
+    "kexec_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "setns",
+    "unshare",
+    "syslog",
+    "move_pages",
+    "process_vm_readv",
+    "process_vm_writev",
+    "open_by_handle_at",
+    "add_key",
+    "request_key",
+    "keyctl",
+    "ptrace",
+    "bpf",
+    "perf_event_open"
+  ]
+}

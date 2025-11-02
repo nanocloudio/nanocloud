@@ -206,7 +206,15 @@ impl APIResourceList {
                     short_names: Vec::new(),
                     categories: None,
                 },
-                // TODO(http2-exec): advertise pods/exec once the HTTP/2 exec implementation ships.
+                APIResource {
+                    name: "pods/exec".to_string(),
+                    singular_name: "".to_string(),
+                    namespaced: true,
+                    kind: "PodExecOptions".to_string(),
+                    verbs: vec!["create".into()],
+                    short_names: Vec::new(),
+                    categories: None,
+                },
                 APIResource {
                     name: "configmaps".to_string(),
                     singular_name: "".to_string(),

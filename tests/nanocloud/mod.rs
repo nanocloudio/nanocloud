@@ -4,6 +4,7 @@ mod config;
 mod controller;
 mod csi;
 mod engine;
+mod k8s;
 mod network;
 mod oci;
 mod secrets;

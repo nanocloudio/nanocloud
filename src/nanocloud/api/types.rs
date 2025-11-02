@@ -98,8 +98,18 @@ pub struct LogQuery {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ApplyConflict {
+    pub path: String,
+    #[serde(rename = "existingManager")]
+    pub existing_manager: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ErrorBody {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflicts: Option<Vec<ApplyConflict>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,7 +177,7 @@ pub struct BundleSpec {
     /// Target service identifier (matching the OCI manifest name).
     pub service: String,
     /// Optional namespace scope; defaults to `default` when omitted.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// User-supplied installation options.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -184,6 +194,9 @@ pub struct BundleSpec {
     /// Forces a fresh pull of the service image even if cached layers already exist.
     #[serde(default, skip_serializing_if = "is_false")]
     pub update: bool,
+    /// Optional runtime security profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<BundleSecurityProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +207,42 @@ pub struct BundleSnapshotSource {
     /// Media type for the snapshot artifact (default `application/x-tar`).
     #[serde(rename = "mediaType", skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleSecurityProfile {
+    /// Gate for privileged capability requests (CAP_SYS_ADMIN, CAP_SYS_PTRACE, etc).
+    #[serde(rename = "allowPrivileged", default)]
+    pub allow_privileged: bool,
+    /// Explicit capabilities to inject into the container's allowed set.
+    #[serde(
+        rename = "extraCapabilities",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub extra_capabilities: Vec<String>,
+    /// Optional seccomp profile override.
+    #[serde(rename = "seccompProfile", skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile: Option<BundleSeccompProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleSeccompProfile {
+    #[serde(rename = "type")]
+    pub profile_type: BundleSeccompProfileType,
+    #[serde(rename = "localhostProfile", skip_serializing_if = "Option::is_none")]
+    pub localhost_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "PascalCase")]
+pub enum BundleSeccompProfileType {
+    Baseline,
+    RuntimeDefault,
+    Localhost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,12 +267,22 @@ pub enum BundleConditionStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "PascalCase")]
+pub enum BundleConditionKind {
+    Ready,
+    Bound,
+    SecretsProvisioned,
+    ProfilePrepared,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BundleCondition {
-    /// Logical condition identifier (e.g. `ProfilePrepared`, `WorkloadApplied`).
+    /// Logical condition identifier (e.g. `Ready`, `Bound`).
     #[serde(rename = "type")]
-    pub condition_type: String,
+    pub condition_type: BundleConditionKind,
     /// Overall status (True/False/Unknown).
     pub status: BundleConditionStatus,
     /// Machine readable reason (e.g. `ProfileMissing`, `ApplySucceeded`).
@@ -268,6 +327,117 @@ pub struct BundleStatus {
     /// Timestamp of the last successful reconciliation.
     #[serde(rename = "lastReconciledTime", skip_serializing_if = "Option::is_none")]
     pub last_reconciled_time: Option<String>,
+    /// Latest binding execution outcomes.
+    #[serde(
+        rename = "bindingHistory",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub binding_history: Vec<BindingHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BindingHistoryStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BindingHistoryEntry {
+    #[serde(rename = "bindingId")]
+    pub binding_id: String,
+    pub service: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    pub status: BindingHistoryStatus,
+    /// Total attempts recorded for the binding.
+    pub attempts: u32,
+    #[serde(rename = "lastStartedAt", skip_serializing_if = "Option::is_none")]
+    pub last_started_at: Option<String>,
+    #[serde(rename = "lastFinishedAt", skip_serializing_if = "Option::is_none")]
+    pub last_finished_at: Option<String>,
+    #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileExportManifest {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: BundleProfileExportMetadata,
+    /// Hex-encoded SHA256 digest of the profile payload.
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileExportMetadata {
+    pub name: String,
+    pub namespace: String,
+    pub service: String,
+    #[serde(rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
+    pub resource_version: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileArtifact {
+    #[serde(flatten)]
+    pub data: BundleProfileArtifactData,
+    pub integrity: BundleProfileArtifactIntegrity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileArtifactData {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: BundleProfileExportMetadata,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "profileKey")]
+    pub profile_key: String,
+    pub options: HashMap<String, String>,
+    pub secrets: Vec<BundleProfileSecret>,
+    pub bindings: Vec<BindingHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileSecret {
+    pub name: String,
+    #[serde(rename = "cipherText")]
+    pub cipher_text: String,
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleProfileArtifactIntegrity {
+    #[serde(rename = "sha256")]
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +450,18 @@ pub struct Bundle {
     pub spec: BundleSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<BundleStatus>,
+}
+
+/// Payload accepted by the `/status` subresource.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BundleStatusPatch {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: ObjectMeta,
+    pub status: BundleStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

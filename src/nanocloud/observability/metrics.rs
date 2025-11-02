@@ -39,6 +39,12 @@ static AUTH_BOOTSTRAP_ATTEMPTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static EVENTS_EMITTED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static EVENTS_CONSUMED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static EVENTS_STREAM_ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static CONTROLLER_RECONCILES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static BINDING_EXECUTIONS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static IMAGE_PULLS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static RESTARTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static BUNDLE_STATE_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+static POD_COUNTS_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
 static SNAPSHOT_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static SNAPSHOT_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static PROXY_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
@@ -69,6 +75,77 @@ where
         .register(Box::new(collector.clone()))
         .expect("failed to register nanocloud metric collector");
     collector
+}
+
+fn controller_reconciles_total() -> &'static IntCounterVec {
+    CONTROLLER_RECONCILES_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "controller_reconciles_total",
+            "Controller reconciliation attempts grouped by result",
+        );
+        let counter = IntCounterVec::new(opts, &["controller", "result"])
+            .expect("failed to build controller reconcile counter");
+        register_collector(counter)
+    })
+}
+
+fn binding_executions_total() -> &'static IntCounterVec {
+    BINDING_EXECUTIONS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "binding_executions_total",
+            "Binding envelope executions grouped by service and result",
+        );
+        let counter = IntCounterVec::new(opts, &["service", "result"])
+            .expect("failed to build binding execution counter");
+        register_collector(counter)
+    })
+}
+
+fn image_pulls_total() -> &'static IntCounterVec {
+    IMAGE_PULLS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "image_pulls_total",
+            "Image pulls grouped by cache hit status",
+        );
+        let counter =
+            IntCounterVec::new(opts, &["cache_hit"]).expect("failed to build image pulls counter");
+        register_collector(counter)
+    })
+}
+
+fn restarts_total() -> &'static IntCounterVec {
+    RESTARTS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "restarts_total",
+            "Kubelet-triggered restarts grouped by namespace, service, and reason",
+        );
+        let counter = IntCounterVec::new(opts, &["namespace", "service", "reason"])
+            .expect("failed to build restarts counter");
+        register_collector(counter)
+    })
+}
+
+fn bundle_state_gauge() -> &'static IntGaugeVec {
+    BUNDLE_STATE_GAUGE.get_or_init(|| {
+        let opts = Opts::new(
+            "bundles",
+            "Number of bundles grouped by high-level readiness state",
+        );
+        let gauge = IntGaugeVec::new(opts, &["state"]).expect("failed to build bundle state gauge");
+        register_collector(gauge)
+    })
+}
+
+fn pod_counts_gauge() -> &'static IntGaugeVec {
+    POD_COUNTS_GAUGE.get_or_init(|| {
+        let opts = Opts::new(
+            "pods",
+            "Number of Nanocloud-managed pods grouped by namespace",
+        );
+        let gauge =
+            IntGaugeVec::new(opts, &["namespace"]).expect("failed to build pod count gauge");
+        register_collector(gauge)
+    })
 }
 
 fn container_operation_total() -> &'static IntCounterVec {
@@ -769,6 +846,44 @@ pub fn record_event_stream_error(topic: &str, cause: &str) {
         .inc();
 }
 
+pub fn record_controller_reconcile(controller: &str, result: ControllerReconcileResult) {
+    controller_reconciles_total()
+        .with_label_values(&[controller, result.as_label()])
+        .inc();
+}
+
+pub fn record_binding_execution(service: &str, result: BindingExecutionResult) {
+    binding_executions_total()
+        .with_label_values(&[service, result.as_label()])
+        .inc();
+}
+
+pub fn record_image_pull(cache_hit: bool) {
+    let label = if cache_hit { "true" } else { "false" };
+    image_pulls_total().with_label_values(&[label]).inc();
+}
+
+pub fn record_restart(namespace: Option<&str>, service: &str, reason: &str) {
+    let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
+    restarts_total()
+        .with_label_values(&[ns, service, reason])
+        .inc();
+}
+
+pub fn set_bundle_gauges(ready: i64, degraded: i64) {
+    let gauge = bundle_state_gauge();
+    gauge.with_label_values(&["ready"]).set(ready);
+    gauge.with_label_values(&["degraded"]).set(degraded);
+}
+
+pub fn set_pod_gauges(counts: &[(String, i64)]) {
+    let gauge = pod_counts_gauge();
+    gauge.reset();
+    for (namespace, count) in counts {
+        gauge.with_label_values(&[namespace.as_str()]).set(*count);
+    }
+}
+
 /// Publishes gauges that describe the latest StatefulSet reconciliation status.
 pub fn record_statefulset_status(
     namespace: Option<&str>,
@@ -950,5 +1065,36 @@ mod tests {
         assert!(text.contains("nanocloud_keyspace_blocking_active_tasks 2"));
         assert!(text.contains("nanocloud_keyspace_blocking_wait_duration_seconds_sum"));
         assert!(text.contains("operation=\"put\""));
+    }
+}
+#[derive(Copy, Clone, Debug)]
+pub enum ControllerReconcileResult {
+    Success,
+    Error,
+}
+
+impl ControllerReconcileResult {
+    fn as_label(self) -> &'static str {
+        match self {
+            ControllerReconcileResult::Success => "success",
+            ControllerReconcileResult::Error => "error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum BindingExecutionResult {
+    Success,
+    Failed,
+    TimedOut,
+}
+
+impl BindingExecutionResult {
+    fn as_label(self) -> &'static str {
+        match self {
+            BindingExecutionResult::Success => "success",
+            BindingExecutionResult::Failed => "failed",
+            BindingExecutionResult::TimedOut => "timeout",
+        }
     }
 }

@@ -14,19 +14,27 @@
  * limitations under the License.
  */
 
-use crate::nanocloud::api::types::BundleSpec;
+use super::bindings::{run_binding, BindingEnvelopePolicy, BindingInvocation};
+#[cfg(test)]
+use crate::nanocloud::api::types::BundleSeccompProfile;
+use crate::nanocloud::api::types::{BundleSeccompProfileType, BundleSecurityProfile, BundleSpec};
 use crate::nanocloud::csi::{
     csi_plugin, CreateVolumeRequest, DeleteVolumeRequest, NodePublishVolumeRequest,
     NodeUnpublishVolumeRequest,
 };
+use crate::nanocloud::engine::profile::{BindingRecord, BindingStatus};
 use crate::nanocloud::engine::Image;
 use crate::nanocloud::engine::Profile;
 use crate::nanocloud::engine::{
     register_streaming_backup, remove_streaming_backup, streaming_backup_enabled, Snapshot,
 };
+use crate::nanocloud::events::bindings::{BindingEventPayload, BindingEventStatus};
+use crate::nanocloud::events::in_memory::InMemoryEventBus;
+use crate::nanocloud::events::{EventEnvelope, EventKey, EventPublisher, EventTopic, EventType};
 use crate::nanocloud::k8s::configmap::ConfigMap;
 use crate::nanocloud::k8s::pod::{
-    ContainerEnvVar, ContainerSpec, HostPathVolumeSource, KeyToPath, Pod, PodSpec, VolumeSpec,
+    ContainerEnvVar, ContainerSpec, HostPathVolumeSource, KeyToPath, Pod, PodSeccompProfile,
+    PodSecurityContext, PodSpec, VolumeSpec,
 };
 use crate::nanocloud::k8s::store as pod_store;
 use crate::nanocloud::kubelet::runtime::{
@@ -35,23 +43,27 @@ use crate::nanocloud::kubelet::runtime::{
 };
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_debug, log_info, log_warn};
-use crate::nanocloud::observability::metrics::{self, ContainerOperation};
+use crate::nanocloud::observability::metrics::{self, BindingExecutionResult, ContainerOperation};
 use crate::nanocloud::oci::container_runtime;
+use crate::nanocloud::oci::runtime::resolve_process_user;
 use crate::nanocloud::secrets::{KeyspaceSecretStore, StoredSecret};
+use crate::nanocloud::security::profile::dedupe_capabilities;
+use crate::nanocloud::security::{PRIVILEGE_ESCALATION_DENIED, SECURITY_POLICY_VIOLATION};
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::Config;
+use nix::unistd::{chown, Gid, Uid};
 
 pub use crate::nanocloud::kubelet::runtime::resolve_container_id;
 
-use chrono::Local;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use chrono::{Local, SecondsFormat, Utc};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -61,6 +73,343 @@ type MaterializedResult<T> = Result<T, DynError>;
 
 const CONFIGMAP_VOLUME_ROOT: &str = "/var/lib/nanocloud.io/storage/configmap";
 const SECRET_VOLUME_ROOT: &str = "/var/lib/nanocloud.io/storage/secret";
+const BINDING_EVENT_SCOPE: &str = "controller";
+const BINDING_EVENT_STREAM: &str = "bindings.lifecycle";
+const BINDING_LOG_LIMIT: usize = 4096;
+
+fn binding_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn clip_binding_output(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut chars = value.chars();
+    let mut truncated = String::new();
+    for (idx, ch) in chars.by_ref().enumerate() {
+        if idx >= BINDING_LOG_LIMIT {
+            truncated.push('…');
+            return Some(truncated);
+        }
+        truncated.push(ch);
+    }
+    Some(truncated)
+}
+
+fn binding_event_topic() -> EventTopic {
+    EventTopic::new(BINDING_EVENT_SCOPE, BINDING_EVENT_STREAM)
+}
+
+fn classify_binding_failure(message: &str) -> (BindingStatus, BindingEventStatus) {
+    if message.to_ascii_lowercase().contains("timed out") {
+        (BindingStatus::TimedOut, BindingEventStatus::TimedOut)
+    } else {
+        (BindingStatus::Failed, BindingEventStatus::Failed)
+    }
+}
+
+fn status_to_binding_metric(status: BindingStatus) -> BindingExecutionResult {
+    match status {
+        BindingStatus::Succeeded => BindingExecutionResult::Success,
+        BindingStatus::TimedOut => BindingExecutionResult::TimedOut,
+        BindingStatus::Failed => BindingExecutionResult::Failed,
+        _ => BindingExecutionResult::Failed,
+    }
+}
+
+fn normalize_binding_command(
+    service: &str,
+    index: usize,
+    mut binding: Vec<String>,
+) -> (String, Vec<String>) {
+    if binding.is_empty() {
+        return (format!("{service}#{index}"), binding);
+    }
+    let first = binding.first().cloned().unwrap_or_default();
+    if first.starts_with("bindings.") && binding.len() > 1 {
+        binding.remove(0);
+        (first, binding)
+    } else {
+        (format!("{service}#{index}"), binding)
+    }
+}
+
+async fn run_bindings_for_services<F>(
+    binding_map: &HashMap<String, Vec<Vec<String>>>,
+    binding_policy: &BindingEnvelopePolicy,
+    profile: &mut Profile,
+    namespace: &str,
+    app: &str,
+    event_bus: Arc<InMemoryEventBus>,
+    mut resolve_container: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnMut(&str) -> Result<String, DynError>,
+{
+    for (service, bindings) in binding_map {
+        let container_id = resolve_container(service)?;
+        for (index, binding) in bindings.iter().cloned().enumerate() {
+            let (binding_id, command) = normalize_binding_command(service, index, binding);
+            if command.is_empty() {
+                return Err(new_error(format!(
+                    "Binding '{}' does not define a command to execute",
+                    binding_id
+                )));
+            }
+            let binding_display = command.join(" ");
+            log_info(
+                "bindings",
+                "Running binding command",
+                &[
+                    ("service", service.as_str()),
+                    ("binding", binding_id.as_str()),
+                    ("command", binding_display.as_str()),
+                ],
+            );
+            let binding_key = format!("{service}::{binding_id}");
+            let (attempt, _) =
+                track_binding_start(profile, &binding_key, &binding_id, service, &command);
+            let start_payload =
+                BindingEventPayload::started(app, namespace, service, &binding_id, attempt);
+            publish_binding_event(
+                event_bus.clone(),
+                start_payload,
+                namespace,
+                app,
+                &binding_key,
+            )
+            .await;
+
+            let invocation = BindingInvocation {
+                bundle: app.to_string(),
+                namespace: namespace.to_string(),
+                target_service: service.clone(),
+                container_id: container_id.clone(),
+                binding_id: Some(binding_id.clone()),
+                command: command.clone(),
+            };
+            let result = match run_binding(&invocation, binding_policy).await {
+                Ok(res) => res,
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let (record_status, event_status) = classify_binding_failure(&err_msg);
+                    if let Some(record) = profile.bindings.get_mut(&binding_key) {
+                        update_binding_record(
+                            record,
+                            record_status,
+                            None,
+                            None,
+                            Some(err_msg.clone()),
+                            None,
+                            None,
+                        );
+                    }
+                    let failure_payload =
+                        BindingEventPayload::started(app, namespace, service, &binding_id, attempt)
+                            .with_completion_meta(
+                                event_status,
+                                None,
+                                None,
+                                Some(err_msg.clone()),
+                                None,
+                                None,
+                            );
+                    publish_binding_event(
+                        event_bus.clone(),
+                        failure_payload,
+                        namespace,
+                        app,
+                        &binding_key,
+                    )
+                    .await;
+                    metrics::record_binding_execution(
+                        service,
+                        status_to_binding_metric(record_status),
+                    );
+                    return Err(with_context(
+                        err,
+                        format!(
+                            "Failed to execute binding '{}' for {}",
+                            binding_display, invocation.target_service
+                        ),
+                    ));
+                }
+            };
+
+            let duration_ms = (result.duration.as_millis().min(u128::from(u64::MAX))) as u64;
+            let stdout_snippet = clip_binding_output(&result.stdout);
+            let stderr_snippet = clip_binding_output(&result.stderr);
+            let exit_code = result.status.code();
+
+            if !result.status.success() {
+                let descriptor = exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string());
+                let message = format!(
+                    "Binding command '{}' exited with status {}",
+                    binding_display, descriptor
+                );
+                let (record_status, event_status) = classify_binding_failure(&message);
+                if let Some(record) = profile.bindings.get_mut(&binding_key) {
+                    update_binding_record(
+                        record,
+                        record_status,
+                        Some(duration_ms),
+                        exit_code,
+                        Some(message.clone()),
+                        stdout_snippet.clone(),
+                        stderr_snippet.clone(),
+                    );
+                }
+                let failure_payload =
+                    BindingEventPayload::started(app, namespace, service, &binding_id, attempt)
+                        .with_completion_meta(
+                            event_status,
+                            Some(duration_ms),
+                            exit_code,
+                            Some(message.clone()),
+                            stdout_snippet,
+                            stderr_snippet,
+                        );
+                publish_binding_event(
+                    event_bus.clone(),
+                    failure_payload,
+                    namespace,
+                    app,
+                    &binding_key,
+                )
+                .await;
+                metrics::record_binding_execution(service, status_to_binding_metric(record_status));
+                return Err(new_error(message));
+            }
+
+            if let Some(record) = profile.bindings.get_mut(&binding_key) {
+                update_binding_record(
+                    record,
+                    BindingStatus::Succeeded,
+                    Some(duration_ms),
+                    exit_code,
+                    None,
+                    stdout_snippet.clone(),
+                    stderr_snippet.clone(),
+                );
+            }
+            let completion_payload =
+                BindingEventPayload::started(app, namespace, service, &binding_id, attempt)
+                    .with_completion_meta(
+                        BindingEventStatus::Completed,
+                        Some(duration_ms),
+                        exit_code,
+                        None,
+                        stdout_snippet,
+                        stderr_snippet,
+                    );
+            publish_binding_event(
+                event_bus.clone(),
+                completion_payload,
+                namespace,
+                app,
+                &binding_key,
+            )
+            .await;
+            metrics::record_binding_execution(service, BindingExecutionResult::Success);
+        }
+    }
+    Ok(())
+}
+
+fn track_binding_start(
+    profile: &mut Profile,
+    binding_key: &str,
+    binding_id: &str,
+    service: &str,
+    command: &[String],
+) -> (u32, String) {
+    let record = profile.binding_record_mut(binding_key, binding_id.to_string(), service, command);
+    record.attempts = record.attempts.saturating_add(1);
+    record.status = BindingStatus::Running;
+    record.last_started_at = Some(binding_timestamp());
+    record.last_finished_at = None;
+    record.duration_ms = None;
+    record.exit_code = None;
+    record.message = None;
+    record.stdout = None;
+    record.stderr = None;
+    let event_id = format!("{binding_key}:{}", record.attempts);
+    record.event_id = Some(event_id.clone());
+    (record.attempts, event_id)
+}
+
+fn update_binding_record(
+    record: &mut BindingRecord,
+    status: BindingStatus,
+    duration_ms: Option<u64>,
+    exit_code: Option<i32>,
+    message: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+) {
+    record.status = status;
+    record.last_finished_at = Some(binding_timestamp());
+    record.duration_ms = duration_ms;
+    record.exit_code = exit_code;
+    record.message = message;
+    record.stdout = stdout;
+    record.stderr = stderr;
+}
+
+async fn publish_binding_event(
+    bus: Arc<InMemoryEventBus>,
+    payload: BindingEventPayload,
+    namespace: &str,
+    bundle: &str,
+    binding_key: &str,
+) {
+    let event_type = match payload.status {
+        BindingEventStatus::Started => EventType::Custom("BindingStarted"),
+        BindingEventStatus::Completed => EventType::Custom("BindingCompleted"),
+        BindingEventStatus::Failed => EventType::Custom("BindingFailed"),
+        BindingEventStatus::TimedOut => EventType::Custom("BindingTimeout"),
+    };
+    let status_attr = match payload.status {
+        BindingEventStatus::Started => "started",
+        BindingEventStatus::Completed => "completed",
+        BindingEventStatus::Failed => "failed",
+        BindingEventStatus::TimedOut => "timeout",
+    };
+    let payload_bytes = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log_warn(
+                "bindings",
+                "Failed to serialize binding event payload",
+                &[("error", err.to_string().as_str())],
+            );
+            return;
+        }
+    };
+    let key = EventKey::new(namespace, format!("{binding_key}:{}", payload.attempt));
+    let envelope = EventEnvelope::new(
+        binding_event_topic(),
+        key,
+        event_type,
+        payload_bytes,
+        "application/json",
+    )
+    .with_attribute("bundle", bundle.to_string())
+    .with_attribute("namespace", namespace.to_string())
+    .with_attribute("service", payload.service.clone())
+    .with_attribute("status", status_attr.to_string());
+
+    if let Err(err) = bus.publish(envelope).await {
+        log_warn(
+            "bindings",
+            "Failed to publish binding event",
+            &[("error", err.to_string().as_str())],
+        );
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BackupPlan {
@@ -178,12 +527,13 @@ pub async fn install(
     options: HashMap<String, String>,
     snapshot: Option<&str>,
     force_update: bool,
+    security: Option<BundleSecurityProfile>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     metrics::observe_container_operation(
         namespace,
         app,
         ContainerOperation::Install,
-        install_impl(namespace, app, options, snapshot, force_update),
+        install_impl(namespace, app, options, snapshot, force_update, security),
     )
     .await
 }
@@ -194,6 +544,7 @@ async fn install_impl(
     options: HashMap<String, String>,
     snapshot: Option<&str>,
     force_update: bool,
+    mut security: Option<BundleSecurityProfile>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     // Generate container name
     let container_name = namespace
@@ -228,6 +579,8 @@ async fn install_impl(
     let mut user_provided_options = !options.is_empty();
     let mut cached_profile: Option<Profile> = None;
     let restore_requested = snapshot_name.is_some();
+    let binding_policy = BindingEnvelopePolicy::from_environment()
+        .map_err(|e| with_context(e, "Failed to apply binding envelope policy"))?;
 
     // Read snapshot if provided
     let snapshot = snapshot_name
@@ -250,6 +603,13 @@ async fn install_impl(
         }
         None => options.clone(),
     };
+    if security.is_none() {
+        if let Some(spec) = snapshot_spec_contents.as_ref() {
+            if spec.security.is_some() {
+                security = spec.security.clone();
+            }
+        }
+    }
 
     // // Pull image
     // let manifest = Registry::pull(&format!("registry.nanocloud.io/{}", app)).await?;
@@ -280,6 +640,7 @@ async fn install_impl(
         &container_name,
         Some(&format!("registry.nanocloud.io/{}", app)),
     );
+    apply_security_context(&mut pod_manifest.spec, security.as_ref());
     let namespace_string = namespace
         .filter(|ns| !ns.is_empty())
         .map(|ns| ns.to_string());
@@ -298,6 +659,7 @@ async fn install_impl(
             .as_deref()
             .map(|digest| digest == desired_digest.as_str())
             .unwrap_or(false);
+    metrics::record_image_pull(should_skip_update);
 
     if should_skip_update {
         let digest_excerpt = &desired_digest.get(7..19).unwrap_or(&desired_digest);
@@ -412,55 +774,55 @@ async fn install_impl(
         },
     )?;
 
-    let csi = csi_plugin();
-
-    // Create external bindings
-    let binding_map = image.config.bindings.clone();
-    for (service, bindings) in binding_map {
-        let container_id = get_container_id_by_name(&service).unwrap();
-        for binding in bindings {
-            let container_id_clone = container_id.clone();
-            let binding_args = binding.clone();
-            let service_name = service.clone();
-            exec_in_container(&container_id_clone, move || {
-                let (first, rest) = split_first_rest(&binding_args);
-                let binding_display = binding_args.join(" ");
-                let status = std::process::Command::new(first)
-                    .args(rest)
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .map_err(|e| {
-                        with_context(
-                            e,
-                            format!("Failed to spawn binding command: {binding_display}"),
-                        )
-                    })?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    let descriptor = status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "terminated by signal".to_string());
-                    Err(new_error(format!(
-                        "Binding command '{}' exited with status {descriptor}",
-                        binding_display
-                    )))
-                }
-            })
-            .map_err(|e| {
-                with_context(
-                    e,
-                    format!(
-                        "Failed to execute binding on dependent service {}",
-                        service_name
-                    ),
-                )
-            })?;
+    let profile_source = if snapshot.is_some() {
+        "snapshot"
+    } else {
+        "image"
+    };
+    let profile_fields = [
+        ("app", app),
+        ("container", container_name.as_str()),
+        ("namespace", namespace_value),
+        ("profile_source", profile_source),
+    ];
+    log_info("container", "Loading service profile", &profile_fields);
+    // Load or create profile
+    let mut profile = match snapshot_spec_contents.as_ref() {
+        Some(spec) => {
+            let mut profile = Profile::from_spec_fields(spec.profile_key.as_deref(), &spec.options)
+                .map_err(|e| {
+                    with_context(
+                        e,
+                        "Failed to materialize service profile from snapshot specification",
+                    )
+                })?;
+            profile.set_options(&image.config.options);
+            profile
         }
-    }
+        None => Profile::from_options(&image.config.options)
+            .map_err(|e| with_context(e, "Failed to build profile from image options"))?,
+    };
+
+    let csi = csi_plugin();
+    let event_bus = InMemoryEventBus::global();
+    let binding_map = image.config.bindings.clone();
+    run_bindings_for_services(
+        &binding_map,
+        &binding_policy,
+        &mut profile,
+        namespace_value,
+        app,
+        event_bus.clone(),
+        |service_name| {
+            get_container_id_by_name(service_name).ok_or_else(|| {
+                new_error(format!(
+                    "Container '{}' missing while running bindings",
+                    service_name
+                ))
+            })
+        },
+    )
+    .await?;
 
     let _main_container = runtime_pod_spec
         .containers
@@ -573,6 +935,23 @@ async fn install_impl(
             volume_host_paths.insert(volume.name.clone(), path);
         }
     }
+    for volume in runtime_pod_spec.volumes.iter() {
+        if let Some(host_path) = volume.host_path.as_ref() {
+            volume_host_paths
+                .entry(volume.name.clone())
+                .or_insert_with(|| host_path.path.clone());
+        }
+    }
+
+    reconcile_volume_permissions(app, &runtime_pod_spec, &volume_host_paths).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to prepare volume permissions for container '{}'",
+                container_name
+            ),
+        )
+    })?;
 
     pod_manifest.spec = runtime_pod_spec.clone();
     pod_store::save_pod_manifest(namespace, app, &pod_manifest).map_err(|e| {
@@ -583,14 +962,26 @@ async fn install_impl(
     })?;
 
     // Create the container
-    let container = create_container(
+    let container = match create_container(
         &container_name,
         &image.oci_image,
         &image.oci_manifest,
         &runtime_pod_spec,
     )
     .await
-    .map_err(|e| with_context(e, format!("Failed to create container {container_name}")))?;
+    {
+        Ok(container) => container,
+        Err(err) => {
+            let message = err.to_string();
+            if is_security_error_message(&message) {
+                return Err(new_error(message));
+            }
+            return Err(with_context(
+                err,
+                format!("Failed to create container {container_name}"),
+            ));
+        }
+    };
 
     let container_debug_fields = [
         ("app", app),
@@ -670,35 +1061,6 @@ async fn install_impl(
         log_info("container", "Restored snapshot data", &completed_fields);
     }
 
-    let profile_source = if snapshot.is_some() {
-        "snapshot"
-    } else {
-        "image"
-    };
-    let profile_fields = [
-        ("app", app),
-        ("container", container_name.as_str()),
-        ("namespace", namespace_value),
-        ("profile_source", profile_source),
-    ];
-    log_info("container", "Loading service profile", &profile_fields);
-    // Load or create profile
-    let profile = match snapshot_spec_contents.as_ref() {
-        Some(spec) => {
-            let mut profile = Profile::from_spec_fields(spec.profile_key.as_deref(), &spec.options)
-                .map_err(|e| {
-                    with_context(
-                        e,
-                        "Failed to materialize service profile from snapshot specification",
-                    )
-                })?;
-            profile.set_options(&image.config.options);
-            profile
-        }
-        None => Profile::from_options(&image.config.options)
-            .map_err(|e| with_context(e, "Failed to build profile from image options"))?,
-    };
-
     let runtime_fields = [
         ("app", app),
         ("container", container_name.as_str()),
@@ -743,6 +1105,144 @@ async fn install_impl(
         pod: pod_manifest,
         profile,
     })
+}
+
+fn apply_security_context(pod_spec: &mut PodSpec, profile: Option<&BundleSecurityProfile>) {
+    let mut context = PodSecurityContext::default();
+    if let Some(profile) = profile {
+        context.allow_privileged = profile.allow_privileged;
+        if !profile.extra_capabilities.is_empty() {
+            context.extra_capabilities =
+                dedupe_capabilities(profile.extra_capabilities.iter().map(|cap| cap.as_str()));
+        }
+        if let Some(seccomp) = profile.seccomp_profile.as_ref() {
+            context.seccomp_profile = Some(PodSeccompProfile {
+                profile_type: match seccomp.profile_type {
+                    BundleSeccompProfileType::Baseline => "Baseline".to_string(),
+                    BundleSeccompProfileType::RuntimeDefault => "RuntimeDefault".to_string(),
+                    BundleSeccompProfileType::Localhost => "Localhost".to_string(),
+                },
+                localhost_profile: seccomp.localhost_profile.clone(),
+            });
+        }
+    }
+    pod_spec.security = context;
+}
+
+fn reconcile_volume_permissions(
+    app: &str,
+    pod_spec: &PodSpec,
+    volume_host_paths: &HashMap<String, String>,
+) -> Result<(), DynError> {
+    let mut desired: HashMap<String, (u32, u32)> = HashMap::new();
+    for container in &pod_spec.containers {
+        let (uid, gid) = resolve_process_user(container.user.as_deref());
+        for mount in &container.volume_mounts {
+            if mount.read_only.unwrap_or(false) {
+                continue;
+            }
+            if let Some(host_path) = volume_host_paths.get(&mount.name) {
+                match desired.entry(host_path.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert((uid, gid));
+                    }
+                    Entry::Occupied(existing) => {
+                        if *existing.get() != (uid, gid) {
+                            log_warn(
+                                "container",
+                                "Conflicting ownership requested for shared host volume; keeping original assignment",
+                                &[
+                                    ("app", app),
+                                    ("volume", mount.name.as_str()),
+                                    ("path", host_path.as_str()),
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (host_path, (uid, gid)) in desired {
+        let raw_path = Path::new(&host_path);
+        let resolved = match fs::symlink_metadata(raw_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(raw_path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let path_display = raw_path.display().to_string();
+                    let err_text = err.to_string();
+                    log_warn(
+                        "container",
+                        "Failed to resolve hostPath symlink for volume; skipping ownership update",
+                        &[
+                            ("app", app),
+                            ("path", path_display.as_str()),
+                            ("error", err_text.as_str()),
+                        ],
+                    );
+                    continue;
+                }
+            },
+            Ok(_) => raw_path.to_path_buf(),
+            Err(_) => continue,
+        };
+        if !resolved.exists() {
+            continue;
+        }
+        if !is_nanocloud_managed_path(&resolved) {
+            log::debug!(
+                "Skipping ownership update for unmanaged host volume path {} (app={})",
+                resolved.display(),
+                app
+            );
+            continue;
+        }
+
+        let uid_text = uid.to_string();
+        let gid_text = gid.to_string();
+        let path_text = resolved.display().to_string();
+        log::debug!(
+            "Updating host volume ownership for {} to uid={}, gid={} (app={})",
+            path_text,
+            uid_text,
+            gid_text,
+            app
+        );
+
+        chown(
+            &resolved,
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+        )
+        .map_err(|err| {
+            with_context(
+                err,
+                format!(
+                    "Failed to update ownership on '{}' for uid={}, gid={}",
+                    resolved.display(),
+                    uid,
+                    gid
+                ),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn is_nanocloud_managed_path(path: &Path) -> bool {
+    if let Ok(root) = env::var("NANOCLOUD_STORAGE_ROOT") {
+        if !root.is_empty() && path.starts_with(Path::new(&root)) {
+            return true;
+        }
+    }
+    path.starts_with(Path::new("/var/lib/nanocloud.io"))
+}
+
+fn is_security_error_message(message: &str) -> bool {
+    message.starts_with(SECURITY_POLICY_VIOLATION)
+        || message.starts_with(PRIVILEGE_ESCALATION_DENIED)
 }
 
 fn prepare_config_map_bindings(
@@ -892,11 +1392,12 @@ fn secret_volume_path(container_name: &str, volume_name: &str) -> PathBuf {
         .join(volume_name)
 }
 
-fn reset_volume_dir(path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn reset_volume_dir(path: &Path, mode: u32) -> Result<(), Box<dyn Error + Send + Sync>> {
     if path.exists() {
         fs::remove_dir_all(path)?;
     }
     fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -990,7 +1491,7 @@ fn materialize_config_map_volume(
     let configmap_name = source.name.clone().unwrap_or_else(|| volume.name.clone());
     let optional = source.optional.unwrap_or(false);
     let mount_path = configmap_volume_path(container_name, &volume.name);
-    reset_volume_dir(&mount_path)?;
+    reset_volume_dir(&mount_path, 0o750)?;
 
     match load_config_map_cached(namespace, &configmap_name, cache)? {
         Some(ref config_map) => {
@@ -1035,7 +1536,7 @@ fn materialize_secret_volume(
     let secret_name = secret_name.to_string();
     let optional = secret_source.optional.unwrap_or(false);
     let mount_path = secret_volume_path(container_name, &volume.name);
-    reset_volume_dir(&mount_path)?;
+    reset_volume_dir(&mount_path, 0o700)?;
 
     let secret_record = match load_secret_cached(namespace, &secret_name, cache, store)? {
         Some(record) => record,
@@ -1122,7 +1623,7 @@ fn materialize_projected_volume(
     };
 
     let mount_path = configmap_volume_path(container_name, &volume.name);
-    reset_volume_dir(&mount_path)?;
+    reset_volume_dir(&mount_path, 0o750)?;
     let default_mode = resolve_mode(projected.default_mode, 0o644);
 
     for source in &projected.sources {
@@ -1623,6 +2124,7 @@ async fn stop_impl(namespace: Option<&str>, app: &str) -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[cfg(test)]
 fn split_first_rest(values: &[String]) -> (String, Vec<String>) {
     if values.is_empty() {
         (String::new(), Vec::new())
@@ -1637,18 +2139,46 @@ fn split_first_rest(values: &[String]) -> (String, Vec<String>) {
 mod tests {
     use super::*;
     use crate::nanocloud::engine::get_streaming_backup;
+    use crate::nanocloud::events::in_memory::InMemoryEventBus;
+    use crate::nanocloud::events::{EventSubscriber, EventTopic, EventType, SubscriptionOptions};
     use crate::nanocloud::k8s::configmap::ConfigMap;
     use crate::nanocloud::k8s::pod::{
         ConfigMapEnvSource, ConfigMapKeySelector, ContainerEnvVar, ContainerSpec, EnvFromSource,
-        EnvVarSource, KeyToPath, ObjectMeta, SecretEnvSource, SecretKeySelector,
-        SecretVolumeSource,
+        EnvVarSource, KeyToPath, ObjectMeta, PodSecurityContext, PodSpec, SecretEnvSource,
+        SecretKeySelector, SecretVolumeSource,
     };
     use crate::nanocloud::secrets::{KeyspaceSecretStore, SecretMaterial, StoredSecret};
     use chrono::Utc;
     use std::collections::{BTreeMap, HashMap};
+    use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+    use tokio::time::{timeout, Duration};
+    use tokio_stream::StreamExt;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.previous.as_ref() {
+                env::set_var(self.key, prev);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
 
     fn make_config_map(name: &str, data: &[(&str, &str)]) -> ConfigMap {
         let mut config = ConfigMap::new(ObjectMeta {
@@ -1678,6 +2208,57 @@ mod tests {
             digest: "digest".to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    fn empty_pod_spec() -> PodSpec {
+        PodSpec {
+            init_containers: Vec::new(),
+            containers: Vec::new(),
+            volumes: Vec::new(),
+            restart_policy: None,
+            service_account_name: None,
+            node_name: None,
+            host_network: false,
+            security: PodSecurityContext::default(),
+        }
+    }
+
+    #[test]
+    fn security_context_defaults_to_baseline() {
+        let mut pod_spec = empty_pod_spec();
+        apply_security_context(&mut pod_spec, None);
+        assert!(!pod_spec.security.allow_privileged);
+        assert!(pod_spec.security.extra_capabilities.is_empty());
+        assert!(pod_spec.security.seccomp_profile.is_none());
+    }
+
+    #[test]
+    fn security_context_normalizes_capabilities_and_seccomp() {
+        let mut pod_spec = empty_pod_spec();
+        let profile = BundleSecurityProfile {
+            allow_privileged: true,
+            extra_capabilities: vec![
+                "cap_net_raw".to_string(),
+                "CAP_NET_RAW".to_string(),
+                "net_admin".to_string(),
+            ],
+            seccomp_profile: Some(BundleSeccompProfile {
+                profile_type: BundleSeccompProfileType::Localhost,
+                localhost_profile: Some("custom".to_string()),
+            }),
+        };
+        apply_security_context(&mut pod_spec, Some(&profile));
+        assert!(pod_spec.security.allow_privileged);
+        assert_eq!(
+            pod_spec.security.extra_capabilities,
+            vec!["CAP_NET_RAW".to_string(), "CAP_NET_ADMIN".to_string()]
+        );
+        let seccomp = pod_spec
+            .security
+            .seccomp_profile
+            .expect("seccomp profile expected");
+        assert_eq!(seccomp.profile_type, "Localhost");
+        assert_eq!(seccomp.localhost_profile.as_deref(), Some("custom"));
     }
 
     struct EnvOverride {
@@ -2091,6 +2672,73 @@ mod tests {
             Path::new("/var/lib/nanocloud.io/storage/configmap")
                 .join("service")
                 .join("vol")
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_envelope_emits_events() {
+        let _guard = EnvGuard::set("NANOCLOUD_BINDING_SKIP_ISOLATION", "1");
+        let temp = tempdir().expect("temp dir");
+        let log_path = temp.path().join("bindings.log");
+        let mut binding_map = HashMap::new();
+        binding_map.insert(
+            "svc".to_string(),
+            vec![vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo ok >> {}", log_path.display()),
+            ]],
+        );
+        let mut profile = Profile::from_options(&HashMap::new()).expect("profile");
+        let policy = BindingEnvelopePolicy::from_environment().expect("policy");
+        let event_bus = InMemoryEventBus::global();
+        let topic = EventTopic::new("controller", "bindings.lifecycle");
+        let subscription = event_bus
+            .subscribe(&topic, SubscriptionOptions)
+            .expect("subscribe to events");
+        let mut stream = subscription.stream;
+
+        run_bindings_for_services(
+            &binding_map,
+            &policy,
+            &mut profile,
+            "default",
+            "demo",
+            event_bus,
+            |_service| Ok("test-container".to_string()),
+        )
+        .await
+        .expect("bindings succeed");
+
+        assert!(
+            log_path.exists(),
+            "binding command should write to the log file"
+        );
+        assert_eq!(profile.bindings.len(), 1, "profile stores binding history");
+        let record = profile.bindings.values().next().expect("binding record");
+        assert!(matches!(record.status, BindingStatus::Succeeded));
+
+        let first = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("binding started event present")
+            .expect("event payload")
+            .expect("event envelope");
+        assert!(matches!(
+            first.event_type,
+            EventType::Custom("BindingStarted")
+        ));
+        let second = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("binding completion event present")
+            .expect("event payload")
+            .expect("event envelope");
+        assert!(matches!(
+            second.event_type,
+            EventType::Custom("BindingCompleted")
+        ));
+        assert_eq!(
+            second.attributes.get("status").map(|value| value.as_str()),
+            Some("completed")
         );
     }
 }

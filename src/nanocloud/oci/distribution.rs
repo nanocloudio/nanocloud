@@ -15,6 +15,7 @@
  */
 
 use crate::nanocloud::logger::log_info;
+use crate::nanocloud::oci::{fake_registry_root, image_store_root};
 use crate::nanocloud::util::error::{new_error, with_context};
 use flate2::read::GzDecoder;
 use futures_util::stream::StreamExt;
@@ -246,34 +247,42 @@ fn validate_digest(digest: &str, original: &str) -> Result<(), Box<dyn Error + S
 pub fn load_manifest_from_store(
     reference: &ImageReference,
 ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
-    let image_root = "/var/lib/nanocloud.io/image";
+    let image_root = image_store_root();
     let manifest_path = if let Some(digest) = &reference.digest {
         if !digest.starts_with("sha256:") || digest.len() != 71 {
             return Err(new_error(format!(
                 "Unsupported manifest digest format: {digest}"
             )));
         }
-        format!("{}/blobs/sha256/{}", image_root, &digest[7..])
+        image_root.join("blobs").join("sha256").join(&digest[7..])
     } else {
         let tag = reference
             .tag
             .as_ref()
             .ok_or_else(|| new_error("Image reference missing tag and digest"))?;
-        format!(
-            "{}/refs/{}/{}/{}",
-            image_root, reference.registry, reference.repository, tag
-        )
+        image_root
+            .join("refs")
+            .join(&reference.registry)
+            .join(&reference.repository)
+            .join(tag)
     };
 
     let file = File::open(&manifest_path).map_err(|e| {
         with_context(
             e,
-            format!("Failed to open cached manifest at {manifest_path}"),
+            format!(
+                "Failed to open cached manifest at {}",
+                manifest_path.display()
+            ),
         )
     })?;
     let reader = BufReader::new(file);
-    serde_json::from_reader(reader)
-        .map_err(|e| with_context(e, format!("Failed to parse manifest at {manifest_path}")))
+    serde_json::from_reader(reader).map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to parse manifest at {}", manifest_path.display()),
+        )
+    })
 }
 
 pub struct Registry {}
@@ -284,18 +293,22 @@ impl Registry {
         force_update: bool,
     ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
         let reference = parse_image_reference(image)?;
+        if let Some(fake_root) = fake_registry_root() {
+            return pull_from_fake_registry(&reference, &fake_root, force_update);
+        }
         let registry = reference.registry.clone();
         let repository = reference.repository.clone();
         let tag = reference.tag_or_default().to_string();
         let mut manifest_ref = reference.digest.clone().unwrap_or_else(|| tag.clone());
 
-        let image_dir = "/var/lib/nanocloud.io/image".to_string();
-        let blobs_dir = format!("{}/blobs/sha256", image_dir);
-        let refs_dir = format!("{}/refs/{}/{}", image_dir, registry, repository);
-        let overlay_dir = format!("{}/overlay", image_dir);
+        let image_dir = image_store_root();
+        let blobs_dir = image_dir.join("blobs/sha256");
+        let refs_dir = image_dir.join("refs").join(&registry).join(&repository);
+        let overlay_dir = image_dir.join("overlay");
         for dir in [&blobs_dir, &refs_dir, &overlay_dir] {
-            create_dir_all(dir)
-                .map_err(|e| with_context(e, format!("Failed to create directory {dir}")))?;
+            create_dir_all(dir).map_err(|e| {
+                with_context(e, format!("Failed to create directory {}", dir.display()))
+            })?;
         }
 
         let client = Client::new();
@@ -311,35 +324,47 @@ impl Registry {
         }
         .ok_or_else(|| new_error("Unable to get manifest"))?;
 
-        let layout_path = format!("{image_dir}/oci-layout");
-        std::fs::write(&layout_path, r#"{ "imageLayoutVersion": "1.0.0" }"#)
-            .map_err(|e| with_context(e, format!("Failed to write OCI layout at {layout_path}")))?;
+        let layout_path = image_dir.join("oci-layout");
+        std::fs::write(&layout_path, r#"{ "imageLayoutVersion": "1.0.0" }"#).map_err(|e| {
+            with_context(
+                e,
+                format!("Failed to write OCI layout at {}", layout_path.display()),
+            )
+        })?;
 
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| with_context(e, format!("Failed to serialize manifest {manifest_ref}")))?;
-        let manifest_path = format!("{blobs_dir}/{}", &manifest_ref[7..]);
+        let manifest_path = blobs_dir.join(&manifest_ref[7..]);
         std::fs::write(&manifest_path, manifest_json).map_err(|e| {
             with_context(
                 e,
-                format!("Failed to write manifest {manifest_ref} to {manifest_path}"),
+                format!(
+                    "Failed to write manifest {manifest_ref} to {}",
+                    manifest_path.display()
+                ),
             )
         })?;
 
         validate_config_media_type(&manifest.config.media_type)?;
-        let tag_symlink = format!("{}/{}", &refs_dir, tag);
+        let tag_symlink = refs_dir.join(&tag);
         if let Err(error) = std::fs::remove_file(&tag_symlink) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(with_context(
                     error,
-                    format!("Failed to remove tag symlink {tag_symlink}"),
+                    format!("Failed to remove tag symlink {}", tag_symlink.display()),
                 ));
             }
         }
         std::os::unix::fs::symlink(
-            format!("../../../blobs/sha256/{}", &manifest_ref[7..]),
+            Path::new("../../../blobs/sha256").join(&manifest_ref[7..]),
             &tag_symlink,
         )
-        .map_err(|e| with_context(e, format!("Failed to create tag symlink {tag_symlink}")))?;
+        .map_err(|e| {
+            with_context(
+                e,
+                format!("Failed to create tag symlink {}", tag_symlink.display()),
+            )
+        })?;
 
         download_blob(
             &client,
@@ -374,6 +399,167 @@ impl Registry {
 
         Ok(manifest)
     }
+}
+
+fn pull_from_fake_registry(
+    reference: &ImageReference,
+    fake_root: &Path,
+    force_update: bool,
+) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
+    let manifest_path = fake_root
+        .join("manifests")
+        .join(&reference.registry)
+        .join(&reference.repository)
+        .join(format!("{}.json", reference.tag_or_default()));
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to read fake manifest at {}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to parse fake manifest at {}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    persist_fake_artifacts(
+        reference,
+        &manifest,
+        &manifest_bytes,
+        fake_root,
+        force_update,
+    )?;
+    Ok(manifest)
+}
+
+fn persist_fake_artifacts(
+    reference: &ImageReference,
+    manifest: &OciManifest,
+    manifest_bytes: &[u8],
+    fake_root: &Path,
+    force_update: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let manifest_digest = compute_manifest_digest(manifest_bytes)?;
+    let image_dir = image_store_root();
+    let blobs_dir = image_dir.join("blobs/sha256");
+    let refs_dir = image_dir
+        .join("refs")
+        .join(&reference.registry)
+        .join(&reference.repository);
+    let overlay_dir = image_dir.join("overlay");
+    for dir in [&blobs_dir, &refs_dir, &overlay_dir] {
+        create_dir_all(dir).map_err(|e| {
+            with_context(e, format!("Failed to create directory {}", dir.display()))
+        })?;
+    }
+
+    let layout_path = image_dir.join("oci-layout");
+    std::fs::write(&layout_path, r#"{ "imageLayoutVersion": "1.0.0" }"#).map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to write OCI layout at {}", layout_path.display()),
+        )
+    })?;
+
+    let manifest_hex = digest_hex(&manifest_digest)?;
+    let manifest_path = blobs_dir.join(manifest_hex);
+    std::fs::write(&manifest_path, manifest_bytes).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to persist fake manifest to {}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+
+    let tag_symlink = refs_dir.join(reference.tag_or_default());
+    if let Err(error) = std::fs::remove_file(&tag_symlink) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(with_context(
+                error,
+                format!("Failed to remove tag symlink {}", tag_symlink.display()),
+            ));
+        }
+    }
+    std::os::unix::fs::symlink(
+        Path::new("../../../blobs/sha256").join(manifest_hex),
+        &tag_symlink,
+    )
+    .map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to create tag symlink {}", tag_symlink.display()),
+        )
+    })?;
+
+    copy_fake_blob(fake_root, &manifest.config, &blobs_dir, force_update)?;
+    for layer in &manifest.layers {
+        copy_fake_blob(fake_root, layer, &blobs_dir, force_update)?;
+        unpack_layer(layer, &blobs_dir, &overlay_dir, force_update)?;
+    }
+
+    Ok(())
+}
+
+fn compute_manifest_digest(bytes: &[u8]) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut hasher = Hasher::new(MessageDigest::sha256())
+        .map_err(|e| with_context(e, "Failed to initialize manifest digest"))?;
+    hasher
+        .update(bytes)
+        .map_err(|e| with_context(e, "Failed to hash manifest bytes"))?;
+    let digest = hasher
+        .finish()
+        .map_err(|e| with_context(e, "Failed to finalize manifest digest"))?;
+    Ok(format!("sha256:{}", bytes_to_hex(&digest)))
+}
+
+fn copy_fake_blob<D: Descriptor>(
+    fake_root: &Path,
+    descriptor: &D,
+    blobs_dir: &Path,
+    force_update: bool,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let digest_suffix = digest_hex(descriptor.digest())?.to_owned();
+    let dest = blobs_dir.join(&digest_suffix);
+    if dest.exists() && !force_update {
+        verify_blob(&dest, descriptor)?;
+        return Ok(dest);
+    }
+
+    if let Err(err) = create_dir_all(dest.parent().unwrap()) {
+        return Err(with_context(
+            err,
+            format!("Failed to prepare blob destination {}", dest.display()),
+        ));
+    }
+
+    let source = fake_root.join("blobs").join("sha256").join(&digest_suffix);
+    let copied = std::fs::copy(&source, &dest).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to copy fake blob from {} to {}",
+                source.display(),
+                dest.display()
+            ),
+        )
+    })?;
+    if copied == 0 {
+        return Err(new_error(format!(
+            "Fake blob {} produced zero bytes",
+            source.display()
+        )));
+    }
+    verify_blob(&dest, descriptor)?;
+    Ok(dest)
 }
 
 async fn get_manifest(
@@ -428,13 +614,12 @@ async fn download_blob<D: Descriptor>(
     registry: &str,
     repository: &str,
     descriptor: &D,
-    blobs_dir: &str,
+    blobs_dir: &Path,
     force_update: bool,
 ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let digest = descriptor.digest();
     let digest_hex = digest_hex(digest)?;
-    let blobs_path = Path::new(blobs_dir);
-    let file_path = blobs_path.join(digest_hex);
+    let file_path = blobs_dir.join(digest_hex);
 
     if file_path.exists() {
         if force_update {
@@ -469,7 +654,7 @@ async fn download_blob<D: Descriptor>(
         }
     }
 
-    let tmp_path = blobs_path.join(format!("{}.partial", digest_hex));
+    let tmp_path = blobs_dir.join(format!("{}.partial", digest_hex));
     let mut file = File::create(&tmp_path).map_err(|e| {
         with_context(
             e,
@@ -576,13 +761,13 @@ async fn download_blob<D: Descriptor>(
 
 fn unpack_layer(
     layer: &LayerDescriptor,
-    blobs_dir: &str,
-    overlay_dir: &str,
+    blobs_dir: &Path,
+    overlay_dir: &Path,
     force_update: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let digest_hex = digest_hex(&layer.digest)?;
-    let file_path = Path::new(blobs_dir).join(digest_hex);
-    let out_path = Path::new(overlay_dir).join(digest_hex);
+    let file_path = blobs_dir.join(digest_hex);
+    let out_path = overlay_dir.join(digest_hex);
 
     if out_path.exists() {
         if force_update {

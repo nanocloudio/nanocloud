@@ -363,6 +363,32 @@ pub struct PodSpec {
     pub node_name: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_network: bool,
+    #[serde(default)]
+    pub security: PodSecurityContext,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PodSecurityContext {
+    #[serde(rename = "allowPrivileged", default)]
+    pub allow_privileged: bool,
+    #[serde(
+        rename = "extraCapabilities",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub extra_capabilities: Vec<String>,
+    #[serde(rename = "seccompProfile", skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile: Option<PodSeccompProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PodSeccompProfile {
+    #[serde(rename = "type")]
+    pub profile_type: String,
+    #[serde(rename = "localhostProfile", skip_serializing_if = "Option::is_none")]
+    pub localhost_profile: Option<String>,
 }
 
 const fn is_false(value: &bool) -> bool {

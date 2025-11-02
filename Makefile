@@ -5,8 +5,9 @@ PACKAGE_SCRIPT := packaging/debian/build.sh
 DEB_OUTPUT_DIR := target/debian
 SERVICE_NAME := nanocloud
 VALIDATION_LOG_DIR ?= target/validation
+SCHEMA_OUTPUT_DIR ?= target/schema
 
-.PHONY: all debug release openapi package install clean help validate-controllers
+.PHONY: all debug release openapi package install clean help validate-controllers schema dockyard-docs test-conformance
 
 all: debug
 
@@ -37,8 +38,25 @@ test:
 	export RUST_TEST_THREADS="$${RUST_TEST_THREADS:-1}"; \
 	$(CARGO) test --locked --workspace --all-targets
 
+test-conformance:
+	@set -euo pipefail; \
+	target_dir="$${CARGO_TARGET_DIR:-$$(pwd)/target}"; \
+	out_dir="$$target_dir/oci-conformance"; \
+	rm -rf "$$out_dir"; \
+	mkdir -p "$$out_dir"; \
+	export OCI_CONFORMANCE_DIR="$$out_dir"; \
+	export RUST_TEST_THREADS=1; \
+	$(CARGO) test --locked -p nanocloud --test oci_conformance -- --nocapture; \
+	echo "OCI conformance artifacts written to $$out_dir"
+
 lint:
 	$(CARGO) clippy --all-targets --all-features
+
+schema:
+	./tools/publish_schema.sh $(SCHEMA_OUTPUT_DIR)
+
+dockyard-docs:
+	./tools/dockyard_docgen.sh docs/dockyard/options.manifest docs/dockyard/generated docs/dockyard/generated
 
 # Produce a Debian package using the packaging script. Expect the release binary to already exist.
 package:

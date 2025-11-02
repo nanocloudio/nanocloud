@@ -7,6 +7,7 @@ use std::pin::Pin;
 pub type PublishFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 pub type EventStream<E> = BoxStream<'static, Result<EventEnvelope, E>>;
 
+pub mod bindings;
 pub mod in_memory;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

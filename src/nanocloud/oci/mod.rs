@@ -18,6 +18,7 @@ pub mod distribution;
 pub mod image;
 pub mod runtime;
 pub mod runtime_provider;
+pub mod store;
 
 pub use distribution::OciManifest;
 pub use distribution::Registry;
@@ -30,3 +31,4 @@ pub use runtime::Runtime;
 pub use runtime_provider::{
     container_runtime, register_container_runtime, ContainerRuntime, ExecPrepare, NamespaceAction,
 };
+pub use store::{fake_registry_root, image_store_root};

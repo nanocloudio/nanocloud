@@ -594,6 +594,7 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
             );
             let body = Json(ErrorBody {
                 error: "authentication context missing".to_string(),
+                conflicts: None,
             });
             return (StatusCode::UNAUTHORIZED, body).into_response();
         } else {
@@ -607,6 +608,7 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
             );
             let body = Json(ErrorBody {
                 error: "authentication required".to_string(),
+                conflicts: None,
             });
             return (StatusCode::UNAUTHORIZED, body).into_response();
         }
@@ -629,6 +631,7 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
                 );
                 let body = Json(ErrorBody {
                     error: "insufficient scope".to_string(),
+                    conflicts: None,
                 });
                 return (StatusCode::FORBIDDEN, body).into_response();
             }

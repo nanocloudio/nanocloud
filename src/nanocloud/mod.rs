@@ -31,6 +31,7 @@ pub mod observability;
 pub mod oci;
 pub mod scheduler;
 pub mod secrets;
+pub mod security;
 pub mod server;
 pub mod util;
 

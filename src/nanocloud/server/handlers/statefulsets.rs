@@ -595,7 +595,7 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nanocloud::k8s::pod::{ContainerSpec, ObjectMeta, PodSpec};
+    use crate::nanocloud::k8s::pod::{ContainerSpec, ObjectMeta, PodSecurityContext, PodSpec};
     use crate::nanocloud::k8s::statefulset::{
         LabelSelector, PodTemplateSpec, StatefulSetSpec, StatefulSetStatus,
     };
@@ -662,6 +662,7 @@ mod tests {
             service_account_name: None,
             node_name: None,
             host_network: false,
+            security: PodSecurityContext::default(),
         };
 
         StatefulSet {

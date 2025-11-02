@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+mod bundles;
 mod ca;
 mod config;
+mod devices;
 mod diagnostics;
+mod events;
 mod exec;
 mod install;
 mod lifecycle;
@@ -34,6 +37,8 @@ use std::process;
 
 use crate::nanocloud::api::client::NanocloudClient;
 use crate::nanocloud::cli::Setup;
+use crate::nanocloud::logger;
+use crate::nanocloud::observability::tracing;
 use crate::nanocloud::server;
 
 use super::args::Commands;
@@ -45,6 +50,8 @@ pub async fn run(command: &Commands) -> Result<(), Box<dyn Error + Send + Sync>>
             Ok(())
         }
         Commands::Server(args) => {
+            logger::set_log_format(args.log_format.into());
+            tracing::init();
             let addr: SocketAddr =
                 args.listen
                     .parse()
@@ -100,11 +107,29 @@ pub async fn run(command: &Commands) -> Result<(), Box<dyn Error + Send + Sync>>
             let client = NanocloudClient::new()?;
             status::handle_status(&client, args).await
         }
-        Commands::Diagnostics(args) => diagnostics::handle_diagnostics(args),
+        Commands::Diagnostics(args) => {
+            let exit_code = diagnostics::handle_diagnostics(args).await?;
+            if exit_code != 0 {
+                process::exit(exit_code);
+            }
+            Ok(())
+        }
         Commands::Policy(args) => {
             let client = NanocloudClient::new()?;
             policy::handle_policy(&client, args).await
         }
+        Commands::Events(args) => {
+            let client = NanocloudClient::new()?;
+            events::handle_events(&client, args).await
+        }
+        Commands::Device(args) => {
+            let client = NanocloudClient::new()?;
+            devices::handle_devices(&client, args).await
+        }
         Commands::Volume(args) => volume::handle_volume(args).await,
+        Commands::Bundle(args) => {
+            let client = NanocloudClient::new()?;
+            bundles::handle_bundle(&client, args).await
+        }
     }
 }

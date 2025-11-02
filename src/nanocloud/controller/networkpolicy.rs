@@ -26,6 +26,8 @@ use crate::nanocloud::logger::log_error;
 use crate::nanocloud::network::policy::{
     chain_name, PolicyChain, PolicyDirection, PolicyProgrammer, PolicyRule,
 };
+use crate::nanocloud::observability::metrics::{self, ControllerReconcileResult};
+use crate::nanocloud::observability::tracing;
 use crate::nanocloud::util::error::with_context;
 use crate::nanocloud::util::KeyspaceEventType;
 
@@ -78,8 +80,18 @@ async fn handle_watch_event(kind: &'static str, event: Option<ControllerWatchEve
 }
 
 async fn reconcile_with_reason(trigger: &'static str) {
-    match tokio::task::spawn_blocking(reconcile).await {
-        Ok(Ok(())) => {}
+    let span_name = format!("trigger:{}", trigger);
+    match tracing::with_span("controller.networkpolicy", span_name, async move {
+        tokio::task::spawn_blocking(reconcile).await
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            metrics::record_controller_reconcile(
+                "networkpolicy",
+                ControllerReconcileResult::Success,
+            );
+        }
         Ok(Err(err)) => {
             let message = err.to_string();
             log_error(
@@ -87,6 +99,7 @@ async fn reconcile_with_reason(trigger: &'static str) {
                 "NetworkPolicy reconciliation failed",
                 &[("trigger", trigger), ("error", message.as_str())],
             );
+            metrics::record_controller_reconcile("networkpolicy", ControllerReconcileResult::Error);
         }
         Err(join_err) => {
             let message = join_err.to_string();
@@ -95,6 +108,7 @@ async fn reconcile_with_reason(trigger: &'static str) {
                 "NetworkPolicy reconciliation panic",
                 &[("trigger", trigger), ("error", message.as_str())],
             );
+            metrics::record_controller_reconcile("networkpolicy", ControllerReconcileResult::Error);
         }
     }
 }

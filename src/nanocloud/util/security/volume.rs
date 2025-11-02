@@ -9,10 +9,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use nix::errno::Errno;
 use nix::mount::umount2;
-use nix::unistd::Uid;
+use nix::unistd::{chown, Gid, Uid};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::Config;
@@ -380,10 +380,40 @@ pub fn ensure_encrypted_volume_root() -> Result<PathBuf, Box<dyn Error + Send + 
             ),
         )
     })?;
-    if let Ok(metadata) = fs::metadata(&root) {
-        if metadata.uid() == 0 && Uid::effective().is_root() {
-            // leave ownership as root:root
-        }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        with_context(
+            e,
+            format!(
+                "Failed to set permissions on encrypted volume root '{}'",
+                root.display()
+            ),
+        )
+    })?;
+    if Uid::effective().is_root() {
+        let (uid, gid) = runtime_user_ids();
+        chown(&root, Some(uid), Some(gid)).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to set ownership on encrypted volume root '{}'",
+                    root.display()
+                ),
+            )
+        })?;
     }
     Ok(root)
+}
+
+fn runtime_user_ids() -> (Uid, Gid) {
+    let uid = env::var("NANOCLOUD_RUNTIME_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(Uid::from_raw)
+        .unwrap_or_else(Uid::effective);
+    let gid = env::var("NANOCLOUD_RUNTIME_GID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(Gid::from_raw)
+        .unwrap_or_else(Gid::effective);
+    (uid, gid)
 }

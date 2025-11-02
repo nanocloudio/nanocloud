@@ -37,7 +37,7 @@ use crate::nanocloud::k8s::statefulset::{
 use crate::nanocloud::k8s::store::{self, list_stateful_sets_for, normalize_namespace};
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_debug, log_error, log_info, log_warn};
-use crate::nanocloud::observability::metrics;
+use crate::nanocloud::observability::metrics::{self, ControllerReconcileResult};
 use crate::nanocloud::util::{is_missing_value_error, Keyspace, KeyspaceEventType};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -876,7 +876,20 @@ fn start_statefulset_executor(runtime: &Arc<ControllerRuntime>) {
         async move {
             if let ControllerTarget::StatefulSet { namespace, name } = &item.target {
                 let controller = StatefulSetController::new(name.clone(), namespace.clone());
-                if let Err(err) = controller.reconcile_and_apply(&runtime.context(), &item.target) {
+                let reconcile_result =
+                    controller.reconcile_and_apply(&runtime.context(), &item.target);
+                if reconcile_result.is_ok() {
+                    metrics::record_controller_reconcile(
+                        "statefulset",
+                        ControllerReconcileResult::Success,
+                    );
+                } else {
+                    metrics::record_controller_reconcile(
+                        "statefulset",
+                        ControllerReconcileResult::Error,
+                    );
+                }
+                if let Err(err) = reconcile_result {
                     let error_text = err.to_string();
                     log_error(
                         COMPONENT,

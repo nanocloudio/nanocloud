@@ -669,6 +669,8 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio_stream::StreamExt;
 
     fn write_log(path: &Path, entries: &[(&str, &str)]) {
         let mut payload = String::new();
@@ -737,5 +739,48 @@ mod tests {
         assert_eq!(entry.message.trim_end_matches('\n'), "recent");
 
         assert!(tail.next_entry().await.expect("entry").is_none());
+    }
+
+    #[tokio::test]
+    async fn write_and_stream_logs_combines_streams() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("combined.log");
+
+        let (mut stdout_writer, stdout_reader) = duplex(64);
+        let (mut stderr_writer, stderr_reader) = duplex(64);
+
+        let stdout_task = tokio::spawn(async move {
+            stdout_writer
+                .write_all(b"out-one\nout-two\n")
+                .await
+                .expect("stdout write");
+        });
+        let stderr_task = tokio::spawn(async move {
+            stderr_writer
+                .write_all(b"err-one\n")
+                .await
+                .expect("stderr write");
+        });
+
+        write_docker_json_logs(stdout_reader, stderr_reader, &path)
+            .await
+            .expect("log writer");
+        stdout_task.await.expect("stdout task");
+        stderr_task.await.expect("stderr task");
+
+        let options = TailOptions {
+            start: TailStart::Beginning,
+            ..Default::default()
+        };
+        let (handle, mut stream) = spawn_log_stream(&path, options);
+
+        let mut messages = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.expect("log entry");
+            messages.push(entry.message.trim_end().to_string());
+        }
+
+        handle.wait().await.expect("tail join");
+        assert_eq!(messages, vec!["out-one", "out-two", "err-one"]);
     }
 }

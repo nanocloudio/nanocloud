@@ -9,6 +9,7 @@ Nanocloud is a single-binary container platform that delivers a Kubernetes-flavo
 - **Dockyard images** – curated images hosted at `registry.nanocloud.io` advertise options, defaults, and bindings through the `io.nanocloud.options` label.
 - **Bindings-first configuration** – service relationships (database, TLS, identity) are expressed once in image metadata and enforced during reconciliation.
 - **Operational safety** – TLS-only APIs, client-certificate bootstrap flows, exec/session metrics, and declarative backup retention ship out of the box.
+- **Event stream CLI & metrics** – `nanocloud events` mirrors Kubernetes watches, supports `--since`, `--level`, and `--reason` filters plus `--follow`, and the control plane emits Prometheus metrics and structured logs that align with the stream semantics.
 
 ## Architecture in Brief
 
@@ -27,6 +28,7 @@ flowchart TD
 - **Keyspace** – a file-backed, watchable key/value store persists bundle specs, workload state, secrets, and controller metadata with TTL support.
 - **Controllers** – bundle, stateful set, network policy, and snapshot controllers reconcile specs into actionable plans while emitting Kubernetes-style events.
 - **Kubelet & runtime** – a Rust kubelet uses the local OCI runtime to pull Dockyard images, apply CNI/CSI configuration, mount encrypted volumes, and supervise containers.
+- **Exec surface** – the HTTPS API exposes `/api/v1/namespaces/{namespace}/pods/{name}/exec` and `/api/v1/pods/{name}/exec` with WebSocket/HTTP upgrades so `nanocloud exec` can stream stdin/stdout/stderr and request TTY sessions over TLS.
 
 ### Install Flow
 
@@ -144,6 +146,7 @@ Controller discovery endpoints (`/apis/nanocloud.io/v1`, `/api/v1`) list the ava
 - **Metrics** – Prometheus metrics (exec session counts, keyspace queue depth, CNI health, backup throughput, etc.) publish on `/metrics`.
 - **Events** – Kubernetes-style `Event` objects are generated for bundle phases, reconciler failures, and binding status, making troubleshooting familiar.
 - **Diagnostics** – the CLI streams container logs, exposes watch APIs, checks CNI state, and reports controller findings to shorten feedback loops.
+- **Event CLI** – `nanocloud events --follow` upgrades to server-side watches, honors the same selectors as the HTTP stream, and prints structured rows that show namespace/object/reason/message alongside trace/span metadata.
 
 ## Security & Access
 
@@ -151,6 +154,11 @@ Controller discovery endpoints (`/apis/nanocloud.io/v1`, `/api/v1`) list the ava
 - **Tokens** – `nanocloud token` issues short-lived grants (renderable as QR codes) which can be exchanged for service-account JWTs or client certificates.
 - **Secure assets** – `nanocloud setup` prepares `/var/lib/nanocloud.io/secure_assets`, generates encryption keys, and keeps them off the container filesystem.
 - **Bindings safety nets** – option validation ensures binding prerequisites are satisfied before commands execute, preventing privilege mismatches between workloads.
+
+## Device Management
+
+- `nanocloud device` exposes subcommands to list, get, create, and delete device records within namespaces plus issue device certificates by POSTing CSRs. Each command reuses the API client’s authentication plumbing so it inherits TLS, bootstrap, and token support.
+- Devices are represented by the `Device` and `DeviceList` APIs under `apis/nanocloud.io/v1/namespaces/{namespace}/devices`; device certificates leverage the `/devices/certificates` endpoint to return signed PEM bundles and status updates for the issuing flow.
 
 ## Project Status
 

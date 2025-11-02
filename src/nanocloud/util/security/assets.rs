@@ -92,6 +92,25 @@ impl SecureAssets {
         let ca_cert_path = dir.join("ca.crt");
         let secret_key_path = dir.join("secret.key");
 
+        fs::create_dir_all(dir).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to prepare secure assets directory '{}'",
+                    dir.display()
+                ),
+            )
+        })?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to set permissions on secure assets directory '{}'",
+                    dir.display()
+                ),
+            )
+        })?;
+
         if repair && ca_cert_path.exists() && !ca_key_path.exists() {
             return Err(new_error(
                 "Cannot repair secure assets: ca.crt exists but ca.key is missing. Move or remove the certificate before repairing.",

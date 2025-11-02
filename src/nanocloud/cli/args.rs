@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-use clap::{Args, Parser, Subcommand};
+use crate::nanocloud::logger::LogFormat;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Parse a key=value argument into a tuple, validating the format.
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
@@ -80,6 +82,12 @@ pub enum Commands {
     /// Inspect NetworkPolicy state and debugging details
     Policy(PolicyArgs),
 
+    /// Follow controller events
+    Events(EventsArgs),
+
+    /// Manage configured devices
+    Device(DeviceArgs),
+
     /// Run the Nanocloud HTTP server
     Server(ServerArgs),
 
@@ -91,6 +99,9 @@ pub enum Commands {
 
     /// Manage encrypted volumes on the host
     Volume(VolumeArgs),
+
+    /// Manage bundle manifests
+    Bundle(BundleArgs),
 }
 
 #[derive(Args)]
@@ -276,7 +287,60 @@ pub struct StatusArgs {
 
 /// Run host-side diagnostics and cleanup for Nanocloud CNI artifacts
 #[derive(Args)]
-pub struct DiagnosticsArgs {}
+pub struct DiagnosticsArgs {
+    /// Run the loopback probe (set --no-loopback to skip)
+    #[arg(long = "loopback", default_value_t = true)]
+    pub loopback: bool,
+
+    /// Skip the loopback probe even when enabled by default
+    #[arg(long = "no-loopback")]
+    pub no_loopback: bool,
+
+    /// Override the diagnostics image used for the loopback probe
+    #[arg(long = "loopback-image", value_name = "IMAGE")]
+    pub loopback_image: Option<String>,
+
+    /// Override the loopback probe timeout (e.g. 60s, 2m, 500ms)
+    #[arg(long = "loopback-timeout", value_name = "DURATION")]
+    pub loopback_timeout: Option<String>,
+}
+
+#[derive(Args)]
+pub struct EventsArgs {
+    /// Only include events from this namespace
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// Filter events to a single bundle/service
+    #[arg(long)]
+    pub bundle: Option<String>,
+
+    /// Maximum number of events to print from the initial list
+    #[arg(long, value_name = "COUNT")]
+    pub limit: Option<u32>,
+
+    /// Only include events newer than this RFC3339 timestamp or duration (e.g. 30m, 6h)
+    #[arg(long, value_name = "DURATION|RFC3339")]
+    pub since: Option<String>,
+
+    /// Continue watching for new events until interrupted
+    #[arg(long)]
+    pub follow: bool,
+
+    /// Filter by event level (Normal or Warning)
+    #[arg(long, value_enum)]
+    pub level: Option<EventLevelArg>,
+
+    /// Filter by reason (repeatable)
+    #[arg(long = "reason", value_name = "REASON")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum EventLevelArg {
+    Normal,
+    Warning,
+}
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -295,6 +359,30 @@ pub struct ServerArgs {
     /// Address to bind the HTTPS server (e.g. 0.0.0.0:6443)
     #[arg(long, default_value = "127.0.0.1:6443")]
     pub listen: String,
+
+    /// Format to use when emitting server logs
+    #[arg(
+        long = "log-format",
+        value_enum,
+        env = "NANOCLOUD_LOG_FORMAT",
+        default_value = "text"
+    )]
+    pub log_format: LogFormatArg,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogFormatArg {
+    Text,
+    Json,
+}
+
+impl From<LogFormatArg> for LogFormat {
+    fn from(value: LogFormatArg) -> Self {
+        match value {
+            LogFormatArg::Text => LogFormat::Text,
+            LogFormatArg::Json => LogFormat::Json,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -341,6 +429,85 @@ pub struct TokenArgs {
     /// Render an ANSI QR code along with the token URL
     #[arg(long)]
     pub qr: bool,
+}
+
+#[derive(Args)]
+pub struct DeviceArgs {
+    #[command(subcommand)]
+    pub command: DeviceCommands,
+}
+
+#[derive(Subcommand)]
+pub enum DeviceCommands {
+    /// List devices in a namespace
+    List(DeviceListArgs),
+
+    /// Describe a device
+    Get(DeviceGetArgs),
+
+    /// Register a new device record
+    Create(DeviceCreateArgs),
+
+    /// Remove a device record
+    Delete(DeviceDeleteArgs),
+
+    /// Issue a certificate for a device CSR
+    IssueCertificate(DeviceIssueCertificateArgs),
+}
+
+#[derive(Args)]
+pub struct DeviceListArgs {
+    /// Namespace to scope the listing (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Args)]
+pub struct DeviceGetArgs {
+    /// Device record name (e.g. device-<hash>)
+    #[arg()]
+    pub name: String,
+
+    /// Namespace containing the device (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Args)]
+pub struct DeviceCreateArgs {
+    /// Device identity hash
+    #[arg()]
+    pub hash: String,
+
+    /// Namespace to create the device in (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+
+    /// Human-readable description
+    #[arg(short, long)]
+    pub description: Option<String>,
+}
+
+#[derive(Args)]
+pub struct DeviceDeleteArgs {
+    /// Device record name (e.g. device-<hash>)
+    #[arg()]
+    pub name: String,
+
+    /// Namespace containing the device (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Args)]
+pub struct DeviceIssueCertificateArgs {
+    /// Path to the CSR (PEM format) to sign
+    #[arg(value_name = "CSR")]
+    pub csr_path: PathBuf,
+
+    /// Namespace owning the device entry (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Args)]
@@ -406,4 +573,110 @@ pub struct VolumeLockArgs {
     /// Mounted path to unmount and clean up
     #[arg(long = "mount")]
     pub mount_path: Option<String>,
+}
+
+#[derive(Args)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub command: BundleCommands,
+}
+
+#[derive(Subcommand)]
+pub enum BundleCommands {
+    /// Apply a manifest fragment to an existing bundle
+    Apply(BundleApplyArgs),
+
+    /// Export a bundle profile artifact for backups or reinstall
+    Export(BundleExportArgs),
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum BundleApplyFormat {
+    Json,
+    Yaml,
+}
+
+impl BundleApplyFormat {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            BundleApplyFormat::Json => "application/apply-patch+json",
+            BundleApplyFormat::Yaml => "application/apply-patch+yaml",
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct BundleApplyArgs {
+    /// Bundle/service name to update
+    #[arg()]
+    pub service: String,
+
+    /// Namespace of the bundle (defaults to \"default\")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+
+    /// Path to the manifest fragment
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        conflicts_with = "stdin"
+    )]
+    pub file: Option<PathBuf>,
+
+    /// Read the manifest fragment from stdin
+    #[arg(long, conflicts_with = "file")]
+    pub stdin: bool,
+
+    /// Explicitly set the manifest format (inferred from extension when omitted)
+    #[arg(long, value_enum)]
+    pub format: Option<BundleApplyFormat>,
+
+    /// Field manager recorded for the apply operation
+    #[arg(long = "field-manager", default_value = "cli.nanocloud/v1")]
+    pub field_manager: String,
+
+    /// Override existing field managers on conflicting paths
+    #[arg(long = "force")]
+    pub force: bool,
+
+    /// Validate only without persisting changes
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Print the equivalent curl command instead of applying
+    #[arg(long)]
+    pub curl: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct BundleExportArgs {
+    /// Bundle/service name to export
+    #[arg()]
+    pub service: String,
+
+    /// Namespace of the bundle (defaults to "default")
+    #[arg(short, long)]
+    pub namespace: Option<String>,
+
+    /// Write the export artifact to this path
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "PATH",
+        conflicts_with = "stdout"
+    )]
+    pub output: Option<PathBuf>,
+
+    /// Stream the export artifact to stdout instead of writing a file
+    #[arg(long, conflicts_with = "output")]
+    pub stdout: bool,
+
+    /// Include encrypted secrets in the export when server policy allows it
+    #[arg(long = "include-secrets")]
+    pub include_secrets: bool,
+
+    /// Print the equivalent curl command without performing the request
+    #[arg(long)]
+    pub curl: bool,
 }

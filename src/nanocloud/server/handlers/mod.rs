@@ -636,7 +636,10 @@ pub fn build_openapi_doc() -> OpenApiDoc {
         services::restart_bundle,
         services::uninstall_bundle,
         services::stream_latest_backup,
-        // TODO(http2-exec): add exec endpoints once the HTTP/2 streaming redesign lands.
+        crate::nanocloud::server::handlers::exec::exec_ws_namespaced,
+        crate::nanocloud::server::handlers::exec::exec_http_post_namespaced,
+        crate::nanocloud::server::handlers::exec::exec_ws_cluster,
+        crate::nanocloud::server::handlers::exec::exec_http_post_cluster,
     ),
     components(
         schemas(

@@ -28,9 +28,11 @@ use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{DateTime, Utc};
+use humantime::parse_duration;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Default)]
 struct EventFilter {
@@ -129,6 +131,12 @@ pub(crate) struct EventWatchParams {
     resource_version_match: Option<ResourceVersionMatchPolicy>,
     #[serde(default)]
     _format: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 pub(crate) async fn list_all(Query(params): Query<EventWatchParams>) -> Result<Response, ApiError> {
@@ -158,6 +166,9 @@ async fn handle_request(
         continue_token,
         resource_version_match,
         _format: _,
+        since,
+        level,
+        reason,
     } = params;
 
     if label_selector.is_some() {
@@ -186,6 +197,10 @@ async fn handle_request(
         current_rv_u64,
     )?;
 
+    let since_cutoff = since.as_deref().map(parse_since_param).transpose()?;
+    let level_filter = level.as_deref().map(parse_level_filter).transpose()?;
+    let reason_filters = reason.as_deref().map(parse_reason_filters).transpose()?;
+
     let watch_requested = watch.unwrap_or(false);
     if watch_requested {
         if limit.is_some() {
@@ -204,7 +219,15 @@ async fn handle_request(
             .await;
         let filtered: Vec<EventWatchEvent> = events
             .into_iter()
-            .filter(|event| filter.as_ref().map(|f| f.matches(event)).unwrap_or(true))
+            .filter(|event| {
+                event_matches(
+                    event,
+                    filter.as_ref(),
+                    since_cutoff.as_ref(),
+                    level_filter.as_deref(),
+                    reason_filters.as_deref(),
+                )
+            })
             .map(|event| EventWatchEvent {
                 event_type: "ADDED".to_string(),
                 object: event,
@@ -216,11 +239,12 @@ async fn handle_request(
             None => registry.watch_cluster().await,
         };
 
-        let filter_for_watch: Option<Arc<WatchPredicate<Event>>> =
-            filter.as_ref().map(|selector| {
-                let selector = selector.clone();
-                Arc::new(move |event: &Event| selector.matches(event)) as Arc<WatchPredicate<Event>>
-            });
+        let filter_for_watch = build_watch_predicate(
+            filter.clone(),
+            since_cutoff,
+            level_filter.clone(),
+            reason_filters.clone(),
+        );
 
         let body = WatchStreamBuilder::new(
             "server_events",
@@ -267,8 +291,20 @@ async fn handle_request(
         let mut entries = registry
             .collect_entries(namespace_ref, effective_threshold)
             .await;
-        if let Some(selector) = filter.as_ref() {
-            entries.retain(|(_, event, _)| selector.matches(event));
+        if filter.is_some()
+            || since_cutoff.is_some()
+            || level_filter.is_some()
+            || reason_filters.is_some()
+        {
+            entries.retain(|(_, event, _)| {
+                event_matches(
+                    event,
+                    filter.as_ref(),
+                    since_cutoff.as_ref(),
+                    level_filter.as_deref(),
+                    reason_filters.as_deref(),
+                )
+            });
         }
 
         let page =
@@ -363,12 +399,147 @@ fn normalize_value(value: &str) -> String {
     }
 }
 
+fn event_matches(
+    event: &Event,
+    selector: Option<&EventFilter>,
+    since: Option<&SystemTime>,
+    level: Option<&str>,
+    reasons: Option<&[String]>,
+) -> bool {
+    selector.map(|f| f.matches(event)).unwrap_or(true)
+        && matches_since(event, since)
+        && matches_level(event, level)
+        && matches_reason(event, reasons)
+}
+
+fn parse_level_filter(raw: &str) -> Result<String, ApiError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "normal" => Ok("Normal".to_string()),
+        "warning" => Ok("Warning".to_string()),
+        other => Err(ApiError::bad_request(format!(
+            "Unsupported level '{}'; expected Normal or Warning",
+            other
+        ))),
+    }
+}
+
+fn parse_reason_filters(raw: &str) -> Result<Vec<String>, ApiError> {
+    let values: Vec<String> = raw
+        .split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect();
+    if values.is_empty() {
+        Err(ApiError::bad_request(
+            "reason query parameter must include at least one value",
+        ))
+    } else {
+        Ok(values)
+    }
+}
+
+fn parse_since_param(raw: &str) -> Result<SystemTime, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("since must not be empty"));
+    }
+
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(timestamp.with_timezone(&Utc).into());
+    }
+
+    match parse_duration(trimmed) {
+        Ok(duration) => SystemTime::now()
+            .checked_sub(duration)
+            .ok_or_else(|| ApiError::bad_request("since duration exceeds UNIX_EPOCH")),
+        Err(_) => Err(ApiError::bad_request(
+            "since must be an RFC3339 timestamp or a duration such as 30m, 6h, 2d",
+        )),
+    }
+}
+
+fn matches_since(event: &Event, cutoff: Option<&SystemTime>) -> bool {
+    let Some(target) = cutoff else {
+        return true;
+    };
+
+    match event_timestamp(event) {
+        Some(timestamp) => timestamp >= *target,
+        None => true,
+    }
+}
+
+fn matches_level(event: &Event, allowed: Option<&str>) -> bool {
+    let Some(expected) = allowed else {
+        return true;
+    };
+    let observed = event.event_type.as_deref().unwrap_or("Normal");
+    observed.eq_ignore_ascii_case(expected)
+}
+
+fn matches_reason(event: &Event, allowed: Option<&[String]>) -> bool {
+    let Some(list) = allowed else {
+        return true;
+    };
+    let Some(reason) = event.reason.as_deref() else {
+        return false;
+    };
+    list.iter()
+        .any(|value| reason.eq_ignore_ascii_case(value.as_str()))
+}
+
+fn event_timestamp(event: &Event) -> Option<SystemTime> {
+    for value in [
+        event.event_time.as_deref(),
+        event.last_timestamp.as_deref(),
+        event.first_timestamp.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+            return Some(parsed.with_timezone(&Utc).into());
+        }
+    }
+    None
+}
+
+fn build_watch_predicate(
+    filter: Option<EventFilter>,
+    since_cutoff: Option<SystemTime>,
+    level_filter: Option<String>,
+    reason_filters: Option<Vec<String>>,
+) -> Option<Arc<WatchPredicate<Event>>> {
+    if filter.is_none()
+        && since_cutoff.is_none()
+        && level_filter.is_none()
+        && reason_filters.is_none()
+    {
+        return None;
+    }
+
+    let selector = filter.clone();
+    let since_clone = since_cutoff;
+    let level_clone = level_filter.clone();
+    let reasons_clone = reason_filters.clone();
+    Some(Arc::new(move |event: &Event| {
+        event_matches(
+            event,
+            selector.as_ref(),
+            since_clone.as_ref(),
+            level_clone.as_deref(),
+            reasons_clone.as_deref(),
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nanocloud::k8s::event::{EventSource, ObjectReference};
     use crate::nanocloud::k8s::pod::ObjectMeta;
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use futures_util::StreamExt;
     use std::sync::OnceLock;
 
@@ -417,6 +588,12 @@ mod tests {
             deprecated_last_timestamp: None,
             deprecated_count: None,
         }
+    }
+
+    fn set_event_timestamp(event: &mut Event, timestamp: &str) {
+        event.event_time = Some(timestamp.to_string());
+        event.first_timestamp = Some(timestamp.to_string());
+        event.last_timestamp = Some(timestamp.to_string());
     }
 
     #[tokio::test]
@@ -509,5 +686,109 @@ mod tests {
         assert_eq!(list.items.len(), 1);
         let event = &list.items[0];
         assert_eq!(event.involved_object.name.as_deref(), Some("bundle-a"));
+    }
+
+    #[tokio::test]
+    async fn since_query_filters_old_events() {
+        let _guard = registry_guard().lock().await;
+        let registry = EventRegistry::shared();
+        registry.clear().await;
+
+        let now = Utc::now();
+        let fresh_ts = now.to_rfc3339();
+        let old_ts = (now - ChronoDuration::minutes(30)).to_rfc3339();
+
+        let mut old_event = sample_event("default", "bundle-old", "BundleReconciled", "Normal");
+        set_event_timestamp(&mut old_event, &old_ts);
+        registry.record(old_event).await;
+
+        let mut fresh_event = sample_event("default", "bundle-new", "BundleReconciled", "Normal");
+        set_event_timestamp(&mut fresh_event, &fresh_ts);
+        registry.record(fresh_event).await;
+
+        let params: EventWatchParams = serde_urlencoded::from_str("since=5m").unwrap();
+        let response = handle_request(None, params).await.expect("response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let list: EventList = serde_json::from_slice(&body).expect("list json");
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(
+            list.items[0].involved_object.name.as_deref(),
+            Some("bundle-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn level_query_filters_events() {
+        let _guard = registry_guard().lock().await;
+        let registry = EventRegistry::shared();
+        registry.clear().await;
+        registry
+            .record(sample_event(
+                "default",
+                "bundle-a",
+                "BundleReconciled",
+                "Normal",
+            ))
+            .await;
+        registry
+            .record(sample_event(
+                "default",
+                "bundle-b",
+                "BundleReconcileFailed",
+                "Warning",
+            ))
+            .await;
+
+        let params: EventWatchParams =
+            serde_urlencoded::from_str("level=Warning").expect("level params");
+        let response = handle_request(None, params).await.expect("response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let list: EventList = serde_json::from_slice(&body).expect("list json");
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(
+            list.items[0].involved_object.name.as_deref(),
+            Some("bundle-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn reason_query_supports_multiple_values() {
+        let _guard = registry_guard().lock().await;
+        let registry = EventRegistry::shared();
+        registry.clear().await;
+        registry
+            .record(sample_event(
+                "default",
+                "bundle-a",
+                "BundleReconciled",
+                "Normal",
+            ))
+            .await;
+        registry
+            .record(sample_event(
+                "default",
+                "bundle-b",
+                "SecurityPolicyViolation",
+                "Warning",
+            ))
+            .await;
+
+        let params: EventWatchParams =
+            serde_urlencoded::from_str("reason=BundleReconciled,PrivilegeEscalationDenied")
+                .expect("reason params");
+        let response = handle_request(None, params).await.expect("response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let list: EventList = serde_json::from_slice(&body).expect("list json");
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(
+            list.items[0].involved_object.name.as_deref(),
+            Some("bundle-a")
+        );
     }
 }

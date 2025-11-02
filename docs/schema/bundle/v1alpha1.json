@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nanocloud.io/schema/bundle/v1alpha1",
+  "title": "Nanocloud Bundle (v1alpha1)",
+  "description": "Validation schema for nanocloud.io/v1 Bundle resources.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "nanocloud.io/v1",
+      "description": "API group/version for Bundle custom resources."
+    },
+    "kind": {
+      "const": "Bundle",
+      "description": "Resource kind identifier."
+    },
+    "metadata": {
+      "$ref": "#/$defs/ObjectMeta"
+    },
+    "spec": {
+      "$ref": "#/$defs/BundleSpec"
+    },
+    "status": {
+      "$ref": "#/$defs/BundleStatus",
+      "description": "Optional status block managed by the controller."
+    }
+  },
+  "$defs": {
+    "ObjectMeta": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "maxLength": 63,
+          "description": "DNS-1123 subdomain compatible bundle name."
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "maxLength": 63,
+          "description": "Namespace containing the bundle (defaults to default)."
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 63
+          }
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "resourceVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "description": "Opaque resource version used for optimistic concurrency."
+        },
+        "uid": {
+          "type": "string"
+        },
+        "creationTimestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "BundleSpec": {
+      "type": "object",
+      "required": ["service"],
+      "additionalProperties": false,
+      "properties": {
+        "service": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target OCI manifest/service identifier."
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Namespace override; defaults to metadata.namespace."
+        },
+        "options": {
+          "type": "object",
+          "default": {},
+          "description": "User-provided installation options (option decorators enforced by Dockyard parser).",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([_a-z0-9:.\\-]*[a-z0-9])?$",
+            "maxLength": 128
+          }
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^(v1:)?[A-Za-z0-9+/=]+$",
+          "description": "Wrapped profile encryption key (base64) with optional prefix when KMS is in use."
+        },
+        "snapshot": {
+          "$ref": "#/$defs/BundleSnapshotSource"
+        },
+        "start": {
+          "type": "boolean",
+          "default": true,
+          "description": "If false, leave workloads stopped after reconciliation."
+        },
+        "update": {
+          "type": "boolean",
+          "default": false,
+          "description": "Force refresh of cached layers before install."
+        },
+        "security": {
+          "$ref": "#/$defs/BundleSecurityProfile",
+          "description": "Optional runtime security overrides (capabilities, seccomp profiles)."
+        }
+      }
+    },
+    "BundleSnapshotSource": {
+      "type": "object",
+      "required": ["source"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "URI referencing snapshot payload (keyspace://, file://, etc.)."
+        },
+        "mediaType": {
+          "type": "string",
+          "default": "application/x-tar",
+          "description": "Media type describing the snapshot contents."
+        }
+      }
+    },
+    "BundleSecurityProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowPrivileged": {
+          "type": "boolean",
+          "default": false,
+          "description": "Gate for privileged capability requests (CAP_SYS_ADMIN, CAP_SYS_PTRACE, etc)."
+        },
+        "extraCapabilities": {
+          "type": "array",
+          "description": "Explicit capabilities to add to the container sandbox.",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_]+$",
+            "minLength": 3,
+            "maxLength": 64
+          },
+          "uniqueItems": true
+        },
+        "seccompProfile": {
+          "$ref": "#/$defs/BundleSeccompProfile"
+        }
+      }
+    },
+    "BundleSeccompProfile": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["Baseline", "RuntimeDefault", "Localhost"]
+        },
+        "localhostProfile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem profile name required when type=Localhost."
+        }
+      }
+    },
+    "BundleStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "observedGeneration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "phase": {
+          "type": "string",
+          "enum": ["PENDING", "VALIDATING", "RENDERING", "APPLYING", "READY", "FAILED", "DELETING"]
+        },
+        "conditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/BundleCondition" }
+        },
+        "workload": {
+          "$ref": "#/$defs/BundleWorkloadRef"
+        },
+        "lastReconciledTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "bindingHistory": {
+          "type": "array",
+          "description": "Latest binding execution outcomes recorded by the controller.",
+          "items": { "$ref": "#/$defs/BindingHistoryEntry" }
+        }
+      }
+    },
+    "BundleCondition": {
+      "type": "object",
+      "required": ["type", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9]+$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["TRUE", "FALSE", "UNKNOWN"]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "lastTransitionTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "BindingHistoryEntry": {
+      "type": "object",
+      "required": ["bindingId", "service", "status", "attempts"],
+      "additionalProperties": false,
+      "properties": {
+        "bindingId": {
+          "type": "string",
+          "description": "Stable identifier emitted by the Dockyard contract."
+        },
+        "service": {
+          "type": "string",
+          "description": "Service associated with the binding command."
+        },
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Command arguments executed for the binding step."
+        },
+        "status": {
+          "$ref": "#/$defs/BindingHistoryStatus"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lastStartedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastFinishedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exitCode": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "stdout": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "stderr": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "eventId": {
+          "type": "string"
+        }
+      }
+    },
+    "BindingHistoryStatus": {
+      "type": "string",
+      "enum": ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT"]
+    },
+    "BundleWorkloadRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

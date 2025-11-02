@@ -27,4 +27,5 @@ pub mod runtime;
 pub mod scheduling;
 pub mod snapshot;
 pub mod statefulset;
+pub mod status;
 pub mod watch;

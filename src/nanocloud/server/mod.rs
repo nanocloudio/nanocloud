@@ -21,9 +21,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use axum::body::Body;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::middleware;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -57,7 +59,7 @@ use crate::nanocloud::k8s::event::{
 use crate::nanocloud::k8s::pod::ObjectMeta;
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_error, log_info, log_warn};
-use crate::nanocloud::observability::metrics;
+use crate::nanocloud::observability::{metrics, tracing};
 use crate::nanocloud::util::error::with_context;
 use tls::{accept_with_tls, build_tls_acceptor};
 use tower::Service;
@@ -133,6 +135,7 @@ fn require_client_certificate() -> bool {
 fn unauthorized_response(message: &str) -> Response {
     let body = Json(ErrorBody {
         error: message.to_string(),
+        conflicts: None,
     });
     (StatusCode::UNAUTHORIZED, body).into_response()
 }
@@ -605,7 +608,13 @@ fn build_router() -> Router {
         )
         .route(
             "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}",
-            get(handlers::bundles::get).delete(handlers::bundles::delete),
+            get(handlers::bundles::get)
+                .delete(handlers::bundles::delete)
+                .patch(handlers::bundles::apply),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/exportProfile",
+            post(handlers::bundles::export_profile),
         )
         .route(
             "/apis/nanocloud.io/v1/namespaces/{namespace}/devices",
@@ -760,6 +769,15 @@ fn build_router() -> Router {
     router
         .layer(middleware::from_fn(auth::require_authenticated_subject))
         .layer(AuthLayer::new())
+        .layer(middleware::from_fn(trace_http_request))
+}
+
+async fn trace_http_request(req: Request<Body>, next: Next) -> Result<Response, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let span_name = format!("{} {}", method, path);
+    let response = tracing::with_span("api", span_name, next.run(req)).await;
+    Ok(response)
 }
 
 #[cfg(test)]

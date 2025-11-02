@@ -23,7 +23,7 @@ use crate::nanocloud::oci::distribution::{load_manifest_from_store, parse_image_
 use crate::nanocloud::oci::runtime::{
     container_refs_dir, container_root_path, netns_dir, ContainerStatus, ExecRequest,
 };
-use crate::nanocloud::oci::{container_runtime, OciImage, OciManifest};
+use crate::nanocloud::oci::{container_runtime, image_store_root, OciImage, OciManifest};
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::util::security::{EncryptionKey, TlsInfo};
 
@@ -114,6 +114,7 @@ pub async fn create_container(
         main_container,
         &pod_spec.volumes,
         pod_spec.host_network,
+        &pod_spec.security,
     );
     let config_path = bundle_path.join("config.json");
     let config_dir = config_path.parent().ok_or_else(|| {
@@ -273,7 +274,7 @@ pub fn remove_container(
         "Removing OCI container",
         &[("container", container_name), ("id", container_id)],
     );
-    container_runtime().delete(container_name, container_id)?;
+    container_runtime().delete(container_id)?;
 
     log_info(
         "kubelet",
@@ -820,11 +821,17 @@ fn create_rootfs(
     let overlay_dir = base.join("overlay");
     let upper = overlay_dir.join("upper");
     let work = overlay_dir.join("work");
+    let overlay_root = image_store_root().join("overlay");
     let lower_dirs = oci_manifest
         .layers
         .iter()
         .rev()
-        .map(|l| format!("/var/lib/nanocloud.io/image/overlay/{}", &l.digest[7..]))
+        .map(|l| {
+            overlay_root
+                .join(&l.digest[7..])
+                .to_string_lossy()
+                .to_string()
+        })
         .collect::<Vec<_>>();
     let lower = if lower_dirs.is_empty() {
         let fallback = overlay_dir.join("lower");
@@ -998,7 +1005,7 @@ fn load_manifest_for_container(
 fn find_manifest_by_config_digest(
     digest: &str,
 ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
-    let refs_root = Path::new("/var/lib/nanocloud.io/image/refs");
+    let refs_root = image_store_root().join("refs");
     let mut stack: Vec<PathBuf> = vec![refs_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1063,10 +1070,12 @@ fn overlay_lowerdirs(manifest: &OciManifest) -> Result<Vec<String>, Box<dyn Erro
                 layer.digest
             )));
         }
-        dirs.push(format!(
-            "/var/lib/nanocloud.io/image/overlay/{}",
-            &layer.digest[7..]
-        ));
+        let path = image_store_root()
+            .join("overlay")
+            .join(&layer.digest[7..])
+            .to_string_lossy()
+            .to_string();
+        dirs.push(path);
     }
     Ok(dirs)
 }
@@ -1447,5 +1456,33 @@ fn get_local_ip() -> Result<String, Box<dyn Error + Send + Sync>> {
         libc::freeifaddrs(ifap);
 
         selected_ip.ok_or_else(|| new_error("Unable to detect local IP address"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::Pid;
+
+    #[test]
+    fn format_wait_status_failure_reports_signal() {
+        let status = WaitStatus::Signaled(Pid::from_raw(42), Signal::SIGTERM, false);
+        let message = format_wait_status_failure("Probe", status);
+        assert!(
+            message.contains("signal SIGTERM"),
+            "message should mention terminating signal: {message}"
+        );
+    }
+
+    #[test]
+    fn format_wait_status_failure_reports_exit_code() {
+        let status = WaitStatus::Exited(Pid::from_raw(7), 3);
+        let message = format_wait_status_failure("Probe", status);
+        assert!(
+            message.contains("status 3"),
+            "message should mention exit status: {message}"
+        );
     }
 }

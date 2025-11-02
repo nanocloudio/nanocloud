@@ -9,7 +9,8 @@ base64 = "0.22.1"
 prometheus = "0.14.0"
 bytes = "1.10.1"
 chrono = "0.4.42"
-clap = { version = "4.5.48", features = ["derive"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
+caps = "0.5.5"
 futures-util = "0.3.31"
 futures-core = "0.3.31"
 axum = { version = "0.8.6", features = ["macros", "ws"] }
@@ -37,19 +38,32 @@ log = "0.4.28"
 jsonwebtoken = { version = "10.0.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 sha1 = "0.10.6"
 hex = "0.4.3"
+jsonschema = "0.17.1"
+sha2 = "0.10.8"
 tower = "0.5.2"
 rand = "0.8.5"
 cron = "0.15.0"
 chrono-tz = "0.10.0"
+dashmap = "5.5.3"
+humantime = "2.1.0"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["registry", "std"] }
+tracing-opentelemetry = { version = "0.26.0", optional = true }
 
 [features]
 default = []
 openapi = ["dep:utoipa"]
 
+[[bin]]
+name = "openapi_gen"
+path = "tools/openapi_gen.rs"
+required-features = ["openapi"]
+
 [dev-dependencies]
 tempfile = "3.23.0"
 serde_urlencoded = "0.7.1"
 serial_test = "3.1.1"
+walkdir = "2.5.0"
 
 [profile.release]
 lto = "thin"

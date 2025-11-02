@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use humantime::parse_duration;
 use std::error::Error;
 
 use crate::nanocloud::cli::args::DiagnosticsArgs;
@@ -21,13 +22,44 @@ use crate::nanocloud::cli::Terminal;
 use crate::nanocloud::cni::{
     cni_plugin, CniContainerCleanup, CniReconciliationReport, NftRuleCleanup,
 };
+use crate::nanocloud::diagnostics::loopback::{
+    run_loopback_probe, LoopbackProbeConfig, LoopbackProbeResult,
+};
 
-pub(super) fn handle_diagnostics(
-    _args: &DiagnosticsArgs,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub(super) async fn handle_diagnostics(
+    args: &DiagnosticsArgs,
+) -> Result<i32, Box<dyn Error + Send + Sync>> {
     let report = cni_plugin().reconcile_cni_artifacts()?;
     print_report(&report);
-    Ok(())
+
+    let mut exit_code = 0;
+    let loopback_enabled = if args.no_loopback {
+        false
+    } else {
+        args.loopback
+    };
+
+    if loopback_enabled {
+        let config = build_loopback_config(args)?;
+        match run_loopback_probe(config.clone()).await {
+            Ok(result) => {
+                let outcome = summarize_loopback_outcome(&result);
+                print_loopback_summary(&config.image, &result, &outcome);
+                print_loopback_hints(&outcome);
+                exit_code = exit_code.max(outcome.exit_code);
+            }
+            Err(err) => {
+                Terminal::stderr(format_args!("Loopback probe failed: {}", err));
+                exit_code = 2;
+            }
+        }
+    } else {
+        Terminal::stdout(format_args!(
+            "Loopback probe skipped (enable with --loopback)."
+        ));
+    }
+
+    Ok(exit_code)
 }
 
 fn print_report(report: &CniReconciliationReport) {
@@ -114,6 +146,62 @@ fn print_cleanup(cleanup: &CniContainerCleanup) {
     ));
 }
 
+fn build_loopback_config(
+    args: &DiagnosticsArgs,
+) -> Result<LoopbackProbeConfig, Box<dyn Error + Send + Sync>> {
+    let mut config = LoopbackProbeConfig::default();
+    if let Some(image) = args.loopback_image.as_deref() {
+        config.image = image.to_string();
+    }
+    if let Some(raw_timeout) = args.loopback_timeout.as_deref() {
+        let duration = parse_duration(raw_timeout)
+            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
+        config.timeout = duration;
+    }
+    Ok(config)
+}
+
+fn print_loopback_summary(image: &str, result: &LoopbackProbeResult, outcome: &LoopbackOutcome) {
+    Terminal::stdout(format_args!("Loopback probe image: {}", image));
+    if result.skipped {
+        for note in &result.notes {
+            Terminal::stdout(format_args!("Loopback probe note: {}", note));
+        }
+        Terminal::stdout(format_args!("  Summary: SKIPPED"));
+        return;
+    }
+    Terminal::stdout(format_args!("  DNS check: {}", status_label(result.dns_ok)));
+    Terminal::stdout(format_args!(
+        "  Volume check: {}",
+        status_label(result.volumes_ok)
+    ));
+    Terminal::stdout(format_args!("  Duration: {:?}", result.duration));
+    if let Some(path) = result.log_path.as_deref() {
+        Terminal::stdout(format_args!("  Logs: {}", path.display()));
+    }
+    if !result.notes.is_empty() {
+        for note in &result.notes {
+            Terminal::stdout(format_args!("  Note: {}", note));
+        }
+    }
+    Terminal::stdout(format_args!(
+        "  Summary: {}",
+        if outcome.exit_code == 0 {
+            "PASS"
+        } else {
+            "CHECK FAILURE (see hints)"
+        }
+    ));
+}
+
+fn status_label(ok: bool) -> &'static str {
+    if ok {
+        "OK"
+    } else {
+        "FAIL"
+    }
+}
+
 fn format_rule_list(entries: &[NftRuleCleanup]) -> String {
     if entries.is_empty() {
         return "none".to_string();
@@ -138,5 +226,126 @@ fn yes_no(value: bool) -> &'static str {
         "yes"
     } else {
         "no"
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LoopbackOutcome {
+    exit_code: i32,
+    hints: Vec<&'static str>,
+}
+
+impl LoopbackOutcome {
+    fn success() -> Self {
+        Self {
+            exit_code: 0,
+            hints: Vec::new(),
+        }
+    }
+}
+
+const DNS_HINT: &str =
+    "DNS check failed; confirm /etc/resolv.conf has reachable nameservers and nanocloud0 routes traffic.";
+const VOLUME_HINT: &str =
+    "Volume check failed; inspect CSI logs and ensure the loopback mount path is writable.";
+
+fn summarize_loopback_outcome(result: &LoopbackProbeResult) -> LoopbackOutcome {
+    if result.skipped {
+        return LoopbackOutcome::success();
+    }
+
+    let mut outcome = LoopbackOutcome::success();
+    if !result.dns_ok {
+        outcome.exit_code = 1;
+        outcome.hints.push(DNS_HINT);
+    }
+    if !result.volumes_ok {
+        outcome.exit_code = 1;
+        outcome.hints.push(VOLUME_HINT);
+    }
+    outcome
+}
+
+fn print_loopback_hints(outcome: &LoopbackOutcome) {
+    if outcome.hints.is_empty() {
+        return;
+    }
+    Terminal::stderr(format_args!("Loopback probe hints:"));
+    for hint in &outcome.hints {
+        Terminal::stderr(format_args!("  - {}", hint));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nanocloud::diagnostics::loopback::LoopbackProbeResult;
+    use std::time::Duration;
+
+    fn base_result() -> LoopbackProbeResult {
+        LoopbackProbeResult {
+            dns_ok: true,
+            volumes_ok: true,
+            duration: Duration::from_secs(1),
+            log_path: None,
+            notes: Vec::new(),
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn outcome_success_when_all_checks_pass() {
+        let result = base_result();
+        let outcome = summarize_loopback_outcome(&result);
+        assert_eq!(
+            outcome,
+            LoopbackOutcome {
+                exit_code: 0,
+                hints: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_sets_dns_hint() {
+        let mut result = base_result();
+        result.dns_ok = false;
+        let outcome = summarize_loopback_outcome(&result);
+        assert_eq!(
+            outcome,
+            LoopbackOutcome {
+                exit_code: 1,
+                hints: vec![DNS_HINT]
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_sets_volume_hint() {
+        let mut result = base_result();
+        result.volumes_ok = false;
+        let outcome = summarize_loopback_outcome(&result);
+        assert_eq!(
+            outcome,
+            LoopbackOutcome {
+                exit_code: 1,
+                hints: vec![VOLUME_HINT]
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_handles_both_failures() {
+        let mut result = base_result();
+        result.dns_ok = false;
+        result.volumes_ok = false;
+        let outcome = summarize_loopback_outcome(&result);
+        assert_eq!(
+            outcome,
+            LoopbackOutcome {
+                exit_code: 1,
+                hints: vec![DNS_HINT, VOLUME_HINT]
+            }
+        );
     }
 }

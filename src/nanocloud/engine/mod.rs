@@ -14,13 +14,16 @@
  * limitations under the License.
  */
 
+mod bindings;
 pub mod container;
 mod image;
 pub mod log;
-mod profile;
+pub mod profile;
 mod snapshot;
 mod streaming;
 
+#[allow(unused_imports)]
+pub use bindings::{BindingEnvelopePolicy, BindingInvocation, BindingResult};
 pub use image::Image;
 pub use profile::Profile;
 #[allow(unused_imports)]

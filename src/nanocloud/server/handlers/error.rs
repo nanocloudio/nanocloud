@@ -20,12 +20,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::nanocloud::api::types::ErrorBody;
+use crate::nanocloud::api::types::{ApplyConflict, ErrorBody};
 
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    conflicts: Option<Vec<ApplyConflict>>,
 }
 
 impl ApiError {
@@ -33,6 +34,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            conflicts: None,
         }
     }
 
@@ -56,12 +58,24 @@ impl ApiError {
     pub(super) fn internal_message(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
+
+    pub(super) fn conflict_with_details(
+        message: impl Into<String>,
+        conflicts: Vec<ApplyConflict>,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            conflicts: Some(conflicts),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorBody {
             error: self.message,
+            conflicts: self.conflicts,
         });
         (self.status, body).into_response()
     }

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:31585853a2663c5bcf2407fdbbb86386f2a7280cdc04c49c97d9494a5221226c",
+    "size": 571
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar",
+      "digest": "sha256:d23359bb6fc3e22f6e24b50c0b6da4e0d15ff1eb825015f2f1de96a25f691f5a",
+      "size": 10240
+    }
+  ],
+  "annotations": {
+    "io.nanocloud.test-case": "oci-conformance-fake-loop"
+  }
+}

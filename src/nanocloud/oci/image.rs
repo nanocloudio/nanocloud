@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::oci::image_store_root;
 use crate::nanocloud::util::error::with_context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -68,12 +69,23 @@ pub struct HistoryEntry {
 
 impl OciImage {
     pub fn load(digest: &str) -> Result<OciImage, Box<dyn Error + Send + Sync>> {
-        let path = format!("/var/lib/nanocloud.io/image/blobs/sha256/{}", &digest[7..]);
-        let file = File::open(&path)
-            .map_err(|e| with_context(e, format!("Failed to open image config at {path}")))?;
+        let file_path = image_store_root()
+            .join("blobs")
+            .join("sha256")
+            .join(&digest[7..]);
+        let file = File::open(&file_path).map_err(|e| {
+            with_context(
+                e,
+                format!("Failed to open image config at {}", file_path.display()),
+            )
+        })?;
         let reader = BufReader::new(file);
-        let oci_image: OciImage = serde_json::from_reader(reader)
-            .map_err(|e| with_context(e, format!("Failed to parse image config at {path}")))?;
+        let oci_image: OciImage = serde_json::from_reader(reader).map_err(|e| {
+            with_context(
+                e,
+                format!("Failed to parse image config at {}", file_path.display()),
+            )
+        })?;
 
         Ok(oci_image)
     }

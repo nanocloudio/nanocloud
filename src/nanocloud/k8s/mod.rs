@@ -25,6 +25,7 @@ pub mod endpoints;
 pub mod event;
 pub mod job;
 pub mod networkpolicy;
+pub mod ownership;
 pub mod persistentvolumeclaim;
 pub mod pod;
 pub mod replicaset;

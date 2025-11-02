@@ -1,0 +1,10 @@
+{
+  "deny": [
+    "keyctl",
+    "add_key",
+    "request_key",
+    "ptrace",
+    "bpf",
+    "perf_event_open"
+  ]
+}

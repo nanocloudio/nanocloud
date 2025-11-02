@@ -33,6 +33,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
+use std::time::Instant;
 
 type DynError = Box<dyn Error + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
@@ -858,6 +859,13 @@ impl Network {
         ensure_binary_available("nft")?;
         validate_interface_name(name, "bridge name")?;
 
+        let overall_start = Instant::now();
+        log_info(
+            "cni",
+            "Starting network bridge reconciliation",
+            &[("bridge", name), ("cidr", cidr)],
+        );
+
         // Interpret the provided CIDR as the desired bridge address plus prefix
         // and derive the network portion from it so the gateway is assigned correctly.
         let (gateway_str, prefix_str) = cidr
@@ -881,6 +889,8 @@ impl Network {
         let subnet = Subnet::new(&network_cidr, Some(gateway_str))?;
 
         // Create a bridge interface if it doesn't already exist
+        let ensure_device_start = Instant::now();
+        let mut bridge_created = false;
         let bridge_inspect = Command::new("ip")
             .args(["link", "show", name])
             .output()
@@ -895,17 +905,26 @@ impl Network {
                 format!("Failed to run bridge creation for {name}"),
             )?;
             ensure_success(status, &format!("Failed to create bridge '{name}'"))?;
+            bridge_created = true;
         }
+        let ensure_device_elapsed = ensure_device_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Bridge device ready",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", ensure_device_elapsed.as_str()),
+                ("created", if bridge_created { "true" } else { "false" }),
+            ],
+        );
+        let addr_config_start = Instant::now();
+        let assigned_cidr = format!("{}/{}", subnet.gateway, subnet.mask);
         let addr_status = command_status(
             {
                 let mut cmd = Command::new("ip");
-                cmd.args([
-                    "addr",
-                    "replace",
-                    &format!("{}/{}", subnet.gateway, subnet.mask),
-                    "dev",
-                    name,
-                ]);
+                cmd.args(["addr", "replace"]);
+                cmd.arg(&assigned_cidr);
+                cmd.args(["dev", name]);
                 cmd
             },
             format!("Failed to run address configuration for bridge {name}"),
@@ -914,6 +933,18 @@ impl Network {
             addr_status,
             &format!("Failed to configure address on bridge '{name}'"),
         )?;
+        let addr_elapsed = addr_config_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Bridge address configured",
+            &[
+                ("bridge", name),
+                ("cidr", assigned_cidr.as_str()),
+                ("elapsed_ms", addr_elapsed.as_str()),
+            ],
+        );
+
+        let link_up_start = Instant::now();
         let link_up_status = command_status(
             {
                 let mut cmd = Command::new("ip");
@@ -926,8 +957,18 @@ impl Network {
             link_up_status,
             &format!("Failed to bring bridge '{name}' up"),
         )?;
+        let link_elapsed = link_up_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Bridge link is up",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", link_elapsed.as_str()),
+            ],
+        );
 
         // Ensure the NAT table exists
+        let nat_table_start = Instant::now();
         let nat_table_exists = Command::new("nft")
             .args(["list", "table", "ip", "nat"])
             .output()
@@ -945,8 +986,19 @@ impl Network {
             )?;
             ensure_success(status, "Failed to ensure nft nat table exists")?;
         }
+        let nat_table_elapsed = nat_table_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "NAT table ready",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", nat_table_elapsed.as_str()),
+                ("created", if nat_table_exists { "false" } else { "true" }),
+            ],
+        );
 
         // Ensure the postrouting chain exists
+        let postrouting_start = Instant::now();
         let postrouting_chain_exists = Command::new("nft")
             .args(["list", "chain", "ip", "nat", "POSTROUTING"])
             .output()
@@ -979,13 +1031,38 @@ impl Network {
             )?;
             ensure_success(status, "Failed to ensure nft POSTROUTING chain exists")?;
         }
+        let postrouting_elapsed = postrouting_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "POSTROUTING chain ready",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", postrouting_elapsed.as_str()),
+                ("created", if postrouting_chain_exists { "false" } else { "true" }),
+            ],
+        );
 
         // Add masquerade rule if it doesn't already exist
+        let ruleset_dump_start = Instant::now();
         let ruleset = Command::new("nft")
             .args(["list", "ruleset"])
             .output()
             .map_err(|e| with_context(e, "Failed to list nft ruleset"))?;
         let ruleset_str = String::from_utf8_lossy(&ruleset.stdout);
+        let ruleset_elapsed = ruleset_dump_start.elapsed().as_millis().to_string();
+        let ruleset_bytes = ruleset.stdout.len().to_string();
+        log_info(
+            "cni",
+            "Dumped nft ruleset",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", ruleset_elapsed.as_str()),
+                ("bytes", ruleset_bytes.as_str()),
+            ],
+        );
+
+        let masquerade_step = Instant::now();
+        let mut masquerade_created = false;
         if !ruleset_str.contains(&format!(
             "saddr {}/{} oifname != \"{}\" masquerade",
             subnet.network, subnet.mask, name
@@ -1012,8 +1089,21 @@ impl Network {
                 "Failed to create masquerade rule",
             )?;
             ensure_success(status, "Failed to ensure masquerade rule exists")?;
+            masquerade_created = true;
         }
+        let masquerade_elapsed = masquerade_step.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Masquerade rule ensured",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", masquerade_elapsed.as_str()),
+                ("created", if masquerade_created { "true" } else { "false" }),
+            ],
+        );
 
+        let hairpin_step = Instant::now();
+        let mut hairpin_created = false;
         let hairpin_rule_snippet = format!("fib saddr type local oifname \"{}\"", name);
         if !ruleset_str.contains(&hairpin_rule_snippet) {
             let mut cmd = Command::new("nft");
@@ -1033,11 +1123,43 @@ impl Network {
             cmd.args(["counter", "masquerade"]);
             let status = command_status(cmd, "Failed to create hairpin masquerade rule")?;
             ensure_success(status, "Failed to ensure hairpin masquerade rule exists")?;
+            hairpin_created = true;
         }
+        let hairpin_elapsed = hairpin_step.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Hairpin rule ensured",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", hairpin_elapsed.as_str()),
+                ("created", if hairpin_created { "true" } else { "false" }),
+            ],
+        );
 
+        let sysctl_start = Instant::now();
         ensure_sysctl_value("net.ipv4.conf.all.route_localnet", "1")?;
         ensure_sysctl_value(&format!("net.ipv4.conf.{}.route_localnet", name), "1")?;
         ensure_sysctl_value("net.ipv4.ip_forward", "1")?;
+        let sysctl_elapsed = sysctl_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Sysctl forwarding configured",
+            &[
+                ("bridge", name),
+                ("elapsed_ms", sysctl_elapsed.as_str()),
+            ],
+        );
+
+        let total_elapsed = overall_start.elapsed().as_millis().to_string();
+        log_info(
+            "cni",
+            "Network bridge reconciliation complete",
+            &[
+                ("bridge", name),
+                ("cidr", cidr),
+                ("elapsed_ms", total_elapsed.as_str()),
+            ],
+        );
 
         Ok(())
     }

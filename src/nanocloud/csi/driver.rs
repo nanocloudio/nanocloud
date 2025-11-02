@@ -39,6 +39,7 @@ const VOLUMES_PREFIX: &str = "/volumes";
 const SERVICES_PREFIX: &str = "/services";
 const SNAPSHOTS_PREFIX: &str = "/snapshots";
 
+#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_STORAGE_ROOT: &str = "/var/lib/nanocloud.io/storage/csi";
 const VOLUMES_DIR: &str = "volumes";
 const PUBLISH_DIR: &str = "publish";
@@ -82,7 +83,21 @@ pub struct StoredEncryptedVolume {
 fn storage_root() -> PathBuf {
     env::var("NANOCLOUD_CSI_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_STORAGE_ROOT))
+        .unwrap_or_else(|_| default_storage_root())
+}
+
+#[cfg(not(test))]
+fn default_storage_root() -> PathBuf {
+    PathBuf::from(DEFAULT_STORAGE_ROOT)
+}
+
+#[cfg(test)]
+fn default_storage_root() -> PathBuf {
+    env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("target"))
+        .join("csi")
+        .join("storage")
 }
 
 fn volume_root() -> PathBuf {
@@ -1052,12 +1067,12 @@ mod tests {
         assert_eq!(snapshot_key("snap"), "/snapshots/snap");
         assert_eq!(
             volume_path("vol-1"),
-            PathBuf::from("/var/lib/nanocloud.io/storage/csi/volumes/vol-1")
+            storage_root().join(VOLUMES_DIR).join("vol-1")
         );
         assert_eq!(publication_path("/mnt/data"), PathBuf::from("/mnt/data"));
         assert_eq!(
             snapshot_archive_path("snap"),
-            PathBuf::from("/var/lib/nanocloud.io/storage/csi/snapshots/snap.tar")
+            storage_root().join(SNAPSHOTS_DIR).join("snap.tar")
         );
     }
 }

@@ -25,6 +25,7 @@ use crate::nanocloud::k8s::deployment::Deployment;
 use crate::nanocloud::k8s::endpoints::Endpoints;
 use crate::nanocloud::k8s::job::Job;
 use crate::nanocloud::k8s::networkpolicy::NetworkPolicy;
+use crate::nanocloud::k8s::ownership::BundleFieldOwnership;
 use crate::nanocloud::k8s::pod::{ObjectMeta, Pod};
 use crate::nanocloud::k8s::replicaset::{ReplicaSet, ReplicaSetSpec, ReplicaSetStatus};
 use crate::nanocloud::k8s::service::Service;
@@ -52,6 +53,7 @@ const CONFIGMAP_PREFIX: &str = "/configmaps";
 const ENDPOINTS_PREFIX: &str = "/endpoints";
 const SERVICE_PREFIX: &str = "/services";
 const BUNDLE_PREFIX: &str = "/bundles";
+const BUNDLE_OWNER_FILE: &str = "_owners.json";
 const DEVICE_PREFIX: &str = "/devices";
 const SNAPSHOT_PREFIX: &str = "/volumesnapshots";
 const JOB_PREFIX: &str = "/jobs";
@@ -240,6 +242,13 @@ fn pod_root() -> PathBuf {
 
 fn bundle_root() -> PathBuf {
     Config::Keyspace.get_path().join("k8s").join("bundles")
+}
+
+fn bundle_owner_path(namespace: Option<&str>, name: &str) -> PathBuf {
+    bundle_root()
+        .join(normalize_namespace(namespace))
+        .join(name)
+        .join(BUNDLE_OWNER_FILE)
 }
 
 fn device_root() -> PathBuf {
@@ -1889,6 +1898,85 @@ pub fn list_bundles(namespace: Option<&str>) -> Result<Vec<Bundle>, Box<dyn Erro
     }
 
     Ok(results)
+}
+
+pub fn load_bundle_field_ownership(
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<BundleFieldOwnership, Box<dyn Error + Send + Sync>> {
+    let path = bundle_owner_path(namespace, name);
+    match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).map_err(|err| {
+            with_context(
+                err,
+                format!("Failed to parse Bundle ownership '{}'", path.display()),
+            )
+        }),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(BundleFieldOwnership::default()),
+        Err(err) => Err(with_context(
+            err,
+            format!(
+                "Failed to read Bundle ownership metadata '{}'",
+                path.display()
+            ),
+        )),
+    }
+}
+
+pub fn save_bundle_field_ownership(
+    namespace: Option<&str>,
+    name: &str,
+    ownership: &BundleFieldOwnership,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let path = bundle_owner_path(namespace, name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            with_context(
+                err,
+                format!(
+                    "Failed to create Bundle ownership directory '{}'",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(ownership).map_err(|err| {
+        with_context(
+            err,
+            format!(
+                "Failed to serialize Bundle ownership metadata for '{}/{}'",
+                namespace.unwrap_or("default"),
+                name
+            ),
+        )
+    })?;
+    fs::write(&path, payload).map_err(|err| {
+        with_context(
+            err,
+            format!(
+                "Failed to persist Bundle ownership metadata '{}'",
+                path.display()
+            ),
+        )
+    })
+}
+
+pub fn delete_bundle_field_ownership(
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let path = bundle_owner_path(namespace, name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(with_context(
+            err,
+            format!(
+                "Failed to delete Bundle ownership metadata '{}'",
+                path.display()
+            ),
+        )),
+    }
 }
 
 pub fn list_services(

@@ -21,6 +21,7 @@ use openssl::pkcs12::Pkcs12;
 use openssl::pkey::PKey;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::tls::{Certificate, Identity};
 use reqwest::{Client, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -45,10 +46,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::nanocloud::api::types::{
-    Bundle, BundleSnapshotSource, BundleSpec, CaRequest, CertificateRequest, CertificateResponse,
-    CertificateSpec, Device, DeviceList, DeviceSpec, NetworkPolicyDebugResponse, PodTable,
-    ServiceActionResponse,
+    ApplyConflict, Bundle, BundleList, BundleSnapshotSource, BundleSpec, CaRequest,
+    CertificateRequest, CertificateResponse, CertificateSpec, Device, DeviceList, DeviceSpec,
+    NetworkPolicyDebugResponse, PodTable, ServiceActionResponse,
 };
+use crate::nanocloud::k8s::event::EventList;
 use crate::nanocloud::k8s::pod::{ObjectMeta, Pod};
 use crate::nanocloud::util::security::JsonTlsInfo;
 use nix::unistd::isatty;
@@ -73,6 +75,21 @@ const CHANNEL_STATUS: u8 = 3;
 const CHANNEL_RESIZE: u8 = 4;
 const CHANNEL_CLOSE: u8 = 255;
 
+/// Options that tweak bundle profile export behavior.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BundleExportOptions {
+    /// Include encrypted secret payloads in the export artifact when supported.
+    pub include_secrets: bool,
+}
+
+pub struct ApplyBundleOptions<'a> {
+    pub payload: &'a [u8],
+    pub content_type: &'a str,
+    pub field_manager: &'a str,
+    pub force: bool,
+    pub dry_run: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecProtocol {
     V5,
@@ -95,6 +112,7 @@ pub struct ExecRequest {
 pub struct HttpError {
     pub status: StatusCode,
     pub message: String,
+    pub conflicts: Option<Vec<ApplyConflict>>,
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -176,7 +194,24 @@ impl HttpError {
         HttpError {
             status,
             message: message.into(),
+            conflicts: None,
         }
+    }
+
+    fn with_conflicts(
+        status: StatusCode,
+        message: impl Into<String>,
+        conflicts: Vec<ApplyConflict>,
+    ) -> Self {
+        HttpError {
+            status,
+            message: message.into(),
+            conflicts: Some(conflicts),
+        }
+    }
+
+    pub fn conflicts(&self) -> Option<&[ApplyConflict]> {
+        self.conflicts.as_deref()
     }
 }
 
@@ -1627,6 +1662,18 @@ impl NanocloudClient {
         segments
     }
 
+    pub fn event_collection_segments(namespace: Option<&str>) -> Vec<&str> {
+        let mut segments = vec!["api", "v1"];
+        if let Some(ns) = namespace.filter(|s| !s.is_empty()) {
+            segments.push("namespaces");
+            segments.push(ns);
+            segments.push("events");
+        } else {
+            segments.push("events");
+        }
+        segments
+    }
+
     pub async fn list_pods_table(
         &self,
         namespace: Option<&str>,
@@ -2038,6 +2085,29 @@ impl NanocloudClient {
         segments
     }
 
+    #[allow(clippy::needless_lifetimes)]
+    pub fn bundle_collection_segments<'a>(namespace: Option<&'a str>) -> Vec<&'a str> {
+        let ns = namespace.filter(|s| !s.is_empty()).unwrap_or("default");
+        vec!["apis", "nanocloud.io", "v1", "namespaces", ns, "bundles"]
+    }
+
+    #[allow(clippy::needless_lifetimes)]
+    pub fn bundle_segments<'a>(namespace: Option<&'a str>, name: &'a str) -> Vec<&'a str> {
+        let mut segments = Self::bundle_collection_segments(namespace);
+        segments.push(name);
+        segments
+    }
+
+    pub fn bundle_export_segments(namespace: Option<&str>, name: &str) -> Vec<String> {
+        let mut segments = Self::bundle_collection_segments(namespace)
+            .into_iter()
+            .map(|segment| segment.to_string())
+            .collect::<Vec<_>>();
+        segments.push(name.to_string());
+        segments.push("exportProfile".to_string());
+        segments
+    }
+
     async fn handle_json<T>(
         &self,
         response: reqwest::Response,
@@ -2052,15 +2122,21 @@ impl NanocloudClient {
         }
 
         let text = response.text().await.unwrap_or_default();
+        if let Ok(parsed) = serde_json::from_str::<crate::nanocloud::api::types::ErrorBody>(&text) {
+            let err = match parsed.conflicts {
+                Some(conflicts) if !conflicts.is_empty() => {
+                    HttpError::with_conflicts(status, parsed.error, conflicts)
+                }
+                _ => HttpError::new(status, parsed.error),
+            };
+            return Err(Box::new(err));
+        }
+
         let message = if text.is_empty() {
             status
                 .canonical_reason()
                 .unwrap_or("request failed")
                 .to_string()
-        } else if let Ok(parsed) =
-            serde_json::from_str::<crate::nanocloud::api::types::ErrorBody>(&text)
-        {
-            parsed.error
         } else {
             text
         };
@@ -2342,6 +2418,7 @@ impl NanocloudClient {
             }),
             start,
             update,
+            security: None,
         };
 
         let payload = Bundle {
@@ -2362,6 +2439,80 @@ impl NanocloudClient {
         ])?;
         let request = self.client.post(url).json(&payload);
         self.send_json(request).await
+    }
+
+    pub async fn apply_bundle(
+        &self,
+        namespace: Option<&str>,
+        service: &str,
+        options: ApplyBundleOptions<'_>,
+    ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
+        let trimmed_manager = options.field_manager.trim();
+        if trimmed_manager.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "field manager is required for apply operations",
+            )));
+        }
+
+        let segments = Self::bundle_segments(namespace, service);
+        let mut url = self.url_from_segments(&segments)?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("fieldManager", trimmed_manager);
+            if options.force {
+                pairs.append_pair("force", "true");
+            }
+            if options.dry_run {
+                pairs.append_pair("dryRun", "true");
+            }
+        }
+
+        let request = self
+            .client
+            .patch(url)
+            .header(CONTENT_TYPE, options.content_type)
+            .body(options.payload.to_vec());
+        self.send_json(request).await
+    }
+
+    pub async fn list_bundles(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<BundleList, Box<dyn Error + Send + Sync>> {
+        let segments = Self::bundle_collection_segments(namespace);
+        let url = self.url_from_segments(&segments)?;
+        let request = self.client.get(url);
+        self.send_json(request).await
+    }
+
+    pub async fn get_bundle(
+        &self,
+        namespace: Option<&str>,
+        service: &str,
+    ) -> Result<Option<Bundle>, Box<dyn Error + Send + Sync>> {
+        let segments = Self::bundle_segments(namespace, service);
+        let url = self.url_from_segments(&segments)?;
+        let response = self.apply_auth(self.client.get(url)).send().await?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(None),
+            status if status.is_success() => {
+                let bundle = response.json::<Bundle>().await?;
+                Ok(Some(bundle))
+            }
+            status => {
+                let text = response.text().await.unwrap_or_default();
+                let message = if text.is_empty() {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("request failed")
+                        .to_string()
+                } else {
+                    text
+                };
+                Err(Box::new(HttpError::new(status, message)))
+            }
+        }
     }
 
     pub async fn uninstall_bundle(
@@ -2492,6 +2643,39 @@ impl NanocloudClient {
         }
     }
 
+    pub async fn export_bundle_profile(
+        &self,
+        namespace: Option<&str>,
+        service: &str,
+        options: BundleExportOptions,
+    ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let owned_segments = Self::bundle_export_segments(namespace, service);
+        let segment_refs: Vec<&str> = owned_segments
+            .iter()
+            .map(|segment| segment.as_str())
+            .collect();
+        let mut url = self.url_from_segments(&segment_refs)?;
+        if options.include_secrets {
+            url.query_pairs_mut()
+                .append_pair("includeSecrets", Self::bool_query_value(true));
+        }
+        let response = self.apply_auth(self.client.post(url)).send().await?;
+        if response.status().is_success() {
+            let body = response.bytes().await?;
+            return Ok(body.to_vec());
+        }
+        let status = response.status();
+        let message = response.text().await.unwrap_or_else(|_| "".to_string());
+        if message.is_empty() {
+            Err(Box::new(HttpError::new(
+                status,
+                "failed to export bundle profile",
+            )))
+        } else {
+            Err(Box::new(HttpError::new(status, message)))
+        }
+    }
+
     pub async fn network_policy_debug(
         &self,
     ) -> Result<NetworkPolicyDebugResponse, Box<dyn Error + Send + Sync>> {
@@ -2586,6 +2770,129 @@ impl NanocloudClient {
             Err(Box::new(HttpError::new(status, message)))
         }
     }
+
+    pub async fn list_events(
+        &self,
+        namespace: Option<&str>,
+        query: &EventQuery,
+    ) -> Result<EventList, Box<dyn Error + Send + Sync>> {
+        let segments = Self::event_collection_segments(namespace);
+        let url = self.url_from_segments(&segments)?;
+        let mut params: Vec<(String, String)> = Vec::new();
+
+        if let Some(limit) = query.limit {
+            if limit > 0 {
+                params.push(("limit".to_string(), limit.to_string()));
+            }
+        }
+
+        if let Some(since) = query
+            .since
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(("since".to_string(), since.to_string()));
+        }
+
+        if let Some(level) = query.level {
+            params.push(("level".to_string(), level.as_str().to_string()));
+        }
+
+        if !query.reasons.is_empty() {
+            let joined = query
+                .reasons
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !joined.is_empty() {
+                params.push(("reason".to_string(), joined));
+            }
+        }
+
+        if let Some(selector) = query.build_field_selector() {
+            params.push(("fieldSelector".to_string(), selector));
+        }
+
+        let request = if params.is_empty() {
+            self.client.get(url)
+        } else {
+            let pairs: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            self.client.get(url).query(&pairs)
+        };
+
+        let response = self.apply_auth(request).send().await?;
+        self.handle_json(response).await
+    }
+
+    pub async fn watch_events(
+        &self,
+        namespace: Option<&str>,
+        query: &EventQuery,
+    ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+        let segments = Self::event_collection_segments(namespace);
+        let url = self.url_from_segments(&segments)?;
+
+        let mut params: Vec<(String, String)> = Vec::new();
+        params.push(("watch".to_string(), "true".to_string()));
+        if let Some(selector) = query.build_field_selector() {
+            params.push(("fieldSelector".to_string(), selector));
+        }
+
+        if let Some(limit) = query.limit {
+            if limit > 0 {
+                params.push(("limit".to_string(), limit.to_string()));
+            }
+        }
+
+        if let Some(since) = query
+            .since
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(("since".to_string(), since.to_string()));
+        }
+
+        if let Some(rv) = query.resource_version.as_deref() {
+            params.push(("resourceVersion".to_string(), rv.to_string()));
+            params.push((
+                "resourceVersionMatch".to_string(),
+                "NotOlderThan".to_string(),
+            ));
+        }
+
+        params.push(("allowWatchBookmarks".to_string(), "true".to_string()));
+        let timeout = query.timeout_seconds.unwrap_or(30);
+        params.push(("timeoutSeconds".to_string(), timeout.to_string()));
+
+        let pairs: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let request = self.client.get(url).query(&pairs);
+        let response = self.apply_auth(request).send().await?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let message = if text.is_empty() {
+                status
+                    .canonical_reason()
+                    .unwrap_or("watch request failed")
+                    .to_string()
+            } else {
+                text
+            };
+            Err(Box::new(HttpError::new(status, message)))
+        }
+    }
 }
 
 fn select_endpoint(host: Option<&str>) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -2610,5 +2917,50 @@ fn normalize_host_to_url(host: &str) -> String {
         host.to_string()
     } else {
         format!("https://{}", host)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EventQuery {
+    pub bundle: Option<String>,
+    pub limit: Option<u32>,
+    pub since: Option<String>,
+    pub resource_version: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub level: Option<EventLevel>,
+    pub reasons: Vec<String>,
+}
+
+impl EventQuery {
+    fn build_field_selector(&self) -> Option<String> {
+        let mut selectors: Vec<String> = Vec::new();
+        if let Some(bundle) = self
+            .bundle
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|v| !v.is_empty())
+        {
+            selectors.push(format!("involvedObject.name={bundle}"));
+        }
+        if selectors.is_empty() {
+            None
+        } else {
+            Some(selectors.join(","))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EventLevel {
+    Normal,
+    Warning,
+}
+
+impl EventLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EventLevel::Normal => "Normal",
+            EventLevel::Warning => "Warning",
+        }
     }
 }

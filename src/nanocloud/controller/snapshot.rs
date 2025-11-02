@@ -4,7 +4,10 @@ use crate::nanocloud::engine::container::backup_directory;
 use crate::nanocloud::engine::{register_streaming_backup, streaming_backup_enabled, Snapshot};
 use crate::nanocloud::k8s::store::{list_volume_snapshots, save_volume_snapshot};
 use crate::nanocloud::logger::{log_debug, log_error, log_info, log_warn};
-use crate::nanocloud::observability::metrics::{self, SnapshotOperation};
+use crate::nanocloud::observability::{
+    metrics::{self, ControllerReconcileResult, SnapshotOperation},
+    tracing,
+};
 use crate::nanocloud::util::KeyspaceEventType;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -86,20 +89,21 @@ async fn process_snapshot(snapshot: VolumeSnapshot) {
     let namespace_value = namespace_label.unwrap_or("default");
     let mut snapshot_for_failure = snapshot.clone();
 
-    let result = metrics::observe_snapshot_operation(
+    let reconcile_future = metrics::observe_snapshot_operation(
         namespace_label,
         name.as_str(),
         SnapshotOperation::Reconcile,
         async move { reconcile_snapshot(snapshot).await },
-    )
-    .await;
+    );
+    let span_label = format!("{}/{}", namespace_value, name);
+    let result = tracing::with_span("controller.snapshot", span_label, reconcile_future).await;
 
-    if let Err(err) = result {
+    if let Err(err) = &result {
         if let Err(status_err) = mark_snapshot_failed(
             &mut snapshot_for_failure,
             namespace_label,
             name.as_str(),
-            &err,
+            err,
         ) {
             log_error(
                 COMPONENT,
@@ -121,6 +125,12 @@ async fn process_snapshot(snapshot: VolumeSnapshot) {
             ],
         );
     }
+    let reconcile_outcome = if result.is_ok() {
+        ControllerReconcileResult::Success
+    } else {
+        ControllerReconcileResult::Error
+    };
+    metrics::record_controller_reconcile("snapshot", reconcile_outcome);
 }
 
 async fn reconcile_snapshot(mut snapshot: VolumeSnapshot) -> Result<(), SnapshotError> {

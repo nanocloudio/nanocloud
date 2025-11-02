@@ -1,0 +1,21 @@
+{
+  "created": "2025-11-12T00:00:00Z",
+  "architecture": "amd64",
+  "variant": null,
+  "os": "linux",
+  "config": {
+    "User": null,
+    "Env": ["CHECKPOINT=loopback"],
+    "Entrypoint": ["/bin/sh"],
+    "Cmd": ["-c", "echo conformance"],
+    "WorkingDir": "/",
+    "Labels": {
+      "io.nanocloud.options": "{\"runtime_command\":[\"/bin/sh\"],\"runtime_args\":[\"-c\",\"echo conformance\"],\"macro_dns\":[\"!dns\"],\"macro_rand\":[\"!rand 8 hex\"],\"macro_tls\":[\"!tls cert\"]}"
+    }
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": []
+  },
+  "history": []
+}

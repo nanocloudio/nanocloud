@@ -19,7 +19,9 @@ use std::error::Error;
 use crate::nanocloud::api::client::NanocloudClient;
 use crate::nanocloud::cli::args::StatusArgs;
 use crate::nanocloud::cli::curl::print_curl_request;
-use crate::nanocloud::cli::output::{print_pod_state, print_pod_table, service_display_name};
+use crate::nanocloud::cli::output::{
+    print_bundle_state, print_bundle_table, print_pod_table, service_display_name,
+};
 use crate::nanocloud::cli::Terminal;
 
 pub(super) async fn handle_status(
@@ -57,40 +59,29 @@ pub(super) async fn handle_status(
     }
     if args.curl {
         if let Some(service) = args.service.as_deref() {
-            let pod_name = service_display_name(namespace, service);
-            let segments = NanocloudClient::pod_segments(namespace, &pod_name);
+            let segments = NanocloudClient::bundle_segments(namespace, service);
             let url = client.url_from_segments(&segments)?.to_string();
             print_curl_request(client, "GET", &url, None)?;
         } else {
-            let segments = NanocloudClient::pod_collection_segments(namespace);
-            let mut url = client.url_from_segments(&segments)?;
-            url.query_pairs_mut().append_pair("format", "table");
-            print_curl_request(client, "GET", url.as_ref(), None)?;
+            let segments = NanocloudClient::bundle_collection_segments(namespace);
+            let url = client.url_from_segments(&segments)?.to_string();
+            print_curl_request(client, "GET", &url, None)?;
         }
         return Ok(());
     }
 
     if let Some(service) = args.service.as_deref() {
-        let pod_name = service_display_name(namespace, service);
-        match client.get_pod(namespace, &pod_name).await? {
-            Some(pod) => print_pod_state(namespace, service, &pod),
+        match client.get_bundle(namespace, service).await? {
+            Some(bundle) => print_bundle_state(&bundle),
             None => {
                 let target = service_display_name(namespace, service);
-                Terminal::stderr(format_args!("Pod '{}' not found", target));
+                Terminal::stderr(format_args!("Bundle '{}' not found", target));
             }
         }
         return Ok(());
     }
 
-    let table = client.list_pods_table(namespace).await?;
-    if table.rows.is_empty() {
-        if let Some(ns) = namespace {
-            Terminal::stdout(format_args!("No pods found in namespace '{}'.", ns));
-        } else {
-            Terminal::stdout(format_args!("No pods found."));
-        }
-        return Ok(());
-    }
-    print_pod_table(&table);
+    let bundles = client.list_bundles(namespace).await?;
+    print_bundle_table(&bundles.items);
     Ok(())
 }

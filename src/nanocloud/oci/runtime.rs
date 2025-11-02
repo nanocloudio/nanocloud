@@ -17,14 +17,20 @@
 use crate::nanocloud::engine::log::{
     container_log_dir, container_log_path, write_docker_json_logs,
 };
-use crate::nanocloud::k8s::pod::{ContainerResources, ContainerSpec, VolumeSpec};
-use crate::nanocloud::util::error::with_context;
+use crate::nanocloud::k8s::pod::{
+    ContainerResources, ContainerSpec, PodSecurityContext, VolumeSpec,
+};
+use crate::nanocloud::security::profile::normalize_capability_name;
+use crate::nanocloud::security::seccomp::SeccompFilter;
+use crate::nanocloud::security::{PRIVILEGE_ESCALATION_DENIED, SECURITY_POLICY_VIOLATION};
+use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::util::security::volume::{
     cleanup_mount_dir, close_mapper, encrypted_host_mount, encrypted_mapper_name,
     ensure_encrypted_volume_root, ensure_luks_device, mount_mapper, open_mapper, read_volume_key,
     unmount_if_mounted,
 };
 
+use caps::{self, CapSet, Capability};
 use chrono::{TimeZone, Utc};
 use log::{debug, error, info, warn};
 use nix::errno::Errno;
@@ -47,6 +53,7 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,6 +70,8 @@ pub struct OciConfig {
     pub linux: Linux,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub encrypted_volumes: Vec<EncryptedVolumeMount>,
+    #[serde(default)]
+    pub security: SecurityPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,6 +116,16 @@ pub struct EncryptedVolumeMount {
     pub mapper: String,
     #[serde(rename = "hostMount")]
     pub host_mount: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SecurityPolicy {
+    #[serde(
+        rename = "allowedCapabilities",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -288,6 +307,10 @@ pub fn netns_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/var/run/netns"))
 }
 
+const RUNTIME_SECCOMP_PROFILE: &str =
+    include_str!("../../../assets/security/seccomp-baseline.json");
+static RUNTIME_SECCOMP: OnceLock<SeccompFilter> = OnceLock::new();
+
 impl Runtime {
     pub fn configure_from_spec(
         container_id: &str,
@@ -295,6 +318,7 @@ impl Runtime {
         container: &ContainerSpec,
         volumes: &[VolumeSpec],
         host_network: bool,
+        security: &PodSecurityContext,
     ) -> OciConfig {
         let oci_version = "1.2.1".to_string();
         let effective_command = if container.command.is_empty() {
@@ -536,6 +560,21 @@ impl Runtime {
             namespaces,
             resources,
         };
+        let security_policy = SecurityPolicy {
+            allowed_capabilities: security.extra_capabilities.clone(),
+        };
+        let seccomp_hint = security
+            .seccomp_profile
+            .as_ref()
+            .map(|profile| profile.profile_type.clone());
+        debug!(
+            "Configuring OCI spec for {}: host_network={}, allow_privileged={}, extra_caps={:?}, seccomp_profile={:?}",
+            container_name,
+            host_network,
+            security.allow_privileged,
+            security.extra_capabilities,
+            seccomp_hint,
+        );
         OciConfig {
             oci_version,
             process,
@@ -544,6 +583,7 @@ impl Runtime {
             mounts,
             linux,
             encrypted_volumes,
+            security: security_policy,
         }
     }
 
@@ -583,6 +623,11 @@ impl Runtime {
 
         let uid = config.process.user.uid;
         let gid = config.process.user.gid;
+        let allowed_caps = parse_security_capabilities(&config.security)?;
+        debug!(
+            "Spawning container {} (has_network_namespace: {}, root readonly: {}) with uid={}, gid={}, allowed_caps={:?}",
+            container_id, has_network_namespace, config.root.readonly, uid, gid, allowed_caps,
+        );
         let args: Vec<CString> = config
             .process
             .args
@@ -723,7 +768,12 @@ impl Runtime {
                 drop(parent_write);
                 nix::unistd::close(parent_read)?;
                 debug!("Creating new PID namespace");
-                nix::sched::unshare(CloneFlags::CLONE_NEWPID)?;
+                nix::sched::unshare(CloneFlags::CLONE_NEWPID).map_err(|err| {
+                    with_context(
+                        err,
+                        "Failed to unshare CLONE_NEWPID for container bootstrap",
+                    )
+                })?;
 
                 match unsafe { nix::unistd::fork() } {
                     Ok(ForkResult::Parent { child }) => {
@@ -757,11 +807,18 @@ impl Runtime {
                             } else {
                                 debug!("Host network enabled; skipping network namespace entry");
                             }
+                            debug!("Unsharing UTS, mount, and IPC namespaces");
                             nix::sched::unshare(
                                 CloneFlags::CLONE_NEWUTS
                                     | CloneFlags::CLONE_NEWNS
                                     | CloneFlags::CLONE_NEWIPC,
-                            )?;
+                            )
+                            .map_err(|err| {
+                                with_context(
+                                    err,
+                                    "Failed to unshare CLONE_NEWUTS|CLONE_NEWNS|CLONE_NEWIPC",
+                                )
+                            })?;
                             do_mount(
                                 None,
                                 &CString::new("/")?,
@@ -883,7 +940,7 @@ impl Runtime {
                             .map_err(|e| format!("start pipe read failed: {}", e))?;
                         info!("Start command received");
 
-                        init_process(uid, gid, &cwd, &args, &proc_env)?;
+                        init_process(uid, gid, &cwd, &args, &proc_env, &allowed_caps)?;
 
                         exit(0);
                     }
@@ -946,12 +1003,8 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn delete(
-        container_name: &str,
-        container_id: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub fn delete(container_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         drop_start_pipe(container_id)?;
-        // TODO: get container name from runtime - we should only need the container_id here
         let root = container_root_path(container_id);
         let config_path = root.join("config.json");
         let encrypted_volumes = match File::open(&config_path) {
@@ -973,8 +1026,20 @@ impl Runtime {
 
         teardown_encrypted_volumes(&encrypted_volumes)?;
         std::fs::remove_dir_all(&root)?;
-        let refs_path = container_refs_dir().join(container_name);
-        std::fs::remove_file(refs_path)?;
+        let name_map = read_container_name_map()?;
+        if let Some(ref_name) = name_map.get(container_id) {
+            let refs_path = container_refs_dir().join(ref_name);
+            match std::fs::remove_file(refs_path) {
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(Box::new(err)),
+            }
+        } else {
+            warn!(
+                "Container reference entry missing for {}; skipping ref removal",
+                container_id
+            );
+        }
 
         let netns_path = netns_dir().join(container_id);
         if let Err(err) = std::fs::remove_file(&netns_path) {
@@ -1717,7 +1782,188 @@ fn map_container_resources(spec: &ContainerResources) -> Option<LinuxResources> 
     }
 }
 
-fn resolve_process_user(user_spec: Option<&str>) -> (u32, u32) {
+fn runtime_seccomp_filter() -> &'static SeccompFilter {
+    RUNTIME_SECCOMP.get_or_init(|| {
+        SeccompFilter::from_str(RUNTIME_SECCOMP_PROFILE)
+            .expect("runtime seccomp profile must be valid")
+    })
+}
+
+fn apply_runtime_seccomp() -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime_seccomp_filter()
+        .apply()
+        .map_err(|err| with_context(err, "Failed to apply runtime seccomp filter"))
+}
+
+fn security_violation(prefix: &str, detail: impl Into<String>) -> Box<dyn Error + Send + Sync> {
+    new_error(format!("{} {}", prefix, detail.into()))
+}
+
+fn parse_security_capabilities(
+    policy: &SecurityPolicy,
+) -> Result<Vec<Capability>, Box<dyn Error + Send + Sync>> {
+    let mut caps_vec = Vec::with_capacity(policy.allowed_capabilities.len());
+    for capability in &policy.allowed_capabilities {
+        let normalized = normalize_capability_name(capability);
+        if normalized.is_empty() {
+            continue;
+        }
+        let parsed = Capability::from_str(&normalized).map_err(|_| {
+            security_violation(
+                SECURITY_POLICY_VIOLATION,
+                format!(
+                    "Unknown capability '{}' in pod security context",
+                    capability
+                ),
+            )
+        })?;
+        caps_vec.push(parsed);
+    }
+    Ok(caps_vec)
+}
+
+fn configure_identity_and_capabilities(
+    uid: u32,
+    gid: u32,
+    allowed_caps: &[Capability],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut transitional_caps: Vec<Capability> = allowed_caps.to_vec();
+    let allowed_set: caps::CapsHashSet = allowed_caps.iter().copied().collect();
+    let mut first_drop_allowed = allowed_set.clone();
+    let target_uid = Uid::from_raw(uid);
+    let target_gid = Gid::from_raw(gid);
+    let current_uid = Uid::effective();
+    let current_gid = Gid::effective();
+
+    if target_uid != current_uid && !transitional_caps.contains(&Capability::CAP_SETUID) {
+        transitional_caps.push(Capability::CAP_SETUID);
+        first_drop_allowed.insert(Capability::CAP_SETUID);
+    }
+    if target_gid != current_gid && !transitional_caps.contains(&Capability::CAP_SETGID) {
+        transitional_caps.push(Capability::CAP_SETGID);
+        first_drop_allowed.insert(Capability::CAP_SETGID);
+    }
+    if !transitional_caps.contains(&Capability::CAP_SETPCAP) {
+        transitional_caps.push(Capability::CAP_SETPCAP);
+    }
+    first_drop_allowed.insert(Capability::CAP_SETPCAP);
+
+    // Keep capabilities through uid/gid changes so we can reconfigure after dropping extras.
+    set_keepcaps(true)?;
+
+    let all_caps: Vec<Capability> = caps::all().into_iter().collect();
+    configure_capability_sets(&all_caps)?;
+    drop_bounding_capabilities(&first_drop_allowed)?;
+    configure_capability_sets(&transitional_caps)?;
+    setgid(target_gid)?;
+    setuid(target_uid)?;
+
+    drop_bounding_capabilities(&allowed_set)?;
+    configure_capability_sets(allowed_caps)?;
+    set_keepcaps(false)?;
+    Ok(())
+}
+
+fn configure_capability_sets(
+    allowed_caps: &[Capability],
+) -> Result<caps::CapsHashSet, Box<dyn Error + Send + Sync>> {
+    let allowed_set: caps::CapsHashSet = allowed_caps.iter().copied().collect();
+    caps::set(None, CapSet::Effective, &allowed_set).map_err(|err| {
+        security_violation(
+            PRIVILEGE_ESCALATION_DENIED,
+            format!("Failed to configure effective capabilities: {err}"),
+        )
+    })?;
+    caps::set(None, CapSet::Permitted, &allowed_set).map_err(|err| {
+        security_violation(
+            PRIVILEGE_ESCALATION_DENIED,
+            format!("Failed to configure permitted capabilities: {err}"),
+        )
+    })?;
+    caps::set(None, CapSet::Inheritable, &allowed_set).map_err(|err| {
+        security_violation(
+            PRIVILEGE_ESCALATION_DENIED,
+            format!("Failed to configure inheritable capabilities: {err}"),
+        )
+    })?;
+    caps::set(None, CapSet::Ambient, &allowed_set).map_err(|err| {
+        security_violation(
+            PRIVILEGE_ESCALATION_DENIED,
+            format!("Failed to configure ambient capabilities: {err}"),
+        )
+    })?;
+    Ok(allowed_set)
+}
+
+fn drop_bounding_capabilities(
+    allowed: &caps::CapsHashSet,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let drop_setpcap_last = !allowed.contains(&Capability::CAP_SETPCAP);
+    let mut dropped = Vec::new();
+    for cap in caps::all() {
+        if drop_setpcap_last && cap == Capability::CAP_SETPCAP {
+            continue;
+        }
+        if allowed.contains(&cap) {
+            continue;
+        }
+        match caps::drop(None, CapSet::Bounding, cap) {
+            Ok(()) => dropped.push(cap),
+            Err(err) if err.to_string().contains("Operation not permitted") => {
+                debug!(
+                    "Bounding drop rejected for {:?}: {}; leaving capability in place",
+                    cap, err
+                );
+            }
+            Err(err) => {
+                return Err(security_violation(
+                    PRIVILEGE_ESCALATION_DENIED,
+                    format!("Failed to drop bounding capability {:?}: {err}", cap),
+                ));
+            }
+        }
+    }
+    if drop_setpcap_last {
+        let cap = Capability::CAP_SETPCAP;
+        match caps::drop(None, CapSet::Bounding, cap) {
+            Ok(()) => dropped.push(cap),
+            Err(err) if err.to_string().contains("Operation not permitted") => {
+                debug!(
+                    "Bounding drop rejected for {:?}: {}; leaving capability in place",
+                    cap, err
+                );
+            }
+            Err(err) => {
+                return Err(security_violation(
+                    PRIVILEGE_ESCALATION_DENIED,
+                    format!("Failed to drop bounding capability {:?}: {err}", cap),
+                ));
+            }
+        }
+    }
+    debug!(
+        "Bounding capabilities dropped: {:?}; allowed set {:?}",
+        dropped, allowed
+    );
+    Ok(())
+}
+
+fn set_keepcaps(enable: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let value = if enable { 1 } else { 0 };
+    let result = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, value, 0, 0, 0) };
+    if result != 0 {
+        return Err(security_violation(
+            PRIVILEGE_ESCALATION_DENIED,
+            format!(
+                "Failed to {} keepcaps",
+                if enable { "enable" } else { "disable" }
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_process_user(user_spec: Option<&str>) -> (u32, u32) {
     const DEFAULT_UID: u32 = 1000;
     const DEFAULT_GID: u32 = 1000;
 
@@ -2529,11 +2775,7 @@ fn do_mount(
             source_mode = Some(src_metadata.mode() & 0o7777);
         }
 
-        if source_path_obj.exists() && is_nanocloud_managed_path(source_path_obj) {
-            let uid = Some(nix::unistd::Uid::from_raw(1000));
-            let gid = Some(nix::unistd::Gid::from_raw(1000));
-            nix::unistd::chown(source_path_obj, uid, gid)?;
-        }
+        // Storage ownership is reconciled before container creation; avoid overriding it here.
     }
 
     let target_path = target.to_string_lossy().to_string();
@@ -2608,22 +2850,6 @@ fn teardown_encrypted_volumes(
     Ok(())
 }
 
-fn is_nanocloud_managed_path(path: &Path) -> bool {
-    let container_root = container_base_dir();
-    if path.starts_with(&container_root) {
-        return true;
-    }
-
-    if let Ok(storage_root) = env::var("NANOCLOUD_STORAGE_ROOT") {
-        let storage_path = PathBuf::from(storage_root);
-        if path.starts_with(&storage_path) {
-            return true;
-        }
-    }
-
-    path.starts_with(Path::new("/var/lib/nanocloud.io"))
-}
-
 fn pivot_rootfs(new_root: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let new_root_path = Path::new(new_root);
     if !is_mount_point(new_root_path)? {
@@ -2680,14 +2906,15 @@ fn init_process(
     cwd: &str,
     args: &[CString],
     env: &[CString],
+    allowed_caps: &[Capability],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     adjust_stdio_ownership(uid, gid)?;
     debug!("Setting uid={}, gid={}", uid, gid);
-    setgid(Gid::from_raw(gid))?;
-    setuid(Uid::from_raw(uid))?;
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
         return Err(Box::new(io::Error::last_os_error()));
     }
+    apply_runtime_seccomp()?;
+    configure_identity_and_capabilities(uid, gid, allowed_caps)?;
 
     debug!("Changing directory to {}", cwd);
     chdir(cwd)?;
@@ -2852,7 +3079,14 @@ mod tests {
     #[test]
     fn configure_sets_network_namespace_by_default() {
         let container = base_container();
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &[], false);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &[],
+            false,
+            &PodSecurityContext::default(),
+        );
 
         assert_eq!(config.linux.namespaces.len(), 1);
         let ns = config.linux.namespaces.first().unwrap();
@@ -2867,7 +3101,14 @@ mod tests {
     #[test]
     fn configure_skips_network_namespace_with_host_network() {
         let container = base_container();
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &[], true);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &[],
+            true,
+            &PodSecurityContext::default(),
+        );
 
         assert!(config.linux.namespaces.is_empty());
     }
@@ -2875,7 +3116,14 @@ mod tests {
     #[test]
     fn configure_populates_core_isolation_mounts() {
         let container = base_container();
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &[], false);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &[],
+            false,
+            &PodSecurityContext::default(),
+        );
 
         let proc_mount = config
             .mounts
@@ -2954,7 +3202,14 @@ mod tests {
             ..Default::default()
         }];
 
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &volumes, false);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &volumes,
+            false,
+            &PodSecurityContext::default(),
+        );
         let mount = config
             .mounts
             .iter()
@@ -2992,7 +3247,14 @@ mod tests {
             ..Default::default()
         }];
 
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &volumes, false);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &volumes,
+            false,
+            &PodSecurityContext::default(),
+        );
         let mount = config
             .mounts
             .iter()
@@ -3042,7 +3304,14 @@ mod tests {
             pids_limit: Some(128),
         });
 
-        let config = Runtime::configure_from_spec("abc123", "demo", &container, &[], false);
+        let config = Runtime::configure_from_spec(
+            "abc123",
+            "demo",
+            &container,
+            &[],
+            false,
+            &PodSecurityContext::default(),
+        );
         let resources = config
             .linux
             .resources
@@ -3059,6 +3328,15 @@ mod tests {
 
         let pids = resources.pids.expect("pids resources missing");
         assert_eq!(pids.limit, 128);
+    }
+
+    #[test]
+    fn parse_security_capabilities_rejects_unknown_entries() {
+        let policy = SecurityPolicy {
+            allowed_capabilities: vec!["CAP_FAKE_PRIV".to_string()],
+        };
+        let err = parse_security_capabilities(&policy).expect_err("expected security error");
+        assert!(err.to_string().starts_with(SECURITY_POLICY_VIOLATION));
     }
 
     #[test]

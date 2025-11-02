@@ -17,7 +17,7 @@
 use super::runtime::{
     ContainerState, ContainerStatus, ContainerSummary, ExecRequest, ExecResult, OciConfig, Runtime,
 };
-use crate::nanocloud::k8s::pod::{ContainerSpec, VolumeSpec};
+use crate::nanocloud::k8s::pod::{ContainerSpec, PodSecurityContext, VolumeSpec};
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
@@ -65,6 +65,7 @@ pub trait ContainerRuntime: Send + Sync {
         container: &ContainerSpec,
         volumes: &[VolumeSpec],
         host_network: bool,
+        security: &PodSecurityContext,
     ) -> OciConfig;
 
     fn create(
@@ -76,7 +77,7 @@ pub trait ContainerRuntime: Send + Sync {
 
     fn recreate(&self, container_id: &str) -> DynResult<()>;
 
-    fn delete(&self, container_name: &str, container_id: &str) -> DynResult<()>;
+    fn delete(&self, container_id: &str) -> DynResult<()>;
 
     fn state(&self, container_id: &str) -> DynResult<ContainerState>;
 
@@ -106,6 +107,7 @@ impl ContainerRuntime for LocalContainerRuntime {
         container: &ContainerSpec,
         volumes: &[VolumeSpec],
         host_network: bool,
+        security: &PodSecurityContext,
     ) -> OciConfig {
         Runtime::configure_from_spec(
             container_id,
@@ -113,6 +115,7 @@ impl ContainerRuntime for LocalContainerRuntime {
             container,
             volumes,
             host_network,
+            security,
         )
     }
 
@@ -129,8 +132,8 @@ impl ContainerRuntime for LocalContainerRuntime {
         Runtime::recreate(container_id)
     }
 
-    fn delete(&self, container_name: &str, container_id: &str) -> DynResult<()> {
-        Runtime::delete(container_name, container_id)
+    fn delete(&self, container_id: &str) -> DynResult<()> {
+        Runtime::delete(container_id)
     }
 
     fn state(&self, container_id: &str) -> DynResult<ContainerState> {

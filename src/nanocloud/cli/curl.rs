@@ -74,6 +74,16 @@ pub(super) fn print_curl_request(
     url: &str,
     body: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    print_curl_request_with_type(client, method, url, body, "application/json")
+}
+
+pub(super) fn print_curl_request_with_type(
+    client: &NanocloudClient,
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    content_type: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prefix = curl_prefix(client)?;
     let owner_header = client
         .owner()
@@ -87,8 +97,8 @@ pub(super) fn print_curl_request(
     match body {
         Some(payload) => {
             Terminal::stdout(format_args!(
-                "cat <<'EOF' | {} -X {} '{}' {} -H 'Content-Type: application/json' --data-binary @-",
-                prefix, method, url, owner_header
+                "cat <<'EOF' | {} -X {} '{}' {} -H 'Content-Type: {}' --data-binary @-",
+                prefix, method, url, owner_header, content_type
             ));
             Terminal::stdout(format_args!("{}", payload));
             Terminal::stdout(format_args!("EOF"));

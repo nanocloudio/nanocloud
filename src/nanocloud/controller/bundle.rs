@@ -15,19 +15,27 @@
  */
 
 use crate::nanocloud::api::types::{
-    Bundle, BundleCondition, BundleConditionStatus, BundlePhase, BundleSnapshotSource,
-    BundleStatus, BundleWorkloadRef,
+    BindingHistoryEntry, Bundle, BundleCondition, BundleConditionKind, BundleConditionStatus,
+    BundlePhase, BundleSnapshotSource, BundleStatus, BundleWorkloadRef,
 };
+use crate::nanocloud::controller::status::BundleConditionReason;
 use crate::nanocloud::controller::watch::ControllerWatchManager;
 use crate::nanocloud::engine::container;
+use crate::nanocloud::engine::profile::is_reserved_profile_key;
 use crate::nanocloud::events::in_memory::InMemoryEventBus;
 use crate::nanocloud::events::{EventEnvelope, EventKey, EventPublisher, EventTopic, EventType};
 use crate::nanocloud::k8s::bundle_manager::BundleRegistry;
 use crate::nanocloud::logger::{log_debug, log_error, log_info, log_warn};
+use crate::nanocloud::observability::{
+    metrics::{self, ControllerReconcileResult},
+    tracing,
+};
+use crate::nanocloud::security::{PRIVILEGE_ESCALATION_DENIED, SECURITY_POLICY_VIOLATION};
 use crate::nanocloud::util::KeyspaceEventType;
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -102,19 +110,60 @@ pub fn spawn() -> JoinHandle<()> {
     })
 }
 
+async fn refresh_bundle_gauges(registry: &Arc<BundleRegistry>) {
+    let mut ready = 0i64;
+    let mut degraded = 0i64;
+    for bundle in registry.list(None).await {
+        let phase = bundle
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.as_ref());
+        if matches!(phase, Some(BundlePhase::Ready)) {
+            ready += 1;
+        } else {
+            degraded += 1;
+        }
+    }
+    metrics::set_bundle_gauges(ready, degraded);
+}
+
 async fn reconcile_bundle(
     registry: Arc<BundleRegistry>,
     event_bus: Arc<InMemoryEventBus>,
     bundle: Bundle,
 ) -> Result<(), String> {
+    let span_namespace = bundle
+        .metadata
+        .namespace
+        .clone()
+        .or_else(|| bundle.spec.namespace.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let span_name = bundle
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| bundle.spec.service.clone());
     let bundle_for_event = bundle.clone();
-    let result = reconcile_bundle_inner(registry, bundle).await;
+    let registry_for_span = Arc::clone(&registry);
+    let result = tracing::with_span(
+        "controller.bundle",
+        format!("{}/{}", span_namespace, span_name),
+        reconcile_bundle_inner(registry_for_span, bundle),
+    )
+    .await;
     publish_bundle_event(
         Arc::clone(&event_bus),
         &bundle_for_event,
         result.as_ref().err().map(|e| e.as_str()),
     )
     .await;
+    let controller_result = if result.is_ok() {
+        ControllerReconcileResult::Success
+    } else {
+        ControllerReconcileResult::Error
+    };
+    metrics::record_controller_reconcile("bundle", controller_result);
+    refresh_bundle_gauges(&registry).await;
     result
 }
 
@@ -139,6 +188,20 @@ async fn reconcile_bundle_inner(
             return Ok(());
         }
     }
+
+    let mut next_observed_generation = current_rv.saturating_add(1);
+    let previous_conditions: HashMap<BundleConditionKind, BundleCondition> = bundle
+        .status
+        .as_ref()
+        .map(|status| {
+            status
+                .conditions
+                .iter()
+                .map(|condition| (condition.condition_type, condition.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut latest_binding_history = previous_binding_history(&bundle);
 
     let resolved_namespace = bundle
         .spec
@@ -169,7 +232,13 @@ async fn reconcile_bundle_inner(
         ],
     );
 
-    let install_options = bundle.spec.options.clone();
+    let install_options = bundle
+        .spec
+        .options
+        .iter()
+        .filter(|(key, _)| !is_reserved_profile_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
 
     let snapshot_path = match resolve_snapshot_source(bundle.spec.snapshot.as_ref()) {
         Ok(path) => path,
@@ -183,17 +252,36 @@ async fn reconcile_bundle_inner(
                     ("error", message.as_str()),
                 ],
             );
-            let status = BundleStatus {
-                observed_generation: Some(current_rv),
-                phase: Some(BundlePhase::Failed),
-                conditions: vec![make_condition(
-                    "WorkloadApplied",
+            let conditions = build_conditions(
+                &previous_conditions,
+                ConditionSpec::new(
                     BundleConditionStatus::False,
-                    Some("SnapshotInvalid".to_string()),
-                    Some(message),
-                )],
+                    BundleConditionReason::ProfileFailed,
+                    Some(message.clone()),
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::False,
+                    BundleConditionReason::SecretsFailed,
+                    Some("Secrets blocked by profile failure".to_string()),
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::False,
+                    BundleConditionReason::WorkloadPending,
+                    Some("Workloads never applied".to_string()),
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::False,
+                    BundleConditionReason::StartPending,
+                    Some("Bundle never started".to_string()),
+                ),
+            );
+            let status = BundleStatus {
+                observed_generation: Some(next_observed_generation),
+                phase: Some(BundlePhase::Failed),
+                conditions,
                 workload: None,
                 last_reconciled_time: Some(now_timestamp()),
+                binding_history: latest_binding_history.clone(),
             };
             apply_status(
                 registry,
@@ -213,6 +301,7 @@ async fn reconcile_bundle_inner(
         install_options,
         snapshot_path.as_deref(),
         bundle.spec.update,
+        bundle.spec.security.clone(),
     )
     .await
     {
@@ -228,17 +317,36 @@ async fn reconcile_bundle_inner(
                     ("error", message.as_str()),
                 ],
             );
-            let status = BundleStatus {
-                observed_generation: Some(current_rv),
-                phase: Some(BundlePhase::Failed),
-                conditions: vec![make_condition(
-                    "WorkloadApplied",
+            let conditions = build_conditions(
+                &previous_conditions,
+                ConditionSpec::new(
+                    BundleConditionStatus::True,
+                    BundleConditionReason::ProfilePersisted,
+                    None,
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::True,
+                    BundleConditionReason::SecretsDistributed,
+                    None,
+                ),
+                ConditionSpec::new(
                     BundleConditionStatus::False,
-                    Some("InstallFailed".to_string()),
-                    Some(message),
-                )],
+                    BundleConditionReason::WorkloadFailed,
+                    Some(message.clone()),
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::False,
+                    BundleConditionReason::StartPending,
+                    Some("Bundle failed before start completed".to_string()),
+                ),
+            );
+            let status = BundleStatus {
+                observed_generation: Some(next_observed_generation),
+                phase: Some(BundlePhase::Failed),
+                conditions,
                 workload: None,
                 last_reconciled_time: Some(now_timestamp()),
+                binding_history: latest_binding_history.clone(),
             };
             apply_status(
                 registry,
@@ -251,11 +359,16 @@ async fn reconcile_bundle_inner(
             return Ok(());
         }
     };
-    let pod = install_result.pod;
-    let (profile_key, persisted_options) = install_result
-        .profile
+    let container::InstallResult { pod, profile } = install_result;
+    let binding_history_snapshot = profile.binding_history_entries();
+    latest_binding_history = binding_history_snapshot.clone();
+    let (profile_key, persisted_options_raw) = profile
         .to_serialized_fields()
         .map_err(|err| err.to_string())?;
+    let persisted_options: HashMap<String, String> = persisted_options_raw
+        .into_iter()
+        .filter(|(key, _)| !is_reserved_profile_key(key))
+        .collect();
 
     let updated_bundle = registry
         .update_spec_profile(
@@ -270,6 +383,7 @@ async fn reconcile_bundle_inner(
         expected_resource_version = rv.clone();
         if let Ok(parsed) = rv.parse::<i64>() {
             current_rv = parsed;
+            next_observed_generation = current_rv.saturating_add(1);
         }
     }
 
@@ -297,29 +411,40 @@ async fn reconcile_bundle_inner(
                     ("error", message.as_str()),
                 ],
             );
+            let conditions = build_conditions(
+                &previous_conditions,
+                ConditionSpec::new(
+                    BundleConditionStatus::True,
+                    BundleConditionReason::ProfilePersisted,
+                    None,
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::True,
+                    BundleConditionReason::SecretsDistributed,
+                    None,
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::True,
+                    BundleConditionReason::WorkloadApplied,
+                    None,
+                ),
+                ConditionSpec::new(
+                    BundleConditionStatus::False,
+                    BundleConditionReason::StartFailed,
+                    Some(message),
+                ),
+            );
             let status = BundleStatus {
-                observed_generation: Some(current_rv),
+                observed_generation: Some(next_observed_generation),
                 phase: Some(BundlePhase::Failed),
-                conditions: vec![
-                    make_condition(
-                        "WorkloadApplied",
-                        BundleConditionStatus::True,
-                        Some("InstallSucceeded".to_string()),
-                        None,
-                    ),
-                    make_condition(
-                        "Started",
-                        BundleConditionStatus::False,
-                        Some("StartFailed".to_string()),
-                        Some(message),
-                    ),
-                ],
+                conditions,
                 workload: Some(BundleWorkloadRef {
                     name: workload_name.clone(),
                     namespace: Some(workload_namespace.clone()),
                     uid: None,
                 }),
                 last_reconciled_time: Some(now_timestamp()),
+                binding_history: latest_binding_history.clone(),
             };
             apply_status(
                 registry,
@@ -333,31 +458,41 @@ async fn reconcile_bundle_inner(
         }
     }
 
-    let mut conditions = Vec::new();
-    conditions.push(make_condition(
-        "WorkloadApplied",
-        BundleConditionStatus::True,
-        Some("InstallSucceeded".to_string()),
-        None,
-    ));
-    if bundle.spec.start {
-        conditions.push(make_condition(
-            "Started",
+    let ready_condition = if bundle.spec.start {
+        ConditionSpec::new(
             BundleConditionStatus::True,
-            Some("StartCompleted".to_string()),
+            BundleConditionReason::StartCompleted,
             None,
-        ));
+        )
     } else {
-        conditions.push(make_condition(
-            "Started",
-            BundleConditionStatus::False,
-            Some("StartSkipped".to_string()),
+        ConditionSpec::new(
+            BundleConditionStatus::True,
+            BundleConditionReason::StartSkipped,
             Some("Bundle spec requested start=false; workload left stopped".to_string()),
-        ));
-    }
+        )
+    };
+    let conditions = build_conditions(
+        &previous_conditions,
+        ConditionSpec::new(
+            BundleConditionStatus::True,
+            BundleConditionReason::ProfilePersisted,
+            None,
+        ),
+        ConditionSpec::new(
+            BundleConditionStatus::True,
+            BundleConditionReason::SecretsDistributed,
+            None,
+        ),
+        ConditionSpec::new(
+            BundleConditionStatus::True,
+            BundleConditionReason::WorkloadApplied,
+            None,
+        ),
+        ready_condition,
+    );
 
     let status = BundleStatus {
-        observed_generation: Some(current_rv),
+        observed_generation: Some(next_observed_generation),
         phase: Some(BundlePhase::Ready),
         conditions,
         workload: Some(BundleWorkloadRef {
@@ -366,6 +501,7 @@ async fn reconcile_bundle_inner(
             uid: None,
         }),
         last_reconciled_time: Some(now_timestamp()),
+        binding_history: latest_binding_history.clone(),
     };
 
     apply_status(
@@ -424,16 +560,23 @@ async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error
     let failure_detail = failure_condition
         .as_ref()
         .and_then(|condition| condition.message.clone());
-    let explicit_error = error.map(|value| value.to_string());
+    let mut explicit_error = error.map(|value| value.to_string());
     let is_failure = explicit_error.is_some() || matches!(phase, Some(BundlePhase::Failed));
 
-    let reason_text = if is_failure {
+    let mut reason_text = if is_failure {
         failure_reason
             .clone()
             .unwrap_or_else(|| "BundleReconcileFailed".to_string())
     } else {
         "BundleReconciled".to_string()
     };
+
+    if let Some(err_text) = explicit_error.as_mut() {
+        if let Some((reason, detail)) = normalize_security_error(err_text) {
+            reason_text = reason.to_string();
+            *err_text = detail;
+        }
+    }
 
     let message_text = if is_failure {
         explicit_error
@@ -567,23 +710,133 @@ async fn apply_status(
     Ok(())
 }
 
+fn normalize_security_error(message: &str) -> Option<(&'static str, String)> {
+    if let Some(detail) = message.strip_prefix(SECURITY_POLICY_VIOLATION) {
+        return Some(("SecurityPolicyViolation", detail.trim().to_string()));
+    }
+    if let Some(detail) = message.strip_prefix(PRIVILEGE_ESCALATION_DENIED) {
+        return Some(("PrivilegeEscalationDenied", detail.trim().to_string()));
+    }
+    None
+}
+
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn make_condition(
-    condition_type: &str,
+    previous: Option<&BundleCondition>,
+    condition_type: BundleConditionKind,
     status: BundleConditionStatus,
-    reason: Option<String>,
+    reason: BundleConditionReason,
     message: Option<String>,
 ) -> BundleCondition {
+    let last_transition_time = match previous {
+        Some(existing) if existing.status == status => existing
+            .last_transition_time
+            .clone()
+            .or_else(|| Some(now_timestamp())),
+        _ => Some(now_timestamp()),
+    };
+
     BundleCondition {
-        condition_type: condition_type.to_string(),
+        condition_type,
+        status,
+        reason: Some(reason.as_str().to_string()),
+        message,
+        last_transition_time,
+    }
+}
+
+struct ConditionSpec {
+    status: BundleConditionStatus,
+    reason: BundleConditionReason,
+    message: Option<String>,
+}
+
+impl ConditionSpec {
+    fn new(
+        status: BundleConditionStatus,
+        reason: BundleConditionReason,
+        message: Option<String>,
+    ) -> Self {
+        ConditionSpec {
+            status,
+            reason,
+            message,
+        }
+    }
+}
+
+fn build_conditions(
+    previous: &HashMap<BundleConditionKind, BundleCondition>,
+    profile: ConditionSpec,
+    secrets: ConditionSpec,
+    bound: ConditionSpec,
+    ready: ConditionSpec,
+) -> Vec<BundleCondition> {
+    let mut conditions = Vec::new();
+    let ConditionSpec {
         status,
         reason,
         message,
-        last_transition_time: Some(now_timestamp()),
-    }
+    } = profile;
+    conditions.push(make_condition(
+        previous.get(&BundleConditionKind::ProfilePrepared),
+        BundleConditionKind::ProfilePrepared,
+        status,
+        reason,
+        message,
+    ));
+
+    let ConditionSpec {
+        status,
+        reason,
+        message,
+    } = secrets;
+    conditions.push(make_condition(
+        previous.get(&BundleConditionKind::SecretsProvisioned),
+        BundleConditionKind::SecretsProvisioned,
+        status,
+        reason,
+        message,
+    ));
+
+    let ConditionSpec {
+        status,
+        reason,
+        message,
+    } = bound;
+    conditions.push(make_condition(
+        previous.get(&BundleConditionKind::Bound),
+        BundleConditionKind::Bound,
+        status,
+        reason,
+        message,
+    ));
+
+    let ConditionSpec {
+        status,
+        reason,
+        message,
+    } = ready;
+    conditions.push(make_condition(
+        previous.get(&BundleConditionKind::Ready),
+        BundleConditionKind::Ready,
+        status,
+        reason,
+        message,
+    ));
+
+    conditions
+}
+
+fn previous_binding_history(bundle: &Bundle) -> Vec<BindingHistoryEntry> {
+    bundle
+        .status
+        .as_ref()
+        .map(|status| status.binding_history.clone())
+        .unwrap_or_default()
 }
 
 fn resolve_snapshot_source(
@@ -607,5 +860,243 @@ fn resolve_snapshot_source(
             Ok(Some(trimmed.to_string()))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn condition_map(pairs: Vec<BundleCondition>) -> HashMap<BundleConditionKind, BundleCondition> {
+        pairs
+            .into_iter()
+            .map(|condition| (condition.condition_type, condition))
+            .collect()
+    }
+
+    fn sample_condition(
+        kind: BundleConditionKind,
+        status: BundleConditionStatus,
+        reason: &str,
+        last_transition: Option<&str>,
+    ) -> BundleCondition {
+        BundleCondition {
+            condition_type: kind,
+            status,
+            reason: Some(reason.to_string()),
+            message: None,
+            last_transition_time: last_transition.map(|value| value.to_string()),
+        }
+    }
+
+    #[test]
+    fn failure_conditions_mark_all_dependencies_false() {
+        let previous = HashMap::new();
+        let conditions = build_conditions(
+            &previous,
+            ConditionSpec::new(
+                BundleConditionStatus::False,
+                BundleConditionReason::ProfileFailed,
+                Some("profile failed".to_string()),
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::False,
+                BundleConditionReason::SecretsFailed,
+                Some("secrets blocked".to_string()),
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::False,
+                BundleConditionReason::WorkloadPending,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::False,
+                BundleConditionReason::StartPending,
+                None,
+            ),
+        );
+        assert_condition(
+            &conditions,
+            BundleConditionKind::ProfilePrepared,
+            BundleConditionStatus::False,
+            "ProfileFailed",
+        );
+        assert_condition(
+            &conditions,
+            BundleConditionKind::SecretsProvisioned,
+            BundleConditionStatus::False,
+            "SecretsFailed",
+        );
+        assert_condition(
+            &conditions,
+            BundleConditionKind::Bound,
+            BundleConditionStatus::False,
+            "WorkloadPending",
+        );
+        assert_condition(
+            &conditions,
+            BundleConditionKind::Ready,
+            BundleConditionStatus::False,
+            "StartPending",
+        );
+    }
+
+    #[test]
+    fn start_skipped_marks_ready_true() {
+        let previous = HashMap::new();
+        let conditions = build_conditions(
+            &previous,
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::ProfilePersisted,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::SecretsDistributed,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::WorkloadApplied,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::StartSkipped,
+                Some("start disabled".to_string()),
+            ),
+        );
+        assert_condition(
+            &conditions,
+            BundleConditionKind::Ready,
+            BundleConditionStatus::True,
+            "StartSkipped",
+        );
+    }
+
+    #[test]
+    fn normalize_security_error_strips_prefixes() {
+        let policy = normalize_security_error(
+            "[SecurityPolicyViolation] Capability 'CAP_SYS_ADMIN' is not allowed",
+        );
+        assert_eq!(
+            policy,
+            Some((
+                "SecurityPolicyViolation",
+                "Capability 'CAP_SYS_ADMIN' is not allowed".to_string()
+            ))
+        );
+
+        let privilege = normalize_security_error(
+            "[PrivilegeEscalationDenied] Failed to configure capabilities",
+        );
+        assert_eq!(
+            privilege,
+            Some((
+                "PrivilegeEscalationDenied",
+                "Failed to configure capabilities".to_string()
+            ))
+        );
+
+        assert_eq!(normalize_security_error("other error"), None);
+    }
+
+    #[test]
+    fn last_transition_preserved_when_status_stable() {
+        let previous_ts = "2025-01-10T10:00:00Z";
+        let previous = condition_map(vec![sample_condition(
+            BundleConditionKind::Ready,
+            BundleConditionStatus::True,
+            "StartCompleted",
+            Some(previous_ts),
+        )]);
+        let conditions = build_conditions(
+            &previous,
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::ProfilePersisted,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::SecretsDistributed,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::WorkloadApplied,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::StartCompleted,
+                None,
+            ),
+        );
+        let ready = conditions
+            .iter()
+            .find(|cond| cond.condition_type == BundleConditionKind::Ready)
+            .expect("ready condition expected");
+        assert_eq!(ready.last_transition_time.as_deref(), Some(previous_ts));
+    }
+
+    #[test]
+    fn last_transition_updates_on_status_change() {
+        let previous = condition_map(vec![sample_condition(
+            BundleConditionKind::Ready,
+            BundleConditionStatus::True,
+            "StartCompleted",
+            Some("2025-01-10T10:00:00Z"),
+        )]);
+        let conditions = build_conditions(
+            &previous,
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::ProfilePersisted,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::SecretsDistributed,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::True,
+                BundleConditionReason::WorkloadApplied,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::False,
+                BundleConditionReason::StartFailed,
+                Some("boom".to_string()),
+            ),
+        );
+        let ready = conditions
+            .iter()
+            .find(|cond| cond.condition_type == BundleConditionKind::Ready)
+            .expect("ready condition expected");
+        assert_ne!(
+            ready.last_transition_time.as_deref(),
+            Some("2025-01-10T10:00:00Z")
+        );
+        assert_eq!(
+            ready.reason.as_deref(),
+            Some(BundleConditionReason::StartFailed.as_str())
+        );
+    }
+
+    fn assert_condition(
+        conditions: &[BundleCondition],
+        kind: BundleConditionKind,
+        expected_status: BundleConditionStatus,
+        expected_reason: &str,
+    ) {
+        let condition = conditions
+            .iter()
+            .find(|cond| cond.condition_type == kind)
+            .unwrap_or_else(|| panic!("condition {:?} missing", kind));
+        assert_eq!(condition.status, expected_status);
+        assert_eq!(condition.reason.as_deref(), Some(expected_reason));
     }
 }

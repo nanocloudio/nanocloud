@@ -17,7 +17,8 @@
 use crate::nanocloud::engine::Profile;
 use crate::nanocloud::k8s::pod::{
     ContainerEnvVar, ContainerPort, ContainerProbe, ContainerSpec, EncryptedVolumeSource,
-    EnvVarSource, ObjectMeta, Pod, PodSpec, ProbeExec, SecretKeySelector, VolumeMount, VolumeSpec,
+    EnvVarSource, ObjectMeta, Pod, PodSecurityContext, PodSpec, ProbeExec, SecretKeySelector,
+    VolumeMount, VolumeSpec,
 };
 use crate::nanocloud::oci::{OciImage, OciManifest, Registry};
 use crate::nanocloud::util::error::{new_error, with_context};
@@ -287,6 +288,7 @@ impl Image {
             service_account_name: None,
             node_name: None,
             host_network,
+            security: PodSecurityContext::default(),
         };
 
         Pod {

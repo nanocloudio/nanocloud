@@ -26,6 +26,7 @@ use crate::nanocloud::api::types::ErrorBody;
 use crate::nanocloud::api::types::ServiceActionResponse;
 use crate::nanocloud::engine::container::{start, stop, uninstall, BackupPlan};
 use crate::nanocloud::k8s::store;
+use crate::nanocloud::observability::metrics;
 use crate::nanocloud::server::handlers::error::ApiError;
 
 const OWNER_HEADER: &str = "x-nanocloud-owner";
@@ -107,6 +108,7 @@ pub(crate) async fn start_bundle(
     start(namespace_ref(&namespace), &service)
         .await
         .map_err(ApiError::map_container_error)?;
+    metrics::record_restart(namespace_ref(&namespace), &service, "manual");
     Ok((
         StatusCode::ACCEPTED,
         Json(ServiceActionResponse {

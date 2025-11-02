@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -27,7 +27,7 @@ use tokio::io::{self as tokio_io, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::nanocloud::api::client::{HttpError, NanocloudClient};
+use crate::nanocloud::api::client::{BundleExportOptions, HttpError, NanocloudClient};
 use crate::nanocloud::api::types::{Bundle, BundleSnapshotSource, BundleSpec};
 use crate::nanocloud::cli::args::{InstallArgs, UninstallArgs};
 use crate::nanocloud::cli::curl::print_curl_request;
@@ -159,6 +159,23 @@ pub(super) async fn handle_uninstall(
         ])?;
         print_curl_request(client, "POST", url.as_ref(), None)?;
         if let Some(path) = args.snapshot.as_deref() {
+            let profile_target = profile_export_path(Path::new(path), &args.service);
+            let export_segments =
+                NanocloudClient::bundle_export_segments(args.namespace.as_deref(), &args.service);
+            let segment_refs: Vec<&str> = export_segments
+                .iter()
+                .map(|segment| segment.as_str())
+                .collect();
+            let mut export_url = client.url_from_segments(&segment_refs)?;
+            {
+                let mut pairs = export_url.query_pairs_mut();
+                pairs.append_pair("includeSecrets", "true");
+            }
+            Terminal::stdout(format_args!(
+                "# Export the bundle profile (redirect output to save locally, e.g. > {})",
+                profile_target.display()
+            ));
+            print_curl_request(client, "POST", export_url.as_ref(), None)?;
             let backup_url = client.url_from_segments(&[
                 "apis",
                 "nanocloud.io",
@@ -180,6 +197,16 @@ pub(super) async fn handle_uninstall(
     }
 
     Terminal::stdout(format_args!("Uninstalling {}", display));
+    if let Some(target) = args.snapshot.as_deref() {
+        export_profile_snapshot(
+            client,
+            namespace,
+            &args.service,
+            &display,
+            Path::new(target),
+        )
+        .await?;
+    }
 
     let mut service_missing = false;
     match client.uninstall_bundle(namespace, &args.service).await {
@@ -239,6 +266,79 @@ pub(super) async fn handle_uninstall(
 
     Terminal::stdout(format_args!("✅ {} uninstalled", display));
     Ok(())
+}
+
+async fn export_profile_snapshot(
+    client: &NanocloudClient,
+    namespace: Option<&str>,
+    service: &str,
+    display: &str,
+    snapshot_target: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let profile_path = profile_export_path(snapshot_target, service);
+    Terminal::stdout(format_args!(
+        "Exporting profile for {} to {}",
+        display,
+        profile_path.display()
+    ));
+    match client
+        .export_bundle_profile(
+            namespace,
+            service,
+            BundleExportOptions {
+                include_secrets: true,
+            },
+        )
+        .await
+    {
+        Ok(payload) => {
+            if let Some(parent) = profile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent).await?;
+            }
+            let mut file = fs::File::create(&profile_path).await?;
+            file.write_all(&payload).await?;
+            file.flush().await?;
+            Terminal::stdout(format_args!(
+                "Saved profile export to {}",
+                profile_path.display()
+            ));
+        }
+        Err(err) => match err.downcast::<HttpError>() {
+            Ok(http_err) if http_err.status == StatusCode::NOT_FOUND => {
+                Terminal::stderr(format_args!(
+                    "Warning: no profile export available for '{}'",
+                    display
+                ));
+            }
+            Ok(http_err) => return Err(Box::new(http_err)),
+            Err(other) => return Err(other),
+        },
+    }
+    Ok(())
+}
+
+fn profile_export_path(snapshot_target: &Path, service: &str) -> PathBuf {
+    let parent = snapshot_target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf());
+    let stem = snapshot_target
+        .file_stem()
+        .and_then(|s| {
+            let value = s.to_string_lossy();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.into_owned())
+            }
+        })
+        .unwrap_or_else(|| service.to_string());
+    let file_name = format!("{}.profile.tar", stem);
+    if let Some(dir) = parent {
+        dir.join(&file_name)
+    } else {
+        PathBuf::from(file_name)
+    }
 }
 
 async fn wait_for_pod_ready(
@@ -429,6 +529,7 @@ fn bundle_payload(
         }),
         start,
         update,
+        security: None,
     };
 
     Bundle {

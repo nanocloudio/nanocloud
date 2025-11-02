@@ -30,6 +30,9 @@ use crate::nanocloud::observability::metrics::{
 use crate::nanocloud::oci::container_runtime;
 use crate::nanocloud::oci::runtime::{ExecRequest, ExecResult};
 
+#[cfg(feature = "openapi")]
+use crate::nanocloud::api::types::ErrorBody;
+
 use super::error::ApiError;
 use super::exec_common::{
     parse_resize_payload, validate_query, ExecOptions, RawExecQuery, ResizeEvent, CHANNEL_CLOSE,
@@ -89,6 +92,30 @@ struct ExecSession {
     context: Arc<SessionContext>,
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/v1/namespaces/{namespace}/pods/{name}/exec",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the target pod"),
+        ("name" = String, Path, description = "Pod name"),
+        ("container" = Option<String>, Query, description = "Target container in the pod"),
+        ("stdin" = Option<bool>, Query, description = "Enable stdin stream"),
+        ("stdout" = Option<bool>, Query, description = "Include stdout stream"),
+        ("stderr" = Option<bool>, Query, description = "Include stderr stream"),
+        ("tty" = Option<bool>, Query, description = "Request a pseudo-terminal")
+    ),
+    responses(
+        (status = 101, description = "Switching protocols"),
+        (status = 400, description = "Invalid exec request", body = ErrorBody),
+        (status = 404, description = "Pod not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody)
+    ),
+    security(
+        ("NanocloudCertificate" = []),
+        ("NanocloudBearer" = ["pods.exec"])
+    ),
+    tag = "nanocloud"
+))]
 pub(crate) async fn exec_ws_namespaced(
     Path((namespace, pod)): Path<(String, String)>,
     Query(mut raw): Query<RawExecQuery>,
@@ -100,6 +127,30 @@ pub(crate) async fn exec_ws_namespaced(
     exec_websocket_impl(raw, ws, headers).await
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/v1/pods/{name}/exec",
+    params(
+        ("name" = String, Path, description = "Pod name"),
+        ("namespace" = Option<String>, Query, description = "Namespace of the target pod (defaults to \"default\")"),
+        ("container" = Option<String>, Query, description = "Target container in the pod"),
+        ("stdin" = Option<bool>, Query, description = "Enable stdin stream"),
+        ("stdout" = Option<bool>, Query, description = "Include stdout stream"),
+        ("stderr" = Option<bool>, Query, description = "Include stderr stream"),
+        ("tty" = Option<bool>, Query, description = "Request a pseudo-terminal")
+    ),
+    responses(
+        (status = 101, description = "Switching protocols"),
+        (status = 400, description = "Invalid exec request", body = ErrorBody),
+        (status = 404, description = "Pod not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody)
+    ),
+    security(
+        ("NanocloudCertificate" = []),
+        ("NanocloudBearer" = ["pods.exec"])
+    ),
+    tag = "nanocloud"
+))]
 pub(crate) async fn exec_ws_cluster(
     Path(pod): Path<String>,
     Query(mut raw): Query<RawExecQuery>,
@@ -113,6 +164,30 @@ pub(crate) async fn exec_ws_cluster(
     exec_websocket_impl(raw, ws, headers).await
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/api/v1/namespaces/{namespace}/pods/{name}/exec",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the target pod"),
+        ("name" = String, Path, description = "Pod name"),
+        ("container" = Option<String>, Query, description = "Target container in the pod"),
+        ("stdin" = Option<bool>, Query, description = "Enable stdin stream"),
+        ("stdout" = Option<bool>, Query, description = "Include stdout stream"),
+        ("stderr" = Option<bool>, Query, description = "Include stderr stream"),
+        ("tty" = Option<bool>, Query, description = "Request a pseudo-terminal")
+    ),
+    responses(
+        (status = 101, description = "Switching protocols"),
+        (status = 400, description = "Invalid exec request", body = ErrorBody),
+        (status = 404, description = "Pod not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody)
+    ),
+    security(
+        ("NanocloudCertificate" = []),
+        ("NanocloudBearer" = ["pods.exec"])
+    ),
+    tag = "nanocloud"
+))]
 pub(crate) async fn exec_http_post_namespaced(
     Path((namespace, pod)): Path<(String, String)>,
     Query(mut raw): Query<RawExecQuery>,
@@ -123,6 +198,30 @@ pub(crate) async fn exec_http_post_namespaced(
     exec_http_post_impl(raw, req).await
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/api/v1/pods/{name}/exec",
+    params(
+        ("name" = String, Path, description = "Pod name"),
+        ("namespace" = Option<String>, Query, description = "Namespace of the target pod (defaults to \"default\")"),
+        ("container" = Option<String>, Query, description = "Target container in the pod"),
+        ("stdin" = Option<bool>, Query, description = "Enable stdin stream"),
+        ("stdout" = Option<bool>, Query, description = "Include stdout stream"),
+        ("stderr" = Option<bool>, Query, description = "Include stderr stream"),
+        ("tty" = Option<bool>, Query, description = "Request a pseudo-terminal")
+    ),
+    responses(
+        (status = 101, description = "Switching protocols"),
+        (status = 400, description = "Invalid exec request", body = ErrorBody),
+        (status = 404, description = "Pod not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody)
+    ),
+    security(
+        ("NanocloudCertificate" = []),
+        ("NanocloudBearer" = ["pods.exec"])
+    ),
+    tag = "nanocloud"
+))]
 pub(crate) async fn exec_http_post_cluster(
     Path(pod): Path<String>,
     Query(mut raw): Query<RawExecQuery>,

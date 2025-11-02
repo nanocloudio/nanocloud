@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+pub mod loopback;
+
 use std::error::Error;
 
 use tokio::task;

@@ -1,8 +1,5053 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Nanocloud API",
+    "title": "nanocloud",
+    "description": "A CLI tool for managing your Nanocloud",
+    "license": {
+      "name": ""
+    },
     "version": "0.0.1"
   },
-  "paths": {}
+  "paths": {
+    "/api": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "core_api_versions",
+        "responses": {
+          "200": {
+            "description": "Core API versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIVersions"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "core_api_resources",
+        "responses": {
+          "200": {
+            "description": "Core API resources",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResourceList"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/configmaps": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "list_configmaps_all",
+        "parameters": [
+          {
+            "name": "watch",
+            "in": "query",
+            "description": "Stream updates instead of returning a list",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "resourceVersion",
+            "in": "query",
+            "description": "Return items newer than the provided resourceVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fieldSelector",
+            "in": "query",
+            "description": "Filter by field expressions such as metadata.name=<name>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelSelector",
+            "in": "query",
+            "description": "Filter by Kubernetes label selector expressions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutSeconds",
+            "in": "query",
+            "description": "Terminate a watch after the specified number of seconds",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "allowWatchBookmarks",
+            "in": "query",
+            "description": "Emit periodic bookmark events when watch=true",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of configmaps to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "continue",
+            "in": "query",
+            "description": "Continue token from a previous list response",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List ConfigMaps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigMapList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "configmaps.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/configmaps": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "list_configmaps",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "ConfigMap namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "watch",
+            "in": "query",
+            "description": "Stream updates instead of returning a list",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "resourceVersion",
+            "in": "query",
+            "description": "Return items newer than the provided resourceVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fieldSelector",
+            "in": "query",
+            "description": "Filter by field expressions such as metadata.name=<name>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelSelector",
+            "in": "query",
+            "description": "Filter by Kubernetes label selector expressions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutSeconds",
+            "in": "query",
+            "description": "Terminate a watch after the specified number of seconds",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "allowWatchBookmarks",
+            "in": "query",
+            "description": "Emit periodic bookmark events when watch=true",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of configmaps to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "continue",
+            "in": "query",
+            "description": "Continue token from a previous list response",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List ConfigMaps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigMapList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "configmaps.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/pods": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "list_pods_openapi",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Pod namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "watch",
+            "in": "query",
+            "description": "Stream updates instead of returning a list",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "resourceVersion",
+            "in": "query",
+            "description": "Return items newer than the provided resourceVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fieldSelector",
+            "in": "query",
+            "description": "Filter by field expressions such as metadata.name=<name>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelSelector",
+            "in": "query",
+            "description": "Filter by Kubernetes label selector expressions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutSeconds",
+            "in": "query",
+            "description": "Terminate a watch after the specified number of seconds",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "allowWatchBookmarks",
+            "in": "query",
+            "description": "Emit periodic bookmark events when watch=true",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of pods to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "continue",
+            "in": "query",
+            "description": "Continue token from a previous list response",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List Pods (JSON list or Table projection negotiated via Accept header or format=table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PodList"
+                }
+              },
+              "application/json;as=Table;g=meta.k8s.io;v=v1": {
+                "schema": {
+                  "$ref": "#/components/schemas/Table"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/pods/{name}/exec": {
+      "get": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "exec_ws_namespaced",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the target pod",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Pod name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "container",
+            "in": "query",
+            "description": "Target container in the pod",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stdin",
+            "in": "query",
+            "description": "Enable stdin stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stdout",
+            "in": "query",
+            "description": "Include stdout stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stderr",
+            "in": "query",
+            "description": "Include stderr stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "tty",
+            "in": "query",
+            "description": "Request a pseudo-terminal",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols"
+          },
+          "400": {
+            "description": "Invalid exec request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pod not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.exec"
+            ]
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "exec_http_post_namespaced",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the target pod",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Pod name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "container",
+            "in": "query",
+            "description": "Target container in the pod",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stdin",
+            "in": "query",
+            "description": "Enable stdin stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stdout",
+            "in": "query",
+            "description": "Include stdout stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stderr",
+            "in": "query",
+            "description": "Include stderr stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "tty",
+            "in": "query",
+            "description": "Request a pseudo-terminal",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols"
+          },
+          "400": {
+            "description": "Invalid exec request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pod not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.exec"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/pods": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "list_pods_all_openapi",
+        "parameters": [
+          {
+            "name": "watch",
+            "in": "query",
+            "description": "Stream updates instead of returning a list",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "resourceVersion",
+            "in": "query",
+            "description": "Return items newer than the provided resourceVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fieldSelector",
+            "in": "query",
+            "description": "Filter by field expressions such as metadata.name=<name>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelSelector",
+            "in": "query",
+            "description": "Filter by Kubernetes label selector expressions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutSeconds",
+            "in": "query",
+            "description": "Terminate a watch after the specified number of seconds",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "allowWatchBookmarks",
+            "in": "query",
+            "description": "Emit periodic bookmark events when watch=true",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of pods to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "continue",
+            "in": "query",
+            "description": "Continue token from a previous list response",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List Pods (JSON list or Table projection negotiated via Accept header or format=table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PodList"
+                }
+              },
+              "application/json;as=Table;g=meta.k8s.io;v=v1": {
+                "schema": {
+                  "$ref": "#/components/schemas/Table"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/pods/{name}/exec": {
+      "get": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "exec_ws_cluster",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Pod name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "query",
+            "description": "Namespace of the target pod (defaults to \"default\")",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "container",
+            "in": "query",
+            "description": "Target container in the pod",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stdin",
+            "in": "query",
+            "description": "Enable stdin stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stdout",
+            "in": "query",
+            "description": "Include stdout stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stderr",
+            "in": "query",
+            "description": "Include stderr stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "tty",
+            "in": "query",
+            "description": "Request a pseudo-terminal",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols"
+          },
+          "400": {
+            "description": "Invalid exec request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pod not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.exec"
+            ]
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "exec_http_post_cluster",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Pod name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "query",
+            "description": "Namespace of the target pod (defaults to \"default\")",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "container",
+            "in": "query",
+            "description": "Target container in the pod",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stdin",
+            "in": "query",
+            "description": "Enable stdin stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stdout",
+            "in": "query",
+            "description": "Include stdout stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "stderr",
+            "in": "query",
+            "description": "Include stderr stream",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "tty",
+            "in": "query",
+            "description": "Request a pseudo-terminal",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols"
+          },
+          "400": {
+            "description": "Invalid exec request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pod not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "pods.exec"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "api_groups",
+        "responses": {
+          "200": {
+            "description": "Registered API groups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIGroupList"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "nanocloud_api_group",
+        "responses": {
+          "200": {
+            "description": "Nanocloud API group",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIGroup"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "nanocloud_api_resources",
+        "responses": {
+          "200": {
+            "description": "Nanocloud API resources",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIResourceList"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/certificates": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "issue_ephemeral_certificate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CertificateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Certificate issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CertificateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token expired or invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token lacks certificate scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBootstrap": [
+              "bootstrap"
+            ]
+          },
+          {
+            "NanocloudBearer": [
+              "certificate.issue"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles": {
+      "get": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace to query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of entries to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "continue",
+            "in": "query",
+            "description": "Continue token for pagination",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bundle list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BundleList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "bundles.read"
+            ]
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "create",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace for the new bundle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Bundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bundle created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bundle"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Bundle already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "bundles.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}": {
+      "get": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "get",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the bundle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bundle"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bundle not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "bundles.read"
+            ]
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "delete",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the bundle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Bundle deletion accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bundle"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bundle not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "bundles.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/restart": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "restart_bundle",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Bundle namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Restart accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceActionResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "services.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/start": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "start_bundle",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Bundle namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Start accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceActionResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "services.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/stop": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "stop_bundle",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Bundle namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Stop accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceActionResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "services.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/uninstall": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "uninstall_bundle",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Bundle namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Nanocloud-Owner",
+            "in": "header",
+            "description": "Backup owner identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Uninstall accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceActionResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "services.manage"
+            ]
+          }
+        ]
+      }
+    },
+    "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/backups/latest": {
+      "get": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "stream_latest_backup",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Bundle namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Bundle name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Nanocloud-Owner",
+            "in": "header",
+            "description": "Backup owner identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Latest backup archive"
+          },
+          "404": {
+            "description": "No backup available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "services.read"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/ca": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "issue_certificate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Certificate issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonTlsInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBootstrap": [
+              "bootstrap"
+            ]
+          },
+          {
+            "NanocloudBearer": [
+              "certificate.issue"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/serviceaccounts/token": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "exchange_serviceaccount_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceAccountTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "JWT issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Single-use token not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Single-use token expired or replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBootstrap": [
+              "bootstrap"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/setup": {
+      "post": {
+        "tags": [
+          "nanocloud"
+        ],
+        "operationId": "setup",
+        "responses": {
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Setup is only available via the CLI",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBootstrap": [
+              "bootstrap"
+            ]
+          },
+          {
+            "NanocloudBearer": [
+              "system.setup.execute"
+            ]
+          }
+        ]
+      }
+    },
+    "/version": {
+      "get": {
+        "tags": [
+          "kubernetes"
+        ],
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "description": "Server version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "NanocloudCertificate": []
+          },
+          {
+            "NanocloudBearer": [
+              "discovery.read"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "APIGroup": {
+        "type": "object",
+        "required": [
+          "name",
+          "versions",
+          "preferredVersion"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "preferredVersion": {
+            "$ref": "#/components/schemas/GroupVersion"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GroupVersion"
+            }
+          }
+        }
+      },
+      "APIGroupList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "groups"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/APIGroup"
+            }
+          },
+          "kind": {
+            "type": "string"
+          }
+        }
+      },
+      "APIResource": {
+        "type": "object",
+        "required": [
+          "name",
+          "singularName",
+          "namespaced",
+          "kind",
+          "verbs"
+        ],
+        "properties": {
+          "categories": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespaced": {
+            "type": "boolean"
+          },
+          "shortNames": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "singularName": {
+            "type": "string"
+          },
+          "verbs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "APIResourceList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "groupVersion",
+          "resources"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "groupVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/APIResource"
+            }
+          }
+        }
+      },
+      "APIVersions": {
+        "type": "object",
+        "required": [
+          "kind",
+          "versions"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "serverAddressByClientCIDRs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServerAddressByClientCIDR"
+            }
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApplyConflict": {
+        "type": "object",
+        "required": [
+          "path",
+          "existingManager"
+        ],
+        "properties": {
+          "existingManager": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "AsyncStatus": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "BindingHistoryEntry": {
+        "type": "object",
+        "required": [
+          "bindingId",
+          "service",
+          "status",
+          "attempts"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total attempts recorded for the binding.",
+            "minimum": 0
+          },
+          "bindingId": {
+            "type": "string"
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "durationMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "eventId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "lastFinishedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastStartedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BindingHistoryStatus"
+          },
+          "stderr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stdout": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "BindingHistoryStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "RUNNING",
+          "SUCCEEDED",
+          "FAILED",
+          "TIMED_OUT"
+        ]
+      },
+      "Bundle": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/BundleSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleStatus"
+              }
+            ]
+          }
+        }
+      },
+      "BundleCondition": {
+        "type": "object",
+        "required": [
+          "type",
+          "status"
+        ],
+        "properties": {
+          "lastTransitionTime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 timestamp for the last transition."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human readable context for the condition."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Machine readable reason (e.g. `ProfileMissing`, `ApplySucceeded`)."
+          },
+          "status": {
+            "$ref": "#/components/schemas/BundleConditionStatus",
+            "description": "Overall status (True/False/Unknown)."
+          },
+          "type": {
+            "$ref": "#/components/schemas/BundleConditionKind",
+            "description": "Logical condition identifier (e.g. `Ready`, `Bound`)."
+          }
+        }
+      },
+      "BundleConditionKind": {
+        "type": "string",
+        "enum": [
+          "Ready",
+          "Bound",
+          "SecretsProvisioned",
+          "ProfilePrepared"
+        ]
+      },
+      "BundleConditionStatus": {
+        "type": "string",
+        "enum": [
+          "TRUE",
+          "FALSE",
+          "UNKNOWN"
+        ]
+      },
+      "BundleList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Bundle"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "BundlePhase": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "VALIDATING",
+          "RENDERING",
+          "APPLYING",
+          "READY",
+          "FAILED",
+          "DELETING"
+        ]
+      },
+      "BundleSeccompProfile": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "localhostProfile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/BundleSeccompProfileType"
+          }
+        }
+      },
+      "BundleSeccompProfileType": {
+        "type": "string",
+        "enum": [
+          "Baseline",
+          "RuntimeDefault",
+          "Localhost"
+        ]
+      },
+      "BundleSecurityProfile": {
+        "type": "object",
+        "properties": {
+          "allowPrivileged": {
+            "type": "boolean",
+            "description": "Gate for privileged capability requests (CAP_SYS_ADMIN, CAP_SYS_PTRACE, etc)."
+          },
+          "extraCapabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit capabilities to inject into the container's allowed set."
+          },
+          "seccompProfile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleSeccompProfile",
+                "description": "Optional seccomp profile override."
+              }
+            ]
+          }
+        }
+      },
+      "BundleSnapshotSource": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "mediaType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Media type for the snapshot artifact (default `application/x-tar`)."
+          },
+          "source": {
+            "type": "string",
+            "description": "URI referencing the snapshot payload (e.g. `keyspace://profiles/...` or `file:///path`)."
+          }
+        }
+      },
+      "BundleSpec": {
+        "type": "object",
+        "required": [
+          "service"
+        ],
+        "properties": {
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Wrapped profile encryption key (base64-encoded)."
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional namespace scope; defaults to `default` when omitted."
+          },
+          "options": {
+            "type": "object",
+            "description": "User-supplied installation options.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "security": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleSecurityProfile",
+                "description": "Optional runtime security profile."
+              }
+            ]
+          },
+          "service": {
+            "type": "string",
+            "description": "Target service identifier (matching the OCI manifest name)."
+          },
+          "snapshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleSnapshotSource",
+                "description": "Optional snapshot source used to seed persistent volumes at install time."
+              }
+            ]
+          },
+          "start": {
+            "type": "boolean",
+            "description": "Indicates whether the workload should be started after reconciliation."
+          },
+          "update": {
+            "type": "boolean",
+            "description": "Forces a fresh pull of the service image even if cached layers already exist."
+          }
+        }
+      },
+      "BundleStatus": {
+        "type": "object",
+        "properties": {
+          "bindingHistory": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BindingHistoryEntry"
+            },
+            "description": "Latest binding execution outcomes."
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BundleCondition"
+            },
+            "description": "Detailed condition set mirroring Kubernetes conventions."
+          },
+          "lastReconciledTime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Timestamp of the last successful reconciliation."
+          },
+          "observed_generation": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Observed bundle generation."
+          },
+          "phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundlePhase",
+                "description": "High-level reconciliation phase."
+              }
+            ]
+          },
+          "workload": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleWorkloadRef",
+                "description": "Workload reference emitted by the controller (StatefulSet/Deployment/etc)."
+              }
+            ]
+          }
+        }
+      },
+      "BundleWorkloadRef": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Workload name materialised from the bundle."
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Namespace hosting the workload; defaults to the bundle namespace when omitted."
+          },
+          "uid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional UID of the managed resource."
+          }
+        }
+      },
+      "CaRequest": {
+        "type": "object",
+        "required": [
+          "common_name"
+        ],
+        "properties": {
+          "additional": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "common_name": {
+            "type": "string"
+          }
+        }
+      },
+      "CertificateRequest": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/CertificateSpec"
+          }
+        }
+      },
+      "CertificateResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "status"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CertificateStatus"
+          }
+        }
+      },
+      "CertificateSpec": {
+        "type": "object",
+        "required": [
+          "csr"
+        ],
+        "properties": {
+          "csr": {
+            "type": "string"
+          }
+        }
+      },
+      "CertificateStatus": {
+        "type": "object",
+        "required": [
+          "certificate",
+          "caBundle"
+        ],
+        "properties": {
+          "caBundle": {
+            "type": "string"
+          },
+          "certificate": {
+            "type": "string"
+          },
+          "expirationTimestamp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ConfigMap": {
+        "type": "object",
+        "description": "Minimal ConfigMap resource compatible with kubectl expectations.",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "binaryData": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "immutable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          }
+        }
+      },
+      "ConfigMapEnvSource": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "ConfigMapKeySelector": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "ConfigMapList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigMap"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "ConfigMapProjection": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyToPath"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "ConfigMapVolumeSource": {
+        "type": "object",
+        "properties": {
+          "defaultMode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyToPath"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "ContainerEnvVar": {
+        "type": "object",
+        "description": "Minimal environment variable spec.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valueFrom": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvVarSource"
+              }
+            ]
+          }
+        }
+      },
+      "ContainerNetwork": {
+        "type": "object",
+        "required": [
+          "ip_addresses"
+        ],
+        "properties": {
+          "ip_addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ContainerPort": {
+        "type": "object",
+        "description": "Container port declaration.",
+        "required": [
+          "container_port"
+        ],
+        "properties": {
+          "container_port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "host_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protocol": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ContainerProbe": {
+        "type": "object",
+        "description": "Liveness/readiness probe configuration.",
+        "properties": {
+          "exec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProbeExec"
+              }
+            ]
+          },
+          "http_get": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProbeHttpGet"
+              }
+            ]
+          },
+          "initial_delay_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "period_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        }
+      },
+      "ContainerResources": {
+        "type": "object",
+        "description": "Minimal resource declaration for CPU, memory, and PIDs.",
+        "properties": {
+          "cpu_period": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "cpu_quota": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "cpu_shares": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "memory_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "memory_swap": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "pids_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "ContainerSpec": {
+        "type": "object",
+        "description": "Minimal container specification derived from Kubernetes `Container`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContainerEnvVar"
+            }
+          },
+          "envFrom": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvFromSource"
+            }
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lifecycle": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Lifecycle"
+              }
+            ]
+          },
+          "liveness_probe": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerProbe"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContainerPort"
+            }
+          },
+          "readiness_probe": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerProbe"
+              }
+            ]
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerResources"
+              }
+            ]
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "volume_mounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeMount"
+            }
+          },
+          "working_dir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ContainerState": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "bundle",
+          "rootfs",
+          "command",
+          "environment",
+          "annotations",
+          "labels",
+          "runtime",
+          "network"
+        ],
+        "properties": {
+          "annotations": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "bundle": {
+            "type": "string"
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "config_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network": {
+            "$ref": "#/components/schemas/ContainerNetwork"
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "rootfs": {
+            "type": "string"
+          },
+          "runtime": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/ContainerStatus"
+          },
+          "status_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ContainerStatus": {
+        "type": "object",
+        "description": "Container-level status information compatible with kubectl expectations.",
+        "required": [
+          "name",
+          "restartCount",
+          "ready"
+        ],
+        "properties": {
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "imageID": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "restartCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "state": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "DaemonSet": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/DaemonSetSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DaemonSetStatus"
+              }
+            ]
+          }
+        }
+      },
+      "DaemonSetList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DaemonSet"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "DaemonSetRollingUpdate": {
+        "type": "object",
+        "properties": {
+          "maxUnavailable": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RollingUpdateValue"
+              }
+            ]
+          }
+        }
+      },
+      "DaemonSetSpec": {
+        "type": "object",
+        "required": [
+          "template"
+        ],
+        "properties": {
+          "selector": {
+            "$ref": "#/components/schemas/LabelSelector"
+          },
+          "template": {
+            "$ref": "#/components/schemas/PodTemplateSpec"
+          },
+          "updateStrategy": {
+            "$ref": "#/components/schemas/DaemonSetUpdateStrategy"
+          }
+        }
+      },
+      "DaemonSetStatus": {
+        "type": "object",
+        "properties": {
+          "conditions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "currentNumberScheduled": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "numberReady": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "numberUnavailable": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "updatedNumberScheduled": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        }
+      },
+      "DaemonSetUpdateStrategy": {
+        "type": "object",
+        "properties": {
+          "rollingUpdate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DaemonSetRollingUpdate"
+              }
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/DaemonSetUpdateStrategyType"
+          }
+        }
+      },
+      "DaemonSetUpdateStrategyType": {
+        "type": "string",
+        "enum": [
+          "RollingUpdate",
+          "OnDelete"
+        ]
+      },
+      "Deployment": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/DeploymentSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentStatus"
+              }
+            ]
+          }
+        }
+      },
+      "DeploymentList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Deployment"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "DeploymentSpec": {
+        "type": "object",
+        "required": [
+          "replicas",
+          "template"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "revisionHistoryLimit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "selector": {
+            "$ref": "#/components/schemas/LabelSelector"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/DeploymentStrategy"
+          },
+          "template": {
+            "$ref": "#/components/schemas/PodTemplateSpec"
+          }
+        }
+      },
+      "DeploymentStatus": {
+        "type": "object",
+        "properties": {
+          "conditions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "observedGeneration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "DeploymentStrategy": {
+        "type": "object",
+        "properties": {
+          "rollingUpdate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RollingUpdateDeployment"
+              }
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/DeploymentStrategyType"
+          }
+        }
+      },
+      "DeploymentStrategyType": {
+        "type": "string",
+        "enum": [
+          "RollingUpdate",
+          "Recreate"
+        ]
+      },
+      "EmptyDirVolumeSource": {
+        "type": "object",
+        "properties": {
+          "medium": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "EncryptedVolumeSource": {
+        "type": "object",
+        "required": [
+          "device",
+          "keyName"
+        ],
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "filesystem": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keyName": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvFromSource": {
+        "type": "object",
+        "properties": {
+          "configMapRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConfigMapEnvSource"
+              }
+            ]
+          },
+          "secretRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretEnvSource"
+              }
+            ]
+          }
+        }
+      },
+      "EnvVarSource": {
+        "type": "object",
+        "properties": {
+          "configMapKeyRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConfigMapKeySelector"
+              }
+            ]
+          },
+          "secretKeyRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretKeySelector"
+              }
+            ]
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "conflicts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ApplyConflict"
+            }
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "GroupVersion": {
+        "type": "object",
+        "required": [
+          "groupVersion",
+          "version"
+        ],
+        "properties": {
+          "groupVersion": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "HostPathVolumeSource": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "JsonTlsInfo": {
+        "type": "object",
+        "required": [
+          "key",
+          "cert",
+          "ca"
+        ],
+        "properties": {
+          "ca": {
+            "type": "string"
+          },
+          "cert": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        }
+      },
+      "KeyToPath": {
+        "type": "object",
+        "required": [
+          "key",
+          "path"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "mode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "LabelSelector": {
+        "type": "object",
+        "description": "Minimal label selector supporting exact-match labels.",
+        "properties": {
+          "matchLabels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Lifecycle": {
+        "type": "object",
+        "properties": {
+          "postStart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProbeExec"
+              }
+            ]
+          },
+          "preStart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProbeExec"
+              }
+            ]
+          }
+        }
+      },
+      "ListMeta": {
+        "type": "object",
+        "description": "Metadata included with Kubernetes list responses.",
+        "properties": {
+          "continue": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remainingItemCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "resourceVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ObjectMeta": {
+        "type": "object",
+        "description": "Minimal representation of Kubernetes object metadata.",
+        "properties": {
+          "annotations": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "labels": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resourceVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PersistentVolumeClaim": {
+        "type": "object",
+        "description": "PersistentVolumeClaim template embedded within StatefulSets.",
+        "required": [
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/PersistentVolumeClaimSpec"
+          }
+        }
+      },
+      "PersistentVolumeClaimSpec": {
+        "type": "object",
+        "description": "PersistentVolumeClaimSpec matching the subset Nanocloud requires.",
+        "properties": {
+          "accessModes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResourceRequirements"
+              }
+            ]
+          },
+          "storageClassName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "volumeMode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PersistentVolumeClaimVolumeSource": {
+        "type": "object",
+        "required": [
+          "claimName"
+        ],
+        "properties": {
+          "claimName": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "Pod": {
+        "type": "object",
+        "description": "Pod object wrapper for convenience when exporting manifests.",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/PodSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PodStatus"
+              }
+            ]
+          }
+        }
+      },
+      "PodCondition": {
+        "type": "object",
+        "description": "Minimal Pod condition representation used by kubectl wait/describe.",
+        "required": [
+          "type",
+          "status"
+        ],
+        "properties": {
+          "lastTransitionTime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "PodList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Pod"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "PodSeccompProfile": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "localhostProfile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "PodSecurityContext": {
+        "type": "object",
+        "properties": {
+          "allowPrivileged": {
+            "type": "boolean"
+          },
+          "extraCapabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "seccompProfile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PodSeccompProfile"
+              }
+            ]
+          }
+        }
+      },
+      "PodSpec": {
+        "type": "object",
+        "description": "Minimal pod specification capturing the data Nanocloud needs.",
+        "required": [
+          "containers"
+        ],
+        "properties": {
+          "containers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContainerSpec"
+            }
+          },
+          "host_network": {
+            "type": "boolean"
+          },
+          "init_containers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContainerSpec"
+            }
+          },
+          "nodeName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restart_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "security": {
+            "$ref": "#/components/schemas/PodSecurityContext"
+          },
+          "service_account_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeSpec"
+            }
+          }
+        }
+      },
+      "PodStatus": {
+        "type": "object",
+        "description": "Runtime status snapshot for the pod to surface through watch APIs.",
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PodCondition"
+            }
+          },
+          "containerStatuses": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContainerStatus"
+            }
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "podIP": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "startTime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PodTemplateSpec": {
+        "type": "object",
+        "description": "Template describing the pods managed by the StatefulSet.",
+        "required": [
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/PodSpec"
+          }
+        }
+      },
+      "ProbeExec": {
+        "type": "object",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProbeHttpGet": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ProjectedVolumeSource": {
+        "type": "object",
+        "properties": {
+          "defaultMode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeProjection"
+            }
+          }
+        }
+      },
+      "ReplicaSet": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/ReplicaSetSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReplicaSetStatus"
+              }
+            ]
+          }
+        }
+      },
+      "ReplicaSetList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicaSet"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "ReplicaSetSpec": {
+        "type": "object",
+        "required": [
+          "replicas",
+          "template"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "selector": {
+            "$ref": "#/components/schemas/LabelSelector"
+          },
+          "template": {
+            "$ref": "#/components/schemas/PodTemplateSpec"
+          }
+        }
+      },
+      "ReplicaSetStatus": {
+        "type": "object",
+        "properties": {
+          "availableReplicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "fullyLabeledReplicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "readyReplicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "replicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        }
+      },
+      "ResourceRequirements": {
+        "type": "object",
+        "description": "Minimal representation of Kubernetes resource requirements.",
+        "properties": {
+          "limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "requests": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "RollingUpdateDeployment": {
+        "type": "object",
+        "properties": {
+          "maxSurge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RollingUpdateValue"
+              }
+            ]
+          },
+          "maxUnavailable": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RollingUpdateValue"
+              }
+            ]
+          }
+        }
+      },
+      "RollingUpdateValue": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "SecretEnvSource": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecretKeySelector": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecretVolumeSource": {
+        "type": "object",
+        "required": [
+          "secretName"
+        ],
+        "properties": {
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "optional": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "secretName": {
+            "type": "string"
+          }
+        }
+      },
+      "ServerAddressByClientCIDR": {
+        "type": "object",
+        "required": [
+          "clientCIDR",
+          "serverAddress"
+        ],
+        "properties": {
+          "clientCIDR": {
+            "type": "string"
+          },
+          "serverAddress": {
+            "type": "string"
+          }
+        }
+      },
+      "ServiceAccountTokenRequest": {
+        "type": "object",
+        "required": [
+          "singleUseToken"
+        ],
+        "properties": {
+          "singleUseToken": {
+            "type": "string"
+          }
+        }
+      },
+      "ServiceAccountTokenResponse": {
+        "type": "object",
+        "required": [
+          "token",
+          "expiresAt",
+          "issuedAt"
+        ],
+        "properties": {
+          "expiresAt": {
+            "type": "string"
+          },
+          "issuedAt": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "ServiceActionResponse": {
+        "type": "object",
+        "required": [
+          "service",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "type": "string"
+          },
+          "started": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "StatefulSet": {
+        "type": "object",
+        "description": "StatefulSet object description.",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "spec"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ObjectMeta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/StatefulSetSpec"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StatefulSetStatus"
+              }
+            ]
+          }
+        }
+      },
+      "StatefulSetCondition": {
+        "type": "object",
+        "description": "High-level condition describing StatefulSet rollout state.",
+        "required": [
+          "type",
+          "status"
+        ],
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "StatefulSetList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "items"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatefulSet"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          }
+        }
+      },
+      "StatefulSetRollingUpdate": {
+        "type": "object",
+        "description": "Rolling update configuration for StatefulSets.",
+        "properties": {
+          "partition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "StatefulSetSpec": {
+        "type": "object",
+        "description": "Minimal StatefulSet specification to support Nanocloud workloads.",
+        "required": [
+          "serviceName",
+          "replicas",
+          "selector",
+          "template"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "selector": {
+            "$ref": "#/components/schemas/LabelSelector"
+          },
+          "serviceName": {
+            "type": "string"
+          },
+          "template": {
+            "$ref": "#/components/schemas/PodTemplateSpec"
+          },
+          "updateStrategy": {
+            "$ref": "#/components/schemas/StatefulSetUpdateStrategy"
+          },
+          "volumeClaimTemplates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersistentVolumeClaim"
+            }
+          }
+        }
+      },
+      "StatefulSetStatus": {
+        "type": "object",
+        "description": "Basic runtime status for a StatefulSet.",
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatefulSetCondition"
+            }
+          },
+          "currentReplicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "readyReplicas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        }
+      },
+      "StatefulSetUpdateStrategy": {
+        "type": "object",
+        "description": "StatefulSet update behaviour.",
+        "properties": {
+          "rollingUpdate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StatefulSetRollingUpdate"
+              }
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/StatefulSetUpdateStrategyType"
+          }
+        }
+      },
+      "StatefulSetUpdateStrategyType": {
+        "type": "string",
+        "description": "Supported update strategy types.",
+        "enum": [
+          "RollingUpdate",
+          "OnDelete"
+        ]
+      },
+      "Table": {
+        "type": "object",
+        "description": "Kubernetes `Table` representation from `meta.k8s.io/v1`.",
+        "required": [
+          "apiVersion",
+          "kind",
+          "metadata",
+          "columnDefinitions",
+          "rows"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "columnDefinitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableColumnDefinition"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ListMeta"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableRow"
+            }
+          }
+        }
+      },
+      "TableColumnDefinition": {
+        "type": "object",
+        "description": "Column schema describing how clients should display table cells.",
+        "required": [
+          "name",
+          "type"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "TableRow": {
+        "type": "object",
+        "description": "Individual table row with serialized cell values and optional raw object.",
+        "properties": {
+          "cells": {
+            "type": "array",
+            "items": {}
+          },
+          "object": {}
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "required": [
+          "major",
+          "minor",
+          "gitVersion",
+          "gitCommit",
+          "gitTreeState",
+          "buildDate",
+          "compiler",
+          "platform"
+        ],
+        "properties": {
+          "buildDate": {
+            "type": "string"
+          },
+          "compiler": {
+            "type": "string"
+          },
+          "gitCommit": {
+            "type": "string"
+          },
+          "gitTreeState": {
+            "type": "string"
+          },
+          "gitVersion": {
+            "type": "string"
+          },
+          "major": {
+            "type": "string"
+          },
+          "minor": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          }
+        }
+      },
+      "VolumeMount": {
+        "type": "object",
+        "description": "Describes how a volume is mounted inside the container.",
+        "required": [
+          "name",
+          "mount_path"
+        ],
+        "properties": {
+          "mount_path": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "VolumeProjection": {
+        "type": "object",
+        "properties": {
+          "configMap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConfigMapProjection"
+              }
+            ]
+          }
+        }
+      },
+      "VolumeSpec": {
+        "type": "object",
+        "description": "Simplified volume specification supporting the sources needed by Nanocloud.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "configMap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConfigMapVolumeSource"
+              }
+            ]
+          },
+          "empty_dir": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EmptyDirVolumeSource"
+              }
+            ]
+          },
+          "encrypted": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EncryptedVolumeSource"
+              }
+            ]
+          },
+          "host_path": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HostPathVolumeSource"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "persistentVolumeClaim": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PersistentVolumeClaimVolumeSource"
+              }
+            ]
+          },
+          "projected": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectedVolumeSource"
+              }
+            ]
+          },
+          "secret": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretVolumeSource"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "nanocloud",
+      "description": "Nanocloud service management API"
+    }
+  ]
 }

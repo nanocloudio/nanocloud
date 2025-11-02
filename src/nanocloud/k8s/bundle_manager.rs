@@ -14,15 +14,24 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::api::schema::{
+    format_bundle_error_summary, validate_bundle, BundleSchemaError,
+};
 use crate::nanocloud::api::types::{Bundle, BundlePhase, BundleStatus};
-use crate::nanocloud::k8s::store::{delete_bundle, list_bundles, normalize_namespace, save_bundle};
+use crate::nanocloud::k8s::ownership::BundleFieldOwnership;
+use crate::nanocloud::k8s::store::{
+    delete_bundle, delete_bundle_field_ownership, list_bundles, load_bundle_field_ownership,
+    normalize_namespace, save_bundle, save_bundle_field_ownership,
+};
 
-use std::collections::HashMap;
+use dashmap::DashMap;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug)]
 pub enum BundleError {
@@ -60,8 +69,53 @@ impl BundleError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ApplyFieldConflict {
+    pub path: String,
+    pub owner: String,
+}
+
+#[derive(Debug)]
+pub enum BundleApplyError {
+    Conflict {
+        message: String,
+        conflicts: Vec<ApplyFieldConflict>,
+    },
+    Failure(BundleError),
+}
+
+impl BundleApplyError {
+    pub fn conflict(message: impl Into<String>, conflicts: Vec<ApplyFieldConflict>) -> Self {
+        Self::Conflict {
+            message: message.into(),
+            conflicts,
+        }
+    }
+}
+
+impl From<BundleError> for BundleApplyError {
+    fn from(err: BundleError) -> Self {
+        BundleApplyError::Failure(err)
+    }
+}
+
+pub struct BundleApplyOptions<'a> {
+    pub manager: &'a str,
+    pub force: bool,
+    pub dry_run: bool,
+}
+
 fn bundle_key(namespace: &str, name: &str) -> String {
     format!("{}/{}", normalize_namespace(Some(namespace)), name)
+}
+
+fn ensure_identity(bundle: &mut Bundle) {
+    if bundle.api_version.trim().is_empty() {
+        bundle.api_version = "nanocloud.io/v1".to_string();
+    }
+    if bundle.kind.trim().is_empty() {
+        bundle.kind = "Bundle".to_string();
+    }
 }
 
 fn ensure_namespace(namespace: &str, bundle: &mut Bundle) -> String {
@@ -82,6 +136,19 @@ fn ensure_namespace(namespace: &str, bundle: &mut Bundle) -> String {
         _ => {}
     }
     ns
+}
+
+fn schema_error(err: BundleSchemaError) -> BundleError {
+    match err {
+        BundleSchemaError::UnsupportedVersion(version) => BundleError::Invalid(format!(
+            "Unsupported bundle apiVersion '{}'; supported: nanocloud.io/v1",
+            version
+        )),
+        BundleSchemaError::Validation(issues) => {
+            let detail = format_bundle_error_summary(&issues);
+            BundleError::Invalid(detail)
+        }
+    }
 }
 
 fn ensure_name(name: &str, bundle: &mut Bundle) -> Result<String, BundleError> {
@@ -125,9 +192,11 @@ fn normalize_key_new(namespace: &str, bundle: &mut Bundle) -> Result<String, Bun
 pub struct BundleRegistry {
     bundles: RwLock<HashMap<String, Bundle>>,
     resource_counter: AtomicU64,
+    apply_guards: DashMap<String, Arc<Mutex<()>>>,
 }
 
 static REGISTRY: OnceLock<Arc<BundleRegistry>> = OnceLock::new();
+const BUNDLE_CONTROLLER_MANAGER: &str = "controller/bundle";
 
 impl BundleRegistry {
     pub fn shared() -> Arc<Self> {
@@ -137,8 +206,16 @@ impl BundleRegistry {
                 Arc::new(BundleRegistry {
                     bundles: RwLock::new(items),
                     resource_counter: AtomicU64::new(counter.max(1)),
+                    apply_guards: DashMap::new(),
                 })
             })
+            .clone()
+    }
+
+    fn guard_for(&self, key: &str) -> Arc<Mutex<()>> {
+        self.apply_guards
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
@@ -168,18 +245,14 @@ impl BundleRegistry {
         namespace: &str,
         mut payload: Bundle,
     ) -> Result<Bundle, BundleError> {
-        if payload.api_version.is_empty() {
-            payload.api_version = "nanocloud.io/v1".to_string();
-        }
-        if payload.kind.is_empty() {
-            payload.kind = "Bundle".to_string();
-        }
+        ensure_identity(&mut payload);
         if payload.metadata.resource_version.is_some() {
             return Err(BundleError::Invalid(
                 "resourceVersion must not be set on create".to_string(),
             ));
         }
         let key = normalize_key_new(namespace, &mut payload)?;
+        validate_bundle(&payload).map_err(schema_error)?;
 
         {
             let bundles = self.bundles.read().await;
@@ -248,8 +321,10 @@ impl BundleRegistry {
 
         let resource_version = self.next_resource_version();
         let mut status = status;
-        if let Ok(parsed) = resource_version.parse::<i64>() {
-            status.observed_generation = Some(parsed);
+        if status.observed_generation.is_none() {
+            if let Ok(parsed) = resource_version.parse::<i64>() {
+                status.observed_generation = Some(parsed);
+            }
         }
         existing.metadata.resource_version = Some(resource_version);
         existing.status = Some(status);
@@ -259,6 +334,8 @@ impl BundleRegistry {
             &existing,
         )
         .map_err(BundleError::persistence_box)?;
+        self.record_field_owners(namespace, name, BUNDLE_CONTROLLER_MANAGER, &["/status"])
+            .await?;
 
         {
             let mut bundles = self.bundles.write().await;
@@ -297,6 +374,8 @@ impl BundleRegistry {
 
         existing.spec.profile_key = Some(profile_key);
         existing.spec.options = options;
+        ensure_identity(&mut existing);
+        validate_bundle(&existing).map_err(schema_error)?;
         let resource_version = self.next_resource_version();
         existing.metadata.resource_version = Some(resource_version);
 
@@ -306,6 +385,13 @@ impl BundleRegistry {
             &existing,
         )
         .map_err(BundleError::persistence_box)?;
+        self.record_field_owners(
+            namespace,
+            name,
+            BUNDLE_CONTROLLER_MANAGER,
+            &["/spec/options", "/spec/key"],
+        )
+        .await?;
 
         {
             let mut bundles = self.bundles.write().await;
@@ -313,6 +399,111 @@ impl BundleRegistry {
         }
 
         Ok(existing)
+    }
+
+    pub async fn apply_bundle(
+        &self,
+        namespace: &str,
+        name: &str,
+        payload: Value,
+        options: BundleApplyOptions<'_>,
+    ) -> Result<Bundle, BundleApplyError> {
+        let key = bundle_key(namespace, name);
+        let guard = self.guard_for(&key);
+        let _permit = guard.lock().await;
+
+        let existing = {
+            let bundles = self.bundles.read().await;
+            bundles.get(&key).cloned()
+        };
+
+        let Some(mut bundle) = existing else {
+            return Err(BundleApplyError::from(BundleError::NotFound(format!(
+                "Bundle '{name}' not found"
+            ))));
+        };
+
+        let spec_patch = extract_spec_patch(&payload)?;
+        let touched = collect_spec_pointers(&spec_patch);
+        if touched.is_empty() {
+            return Err(BundleApplyError::from(BundleError::Invalid(
+                "Apply payload must include at least one spec field".to_string(),
+            )));
+        }
+
+        let mut ownership = self
+            .load_field_ownership(namespace, name)
+            .await
+            .map_err(BundleApplyError::from)?;
+
+        let mut conflicts = Vec::new();
+        for pointer in &touched {
+            if let Some(owner) = ownership.manager_for(pointer) {
+                if owner != options.manager {
+                    conflicts.push(ApplyFieldConflict {
+                        path: pointer.clone(),
+                        owner: owner.to_string(),
+                    });
+                }
+            }
+        }
+
+        if !conflicts.is_empty() && !options.force {
+            return Err(BundleApplyError::conflict(
+                "Apply would modify fields managed by another actor",
+                conflicts,
+            ));
+        }
+
+        let mut spec_value = serde_json::to_value(&bundle.spec).map_err(|err| {
+            BundleApplyError::from(BundleError::Invalid(format!(
+                "Failed to serialize Bundle spec: {err}"
+            )))
+        })?;
+
+        merge_spec(&mut spec_value, &spec_patch);
+
+        bundle.spec = serde_json::from_value(spec_value).map_err(|err| {
+            BundleApplyError::from(BundleError::Invalid(format!(
+                "Failed to deserialize Bundle spec: {err}"
+            )))
+        })?;
+
+        ensure_identity(&mut bundle);
+        validate_bundle(&bundle)
+            .map_err(schema_error)
+            .map_err(BundleApplyError::from)?;
+
+        if options.dry_run {
+            return Ok(bundle);
+        }
+
+        let resource_version = self.next_resource_version();
+        bundle.metadata.resource_version = Some(resource_version);
+
+        save_bundle(
+            bundle.metadata.namespace.as_deref(),
+            bundle.metadata.name.as_deref().unwrap(),
+            &bundle,
+        )
+        .map_err(BundleError::persistence_box)
+        .map_err(BundleApplyError::from)?;
+
+        for pointer in &touched {
+            ownership.set_owner(pointer, options.manager);
+        }
+        let bundle_namespace = bundle.metadata.namespace.as_deref().unwrap_or(namespace);
+        let bundle_name = bundle.metadata.name.as_deref().unwrap_or(name);
+        self.save_field_ownership(bundle_namespace, bundle_name, &ownership)
+            .await
+            .map_err(BundleApplyError::from)?;
+
+        {
+            let mut bundles = self.bundles.write().await;
+            bundles.insert(key, bundle.clone());
+        }
+
+        Ok(bundle)
     }
 
     pub async fn delete(&self, namespace: &str, name: &str) -> Result<(), BundleError> {
@@ -328,12 +519,97 @@ impl BundleRegistry {
             }
         }
 
-        delete_bundle(Some(namespace), name).map_err(BundleError::persistence_box)
+        delete_bundle(Some(namespace), name).map_err(BundleError::persistence_box)?;
+        self.delete_field_ownership(namespace, name).await
+    }
+
+    pub async fn load_field_ownership(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<BundleFieldOwnership, BundleError> {
+        load_bundle_field_ownership(Some(namespace), name).map_err(BundleError::persistence_box)
+    }
+
+    pub async fn save_field_ownership(
+        &self,
+        namespace: &str,
+        name: &str,
+        ownership: &BundleFieldOwnership,
+    ) -> Result<(), BundleError> {
+        save_bundle_field_ownership(Some(namespace), name, ownership)
+            .map_err(BundleError::persistence_box)
+    }
+
+    pub async fn delete_field_ownership(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), BundleError> {
+        delete_bundle_field_ownership(Some(namespace), name).map_err(BundleError::persistence_box)
+    }
+
+    async fn record_field_owners(
+        &self,
+        namespace: &str,
+        name: &str,
+        manager: &str,
+        pointers: &[&str],
+    ) -> Result<(), BundleError> {
+        let mut ownership = self.load_field_ownership(namespace, name).await?;
+        for pointer in pointers {
+            ownership.set_owner(pointer, manager);
+        }
+        self.save_field_ownership(namespace, name, &ownership).await
     }
 
     fn next_resource_version(&self) -> String {
         let next = self.resource_counter.fetch_add(1, Ordering::SeqCst);
         next.to_string()
+    }
+}
+
+fn extract_spec_patch(payload: &Value) -> Result<Value, BundleApplyError> {
+    match payload.get("spec") {
+        Some(spec) if spec.is_object() => Ok(spec.clone()),
+        Some(_) => Err(BundleApplyError::from(BundleError::Invalid(
+            "Apply payload 'spec' must be an object".to_string(),
+        ))),
+        None => Err(BundleApplyError::from(BundleError::Invalid(
+            "Apply payload must include a 'spec' object".to_string(),
+        ))),
+    }
+}
+
+fn collect_spec_pointers(spec_patch: &Value) -> Vec<String> {
+    let mut unique = BTreeSet::new();
+    if let Value::Object(map) = spec_patch {
+        for key in map.keys() {
+            unique.insert(format!("/spec/{key}"));
+        }
+    }
+    unique.into_iter().collect()
+}
+
+fn merge_spec(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target_map), Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                if value.is_null() {
+                    target_map.remove(key);
+                    continue;
+                }
+                match target_map.get_mut(key) {
+                    Some(entry) => merge_spec(entry, value),
+                    None => {
+                        target_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target_value, patch_value) => {
+            *target_value = patch_value.clone();
+        }
     }
 }
 

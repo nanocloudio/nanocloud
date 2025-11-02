@@ -118,7 +118,7 @@ pub struct Event {
     pub deprecated_count: Option<i32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventWatchEvent {
     #[serde(rename = "type")]
     pub event_type: String,

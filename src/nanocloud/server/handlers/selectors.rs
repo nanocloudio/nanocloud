@@ -429,7 +429,7 @@ fn normalize_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nanocloud::k8s::pod::{Pod, PodSpec, PodStatus};
+    use crate::nanocloud::k8s::pod::{Pod, PodSecurityContext, PodSpec, PodStatus};
     use axum::response::IntoResponse;
     use std::collections::HashMap;
 
@@ -465,6 +465,7 @@ mod tests {
                 service_account_name: None,
                 node_name: node_name.map(|value| value.to_string()),
                 host_network: false,
+                security: PodSecurityContext::default(),
             },
             status: phase.map(|value| PodStatus {
                 phase: Some(value.to_string()),

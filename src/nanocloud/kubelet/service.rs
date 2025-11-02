@@ -29,7 +29,7 @@ use crate::nanocloud::k8s::statefulset::StatefulSet;
 use crate::nanocloud::k8s::store::{self, paginate_entries, ListCursor, PaginatedResult};
 use crate::nanocloud::kubelet::runtime;
 use crate::nanocloud::logger::{log_error, log_info, log_warn};
-use crate::nanocloud::observability::metrics;
+use crate::nanocloud::observability::{metrics, tracing};
 use crate::nanocloud::oci::runtime::{ContainerState, ContainerStatus as RuntimeStatus};
 use crate::nanocloud::oci::{container_runtime, OciImage, Registry};
 use crate::nanocloud::util::error::{new_error, with_context};
@@ -240,16 +240,27 @@ impl Kubelet {
                 let worker = Arc::clone(&kubelet);
                 tokio::spawn(async move {
                     while let Some(work) = plan_rx.recv().await {
-                        let namespace_clone = work.namespace.clone();
+                        let namespace_label = work
+                            .namespace
+                            .clone()
+                            .unwrap_or_else(|| "default".to_string());
+                        let namespace_for_log = namespace_label.clone();
                         let set_name = work.statefulset.clone();
-                        if let Err(err) = worker.process_replica_plan(work).await {
+                        let span_label = format!("{}/{}", namespace_label, set_name);
+                        let result = tracing::with_span(
+                            "kubelet",
+                            span_label,
+                            worker.process_replica_plan(work),
+                        )
+                        .await;
+                        if let Err(err) = result {
                             let error_text = err.to_string();
                             log_error(
                                 "kubelet",
                                 "Failed to process ReplicaSet plan",
                                 &[
                                     ("statefulset", set_name.as_str()),
-                                    ("namespace", namespace_clone.as_deref().unwrap_or("default")),
+                                    ("namespace", namespace_for_log.as_str()),
                                     ("error", error_text.as_str()),
                                 ],
                             );
@@ -400,6 +411,7 @@ impl Kubelet {
             .refresh_pod(&registration, initial_event, previous_status)
             .await?;
 
+        self.update_pod_gauges().await;
         Ok(())
     }
 
@@ -441,6 +453,7 @@ impl Kubelet {
             );
         }
 
+        self.update_pod_gauges().await;
         Ok(())
     }
 
@@ -843,6 +856,25 @@ impl Kubelet {
         ));
     }
 
+    async fn update_pod_gauges(&self) {
+        let pods_guard = self.pods.read().await;
+        if pods_guard.is_empty() {
+            metrics::set_pod_gauges(&[]);
+            return;
+        }
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for registration in pods_guard.values() {
+            let namespace = registration
+                .namespace
+                .as_deref()
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or("default");
+            *counts.entry(namespace.to_string()).or_insert(0) += 1;
+        }
+        let entries: Vec<(String, i64)> = counts.into_iter().collect();
+        metrics::set_pod_gauges(&entries);
+    }
+
     async fn load_pod_snapshot(
         &self,
         registration: &Arc<PodRegistration>,
@@ -979,6 +1011,7 @@ impl Kubelet {
                     );
                 }
                 registration.restart_count.fetch_add(1, Ordering::SeqCst);
+                metrics::record_restart(namespace, app, "auto");
                 Ok(())
             }
             Err(err) => {
@@ -1679,6 +1712,23 @@ mod tests {
         assert!(
             !restored.should_retry(Instant::now()),
             "restored backoff should respect pending delay"
+        );
+    }
+
+    #[test]
+    fn restart_backoff_success_resets_attempts_and_error() {
+        let mut backoff = RestartBackoff::default();
+        let now = Instant::now();
+        backoff.on_failure(now, "boom".into());
+        assert_eq!(backoff.attempt, 1);
+        assert!(backoff.last_error.is_some());
+
+        backoff.on_success(Instant::now());
+        assert_eq!(backoff.attempt, 0);
+        assert!(backoff.last_error.is_none());
+        assert!(
+            backoff.should_retry(Instant::now()),
+            "successful restart should allow immediate retries"
         );
     }
 

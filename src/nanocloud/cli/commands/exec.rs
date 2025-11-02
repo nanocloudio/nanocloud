@@ -81,3 +81,47 @@ pub(super) async fn handle_exec(
     };
     client.exec(&request).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> ExecArgs {
+        ExecArgs {
+            namespace: None,
+            container: Some("runner".into()),
+            stdin: true,
+            tty: false,
+            pod: "demo".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+        }
+    }
+
+    #[test]
+    fn exec_request_defaults_namespace_and_streams() {
+        let args = base_args();
+        let request = exec_request_from_args(&args);
+        assert_eq!(request.namespace, "default");
+        assert_eq!(request.pod, "demo");
+        assert_eq!(request.container.as_deref(), Some("runner"));
+        assert_eq!(request.command, args.command);
+        assert!(request.stdin);
+        assert!(request.stdout);
+        assert!(request.stderr);
+        assert!(!request.tty);
+    }
+
+    #[test]
+    fn exec_request_respects_custom_namespace_and_tty() {
+        let mut args = base_args();
+        args.namespace = Some("prod".into());
+        args.container = None;
+        args.stdin = false;
+        args.tty = true;
+
+        let request = exec_request_from_args(&args);
+        assert_eq!(request.namespace, "prod");
+        assert!(request.tty);
+        assert!(!request.stdin);
+    }
+}
