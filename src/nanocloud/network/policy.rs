@@ -23,10 +23,12 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::io::Write;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 const BASE_CHAIN: &str = "NCLD-NP";
-const IPTABLES_TABLE: &str = "filter";
+const NFT_FAMILY: &str = "inet";
+const NFT_TABLE: &str = "nanocloud";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PolicyDirection {
@@ -124,8 +126,10 @@ struct CommandRunner {
 
 impl CommandRunner {
     fn new() -> Self {
-        let binary = env::var("NANOCLOUD_IPTABLES").unwrap_or_else(|_| "iptables".to_string());
-        let record_path = env::var("NANOCLOUD_IPTABLES_RECORD").ok();
+        let binary = env::var("NANOCLOUD_NFT").unwrap_or_else(|_| "nft".to_string());
+        let record_path = env::var("NANOCLOUD_NFT_RECORD")
+            .ok()
+            .or_else(|| env::var("NANOCLOUD_IPTABLES_RECORD").ok());
         Self {
             binary,
             record_path,
@@ -141,85 +145,88 @@ impl CommandRunner {
             .into_iter()
             .map(|segment| segment.as_ref().to_string())
             .collect();
-        let binary = env::var("NANOCLOUD_IPTABLES").unwrap_or_else(|_| self.binary.clone());
-        let record_path = env::var("NANOCLOUD_IPTABLES_RECORD")
+        let binary = env::var("NANOCLOUD_NFT").unwrap_or_else(|_| self.binary.clone());
+        let record_path = env::var("NANOCLOUD_NFT_RECORD")
             .ok()
+            .or_else(|| env::var("NANOCLOUD_IPTABLES_RECORD").ok())
             .or_else(|| self.record_path.clone());
         if let Some(record) = record_path.as_ref() {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(record)
-                .map_err(|e| with_context(e, "Failed to open iptables record log"))?;
+                .map_err(|e| with_context(e, "Failed to open nftables record log"))?;
             writeln!(file, "{} {}", binary, args_vec.join(" "))
-                .map_err(|e| with_context(e, "Failed to write iptables record"))?;
-            let is_delete = args_vec.iter().any(|arg| arg == "-D" || arg == "-X");
-            return Ok(!is_delete);
+                .map_err(|e| with_context(e, "Failed to write nftables record"))?;
+            return Ok(true);
         }
 
-        let status = std::process::Command::new(&binary)
+        let status = Command::new(&binary)
             .args(&args_vec)
             .status()
             .map_err(|e| with_context(e, format!("Failed to execute {}", binary)))?;
         Ok(status.success())
     }
 
+    fn ensure_table(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _ = self.run(["add", "table", NFT_FAMILY, NFT_TABLE])?;
+        Ok(())
+    }
+
     fn ensure_chain(&self, chain: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if !self.run(["-w", "-t", IPTABLES_TABLE, "-N", chain])? {
-            self.run(["-w", "-t", IPTABLES_TABLE, "-F", chain])?;
+        if !self.run(["add", "chain", NFT_FAMILY, NFT_TABLE, chain])? {
+            self.run(["flush", "chain", NFT_FAMILY, NFT_TABLE, chain])?;
         }
         Ok(())
     }
 
     fn clear_chain(&self, chain: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run(["-w", "-t", IPTABLES_TABLE, "-F", chain])?;
+        let _ = self.run(["flush", "chain", NFT_FAMILY, NFT_TABLE, chain])?;
         Ok(())
     }
 
     fn delete_chain(&self, chain: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run(["-w", "-t", IPTABLES_TABLE, "-F", chain])?;
-        self.run(["-w", "-t", IPTABLES_TABLE, "-X", chain])?;
+        let _ = self.run(["delete", "chain", NFT_FAMILY, NFT_TABLE, chain])?;
         Ok(())
     }
 
     fn ensure_base_chain(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.ensure_chain(BASE_CHAIN)?;
+        self.ensure_table()?;
+        let definition = "{ type filter hook forward priority 0; policy accept; }";
         if !self.run([
-            "-w",
-            "-t",
-            IPTABLES_TABLE,
-            "-C",
-            "FORWARD",
-            "-j",
+            "add",
+            "chain",
+            NFT_FAMILY,
+            NFT_TABLE,
             BASE_CHAIN,
+            definition,
         ])? {
-            self.run([
-                "-w",
-                "-t",
-                IPTABLES_TABLE,
-                "-A",
-                "FORWARD",
-                "-j",
-                BASE_CHAIN,
-            ])?;
+            self.run(["flush", "chain", NFT_FAMILY, NFT_TABLE, BASE_CHAIN])?;
         }
         Ok(())
     }
 
     fn append_base_jump(&self, chain: &PolicyChain) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut args = vec![
-            "-w".to_string(),
-            "-t".to_string(),
-            IPTABLES_TABLE.to_string(),
-            "-A".to_string(),
+            "add".to_string(),
+            "rule".to_string(),
+            NFT_FAMILY.to_string(),
+            NFT_TABLE.to_string(),
             BASE_CHAIN.to_string(),
         ];
         match chain.direction {
-            PolicyDirection::Ingress => args.push("-d".to_string()),
-            PolicyDirection::Egress => args.push("-s".to_string()),
+            PolicyDirection::Ingress => {
+                args.push("ip".to_string());
+                args.push("daddr".to_string());
+            }
+            PolicyDirection::Egress => {
+                args.push("ip".to_string());
+                args.push("saddr".to_string());
+            }
         }
         args.push(chain.pod_ip.clone());
-        args.push("-j".to_string());
+        args.push("counter".to_string());
+        args.push("jump".to_string());
         args.push(chain.name.clone());
         self.run(args.iter().map(|s| s.as_str()))?;
         Ok(())
@@ -231,17 +238,23 @@ impl CommandRunner {
         rule: &PolicyRule,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut args = vec![
-            "-w".to_string(),
-            "-t".to_string(),
-            IPTABLES_TABLE.to_string(),
-            "-A".to_string(),
+            "add".to_string(),
+            "rule".to_string(),
+            NFT_FAMILY.to_string(),
+            NFT_TABLE.to_string(),
             chain.name.clone(),
         ];
 
         if let Some(cidr) = rule.cidr.as_deref() {
             match chain.direction {
-                PolicyDirection::Ingress => args.push("-s".to_string()),
-                PolicyDirection::Egress => args.push("-d".to_string()),
+                PolicyDirection::Ingress => {
+                    args.push("ip".to_string());
+                    args.push("saddr".to_string());
+                }
+                PolicyDirection::Egress => {
+                    args.push("ip".to_string());
+                    args.push("daddr".to_string());
+                }
             }
             args.push(cidr.to_string());
         }
@@ -252,32 +265,33 @@ impl CommandRunner {
         }
 
         if let Some(proto) = protocol.as_deref() {
-            args.push("-p".to_string());
             args.push(proto.to_string());
         }
 
         if let Some(port) = rule.port {
-            if let Some(proto) = protocol.as_deref() {
-                args.push("-m".to_string());
-                args.push(proto.to_string());
+            if protocol.is_none() {
+                args.push("tcp".to_string());
             }
-            args.push("--dport".to_string());
+            args.push("dport".to_string());
             args.push(port.to_string());
         }
 
-        args.push("-j".to_string());
-        args.push("RETURN".to_string());
+        args.push("counter".to_string());
+        args.push("return".to_string());
         self.run(args.iter().map(|s| s.as_str()))?;
         Ok(())
     }
 
     fn append_drop(&self, chain: &PolicyChain) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run(["-w", "-t", IPTABLES_TABLE, "-A", &chain.name, "-j", "DROP"])?;
-        Ok(())
-    }
-
-    fn append_base_return(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run(["-w", "-t", IPTABLES_TABLE, "-A", BASE_CHAIN, "-j", "RETURN"])?;
+        self.run([
+            "add",
+            "rule",
+            NFT_FAMILY,
+            NFT_TABLE,
+            &chain.name,
+            "counter",
+            "drop",
+        ])?;
         Ok(())
     }
 }
@@ -321,7 +335,6 @@ impl PolicyProgrammer {
             self.runner.append_base_jump(chain)?;
         }
 
-        self.runner.append_base_return()?;
         *installed = desired_names;
         Ok(())
     }
@@ -351,11 +364,11 @@ mod tests {
     fn sync_programs_ingress_rules() {
         let _guard = keyspace_lock().lock();
         let dir = tempdir().expect("tempdir");
-        let log_path = dir.path().join("iptables.log");
-        let previous_record = env::var("NANOCLOUD_IPTABLES_RECORD").ok();
-        let previous_binary = env::var("NANOCLOUD_IPTABLES").ok();
-        env::set_var("NANOCLOUD_IPTABLES_RECORD", &log_path);
-        env::set_var("NANOCLOUD_IPTABLES", "/sbin/iptables");
+        let log_path = dir.path().join("nft.log");
+        let previous_record = env::var("NANOCLOUD_NFT_RECORD").ok();
+        let previous_binary = env::var("NANOCLOUD_NFT").ok();
+        env::set_var("NANOCLOUD_NFT_RECORD", &log_path);
+        env::set_var("NANOCLOUD_NFT", "/usr/sbin/nft");
 
         let programmer = PolicyProgrammer {
             runner: CommandRunner::new(),
@@ -376,26 +389,29 @@ mod tests {
 
         programmer.sync(&[chain]).expect("sync policy");
 
-        let log = fs::read_to_string(&log_path).expect("read iptables log");
+        let log = fs::read_to_string(&log_path).expect("read nft log");
         assert!(
-            log.contains("-A NCLD-NP -d 10.203.0.10 -j"),
+            log.contains("nft add rule inet nanocloud NCLD-NP ip daddr 10.203.0.10 counter jump"),
             "expected base jump in log: {log}"
         );
         assert!(
-            log.contains("--dport 80"),
+            log.contains("tcp dport 80 counter return"),
             "expected port match in log: {log}"
         );
-        assert!(log.contains("-j DROP"), "expected drop rule in log: {log}");
+        assert!(
+            log.contains("counter drop"),
+            "expected drop rule in log: {log}"
+        );
 
         programmer.sync(&[]).expect("sync empty policy set");
 
-        let updated = fs::read_to_string(&log_path).expect("read updated iptables log");
+        let updated = fs::read_to_string(&log_path).expect("read updated nft log");
         assert!(
-            updated.contains("-X"),
+            updated.contains("delete chain inet nanocloud"),
             "expected chain deletion in log: {updated}"
         );
 
-        restore_env("NANOCLOUD_IPTABLES_RECORD", previous_record);
-        restore_env("NANOCLOUD_IPTABLES", previous_binary);
+        restore_env("NANOCLOUD_NFT_RECORD", previous_record);
+        restore_env("NANOCLOUD_NFT", previous_binary);
     }
 }

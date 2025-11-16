@@ -17,7 +17,9 @@
 use super::bindings::{run_binding, BindingEnvelopePolicy, BindingInvocation};
 #[cfg(test)]
 use crate::nanocloud::api::types::BundleSeccompProfile;
-use crate::nanocloud::api::types::{BundleSeccompProfileType, BundleSecurityProfile, BundleSpec};
+use crate::nanocloud::api::types::{
+    BundleRuntimeSpec, BundleSeccompProfileType, BundleSecurityProfile, BundleSpec,
+};
 use crate::nanocloud::csi::{
     csi_plugin, CreateVolumeRequest, DeleteVolumeRequest, NodePublishVolumeRequest,
     NodeUnpublishVolumeRequest,
@@ -34,7 +36,7 @@ use crate::nanocloud::events::{EventEnvelope, EventKey, EventPublisher, EventTop
 use crate::nanocloud::k8s::configmap::ConfigMap;
 use crate::nanocloud::k8s::pod::{
     ContainerEnvVar, ContainerSpec, HostPathVolumeSource, KeyToPath, Pod, PodSeccompProfile,
-    PodSecurityContext, PodSpec, VolumeSpec,
+    PodSecurityContext, PodSpec, VolumeMount, VolumeSpec,
 };
 use crate::nanocloud::k8s::store as pod_store;
 use crate::nanocloud::kubelet::runtime::{
@@ -528,12 +530,21 @@ pub async fn install(
     snapshot: Option<&str>,
     force_update: bool,
     security: Option<BundleSecurityProfile>,
+    runtime_overrides: Option<BundleRuntimeSpec>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     metrics::observe_container_operation(
         namespace,
         app,
         ContainerOperation::Install,
-        install_impl(namespace, app, options, snapshot, force_update, security),
+        install_impl(
+            namespace,
+            app,
+            options,
+            snapshot,
+            force_update,
+            security,
+            runtime_overrides,
+        ),
     )
     .await
 }
@@ -545,6 +556,7 @@ async fn install_impl(
     snapshot: Option<&str>,
     force_update: bool,
     mut security: Option<BundleSecurityProfile>,
+    runtime_overrides: Option<BundleRuntimeSpec>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     // Generate container name
     let container_name = namespace
@@ -591,6 +603,7 @@ async fn install_impl(
         .transpose()?;
 
     let mut snapshot_spec_contents: Option<BundleSpec> = None;
+    let mut runtime_overrides = runtime_overrides;
     let combined_options = match snapshot {
         Some(ref snap) => {
             let spec = snap
@@ -599,6 +612,11 @@ async fn install_impl(
             let profile = Profile::from_spec_fields(spec.profile_key.as_deref(), &spec.options)
                 .map_err(|e| with_context(e, "Failed to materialize snapshot profile"))?;
             snapshot_spec_contents = Some(spec);
+            if runtime_overrides.is_none() {
+                runtime_overrides = snapshot_spec_contents
+                    .as_ref()
+                    .and_then(|spec| spec.runtime.clone());
+            }
             profile.extend(&options)
         }
         None => options.clone(),
@@ -641,6 +659,7 @@ async fn install_impl(
         Some(&format!("registry.nanocloud.io/{}", app)),
     );
     apply_security_context(&mut pod_manifest.spec, security.as_ref());
+    apply_runtime_overrides(&mut pod_manifest.spec, runtime_overrides.as_ref());
     let namespace_string = namespace
         .filter(|ns| !ns.is_empty())
         .map(|ns| ns.to_string());
@@ -1133,6 +1152,59 @@ fn apply_security_context(pod_spec: &mut PodSpec, profile: Option<&BundleSecurit
         }
     }
     pod_spec.security = context;
+}
+
+fn apply_runtime_overrides(
+    pod_spec: &mut PodSpec,
+    runtime: Option<&BundleRuntimeSpec>,
+) {
+    let Some(spec) = runtime else {
+        return;
+    };
+
+    if let Some(container) = pod_spec.containers.first_mut() {
+        if !spec.env_from.is_empty() {
+            container.env_from.extend(spec.env_from.clone());
+        }
+        if !spec.volume_mounts.is_empty() {
+            merge_runtime_volume_mounts(&mut container.volume_mounts, &spec.volume_mounts);
+        }
+    }
+
+    if !spec.volumes.is_empty() {
+        merge_runtime_volumes(&mut pod_spec.volumes, &spec.volumes);
+    }
+}
+
+fn merge_runtime_volume_mounts(existing: &mut Vec<VolumeMount>, additions: &[VolumeMount]) {
+    for mount in additions {
+        if existing
+            .iter()
+            .any(|current| current.name == mount.name && current.mount_path == mount.mount_path)
+        {
+            log_warn(
+                "container",
+                "Skipping duplicate runtime volume mount",
+                &[("volume", mount.name.as_str()), ("path", mount.mount_path.as_str())],
+            );
+            continue;
+        }
+        existing.push(mount.clone());
+    }
+}
+
+fn merge_runtime_volumes(existing: &mut Vec<VolumeSpec>, additions: &[VolumeSpec]) {
+    for volume in additions {
+        if existing.iter().any(|current| current.name == volume.name) {
+            log_warn(
+                "container",
+                "Skipping duplicate runtime volume",
+                &[("volume", volume.name.as_str())],
+            );
+            continue;
+        }
+        existing.push(volume.clone());
+    }
 }
 
 fn reconcile_volume_permissions(
@@ -2149,9 +2221,9 @@ mod tests {
     use crate::nanocloud::events::{EventSubscriber, EventTopic, EventType, SubscriptionOptions};
     use crate::nanocloud::k8s::configmap::ConfigMap;
     use crate::nanocloud::k8s::pod::{
-        ConfigMapEnvSource, ConfigMapKeySelector, ContainerEnvVar, ContainerSpec, EnvFromSource,
-        EnvVarSource, KeyToPath, ObjectMeta, PodSecurityContext, PodSpec, SecretEnvSource,
-        SecretKeySelector, SecretVolumeSource,
+        ConfigMapEnvSource, ConfigMapKeySelector, ConfigMapVolumeSource, ContainerEnvVar,
+        ContainerSpec, EnvFromSource, EnvVarSource, KeyToPath, ObjectMeta, PodSecurityContext,
+        PodSpec, SecretEnvSource, SecretKeySelector, SecretVolumeSource,
     };
     use crate::nanocloud::secrets::{KeyspaceSecretStore, SecretMaterial, StoredSecret};
     use chrono::Utc;
@@ -2271,6 +2343,56 @@ mod tests {
             .expect("seccomp profile expected");
         assert_eq!(seccomp.profile_type, "Localhost");
         assert_eq!(seccomp.localhost_profile.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn runtime_overrides_merge_env_and_volumes() {
+        let mut pod_spec = PodSpec {
+            containers: vec![ContainerSpec {
+                name: "svc".to_string(),
+                ..Default::default()
+            }],
+            volumes: Vec::new(),
+            ..empty_pod_spec()
+        };
+
+        let overrides = BundleRuntimeSpec {
+            env_from: vec![EnvFromSource {
+                config_map_ref: Some(ConfigMapEnvSource {
+                    name: "settings".to_string(),
+                    optional: Some(true),
+                }),
+                secret_ref: None,
+            }],
+            volumes: vec![VolumeSpec {
+                name: "runtime-config".to_string(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: Some("settings".to_string()),
+                    default_mode: None,
+                    items: Vec::new(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }],
+            volume_mounts: vec![VolumeMount {
+                name: "runtime-config".to_string(),
+                mount_path: "/etc/runtime".to_string(),
+                read_only: Some(true),
+            }],
+        };
+
+        apply_runtime_overrides(&mut pod_spec, Some(&overrides));
+        let container = pod_spec.containers.first().expect("container present");
+        assert_eq!(container.env_from.len(), 1);
+        assert_eq!(container.volume_mounts.len(), 1);
+        assert_eq!(pod_spec.volumes.len(), 1);
+
+        // Applying overrides again should not duplicate mounts or volumes.
+        apply_runtime_overrides(&mut pod_spec, Some(&overrides));
+        let container = pod_spec.containers.first().expect("container present");
+        assert_eq!(container.env_from.len(), 2, "envFrom entries append");
+        assert_eq!(container.volume_mounts.len(), 1, "volume mounts dedupe");
+        assert_eq!(pod_spec.volumes.len(), 1, "volumes dedupe by name");
     }
 
     struct EnvOverride {

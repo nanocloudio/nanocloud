@@ -6,7 +6,7 @@
       "apiVersion": "nanocloud.io/v1",
       "status": "current",
       "schema": "bundle/v1alpha1.json",
-      "sha256": "b5d9aacb0ee44c2e5952990ec2cfd61a5ba831b85615f158da118308ecef91bf",
+      "sha256": "a68ca208d0c70c5c3d2b5a961ef6ad69a8181cc7a880e1149f599b37de7e0734",
       "description": "Initial schema covering metadata, spec, snapshot, and status blocks.",
       "releasedAt": "2025-01-07T00:00:00Z"
     }

@@ -4,7 +4,12 @@
   "title": "Nanocloud Bundle (v1alpha1)",
   "description": "Validation schema for nanocloud.io/v1 Bundle resources.",
   "type": "object",
-  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
   "additionalProperties": false,
   "properties": {
     "apiVersion": {
@@ -29,7 +34,9 @@
   "$defs": {
     "ObjectMeta": {
       "type": "object",
-      "required": ["name"],
+      "required": [
+        "name"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -74,7 +81,9 @@
     },
     "BundleSpec": {
       "type": "object",
-      "required": ["service"],
+      "required": [
+        "service"
+      ],
       "additionalProperties": false,
       "properties": {
         "service": {
@@ -122,12 +131,18 @@
         "security": {
           "$ref": "#/$defs/BundleSecurityProfile",
           "description": "Optional runtime security overrides (capabilities, seccomp profiles)."
+        },
+        "runtime": {
+          "$ref": "#/$defs/BundleRuntimeSpec",
+          "description": "Optional Pod-style projections applied on top of the generated workload."
         }
       }
     },
     "BundleSnapshotSource": {
       "type": "object",
-      "required": ["source"],
+      "required": [
+        "source"
+      ],
       "additionalProperties": false,
       "properties": {
         "source": {
@@ -169,12 +184,18 @@
     },
     "BundleSeccompProfile": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["Baseline", "RuntimeDefault", "Localhost"]
+          "enum": [
+            "Baseline",
+            "RuntimeDefault",
+            "Localhost"
+          ]
         },
         "localhostProfile": {
           "type": "string",
@@ -193,11 +214,21 @@
         },
         "phase": {
           "type": "string",
-          "enum": ["PENDING", "VALIDATING", "RENDERING", "APPLYING", "READY", "FAILED", "DELETING"]
+          "enum": [
+            "PENDING",
+            "VALIDATING",
+            "RENDERING",
+            "APPLYING",
+            "READY",
+            "FAILED",
+            "DELETING"
+          ]
         },
         "conditions": {
           "type": "array",
-          "items": { "$ref": "#/$defs/BundleCondition" }
+          "items": {
+            "$ref": "#/$defs/BundleCondition"
+          }
         },
         "workload": {
           "$ref": "#/$defs/BundleWorkloadRef"
@@ -209,13 +240,18 @@
         "bindingHistory": {
           "type": "array",
           "description": "Latest binding execution outcomes recorded by the controller.",
-          "items": { "$ref": "#/$defs/BindingHistoryEntry" }
+          "items": {
+            "$ref": "#/$defs/BindingHistoryEntry"
+          }
         }
       }
     },
     "BundleCondition": {
       "type": "object",
-      "required": ["type", "status"],
+      "required": [
+        "type",
+        "status"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
@@ -224,7 +260,11 @@
         },
         "status": {
           "type": "string",
-          "enum": ["TRUE", "FALSE", "UNKNOWN"]
+          "enum": [
+            "TRUE",
+            "FALSE",
+            "UNKNOWN"
+          ]
         },
         "reason": {
           "type": "string",
@@ -242,7 +282,12 @@
     },
     "BindingHistoryEntry": {
       "type": "object",
-      "required": ["bindingId", "service", "status", "attempts"],
+      "required": [
+        "bindingId",
+        "service",
+        "status",
+        "attempts"
+      ],
       "additionalProperties": false,
       "properties": {
         "bindingId": {
@@ -255,7 +300,9 @@
         },
         "command": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Command arguments executed for the binding step."
         },
         "status": {
@@ -299,7 +346,13 @@
     },
     "BindingHistoryStatus": {
       "type": "string",
-      "enum": ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT"]
+      "enum": [
+        "PENDING",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "TIMED_OUT"
+      ]
     },
     "BundleWorkloadRef": {
       "type": "object",
@@ -313,6 +366,203 @@
         },
         "uid": {
           "type": "string"
+        }
+      }
+    },
+    "BundleRuntimeSpec": {
+      "type": "object",
+      "description": "Optional overrides that reuse familiar Pod envFrom/volume syntax.",
+      "additionalProperties": false,
+      "properties": {
+        "envFrom": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvFromSource"
+          },
+          "description": "Additional envFrom entries appended to the managed container.",
+          "default": []
+        },
+        "volumes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BundleVolumeSpec"
+          },
+          "description": "ConfigMap or Secret volumes to expose inside the workload.",
+          "default": []
+        },
+        "volumeMounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BundleVolumeMount"
+          },
+          "description": "Mount points for the projected runtime volumes.",
+          "default": []
+        }
+      }
+    },
+    "EnvFromSource": {
+      "type": "object",
+      "description": "EnvFrom source compatible with Kubernetes Container specs.",
+      "additionalProperties": false,
+      "properties": {
+        "configMapRef": {
+          "$ref": "#/$defs/ConfigMapEnvSource"
+        },
+        "secretRef": {
+          "$ref": "#/$defs/SecretEnvSource"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "configMapRef"
+          ]
+        },
+        {
+          "required": [
+            "secretRef"
+          ]
+        }
+      ]
+    },
+    "ConfigMapEnvSource": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "optional": {
+          "type": "boolean"
+        }
+      }
+    },
+    "SecretEnvSource": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "optional": {
+          "type": "boolean"
+        }
+      }
+    },
+    "BundleVolumeMount": {
+      "type": "object",
+      "required": [
+        "name",
+        "mountPath"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "mountPath": {
+          "type": "string"
+        },
+        "readOnly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "BundleVolumeSpec": {
+      "type": "object",
+      "description": "Restricted volume definition supporting ConfigMaps and Secrets.",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "configMap": {
+          "$ref": "#/$defs/ConfigMapVolumeSource"
+        },
+        "secret": {
+          "$ref": "#/$defs/SecretVolumeSource"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "configMap"
+          ]
+        },
+        {
+          "required": [
+            "secret"
+          ]
+        }
+      ]
+    },
+    "ConfigMapVolumeSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "defaultMode": {
+          "type": "integer"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeyToPath"
+          }
+        },
+        "optional": {
+          "type": "boolean"
+        }
+      }
+    },
+    "KeyToPath": {
+      "type": "object",
+      "required": [
+        "key",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "integer"
+        }
+      }
+    },
+    "SecretVolumeSource": {
+      "type": "object",
+      "required": [
+        "secretName"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "secretName": {
+          "type": "string"
+        },
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "optional": {
+          "type": "boolean"
         }
       }
     }

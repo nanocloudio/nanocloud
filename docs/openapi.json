@@ -2428,6 +2428,29 @@
           "DELETING"
         ]
       },
+      "BundleRuntimeSpec": {
+        "type": "object",
+        "properties": {
+          "envFrom": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvFromSource"
+            }
+          },
+          "volumeMounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeMount"
+            }
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeSpec"
+            }
+          }
+        }
+      },
       "BundleSeccompProfile": {
         "type": "object",
         "required": [
@@ -2528,6 +2551,17 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "runtime": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BundleRuntimeSpec",
+                "description": "Optional runtime overrides appended to the generated workload Pod."
+              }
+            ]
           },
           "security": {
             "oneOf": [

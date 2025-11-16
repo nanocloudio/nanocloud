@@ -678,7 +678,7 @@ fn build_router() -> Router {
         )
         .route(
             "/api/v1/namespaces/{namespace}/pods/{name}",
-            get(handlers::pods::get_pod).delete(handlers::pods::delete_pod),
+            get(handlers::pods::get_pod),
         )
         .route(
             "/api/v1/namespaces/{namespace}/pods/{name}/log",

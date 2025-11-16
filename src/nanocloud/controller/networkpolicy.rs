@@ -685,19 +685,25 @@ mod tests {
             .expect("reset policy state");
         reconcile().expect("reconcile policies");
 
-        let log = fs::read_to_string(&log_path).expect("read iptables log");
+        let log = fs::read_to_string(&log_path).expect("read nft log");
         let chain = chain_name("default", "web-0", PolicyDirection::Ingress);
         assert!(
-            log.contains(&format!("-A {chain} -s 10.1.0.20")),
+            log.contains(&format!(
+                "nft add rule inet nanocloud {chain} ip saddr 10.1.0.20"
+            )),
             "expected peer rule in {log}"
         );
-        assert!(log.contains("--dport 80"), "expected port match in {log}");
+        assert!(log.contains("dport 80"), "expected port match in {log}");
         assert!(
-            log.contains(&format!("-A {chain} -j DROP")),
+            log.contains(&format!(
+                "nft add rule inet nanocloud {chain} counter drop"
+            )),
             "expected drop rule in {log}"
         );
         assert!(
-            log.contains(&format!("-A NCLD-NP -d 10.1.0.10 -j {chain}")),
+            log.contains(&format!(
+                "nft add rule inet nanocloud NCLD-NP ip daddr 10.1.0.10 counter jump {chain}"
+            )),
             "expected base jump in {log}"
         );
 
@@ -768,10 +774,12 @@ mod tests {
         let log = wait_for_log_contains(&log_path, "10.1.0.20").await;
         let chain = chain_name("default", "web-0", PolicyDirection::Ingress);
         assert!(
-            log.contains(&format!("-A {chain} -s 10.1.0.20")),
+            log.contains(&format!(
+                "nft add rule inet nanocloud {chain} ip saddr 10.1.0.20"
+            )),
             "expected peer rule in {log}"
         );
-        assert!(log.contains("--dport 80"), "expected port match in {log}");
+        assert!(log.contains("dport 80"), "expected port match in {log}");
 
         let initial_len = log.len();
 
@@ -779,10 +787,10 @@ mod tests {
             .delete("/pods/default/web-0")
             .expect("delete web pod");
 
-        let updated_log = wait_for_log_contains(&log_path, "-X").await;
+        let updated_log = wait_for_log_contains(&log_path, "delete chain inet nanocloud").await;
         let delta = &updated_log[initial_len..];
         assert!(
-            delta.contains("-X"),
+            delta.contains("delete chain"),
             "expected chain deletion in delta log: {delta}"
         );
 

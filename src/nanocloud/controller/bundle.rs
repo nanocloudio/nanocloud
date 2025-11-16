@@ -302,6 +302,7 @@ async fn reconcile_bundle_inner(
         snapshot_path.as_deref(),
         bundle.spec.update,
         bundle.spec.security.clone(),
+        bundle.spec.runtime.clone(),
     )
     .await
     {

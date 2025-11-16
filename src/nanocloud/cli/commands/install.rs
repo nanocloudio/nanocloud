@@ -530,6 +530,7 @@ fn bundle_payload(
         start,
         update,
         security: None,
+        runtime: None,
     };
 
     Bundle {

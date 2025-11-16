@@ -30,6 +30,7 @@ fn bundle_without_defaults() -> Bundle {
             start: true,
             update: false,
             security: None,
+            runtime: None,
         },
         status: None,
     }

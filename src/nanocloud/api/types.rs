@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::nanocloud::k8s::pod::{ListMeta, ObjectMeta};
+use crate::nanocloud::k8s::pod::{EnvFromSource, ListMeta, ObjectMeta, VolumeMount, VolumeSpec};
 use crate::nanocloud::k8s::table::Table as KubeTable;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,6 +197,21 @@ pub struct BundleSpec {
     /// Optional runtime security profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<BundleSecurityProfile>,
+    /// Optional runtime overrides appended to the generated workload Pod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<BundleRuntimeSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRuntimeSpec {
+    #[serde(rename = "envFrom", default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<EnvFromSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeSpec>,
+    #[serde(rename = "volumeMounts", default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<VolumeMount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

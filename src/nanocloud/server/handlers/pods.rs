@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use super::jobs::{StatusBody, StatusDetails};
 use super::selectors::{ensure_named_resource, matches_pod_filter, parse_object_selector};
 use super::watch::{
     ensure_resource_version_match, parse_resource_version, resource_version_is_newer,
@@ -22,8 +21,7 @@ use super::watch::{
 };
 use crate::nanocloud::k8s::pod::{ContainerStatus, ListMeta, Pod, PodStatus};
 use crate::nanocloud::k8s::store::{
-    decode_continue_token, encode_continue_token, load_pod_manifest, normalize_namespace,
-    paginate_entries, PaginationError,
+    decode_continue_token, encode_continue_token, paginate_entries, PaginationError,
 };
 use crate::nanocloud::k8s::table::{Table, TableColumnDefinition, TableRow};
 use crate::nanocloud::kubelet::Kubelet;
@@ -35,7 +33,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,16 +60,6 @@ pub struct WatchParams {
     resource_version_match: Option<ResourceVersionMatchPolicy>,
     #[serde(default)]
     format: Option<String>,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct DeleteOptionsPayload {
-    #[serde(rename = "gracePeriodSeconds", default)]
-    pub grace_period_seconds: Option<i64>,
-    #[serde(rename = "propagationPolicy", default)]
-    pub propagation_policy: Option<String>,
 }
 
 #[cfg(test)]
@@ -403,85 +391,6 @@ pub async fn get_pod(
 ) -> Result<Response, ApiError> {
     let kubelet = Kubelet::shared();
     get_pod_impl(Some(namespace.as_str()), &name, params, kubelet).await
-}
-
-#[cfg_attr(feature = "openapi", utoipa::path(
-    delete,
-    path = "/api/v1/namespaces/{namespace}/pods/{name}",
-    params(
-        ("namespace" = String, Path, description = "Namespace of the Pod"),
-        ("name" = String, Path, description = "Pod name")
-    ),
-    request_body = DeleteOptionsPayload,
-    responses(
-        (status = 200, description = "Pod deletion accepted", body = StatusBody),
-        (status = 404, description = "Pod not found", body = crate::nanocloud::api::types::ErrorBody),
-        (status = 500, description = "Internal error", body = crate::nanocloud::api::types::ErrorBody)
-    ),
-    security(
-        ("NanocloudCertificate" = []),
-        ("NanocloudBearer" = ["workloads.write"])
-    ),
-    tag = "kubernetes"
-))]
-pub async fn delete_pod(
-    Path((namespace, name)): Path<(String, String)>,
-    options: Option<Json<DeleteOptionsPayload>>,
-) -> Result<Json<StatusBody>, ApiError> {
-    let kubelet = Kubelet::shared();
-    let namespace_ref = namespace.as_str();
-    let name_ref = name.as_str();
-
-    let exists = kubelet
-        .get_pod(Some(namespace_ref), name_ref)
-        .await
-        .map_err(ApiError::internal_error)?;
-
-    if exists.is_none() {
-        let manifest =
-            load_pod_manifest(Some(namespace_ref), name_ref).map_err(ApiError::internal_error)?;
-        if manifest.is_none() {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("Pod '{name}' not found"),
-            ));
-        }
-    }
-
-    kubelet
-        .delete_pod(Some(namespace_ref), name_ref)
-        .await
-        .map_err(ApiError::internal_error)?;
-
-    let normalized = normalize_namespace(Some(namespace_ref));
-    let deletion_message = options.as_ref().and_then(|payload| {
-        let mut segments = Vec::new();
-        if let Some(grace) = payload.grace_period_seconds {
-            segments.push(format!("gracePeriodSeconds={grace}"));
-        }
-        if let Some(policy) = payload.propagation_policy.as_deref() {
-            if !policy.is_empty() {
-                segments.push(format!("propagationPolicy={policy}"));
-            }
-        }
-        if segments.is_empty() {
-            None
-        } else {
-            Some(format!("Deletion requested with {}", segments.join(", ")))
-        }
-    });
-    let status = StatusBody {
-        api_version: "v1".to_string(),
-        kind: "Status".to_string(),
-        status: "Success".to_string(),
-        message: deletion_message,
-        details: Some(StatusDetails {
-            name,
-            namespace: normalized,
-        }),
-    };
-
-    Ok(Json(status))
 }
 
 async fn list_pods_impl(

@@ -34,6 +34,7 @@ fn sample_bundle(namespace: &str, service: &str) -> Bundle {
             start: true,
             update: false,
             security: None,
+            runtime: None,
         },
         status: None,
     }

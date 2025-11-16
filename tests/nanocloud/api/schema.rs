@@ -26,6 +26,7 @@ fn sample_bundle() -> Bundle {
             start: true,
             update: false,
             security: None,
+            runtime: None,
         },
         status: None,
     }

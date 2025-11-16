@@ -14,7 +14,7 @@ with prose that explains how operators consume the API and CLI surfaces.
 
 | Version | API version | Status  | SHA256                                   | Description                                           |
 | ------- | ----------- | ------- | ---------------------------------------- | ----------------------------------------------------- |
-| v1alpha1 | nanocloud.io/v1 | current | `b5d9aacb0ee44c2e5952990ec2cfd61a5ba831b85615f158da118308ecef91bf` | Initial schema covering metadata, spec, snapshot, and status blocks. |
+| v1alpha1 | nanocloud.io/v1 | current | `a68ca208d0c70c5c3d2b5a961ef6ad69a8181cc7a880e1149f599b37de7e0734` | Initial schema covering metadata, spec, snapshot, and status blocks. |
 
 The checksum above is the value shipped in `manifest.json` and can be verified
 with `sha256sum docs/schema/bundle/v1alpha1.json`. Future versions will append
@@ -36,6 +36,21 @@ The admission controller applies deterministic defaults after schema validation.
 
 These defaults mirror the serde annotations in `src/nanocloud/api/types.rs` and
 are persisted so read/modify/write flows do not churn `resourceVersion`.
+
+### Runtime Projections
+
+Bundles can opt-in to Kubernetes-style projections without abandoning the image
+options contract. The optional `spec.runtime` block accepts:
+
+- `envFrom`: array of `configMapRef`/`secretRef` sources that are appended to the
+  managed container's `envFrom` field before secrets are materialised.
+- `volumes`: ConfigMap or Secret volume definitions mirroring Pod syntax.
+- `volumeMounts`: mount targets for the runtime volumes (matched by name).
+
+The controller merges these fragments into the generated PodSpec, preventing
+duplicate volume or mount names and leaving image-defined PVCs untouched. This
+lets operators project config files or decrypted secrets with familiar YAML
+snippets.
 
 ### CLI Usage
 
@@ -221,6 +236,29 @@ Refer to `docs/guides/bindings.md` for authoring guidance and detailed examples.
   HTTP/2 requests (status `426 Upgrade Required`).
 - Authorization mirrors Kubernetes semantics: TLS client certs (Nanocloud/device),
   bootstrap tokens, or bearer tokens must present at least the `pods.exec` scope.
+
+## Pod API Surface
+
+- `/api/v1/pods` and `/api/v1/namespaces/{namespace}/pods` expose the kubelet's
+  local view of workloads. Only `GET`/`LIST`/`WATCH` verbs are served; the API
+  is intentionally read-only so kubectl tooling can inspect status without
+  allowing deletion or mutation.
+- `/api/v1/.../pods/{name}/log` reuses the streaming log handler used by the CLI
+  and follows the same query parameters (`follow`, `tailLines`, etc.).
+- All pod data is local-only: the kubelet reports the workloads running on the
+  node hosting Nanocloud, not a cluster-wide aggregation. Clients should
+  treat resource versions as single-node cursors.
+
+## NetworkPolicy-lite
+
+- The controller watches `NetworkPolicy` resources but only honours CIDR-based
+  ingress/egress rules (`spec.ingress[].from[].ipBlock` / `spec.egress[].to[].ipBlock`).
+  Pod and namespace selectors are ignored.
+- For each Pod, Nanocloud installs nftables chains (`table inet nanocloud`) with
+  per-direction allowlists and an implicit `counter drop`. Lack of rules implies
+  an allow-all policy.
+- Policies are namespaced: the controller programs jump rules keyed by pod IP.
+  Debug output is available via `nanocloud policy debug` plus `/readyz` health.
 
 ## Device Management API
 
