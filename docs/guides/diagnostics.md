@@ -37,6 +37,10 @@ inspected later:
 }
 ```
 
+Additionally, the probe appends a single-line summary to
+`$NANOCLOUD_DIAGNOSTICS_LOG_DIR` (defaults to `/var/log/nanocloud/diagnostics`),
+making it easy to correlate CLI output with historical diagnostics runs.
+
 ## Customizing the probe
 
 Flags:

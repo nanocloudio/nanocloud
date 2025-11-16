@@ -554,12 +554,19 @@ async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error
             .find(|condition| condition.status != BundleConditionStatus::True)
             .cloned()
     });
-    let failure_reason = failure_condition
+    let mut failure_reason = failure_condition
         .as_ref()
         .and_then(|condition| condition.reason.clone());
-    let failure_detail = failure_condition
+    let mut failure_detail = failure_condition
         .as_ref()
         .and_then(|condition| condition.message.clone());
+
+    if let Some(detail) = failure_detail.as_mut() {
+        if let Some((reason, normalized)) = normalize_security_error(detail) {
+            failure_reason = Some(reason.to_string());
+            *detail = with_security_hint(&normalized);
+        }
+    }
     let mut explicit_error = error.map(|value| value.to_string());
     let is_failure = explicit_error.is_some() || matches!(phase, Some(BundlePhase::Failed));
 
@@ -574,7 +581,7 @@ async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error
     if let Some(err_text) = explicit_error.as_mut() {
         if let Some((reason, detail)) = normalize_security_error(err_text) {
             reason_text = reason.to_string();
-            *err_text = detail;
+            *err_text = with_security_hint(&detail);
         }
     }
 
@@ -708,6 +715,13 @@ async fn apply_status(
     );
 
     Ok(())
+}
+
+const SECURITY_EVENT_HINT: &str =
+    "Defaults drop all caps; set spec.security.allowPrivileged/extraCapabilities to opt in.";
+
+fn with_security_hint(detail: &str) -> String {
+    format!("{} Hint: {}", detail, SECURITY_EVENT_HINT)
 }
 
 fn normalize_security_error(message: &str) -> Option<(&'static str, String)> {

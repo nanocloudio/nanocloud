@@ -127,7 +127,7 @@ struct ReplicaPlanWork {
 }
 
 #[derive(Clone, Debug)]
-struct RestartBackoff {
+pub struct RestartBackoff {
     attempt: u32,
     next_attempt: Instant,
     last_error: Option<String>,
@@ -156,17 +156,17 @@ struct DesiredStateRecord {
 }
 
 impl RestartBackoff {
-    fn should_retry(&self, now: Instant) -> bool {
+    pub fn should_retry(&self, now: Instant) -> bool {
         now >= self.next_attempt
     }
 
-    fn on_success(&mut self, now: Instant) {
+    pub fn on_success(&mut self, now: Instant) {
         self.attempt = 0;
         self.next_attempt = now;
         self.last_error = None;
     }
 
-    fn on_failure(&mut self, now: Instant, message: String) {
+    pub fn on_failure(&mut self, now: Instant, message: String) {
         self.attempt = self.attempt.saturating_add(1);
         let exponent = self.attempt.saturating_sub(1).min(5);
         let delay = Duration::from_secs(1u64 << exponent);

@@ -19,4 +19,9 @@ pub mod runtime;
 mod service;
 
 pub use crate::nanocloud::controller::runtime::WatchEvent;
-pub use service::Kubelet;
+pub use service::{Kubelet, RestartBackoff};
+
+#[doc(hidden)]
+pub trait __RestartBackoffLink {}
+
+impl __RestartBackoffLink for RestartBackoff {}

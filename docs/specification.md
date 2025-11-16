@@ -273,7 +273,7 @@ During container creation Nanocloud reads the `PodSpec.security` block (persiste
    - `SecurityPolicyViolation` – unknown/unsupported capabilities or missing `allowPrivileged=true`.
    - `PrivilegeEscalationDenied` – the host refused to apply the requested capability set (e.g., insufficient privileges or kernel policy).
 
-These events include actionable hints (e.g., “Capability 'CAP_SYS_ADMIN' is not allowed” or “Failed to configure effective capabilities...”) so operators do not have to inspect controller logs to understand why a bundle failed.
+These events include actionable hints (e.g., “Capability 'CAP_SYS_ADMIN' is not allowed”, “Failed to configure effective capabilities...”, or “Defaults drop all caps; set spec.security.allowPrivileged/extraCapabilities to opt-in”) so operators do not have to inspect controller logs to understand why a bundle failed.
 
 The event payload mirrors the bundle namespace/name and surfaces under `nanocloud bundle events --reason SecurityPolicyViolation`, allowing automation to alert on misconfigured workloads.
 
@@ -359,9 +359,11 @@ to craft their own workloads.
      sentinel file to confirm read/write access.
   3. Runs DNS lookups against control-plane endpoints plus the `!dns` macro to
      ensure template expansion behaves as expected.
-  4. Emits a structured JSON payload
+ 4. Emits a structured JSON payload
      (`LoopbackProbeResult { dns_ok, volumes_ok, logs, duration_ms }`) that the
-     CLI converts into human-readable output with remediation hints.
+     CLI converts into human-readable output with remediation hints and persists
+     a terse log line under `$NANOCLOUD_DIAGNOSTICS_LOG_DIR`
+     (default `/var/log/nanocloud/diagnostics`).
 
 ### Exit codes
 

@@ -35,8 +35,8 @@ in CI before accepting runtime changes.
 | ---- | ----- | ----------------- |
 | `image_pull_cache` | Pull the fake Dockyard image twice with caching enabled. | First pull downloads all layers and increments `image_pulls_total`; second pull hits the cache, reports zero downloads, and bumps `image_cache_hits_total`. |
 | `entrypoint_macros` | Launch container with `command: ["print-env"]` and inject options that trigger `!dns`, `!rand`, `!tls`, and `!if`. | Expanded environment variables include resolved DNS/IP, deterministic random token (seeded), TLS cert fingerprint, and branch from the conditional macro. |
-| `signals_restart_policy` | Run a container whose entrypoint exits with non-zero status repeatedly while restart policy is `OnFailure` with `maxRestarts=2`. | Runtime sends SIGTERM, escalates to SIGKILL on timeout, enforces the restart limit, and emits controller events reflecting each restart + final failure. |
-| `log_and_exec_flows` | Start long-running container writing to stdout/stderr and expose an exec endpoint. | Harness can tail logs via the existing streaming API and invoke `exec` to run `/bin/true` inside the container; both operations must succeed without interfering with the workload. |
+| `signals_restart_policy` | Spawn a dummy workload (`sleep`) and terminate it via the runtime helper while exercising `RestartBackoff`. | `terminate_with_timeout` delivers SIGTERM → SIGKILL when needed and the restart backoff enforces the expected 1s/2s delays before allowing another attempt. |
+| `log_and_exec_flows` | Stream synthetic stdout/stderr through `write_docker_json_logs` and, when running as root, invoke `Runtime::with_namespace` inside a lightweight fixture. | Docker-style logs record both streams without reordering, and the exec helper can write a marker file inside the container namespace (skipping the exec phase automatically when root privileges are unavailable). |
 
 Each case records artifacts (logs, event stream transcript) under
 `target/oci-conformance/<case>/` so CI can upload them on failure.

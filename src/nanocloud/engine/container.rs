@@ -1108,7 +1108,13 @@ async fn install_impl(
 }
 
 fn apply_security_context(pod_spec: &mut PodSpec, profile: Option<&BundleSecurityProfile>) {
-    let mut context = PodSecurityContext::default();
+    let mut context = PodSecurityContext {
+        seccomp_profile: Some(PodSeccompProfile {
+            profile_type: "Baseline".to_string(),
+            localhost_profile: None,
+        }),
+        ..PodSecurityContext::default()
+    };
     if let Some(profile) = profile {
         context.allow_privileged = profile.allow_privileged;
         if !profile.extra_capabilities.is_empty() {
@@ -2229,7 +2235,13 @@ mod tests {
         apply_security_context(&mut pod_spec, None);
         assert!(!pod_spec.security.allow_privileged);
         assert!(pod_spec.security.extra_capabilities.is_empty());
-        assert!(pod_spec.security.seccomp_profile.is_none());
+        let seccomp = pod_spec
+            .security
+            .seccomp_profile
+            .as_ref()
+            .expect("baseline seccomp should be set");
+        assert_eq!(seccomp.profile_type, "Baseline");
+        assert!(seccomp.localhost_profile.is_none());
     }
 
     #[test]
