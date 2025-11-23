@@ -19,10 +19,12 @@ use crate::nanocloud::k8s::pod::Pod;
 use crate::nanocloud::k8s::store::normalize_namespace;
 use serde::{Deserialize, Serialize};
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -40,13 +42,14 @@ pub struct WatchEvent<T> {
 /// Controller manager runtime that offers informers, a work queue, and shared dependencies.
 pub struct ControllerRuntime {
     dependencies: DependencyRegistry,
-    work_queue: WorkQueue<ControllerWorkItem>,
+    work_queue: KeyedWorkQueue<ControllerWorkItem>,
     pods: PodInformer,
+    handlers: Arc<StdRwLock<Vec<ExecutorHandler>>>,
+    dispatcher: OnceLock<Arc<JoinHandle<()>>>,
 }
 
 impl ControllerRuntime {
     pub fn shared() -> Arc<Self> {
-        use std::sync::OnceLock;
         static INSTANCE: OnceLock<Arc<ControllerRuntime>> = OnceLock::new();
         INSTANCE.get_or_init(ControllerRuntime::new).clone()
     }
@@ -59,8 +62,10 @@ impl ControllerRuntime {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             dependencies: DependencyRegistry::new(),
-            work_queue: WorkQueue::new(capacity),
+            work_queue: KeyedWorkQueue::new(capacity),
             pods: PodInformer::new(),
+            handlers: Arc::new(StdRwLock::new(Vec::new())),
+            dispatcher: OnceLock::new(),
         }
     }
 
@@ -86,7 +91,7 @@ impl ControllerRuntime {
         ReconcileContext::new(self)
     }
 
-    pub fn work_queue(&self) -> WorkQueue<ControllerWorkItem> {
+    pub fn work_queue(&self) -> KeyedWorkQueue<ControllerWorkItem> {
         self.work_queue.clone()
     }
 
@@ -95,20 +100,51 @@ impl ControllerRuntime {
         H: Fn(ControllerWorkItem) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let queue = self.work_queue.clone();
-        let handler = Arc::new(handler);
-        tokio::spawn(async move {
-            while let Some(item) = queue.next().await {
-                let fut = (handler.as_ref())(item);
-                fut.await;
-            }
-        })
+        {
+            let mut guard = self.handlers.write().expect("handler registry poisoned");
+            guard.push(Arc::new(move |item| Box::pin(handler(item))));
+        }
+        self.ensure_dispatcher();
+        // The dispatcher runs in the background; this handle is a no-op placeholder
+        // to keep the signature stable for callers that previously awaited it.
+        tokio::spawn(async {})
+    }
+
+    fn ensure_dispatcher(&self) {
+        self.dispatcher.get_or_init(|| {
+            let queue = self.work_queue.clone();
+            let handlers = Arc::clone(&self.handlers);
+            Arc::new(tokio::spawn(async move {
+                run_dispatch_loop(queue, handlers).await;
+            }))
+        });
     }
 }
 
 #[derive(Default)]
 struct DependencyRegistry {
     values: StdRwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+}
+
+type ExecutorHandler = Arc<
+    dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn run_dispatch_loop(
+    queue: KeyedWorkQueue<ControllerWorkItem>,
+    handlers: Arc<StdRwLock<Vec<ExecutorHandler>>>,
+) {
+    while let Some(item) = queue.next().await {
+        let listeners = {
+            let guard = handlers.read().expect("handler registry poisoned");
+            guard.clone()
+        };
+        for handler in listeners {
+            handler(item.clone()).await;
+        }
+    }
 }
 
 impl DependencyRegistry {
@@ -175,6 +211,54 @@ where
     }
 }
 
+/// Work queue that de-duplicates items by key to avoid flooding reconciliations.
+#[derive(Clone)]
+pub struct KeyedWorkQueue<T>
+where
+    T: Clone + Eq + Hash + Send + 'static,
+{
+    inner: Arc<KeyedWorkQueueInner<T>>,
+}
+
+struct KeyedWorkQueueInner<T>
+where
+    T: Clone + Eq + Hash + Send + 'static,
+{
+    queue: WorkQueue<T>,
+    in_flight: Mutex<HashSet<T>>,
+}
+
+impl<T> KeyedWorkQueue<T>
+where
+    T: Clone + Eq + Hash + Send + 'static,
+{
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(KeyedWorkQueueInner {
+                queue: WorkQueue::new(capacity),
+                in_flight: Mutex::new(HashSet::new()),
+            }),
+        }
+    }
+
+    /// Enqueues the item if it is not already pending; returns true when the item
+    /// was enqueued and false when it was coalesced with an existing entry.
+    pub async fn enqueue(&self, item: T) -> Result<bool, mpsc::error::SendError<T>> {
+        let mut guard = self.inner.in_flight.lock().await;
+        if !guard.insert(item.clone()) {
+            return Ok(false);
+        }
+        self.inner.queue.enqueue(item).await.map(|_| true)
+    }
+
+    pub async fn next(&self) -> Option<T> {
+        let item = self.inner.queue.next().await?;
+        let mut guard = self.inner.in_flight.lock().await;
+        guard.remove(&item);
+        Some(item)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ControllerTarget {
     ReplicaSet {
@@ -193,6 +277,18 @@ pub enum ControllerTarget {
         namespace: Option<String>,
         name: String,
     },
+    Bundle {
+        namespace: Option<String>,
+        name: String,
+    },
+    VolumeSnapshot {
+        namespace: Option<String>,
+        name: String,
+    },
+    NetworkPolicy {
+        namespace: Option<String>,
+        name: String,
+    },
 }
 
 impl ControllerTarget {
@@ -202,7 +298,10 @@ impl ControllerTarget {
             ControllerTarget::ReplicaSet { namespace, .. }
             | ControllerTarget::StatefulSet { namespace, .. }
             | ControllerTarget::Deployment { namespace, .. }
-            | ControllerTarget::DaemonSet { namespace, .. } => namespace.as_deref(),
+            | ControllerTarget::DaemonSet { namespace, .. }
+            | ControllerTarget::Bundle { namespace, .. }
+            | ControllerTarget::VolumeSnapshot { namespace, .. }
+            | ControllerTarget::NetworkPolicy { namespace, .. } => namespace.as_deref(),
         }
     }
 
@@ -212,7 +311,10 @@ impl ControllerTarget {
             ControllerTarget::ReplicaSet { name, .. }
             | ControllerTarget::StatefulSet { name, .. }
             | ControllerTarget::Deployment { name, .. }
-            | ControllerTarget::DaemonSet { name, .. } => name,
+            | ControllerTarget::DaemonSet { name, .. }
+            | ControllerTarget::Bundle { name, .. }
+            | ControllerTarget::VolumeSnapshot { name, .. }
+            | ControllerTarget::NetworkPolicy { name, .. } => name,
         }
     }
 }
@@ -248,6 +350,30 @@ impl fmt::Display for ControllerTarget {
                 write!(
                     f,
                     "DaemonSet/{}/{}",
+                    normalize_namespace(namespace.as_deref()),
+                    name
+                )
+            }
+            ControllerTarget::Bundle { namespace, name } => {
+                write!(
+                    f,
+                    "Bundle/{}/{}",
+                    normalize_namespace(namespace.as_deref()),
+                    name
+                )
+            }
+            ControllerTarget::VolumeSnapshot { namespace, name } => {
+                write!(
+                    f,
+                    "VolumeSnapshot/{}/{}",
+                    normalize_namespace(namespace.as_deref()),
+                    name
+                )
+            }
+            ControllerTarget::NetworkPolicy { namespace, name } => {
+                write!(
+                    f,
+                    "NetworkPolicy/{}/{}",
                     normalize_namespace(namespace.as_deref()),
                     name
                 )
@@ -295,6 +421,33 @@ impl ControllerWorkItem {
     pub fn daemonset(namespace: Option<&str>, name: &str) -> Self {
         Self {
             target: ControllerTarget::DaemonSet {
+                namespace: namespace.map(|ns| ns.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    pub fn bundle(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            target: ControllerTarget::Bundle {
+                namespace: namespace.map(|ns| ns.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    pub fn volume_snapshot(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            target: ControllerTarget::VolumeSnapshot {
+                namespace: namespace.map(|ns| ns.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    pub fn network_policy(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            target: ControllerTarget::NetworkPolicy {
                 namespace: namespace.map(|ns| ns.to_string()),
                 name: name.to_string(),
             },
@@ -510,6 +663,23 @@ mod tests {
         assert_eq!(queue.next().await, Some(1));
         assert_eq!(queue.next().await, Some(2));
         assert_eq!(queue.next().await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn keyed_queue_coalesces_duplicates() {
+        let queue: KeyedWorkQueue<&'static str> = KeyedWorkQueue::new(4);
+        let first = queue.enqueue("a").await.expect("enqueue a");
+        let second = queue.enqueue("a").await.expect("enqueue duplicate");
+        assert!(first, "first enqueue should insert");
+        assert!(
+            !second,
+            "duplicate enqueue should be coalesced and return false"
+        );
+
+        assert_eq!(queue.next().await, Some("a"));
+        // Once drained, the same key can be enqueued again.
+        let third = queue.enqueue("a").await.expect("enqueue after drain");
+        assert!(third, "key should be accepted after drain");
     }
 
     #[tokio::test]

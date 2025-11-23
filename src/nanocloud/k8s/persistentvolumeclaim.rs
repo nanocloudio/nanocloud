@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use super::pod::ObjectMeta;
+use super::pod::{ListMeta, ObjectMeta};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,4 +64,38 @@ pub struct PersistentVolumeClaim {
     pub kind: Option<String>,
     pub metadata: ObjectMeta,
     pub spec: PersistentVolumeClaimSpec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<PersistentVolumeClaimStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PersistentVolumeClaimStatus {
+    #[serde(rename = "accessModes", default, skip_serializing_if = "Vec::is_empty")]
+    pub access_modes: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub capacity: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PersistentVolumeClaimList {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: ListMeta,
+    pub items: Vec<PersistentVolumeClaim>,
+}
+
+impl Default for PersistentVolumeClaimList {
+    fn default() -> Self {
+        PersistentVolumeClaimList {
+            api_version: "v1".to_string(),
+            kind: "PersistentVolumeClaimList".to_string(),
+            metadata: ListMeta::default(),
+            items: Vec::new(),
+        }
+    }
 }

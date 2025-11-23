@@ -335,6 +335,7 @@ fn replicaset_watch_event_from_controller(
                 labels: Default::default(),
                 annotations: Default::default(),
                 resource_version: Some(event.resource_version.to_string()),
+                ..Default::default()
             },
             spec: ReplicaSetSpec {
                 replicas: 0,

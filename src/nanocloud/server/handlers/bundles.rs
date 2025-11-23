@@ -63,9 +63,10 @@ pub struct ApplyParams {
 
 fn map_error(err: BundleError) -> ApiError {
     match err {
-        BundleError::AlreadyExists(msg) | BundleError::Conflict(msg) => {
-            ApiError::new(StatusCode::CONFLICT, msg)
+        BundleError::AlreadyExists(msg) => {
+            ApiError::with_reason(StatusCode::CONFLICT, "AlreadyExists", msg)
         }
+        BundleError::Conflict(msg) => ApiError::with_reason(StatusCode::CONFLICT, "Conflict", msg),
         BundleError::Invalid(msg) => ApiError::bad_request(msg),
         BundleError::NotFound(msg) => ApiError::new(StatusCode::NOT_FOUND, msg),
         BundleError::Persistence(err) => ApiError::internal_error(err),
@@ -190,16 +191,7 @@ pub async fn delete(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<Bundle>), ApiError> {
     let registry = BundleRegistry::shared();
-    let bundle = match registry.get(&namespace, &name).await {
-        Some(bundle) => bundle,
-        None => {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("Bundle '{name}' not found"),
-            ))
-        }
-    };
-    registry
+    let bundle = registry
         .delete(&namespace, &name)
         .await
         .map_err(map_error)?;

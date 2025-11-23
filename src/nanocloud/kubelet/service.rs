@@ -22,6 +22,7 @@ use crate::nanocloud::controller::runtime::{ControllerRuntime, ControllerTarget,
 use crate::nanocloud::controller::scheduling::{
     KubeletExecutor, KubeletSchedulingBridge, ReplicaSetScheduler,
 };
+use crate::nanocloud::k8s::identity::new_uid;
 use crate::nanocloud::k8s::pod::{
     ContainerStatus as PodContainerStatus, Pod, PodCondition, PodStatus,
 };
@@ -60,6 +61,8 @@ struct PodRegistration {
     restart_count: AtomicU32,
     backoff: Mutex<RestartBackoff>,
     desired_running: AtomicBool,
+    uid: String,
+    creation_timestamp: String,
     monitor: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -73,6 +76,7 @@ impl PodRegistration {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum WorkloadManifest {
     StatefulSet(StatefulSet),
     Pod(Pod),
@@ -372,6 +376,8 @@ impl Kubelet {
                     restart_count: AtomicU32::new(0),
                     backoff: Mutex::new(RestartBackoff::default()),
                     desired_running: AtomicBool::new(true),
+                    uid: new_uid(),
+                    creation_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                     monitor: Mutex::new(None),
                 });
                 pods_guard.insert(key, reg.clone());
@@ -1045,15 +1051,34 @@ impl Kubelet {
         let namespace = normalize_namespace(registration.namespace.as_deref());
         pod.metadata.namespace = Some(namespace.clone());
         pod.metadata.name = Some(registration.name.clone());
+        pod.metadata
+            .uid
+            .get_or_insert_with(|| registration.uid.clone());
+        pod.metadata
+            .creation_timestamp
+            .get_or_insert_with(|| registration.creation_timestamp.clone());
+        pod.metadata
+            .ensure_common_fields(Some(&namespace), Some(&registration.name));
+
+        let failure_message = {
+            let guard = registration.backoff.lock().await;
+            guard.last_error.clone()
+        };
 
         let mut status = PodStatus::default();
-        status.phase = Some(match state.status {
-            RuntimeStatus::Running => "Running".to_string(),
-            RuntimeStatus::Created | RuntimeStatus::Creating => "Pending".to_string(),
-            RuntimeStatus::Paused => "Running".to_string(),
-            RuntimeStatus::Stopped => "Failed".to_string(),
-            RuntimeStatus::Unknown => "Unknown".to_string(),
-        });
+        let phase = match state.status {
+            RuntimeStatus::Running | RuntimeStatus::Paused => "Running",
+            RuntimeStatus::Created | RuntimeStatus::Creating => "Pending",
+            RuntimeStatus::Stopped => {
+                if failure_message.is_some() {
+                    "Failed"
+                } else {
+                    "Succeeded"
+                }
+            }
+            RuntimeStatus::Unknown => "Unknown",
+        };
+        status.phase = Some(phase.to_string());
         status.pod_ip = state
             .network
             .ip_addresses
@@ -1067,9 +1092,10 @@ impl Kubelet {
             _ => "False",
         };
         let container_ready = readiness_status == "True";
-        let failure_message = {
-            let guard = registration.backoff.lock().await;
-            guard.last_error.clone()
+        let initialized_status = match state.status {
+            RuntimeStatus::Creating => "False",
+            RuntimeStatus::Unknown => "Unknown",
+            _ => "True",
         };
 
         let mut previous_conditions = HashMap::new();
@@ -1089,11 +1115,23 @@ impl Kubelet {
             previous_conditions.get("PodScheduled"),
             &now,
         ));
+        conditions.push(build_condition(
+            "Initialized",
+            initialized_status,
+            if initialized_status == "False" {
+                Some("ContainersNotInitialized")
+            } else {
+                None
+            },
+            failure_message.as_deref(),
+            previous_conditions.get("Initialized"),
+            &now,
+        ));
 
         let (ready_reason_key, ready_message_owned): (Option<&'static str>, Option<String>) =
-            match (readiness_status, failure_message) {
+            match (readiness_status, failure_message.as_deref()) {
                 ("True", _) => (None, None),
-                (_, Some(message)) => (Some("ContainerStartFailure"), Some(message)),
+                (_, Some(message)) => (Some("ContainerStartFailure"), Some(message.to_string())),
                 ("Unknown", None) => (
                     Some("Unknown"),
                     Some("Container readiness is unknown".to_string()),

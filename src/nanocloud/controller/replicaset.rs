@@ -77,7 +77,7 @@ impl ReplicaSetPodIdentity {
             namespace: self.namespace,
             labels: self.labels,
             annotations: self.annotations,
-            resource_version: None,
+            ..Default::default()
         }
     }
 }
@@ -723,6 +723,7 @@ mod tests {
         let ctx = TestContext::new();
         let controller =
             ReplicaSetController::new("worker", Some("default".into()), base_metadata());
+        let _ = ReplicaSetController::clear_state(Some("default"), "worker");
         (controller, ctx, guard)
     }
 

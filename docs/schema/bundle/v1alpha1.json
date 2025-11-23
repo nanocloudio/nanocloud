@@ -58,17 +58,24 @@
             "maxLength": 63
           }
         },
-        "annotations": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string",
-            "maxLength": 256
-          }
-        },
-        "resourceVersion": {
-          "type": "string",
-          "pattern": "^[0-9]+$",
-          "description": "Opaque resource version used for optimistic concurrency."
+    "annotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "finalizers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "resourceVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Opaque resource version used for optimistic concurrency."
         },
         "uid": {
           "type": "string"
@@ -215,13 +222,11 @@
         "phase": {
           "type": "string",
           "enum": [
-            "PENDING",
-            "VALIDATING",
-            "RENDERING",
-            "APPLYING",
-            "READY",
+            "INSTALLING",
+            "RUNNING",
+            "UPDATING",
             "FAILED",
-            "DELETING"
+            "UNINSTALLING"
           ]
         },
         "conditions": {

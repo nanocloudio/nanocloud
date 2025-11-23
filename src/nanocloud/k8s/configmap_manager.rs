@@ -92,6 +92,10 @@ fn ensure_namespace(namespace: &str, config_map: &mut ConfigMap) -> String {
         .filter(|ns| !ns.is_empty())
         .unwrap_or_else(|| namespace.to_string());
     config_map.metadata.namespace = Some(ns.clone());
+    let name_hint = config_map.metadata.name.clone();
+    config_map
+        .metadata
+        .ensure_common_fields(Some(&ns), name_hint.as_deref());
     ns
 }
 
@@ -119,6 +123,9 @@ fn normalize_key(
 ) -> Result<String, ConfigMapError> {
     let ns = ensure_namespace(namespace, metadata);
     let name = ensure_name(name, metadata)?;
+    metadata
+        .metadata
+        .ensure_common_fields(Some(&ns), Some(&name));
     Ok(configmap_key(&ns, &name))
 }
 
@@ -130,6 +137,9 @@ fn normalize_key_new(namespace: &str, metadata: &mut ConfigMap) -> Result<String
         .clone()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ConfigMapError::Invalid("metadata.name is required".to_string()))?;
+    metadata
+        .metadata
+        .ensure_common_fields(Some(&ns), Some(&name));
     Ok(configmap_key(&ns, &name))
 }
 
@@ -434,6 +444,9 @@ fn load_initial_configmaps() -> (HashMap<String, ConfigMap>, u64) {
                     .clone()
                     .filter(|ns| !ns.is_empty())
                     .unwrap_or_else(|| "default".to_string());
+                config_map
+                    .metadata
+                    .ensure_common_fields(Some(namespace.as_str()), Some(name.as_str()));
 
                 let key = configmap_key(&namespace, &name);
 

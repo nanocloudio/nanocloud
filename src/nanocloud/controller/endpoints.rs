@@ -1,12 +1,166 @@
-use crate::nanocloud::k8s::endpoints::{EndpointAddress, EndpointPort, EndpointSubset, Endpoints};
+use crate::nanocloud::controller::watch::{ControllerWatchEvent, ControllerWatchManager};
+use crate::nanocloud::k8s::endpoints::{
+    EndpointAddress, EndpointPort, EndpointSubset, Endpoints, EndpointsRegistry,
+};
 use crate::nanocloud::k8s::pod::ObjectMeta;
 use crate::nanocloud::k8s::service::{Service, ServicePort};
+use crate::nanocloud::k8s::service_registry::ServiceRegistry;
 use crate::nanocloud::k8s::store;
+use crate::nanocloud::logger::{log_debug, log_warn};
 use crate::nanocloud::network::proxy;
 use crate::nanocloud::util::error::{new_error, with_context};
+use crate::nanocloud::util::KeyspaceEventType;
+use serde_json;
 
 use std::collections::HashMap;
 use std::error::Error;
+use tokio::task::JoinHandle;
+
+const COMPONENT: &str = "endpoints-controller";
+const POD_PREFIX: &str = "/pods";
+const SERVICE_PREFIX: &str = "/services";
+
+pub fn spawn() -> JoinHandle<()> {
+    tokio::spawn(async move {
+        bootstrap_services().await;
+        let manager = ControllerWatchManager::shared();
+        let mut pod_watch = manager.subscribe(POD_PREFIX, None);
+        let mut service_watch = manager.subscribe(SERVICE_PREFIX, None);
+
+        loop {
+            tokio::select! {
+                event = pod_watch.recv() => {
+                    match event {
+                        Some(evt) => handle_pod_event(evt).await,
+                        None => break,
+                    }
+                }
+                event = service_watch.recv() => {
+                    match event {
+                        Some(evt) => handle_service_event(evt).await,
+                        None => break,
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn bootstrap_services() {
+    let registry = ServiceRegistry::shared();
+    let services = registry.list(None);
+    for service in services {
+        if let Err(err) = reconcile_service(&service) {
+            log_warn(
+                COMPONENT,
+                "Failed to reconcile endpoints during bootstrap",
+                &[
+                    (
+                        "service",
+                        service
+                            .metadata
+                            .name
+                            .as_deref()
+                            .unwrap_or("<unnamed-service>"),
+                    ),
+                    (
+                        "namespace",
+                        service.metadata.namespace.as_deref().unwrap_or("default"),
+                    ),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
+    }
+}
+
+async fn handle_pod_event(event: ControllerWatchEvent) {
+    if let Some((namespace, _)) = parse_key(POD_PREFIX, event.key.as_str()) {
+        reconcile_services_in_namespace(&namespace).await;
+    }
+}
+
+async fn handle_service_event(event: ControllerWatchEvent) {
+    if matches!(event.event_type, KeyspaceEventType::Deleted) {
+        return;
+    }
+    if let Some(service) = load_service_from_event(&event) {
+        if let Err(err) = reconcile_service(&service) {
+            log_warn(
+                COMPONENT,
+                "Failed to reconcile service endpoints",
+                &[
+                    (
+                        "service",
+                        service
+                            .metadata
+                            .name
+                            .as_deref()
+                            .unwrap_or("<unnamed-service>"),
+                    ),
+                    (
+                        "namespace",
+                        service.metadata.namespace.as_deref().unwrap_or("default"),
+                    ),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
+    }
+}
+
+async fn reconcile_services_in_namespace(namespace: &str) {
+    let registry = ServiceRegistry::shared();
+    let services = registry.list(Some(namespace));
+    for service in services {
+        if let Err(err) = reconcile_service(&service) {
+            log_debug(
+                COMPONENT,
+                "Endpoint reconciliation after pod update failed",
+                &[
+                    (
+                        "service",
+                        service
+                            .metadata
+                            .name
+                            .as_deref()
+                            .unwrap_or("<unnamed-service>"),
+                    ),
+                    ("namespace", namespace),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
+    }
+}
+
+fn parse_key(prefix: &str, key: &str) -> Option<(String, String)> {
+    let parts = key
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    if parts[0] != prefix.trim_start_matches('/') {
+        return None;
+    }
+    let namespace = parts[1].to_string();
+    let name = parts[2].to_string();
+    Some((namespace, name))
+}
+
+fn load_service_from_event(event: &ControllerWatchEvent) -> Option<Service> {
+    if let Some(value) = event.value.as_ref() {
+        if let Ok(service) = serde_json::from_str::<Service>(value) {
+            return Some(service);
+        }
+    }
+    if let Some((namespace, name)) = parse_key(SERVICE_PREFIX, event.key.as_str()) {
+        return ServiceRegistry::shared().get(&namespace, &name);
+    }
+    None
+}
 
 pub fn reconcile_service(service: &Service) -> Result<(), Box<dyn Error + Send + Sync>> {
     let name = service.metadata.name.as_deref().ok_or_else(|| {
@@ -60,7 +214,10 @@ pub fn reconcile_service(service: &Service) -> Result<(), Box<dyn Error + Send +
         ..Default::default()
     };
 
-    store::save_endpoints(Some(namespace), name, &endpoints)?;
+    let registry = EndpointsRegistry::shared();
+    registry
+        .upsert(endpoints.clone())
+        .map_err(|err| with_context(err, "Failed to persist endpoints"))?;
     if has_cluster_ip(service) {
         proxy::program_service(service, &endpoints)?;
     }
@@ -74,7 +231,8 @@ pub fn remove_service(service: &Service) -> Result<(), Box<dyn Error + Send + Sy
         .as_deref()
         .ok_or_else(|| new_error("Service metadata.name missing"))?;
     let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
-    store::delete_endpoints(Some(namespace), name)
+    EndpointsRegistry::shared()
+        .remove(namespace, name)
         .map_err(|err| with_context(err, "Failed to delete service endpoints"))?;
     if has_cluster_ip(service) {
         proxy::remove_service(service)?;

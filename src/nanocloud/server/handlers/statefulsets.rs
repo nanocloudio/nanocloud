@@ -277,6 +277,7 @@ fn statefulset_watch_event_from_controller(
                 labels: Default::default(),
                 annotations: Default::default(),
                 resource_version: Some(event.resource_version.to_string()),
+                ..Default::default()
             },
             spec: StatefulSetSpec {
                 service_name: String::new(),
@@ -663,6 +664,7 @@ mod tests {
             node_name: None,
             host_network: false,
             security: PodSecurityContext::default(),
+            node_selector: HashMap::new(),
         };
 
         StatefulSet {
@@ -670,10 +672,8 @@ mod tests {
             kind: "StatefulSet".to_string(),
             metadata: ObjectMeta {
                 name: Some("block-test".to_string()),
-                namespace: None,
                 labels: HashMap::new(),
-                annotations: HashMap::new(),
-                resource_version: None,
+                ..Default::default()
             },
             spec: StatefulSetSpec {
                 service_name: "block-test".to_string(),
@@ -684,10 +684,8 @@ mod tests {
                 template: PodTemplateSpec {
                     metadata: ObjectMeta {
                         name: None,
-                        namespace: None,
                         labels,
-                        annotations: HashMap::new(),
-                        resource_version: None,
+                        ..Default::default()
                     },
                     spec: pod_spec,
                 },

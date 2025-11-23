@@ -60,8 +60,11 @@ pub struct WatchParams {
 
 fn map_error(err: ConfigMapError) -> ApiError {
     match err {
-        ConfigMapError::AlreadyExists(msg) | ConfigMapError::Conflict(msg) => {
-            ApiError::new(StatusCode::CONFLICT, msg)
+        ConfigMapError::AlreadyExists(msg) => {
+            ApiError::with_reason(StatusCode::CONFLICT, "AlreadyExists", msg)
+        }
+        ConfigMapError::Conflict(msg) => {
+            ApiError::with_reason(StatusCode::CONFLICT, "Conflict", msg)
         }
         ConfigMapError::NotFound(msg) => ApiError::new(StatusCode::NOT_FOUND, msg),
         ConfigMapError::Invalid(msg) => ApiError::bad_request(msg),
@@ -441,6 +444,7 @@ mod tests {
                 labels: label_map,
                 annotations: HashMap::new(),
                 resource_version: None,
+                ..Default::default()
             },
             data: HashMap::new(),
             binary_data: HashMap::new(),

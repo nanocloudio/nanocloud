@@ -16,9 +16,12 @@
  * limitations under the License.
  */
 
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+use super::identity::new_uid;
 
 /// Minimal representation of Kubernetes object metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,12 +29,91 @@ use std::collections::HashMap;
 pub struct ObjectMeta {
     pub name: Option<String>,
     pub namespace: Option<String>,
+    #[serde(rename = "generateName", skip_serializing_if = "Option::is_none")]
+    pub generate_name: Option<String>,
+    #[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub annotations: HashMap<String, String>,
+    #[serde(
+        rename = "ownerReferences",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub owner_references: Vec<OwnerReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finalizers: Vec<String>,
+    #[serde(rename = "generation", skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(rename = "creationTimestamp", skip_serializing_if = "Option::is_none")]
+    pub creation_timestamp: Option<String>,
+    #[serde(rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
+    pub deletion_timestamp: Option<String>,
+    #[serde(
+        rename = "deletionGracePeriodSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deletion_grace_period_seconds: Option<i64>,
+    #[serde(
+        rename = "managedFields",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub managed_fields: Vec<ManagedFieldsEntry>,
     #[serde(rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
+}
+
+impl ObjectMeta {
+    pub fn ensure_common_fields(&mut self, namespace: Option<&str>, name: Option<&str>) {
+        if self.namespace.as_deref().map(str::is_empty).unwrap_or(true) {
+            if let Some(ns) = namespace {
+                self.namespace = Some(ns.to_string());
+            }
+        }
+        if self.name.as_deref().map(str::is_empty).unwrap_or(true) {
+            if let Some(name) = name {
+                self.name = Some(name.to_string());
+            }
+        }
+        if self.uid.as_deref().map(str::is_empty).unwrap_or(true) {
+            self.uid = Some(new_uid());
+        }
+        if self.creation_timestamp.is_none() {
+            self.creation_timestamp = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OwnerReference {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(rename = "blockOwnerDeletion", skip_serializing_if = "Option::is_none")]
+    pub block_owner_deletion: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ManagedFieldsEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(rename = "fieldsType", skip_serializing_if = "Option::is_none")]
+    pub fields_type: Option<String>,
 }
 
 /// Metadata included with Kubernetes list responses.
@@ -66,16 +148,36 @@ pub struct ContainerSpec {
     pub env: Vec<ContainerEnvVar>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ContainerPort>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "volumeMounts",
+        alias = "volume_mounts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub volume_mounts: Vec<VolumeMount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<ContainerResources>,
+    #[serde(
+        rename = "workingDir",
+        alias = "working_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub working_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<Lifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(
+        rename = "livenessProbe",
+        alias = "liveness_probe",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub liveness_probe: Option<ContainerProbe>,
+    #[serde(
+        rename = "readinessProbe",
+        alias = "readiness_probe",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub readiness_probe: Option<ContainerProbe>,
 }
 
@@ -148,6 +250,7 @@ pub struct SecretKeySelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ContainerPort {
+    #[serde(rename = "containerPort", alias = "container_port")]
     pub container_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -155,7 +258,11 @@ pub struct ContainerPort {
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "hostPort",
+        alias = "host_port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_port: Option<u16>,
 }
 
@@ -164,8 +271,13 @@ pub struct ContainerPort {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeMount {
     pub name: String,
+    #[serde(rename = "mountPath", alias = "mount_path")]
     pub mount_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "readOnly",
+        alias = "read_only",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub read_only: Option<bool>,
 }
 
@@ -192,9 +304,17 @@ pub struct ContainerResources {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeSpec {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "hostPath",
+        alias = "host_path",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_path: Option<HostPathVolumeSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "emptyDir",
+        alias = "empty_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub empty_dir: Option<EmptyDirVolumeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretVolumeSource>,
@@ -204,10 +324,11 @@ pub struct VolumeSpec {
     pub projected: Option<ProjectedVolumeSource>,
     #[serde(
         rename = "persistentVolumeClaim",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        alias = "persistent_volume_claim"
     )]
     pub persistent_volume_claim: Option<PersistentVolumeClaimVolumeSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "encrypted", skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<EncryptedVolumeSource>,
 }
 
@@ -350,21 +471,45 @@ pub struct ProbeHttpGet {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PodSpec {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "initContainers",
+        alias = "init_containers",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub init_containers: Vec<ContainerSpec>,
     pub containers: Vec<ContainerSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeSpec>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "restartPolicy",
+        alias = "restart_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub restart_policy: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "serviceAccountName",
+        alias = "service_account_name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub service_account_name: Option<String>,
     #[serde(rename = "nodeName", skip_serializing_if = "Option::is_none")]
     pub node_name: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        rename = "hostNetwork",
+        alias = "host_network",
+        default,
+        skip_serializing_if = "is_false"
+    )]
     pub host_network: bool,
-    #[serde(default)]
+    #[serde(rename = "securityContext", alias = "security", default)]
     pub security: PodSecurityContext,
+    #[serde(
+        rename = "nodeSelector",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub node_selector: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

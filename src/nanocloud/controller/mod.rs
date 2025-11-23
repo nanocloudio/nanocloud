@@ -19,6 +19,7 @@ pub mod daemonset;
 pub mod delete;
 pub mod deployment;
 pub mod endpoints;
+pub mod events;
 pub mod networkpolicy;
 pub mod reconcile;
 pub mod replicaset;

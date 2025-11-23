@@ -103,6 +103,43 @@ fn binding_event_topic() -> EventTopic {
     EventTopic::new(BINDING_EVENT_SCOPE, BINDING_EVENT_STREAM)
 }
 
+fn single_node_name() -> String {
+    env::var("NANOCLOUD_NODE_NAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "nanocloud-single-node".to_string())
+}
+
+fn validate_single_node_scheduling(spec: &PodSpec) -> Result<(), DynError> {
+    let node_name = single_node_name();
+    if let Some(requested) = spec.node_name.as_deref() {
+        if !requested.is_empty() && requested != node_name {
+            return Err(new_error(format!(
+                "spec.nodeName '{}' cannot be scheduled on single node '{}'",
+                requested, node_name
+            )));
+        }
+    }
+
+    for (key, value) in spec.node_selector.iter() {
+        match key.as_str() {
+            "kubernetes.io/hostname" | "nanocloud.io/node" => {
+                if value != &node_name {
+                    return Err(new_error(format!(
+                        "nodeSelector '{key}={value}' does not match available node '{node_name}'"
+                    )));
+                }
+            }
+            other => {
+                return Err(new_error(format!(
+                    "nodeSelector key '{other}' is not supported in single-node mode"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn classify_binding_failure(message: &str) -> (BindingStatus, BindingEventStatus) {
     if message.to_ascii_lowercase().contains("timed out") {
         (BindingStatus::TimedOut, BindingEventStatus::TimedOut)
@@ -523,6 +560,7 @@ pub struct InstallResult {
     pub profile: Profile,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn install(
     namespace: Option<&str>,
     app: &str,
@@ -531,6 +569,7 @@ pub async fn install(
     force_update: bool,
     security: Option<BundleSecurityProfile>,
     runtime_overrides: Option<BundleRuntimeSpec>,
+    owner: Option<crate::nanocloud::k8s::pod::OwnerReference>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     metrics::observe_container_operation(
         namespace,
@@ -544,11 +583,13 @@ pub async fn install(
             force_update,
             security,
             runtime_overrides,
+            owner,
         ),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_impl(
     namespace: Option<&str>,
     app: &str,
@@ -557,6 +598,7 @@ async fn install_impl(
     force_update: bool,
     mut security: Option<BundleSecurityProfile>,
     runtime_overrides: Option<BundleRuntimeSpec>,
+    owner: Option<crate::nanocloud::k8s::pod::OwnerReference>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     // Generate container name
     let container_name = namespace
@@ -660,10 +702,21 @@ async fn install_impl(
     );
     apply_security_context(&mut pod_manifest.spec, security.as_ref());
     apply_runtime_overrides(&mut pod_manifest.spec, runtime_overrides.as_ref());
+    validate_single_node_scheduling(&pod_manifest.spec)?;
     let namespace_string = namespace
         .filter(|ns| !ns.is_empty())
         .map(|ns| ns.to_string());
     pod_manifest.metadata.namespace = namespace_string.clone();
+    if let Some(owner_ref) = owner {
+        let already_present = pod_manifest
+            .metadata
+            .owner_references
+            .iter()
+            .any(|existing| existing.uid == owner_ref.uid);
+        if !already_present {
+            pod_manifest.metadata.owner_references.push(owner_ref);
+        }
+    }
     pod_manifest.metadata.annotations.insert(
         "nanocloud.io/profile-managed".to_string(),
         "true".to_string(),
@@ -1154,10 +1207,7 @@ fn apply_security_context(pod_spec: &mut PodSpec, profile: Option<&BundleSecurit
     pod_spec.security = context;
 }
 
-fn apply_runtime_overrides(
-    pod_spec: &mut PodSpec,
-    runtime: Option<&BundleRuntimeSpec>,
-) {
+fn apply_runtime_overrides(pod_spec: &mut PodSpec, runtime: Option<&BundleRuntimeSpec>) {
     let Some(spec) = runtime else {
         return;
     };
@@ -1185,7 +1235,10 @@ fn merge_runtime_volume_mounts(existing: &mut Vec<VolumeMount>, additions: &[Vol
             log_warn(
                 "container",
                 "Skipping duplicate runtime volume mount",
-                &[("volume", mount.name.as_str()), ("path", mount.mount_path.as_str())],
+                &[
+                    ("volume", mount.name.as_str()),
+                    ("path", mount.mount_path.as_str()),
+                ],
             );
             continue;
         }
@@ -2021,9 +2074,18 @@ async fn uninstall_impl(
         .map(|workload| workload.spec.host_network)
         .unwrap_or(false);
 
-    // Get id for container
-    let container_id = get_container_id_by_name(&container_name)
-        .ok_or_else(|| new_error(format!("Service '{}' not found", container_name)))?;
+    // Get id for container (it may have already been removed by a previous uninstall call)
+    let container_id = match get_container_id_by_name(&container_name) {
+        Some(id) => Some(id),
+        None => {
+            log_info(
+                "container",
+                "Container already removed; skipping runtime teardown",
+                &uninstall_fields,
+            );
+            None
+        }
+    };
 
     let csi = csi_plugin();
     let managed_volumes = csi
@@ -2090,7 +2152,9 @@ async fn uninstall_impl(
     prune_backups(&service_dir, plan.retention())?;
 
     // Remove the container
-    remove_container(&container_name, &container_id, host_network)?;
+    if let Some(container_id) = container_id.as_deref() {
+        remove_container(&container_name, container_id, host_network)?;
+    }
     cleanup_configmap_mounts(&container_name);
     Kubelet::shared()
         .forget_pod(namespace, app)
@@ -2298,6 +2362,7 @@ mod tests {
             node_name: None,
             host_network: false,
             security: PodSecurityContext::default(),
+            node_selector: HashMap::new(),
         }
     }
 

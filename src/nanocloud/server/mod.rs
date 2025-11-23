@@ -28,7 +28,6 @@ use axum::middleware;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Json;
 use axum::Router;
 use futures_util::future::{self, Either};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -48,7 +47,6 @@ pub mod auth;
 const EVENT_LOGGER_COMPONENT: &str = "server-event-listener";
 
 use self::auth::{bootstrap::spawn_bootstrap_token_maintenance, AuthLayer, ClientCertificate};
-use crate::nanocloud::api::types::ErrorBody;
 use crate::nanocloud::cni::cni_plugin;
 use crate::nanocloud::diagnostics;
 use crate::nanocloud::events::in_memory::InMemoryEventBus;
@@ -60,6 +58,7 @@ use crate::nanocloud::k8s::pod::ObjectMeta;
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_error, log_info, log_warn};
 use crate::nanocloud::observability::{metrics, tracing};
+use crate::nanocloud::server::handlers::ApiError;
 use crate::nanocloud::util::error::with_context;
 use tls::{accept_with_tls, build_tls_acceptor};
 use tower::Service;
@@ -133,11 +132,7 @@ fn require_client_certificate() -> bool {
 }
 
 fn unauthorized_response(message: &str) -> Response {
-    let body = Json(ErrorBody {
-        error: message.to_string(),
-        conflicts: None,
-    });
-    (StatusCode::UNAUTHORIZED, body).into_response()
+    ApiError::with_reason(StatusCode::UNAUTHORIZED, "Unauthorized", message).into_response()
 }
 
 fn bundle_envelope_to_event(
@@ -428,6 +423,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync>>
         .map_err(|e| with_context(e, "Failed to reconcile CNI artifacts during startup"))?;
     drop(crate::nanocloud::controller::bundle::spawn());
     drop(crate::nanocloud::controller::snapshot::spawn());
+    drop(crate::nanocloud::controller::endpoints::spawn());
     drop(crate::nanocloud::controller::networkpolicy::spawn());
     drop(crate::nanocloud::controller::statefulset::spawn());
     spawn_event_logger();
@@ -649,6 +645,50 @@ fn build_router() -> Router {
             post(handlers::certificates::issue_ephemeral_certificate),
         )
         .route(
+            "/apis/nanocloud.io/v1/volumesnapshots",
+            get(handlers::volumesnapshots::list_all),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/volumesnapshots",
+            get(handlers::volumesnapshots::list_namespaced).post(handlers::volumesnapshots::create),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/volumesnapshots/{name}",
+            get(handlers::volumesnapshots::get).delete(handlers::volumesnapshots::delete),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/roles",
+            get(handlers::rbac::list_roles),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/roles/{name}",
+            get(handlers::rbac::get_role_cluster),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/roles",
+            get(handlers::rbac::list_roles_namespaced),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/roles/{name}",
+            get(handlers::rbac::get_role),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/rolebindings",
+            get(handlers::rbac::list_role_bindings),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/rolebindings/{name}",
+            get(handlers::rbac::get_role_binding_cluster),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/rolebindings",
+            get(handlers::rbac::list_role_bindings_namespaced),
+        )
+        .route(
+            "/apis/nanocloud.io/v1/namespaces/{namespace}/rolebindings/{name}",
+            get(handlers::rbac::get_role_binding),
+        )
+        .route(
             "/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/start",
             post(handlers::services::start_bundle),
         )
@@ -686,6 +726,28 @@ fn build_router() -> Router {
         )
         .route("/api/v1/pods/{name}/log", get(handlers::service_logs_no_ns))
         .route("/api/v1/pods", get(handlers::pods::list_pods_all))
+        .route(
+            "/api/v1/services",
+            get(handlers::service_resources::list_all),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/services",
+            get(handlers::service_resources::list_namespaced)
+                .post(handlers::service_resources::create),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/services/{name}",
+            get(handlers::service_resources::get).delete(handlers::service_resources::delete),
+        )
+        .route("/api/v1/endpoints", get(handlers::endpoints::list_all))
+        .route(
+            "/api/v1/namespaces/{namespace}/endpoints",
+            get(handlers::endpoints::list_namespaced),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/endpoints/{name}",
+            get(handlers::endpoints::get),
+        )
         .route("/api/v1/configmaps", get(handlers::list_configmaps_all))
         .route(
             "/api/v1/namespaces/{namespace}/configmaps",
@@ -696,6 +758,29 @@ fn build_router() -> Router {
             get(handlers::get_configmap)
                 .put(handlers::replace_configmap)
                 .delete(handlers::delete_configmap),
+        )
+        .route(
+            "/api/v1/persistentvolumeclaims",
+            get(handlers::pvcs::list_all),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/persistentvolumeclaims",
+            get(handlers::pvcs::list_namespaced),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}",
+            get(handlers::pvcs::get),
+        )
+        .route("/api/v1/secrets", get(handlers::secrets::list_all))
+        .route(
+            "/api/v1/namespaces/{namespace}/secrets",
+            get(handlers::secrets::list_namespace).post(handlers::secrets::create),
+        )
+        .route(
+            "/api/v1/namespaces/{namespace}/secrets/{name}",
+            get(handlers::secrets::get)
+                .put(handlers::secrets::replace)
+                .delete(handlers::secrets::delete),
         )
         .route(
             "/apis/apps/v1/statefulsets",

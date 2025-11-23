@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fs;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::util::security::kms::ENCRYPTED_BLOB_PREFIX;
 use crate::nanocloud::util::security::EncryptionKey;
-use crate::nanocloud::util::Keyspace;
+use crate::nanocloud::util::{is_missing_value_error, Keyspace};
+use crate::nanocloud::Config;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretMaterial {
@@ -122,6 +124,148 @@ impl KeyspaceSecretStore {
             created_at,
         }))
     }
+
+    pub fn put(
+        &self,
+        secret: SecretMaterial,
+    ) -> Result<StoredSecret, Box<dyn Error + Send + Sync>> {
+        let created_at = Utc::now();
+        let record_key = KeyspaceSecretStore::record_key(&secret.namespace, &secret.name);
+        let (ciphertext, wrapped_key, digest) = encrypt_secret_payload(&record_key, &secret)?;
+
+        let record = SecretStoreRecord {
+            metadata: SecretRecordMetadata {
+                namespace: secret.namespace.clone(),
+                name: secret.name.clone(),
+                type_name: secret.type_name.clone(),
+                immutable: secret.immutable,
+                resource_version: secret.resource_version.clone(),
+            },
+            ciphertext,
+            wrapped_key,
+            digest: digest.clone(),
+            created_at: created_at.to_rfc3339(),
+        };
+
+        let serialized = serde_json::to_string_pretty(&record)
+            .map_err(|e| with_context(e, "Failed to encode encrypted secret"))?;
+        self.keyspace
+            .put(&record_key, &serialized)
+            .map_err(|e| with_context(e, "Failed to persist encrypted secret"))?;
+
+        Ok(StoredSecret {
+            secret,
+            digest,
+            created_at,
+        })
+    }
+
+    pub fn delete(&self, namespace: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let key = KeyspaceSecretStore::record_key(namespace, name);
+        match self.keyspace.delete(&key) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if is_missing_value_error(err.as_ref()) {
+                    Ok(())
+                } else {
+                    Err(with_context(err, "Failed to delete encrypted secret"))
+                }
+            }
+        }
+    }
+
+    pub fn list(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredSecret>, Box<dyn Error + Send + Sync>> {
+        let root = Config::Keyspace.get_path().join("secrets").join("secrets");
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let namespace_filter =
+            namespace.map(|ns| crate::nanocloud::k8s::store::normalize_namespace(Some(ns)));
+        let mut items = Vec::new();
+        for ns_entry in fs::read_dir(&root).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to read secrets namespace directory '{}'",
+                    root.display()
+                ),
+            )
+        })? {
+            let entry = ns_entry.map_err(|e| {
+                with_context(
+                    e,
+                    format!(
+                        "Failed to iterate secrets namespace directory '{}'",
+                        root.display()
+                    ),
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| {
+                with_context(
+                    e,
+                    format!(
+                        "Failed to inspect secrets namespace entry '{}'",
+                        path.display()
+                    ),
+                )
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let ns_name = match entry.file_name().into_string() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let normalized_ns = crate::nanocloud::k8s::store::normalize_namespace(Some(&ns_name));
+            if namespace_filter
+                .as_ref()
+                .is_some_and(|target| target != &normalized_ns)
+            {
+                continue;
+            }
+
+            for secret_entry in fs::read_dir(&path).map_err(|e| {
+                with_context(
+                    e,
+                    format!("Failed to iterate secrets directory '{}'", path.display()),
+                )
+            })? {
+                let entry = secret_entry.map_err(|e| {
+                    with_context(
+                        e,
+                        format!(
+                            "Failed to inspect secret entry in namespace '{}'",
+                            normalized_ns
+                        ),
+                    )
+                })?;
+                let secret_path = entry.path();
+                let file_type = entry.file_type().map_err(|e| {
+                    with_context(
+                        e,
+                        format!("Failed to inspect secret path '{}'", secret_path.display()),
+                    )
+                })?;
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let secret_name = match entry.file_name().into_string() {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if let Some(secret) = self.get(&normalized_ns, &secret_name)? {
+                    items.push(secret);
+                }
+            }
+        }
+
+        Ok(items)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -206,6 +350,41 @@ fn secret_associated_data(
     serde_json::to_vec(&aad).map_err(|e| with_context(e, "Failed to encode secret associated data"))
 }
 
+fn encrypt_secret_payload(
+    record_key: &str,
+    secret: &SecretMaterial,
+) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
+    let payload = SecretCipherPayload {
+        type_name: secret.type_name.clone(),
+        immutable: secret.immutable,
+        data: secret.data.clone(),
+    };
+
+    let plaintext = serde_json::to_vec(&payload)
+        .map_err(|e| with_context(e, "Failed to encode secret payload"))?;
+
+    let data_key = EncryptionKey::new(None);
+    let associated_data = secret_associated_data(
+        record_key,
+        &secret.namespace,
+        &secret.name,
+        &secret.type_name,
+        secret.immutable,
+        secret.resource_version.as_deref(),
+    )?;
+    let ciphertext = data_key
+        .encrypt_with_context(&plaintext, &associated_data)
+        .map_err(|e| with_context(e, "Failed to encrypt secret payload"))?;
+    let wrapped_key = data_key
+        .wrap()
+        .map_err(|e| with_context(e, "Failed to wrap secret data key"))?;
+
+    let digest = compute_digest(&payload.data, data_key.key_bytes())
+        .map_err(|e| with_context(e, "Failed to compute secret digest"))?;
+
+    Ok((ciphertext, wrapped_key, digest))
+}
+
 fn is_not_found(err: &dyn Error) -> bool {
     err.to_string().contains("Value file not found")
 }
@@ -214,7 +393,6 @@ fn is_not_found(err: &dyn Error) -> bool {
 mod tests {
     use super::*;
     use crate::nanocloud::util::security::SecureAssets;
-    use crate::nanocloud::util::Keyspace;
     use std::env;
     use std::fs;
     use tempfile::tempdir;
@@ -252,19 +430,23 @@ mod tests {
         );
 
         let secret = sample_secret();
-        let stored = write_secret(secret.clone()).expect("expected secret write to succeed");
+        let store = KeyspaceSecretStore::new();
+        let stored = store
+            .put(secret.clone())
+            .expect("expected secret write to succeed");
 
         assert_eq!(stored.secret.data.len(), 2);
         assert!(!stored.digest.is_empty());
 
-        let store = KeyspaceSecretStore::new();
         let fetched = store
             .get(&secret.namespace, &secret.name)
             .expect("expected secret get to succeed")
             .expect("secret should exist");
         assert_eq!(fetched.secret.data, secret.data);
 
-        delete_secret(&secret.namespace, &secret.name).expect("expected delete to succeed");
+        store
+            .delete(&secret.namespace, &secret.name)
+            .expect("expected delete to succeed");
 
         let missing = store
             .get(&secret.namespace, &secret.name)
@@ -273,80 +455,5 @@ mod tests {
 
         env::remove_var("NANOCLOUD_KEYSPACE");
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
-    }
-
-    fn write_secret(secret: SecretMaterial) -> Result<StoredSecret, Box<dyn Error + Send + Sync>> {
-        let created_at = Utc::now();
-        let record_key = KeyspaceSecretStore::record_key(&secret.namespace, &secret.name);
-        let (ciphertext, wrapped_key, digest) = encrypt_secret_payload(&record_key, &secret)?;
-
-        let record = SecretStoreRecord {
-            metadata: SecretRecordMetadata {
-                namespace: secret.namespace.clone(),
-                name: secret.name.clone(),
-                type_name: secret.type_name.clone(),
-                immutable: secret.immutable,
-                resource_version: secret.resource_version.clone(),
-            },
-            ciphertext,
-            wrapped_key,
-            digest: digest.clone(),
-            created_at: created_at.to_rfc3339(),
-        };
-
-        let serialized = serde_json::to_string_pretty(&record)
-            .map_err(|e| with_context(e, "Failed to encode encrypted secret"))?;
-        Keyspace::new("secrets")
-            .put(&record_key, &serialized)
-            .map_err(|e| with_context(e, "Failed to persist encrypted secret"))?;
-
-        Ok(StoredSecret {
-            secret,
-            digest,
-            created_at,
-        })
-    }
-
-    fn delete_secret(namespace: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let key = KeyspaceSecretStore::record_key(namespace, name);
-        match Keyspace::new("secrets").delete(&key) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(with_context(err, "Failed to delete encrypted secret")),
-        }
-    }
-
-    fn encrypt_secret_payload(
-        record_key: &str,
-        secret: &SecretMaterial,
-    ) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
-        let payload = SecretCipherPayload {
-            type_name: secret.type_name.clone(),
-            immutable: secret.immutable,
-            data: secret.data.clone(),
-        };
-
-        let plaintext = serde_json::to_vec(&payload)
-            .map_err(|e| with_context(e, "Failed to encode secret payload"))?;
-
-        let data_key = EncryptionKey::new(None);
-        let associated_data = super::secret_associated_data(
-            record_key,
-            &secret.namespace,
-            &secret.name,
-            &secret.type_name,
-            secret.immutable,
-            secret.resource_version.as_deref(),
-        )?;
-        let ciphertext = data_key
-            .encrypt_with_context(&plaintext, &associated_data)
-            .map_err(|e| with_context(e, "Failed to encrypt secret payload"))?;
-        let wrapped_key = data_key
-            .wrap()
-            .map_err(|e| with_context(e, "Failed to wrap secret data key"))?;
-
-        let digest = super::compute_digest(&payload.data, data_key.key_bytes())
-            .map_err(|e| with_context(e, "Failed to compute secret digest"))?;
-
-        Ok((ciphertext, wrapped_key, digest))
     }
 }

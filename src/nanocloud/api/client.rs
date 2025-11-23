@@ -1479,7 +1479,6 @@ impl NanocloudClient {
         let endpoint = select_endpoint(Some(host))?;
         let base_url = Url::parse(&endpoint)?;
         let builder = Client::builder()
-            .timeout(Duration::from_secs(30))
             .http1_only()
             .danger_accept_invalid_certs(true);
 
@@ -1519,7 +1518,6 @@ impl NanocloudClient {
 
         let mut client_builder = Client::builder()
             .identity(identity)
-            .timeout(Duration::from_secs(30))
             .http1_only();
 
         if let Some(bytes) = ca_bytes.as_ref() {
@@ -2123,11 +2121,17 @@ impl NanocloudClient {
 
         let text = response.text().await.unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<crate::nanocloud::api::types::ErrorBody>(&text) {
+            let message = parsed.message.or(parsed.reason).unwrap_or_else(|| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("request failed")
+                    .to_string()
+            });
             let err = match parsed.conflicts {
                 Some(conflicts) if !conflicts.is_empty() => {
-                    HttpError::with_conflicts(status, parsed.error, conflicts)
+                    HttpError::with_conflicts(status, message, conflicts)
                 }
-                _ => HttpError::new(status, parsed.error),
+                _ => HttpError::new(status, message),
             };
             return Err(Box::new(err));
         }

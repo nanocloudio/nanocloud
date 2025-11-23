@@ -23,11 +23,10 @@ use crate::nanocloud::api::types::{
 };
 use crate::nanocloud::cli::Terminal;
 
-const CONDITION_DISPLAY_ORDER: [BundleConditionKind; 4] = [
-    BundleConditionKind::Ready,
-    BundleConditionKind::Bound,
-    BundleConditionKind::SecretsProvisioned,
-    BundleConditionKind::ProfilePrepared,
+const CONDITION_DISPLAY_ORDER: [BundleConditionKind; 3] = [
+    BundleConditionKind::InstallReady,
+    BundleConditionKind::BindingsReady,
+    BundleConditionKind::BackupHealthy,
 ];
 
 pub(super) fn service_display_name(namespace: Option<&str>, service: &str) -> String {
@@ -98,10 +97,9 @@ pub(super) fn print_bundle_table(bundles: &[Bundle]) {
     let headers = [
         "NAMESPACE",
         "BUNDLE",
-        "READY",
-        "BOUND",
-        "SECRETS",
-        "PROFILE",
+        "INSTALL",
+        "BINDINGS",
+        "BACKUP",
         "UPDATED",
     ];
     let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
@@ -120,10 +118,9 @@ pub(super) fn print_bundle_table(bundles: &[Bundle]) {
             .name
             .clone()
             .unwrap_or_else(|| bundle.spec.service.clone());
-        let ready = summarize_condition(bundle, BundleConditionKind::Ready);
-        let bound = summarize_condition(bundle, BundleConditionKind::Bound);
-        let secrets = summarize_condition(bundle, BundleConditionKind::SecretsProvisioned);
-        let profile = summarize_condition(bundle, BundleConditionKind::ProfilePrepared);
+        let install = summarize_condition(bundle, BundleConditionKind::InstallReady);
+        let bindings = summarize_condition(bundle, BundleConditionKind::BindingsReady);
+        let backup = summarize_condition(bundle, BundleConditionKind::BackupHealthy);
         let updated = bundle
             .status
             .as_ref()
@@ -131,7 +128,7 @@ pub(super) fn print_bundle_table(bundles: &[Bundle]) {
             .map(|value| format_timestamp(Some(value)))
             .unwrap_or_else(|| "-".to_string());
 
-        let row = vec![namespace, name, ready, bound, secrets, profile, updated];
+        let row = vec![namespace, name, install, bindings, backup, updated];
         for (idx, cell) in row.iter().enumerate() {
             if cell.len() > widths[idx] {
                 widths[idx] = cell.len();

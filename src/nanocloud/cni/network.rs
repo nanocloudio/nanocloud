@@ -961,10 +961,7 @@ impl Network {
         log_info(
             "cni",
             "Bridge link is up",
-            &[
-                ("bridge", name),
-                ("elapsed_ms", link_elapsed.as_str()),
-            ],
+            &[("bridge", name), ("elapsed_ms", link_elapsed.as_str())],
         );
 
         // Ensure the NAT table exists
@@ -1038,7 +1035,14 @@ impl Network {
             &[
                 ("bridge", name),
                 ("elapsed_ms", postrouting_elapsed.as_str()),
-                ("created", if postrouting_chain_exists { "false" } else { "true" }),
+                (
+                    "created",
+                    if postrouting_chain_exists {
+                        "false"
+                    } else {
+                        "true"
+                    },
+                ),
             ],
         );
 
@@ -1144,10 +1148,7 @@ impl Network {
         log_info(
             "cni",
             "Sysctl forwarding configured",
-            &[
-                ("bridge", name),
-                ("elapsed_ms", sysctl_elapsed.as_str()),
-            ],
+            &[("bridge", name), ("elapsed_ms", sysctl_elapsed.as_str())],
         );
 
         let total_elapsed = overall_start.elapsed().as_millis().to_string();

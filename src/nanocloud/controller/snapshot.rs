@@ -1,8 +1,16 @@
 use crate::nanocloud::api::types::{VolumeSnapshot, VolumeSnapshotPhase, VolumeSnapshotStatus};
-use crate::nanocloud::controller::watch::ControllerWatchManager;
+use crate::nanocloud::controller::events::{EventRecorder, InvolvedObjectRef};
+use crate::nanocloud::controller::runtime::{
+    ControllerRuntime, ControllerTarget, ControllerWorkItem,
+};
+use crate::nanocloud::controller::watch::{ControllerWatchEvent, ControllerWatchManager};
 use crate::nanocloud::engine::container::backup_directory;
 use crate::nanocloud::engine::{register_streaming_backup, streaming_backup_enabled, Snapshot};
-use crate::nanocloud::k8s::store::{list_volume_snapshots, save_volume_snapshot};
+use crate::nanocloud::k8s::bundle_manager::BundleRegistry;
+use crate::nanocloud::k8s::pod::OwnerReference;
+use crate::nanocloud::k8s::store::{
+    list_volume_snapshots, normalize_namespace, save_volume_snapshot,
+};
 use crate::nanocloud::logger::{log_debug, log_error, log_info, log_warn};
 use crate::nanocloud::observability::{
     metrics::{self, ControllerReconcileResult, SnapshotOperation},
@@ -17,6 +25,7 @@ use serde_json;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 const COMPONENT: &str = "snapshot-controller";
@@ -24,61 +33,208 @@ const SNAPSHOT_PREFIX: &str = "/volumesnapshots";
 
 pub fn spawn() -> JoinHandle<()> {
     tokio::spawn(async move {
-        match list_volume_snapshots(None) {
-            Ok(existing) => {
-                if !existing.is_empty() {
-                    let count_text = existing.len().to_string();
-                    log_info(
-                        COMPONENT,
-                        "Reconciling existing VolumeSnapshots on startup",
-                        &[("count", count_text.as_str())],
-                    );
-                }
-                for snapshot in existing {
-                    process_snapshot(snapshot).await;
-                }
-            }
-            Err(err) => {
-                log_error(
-                    COMPONENT,
-                    "Failed to list existing VolumeSnapshots",
-                    &[("error", err.to_string().as_str())],
-                );
-            }
-        }
+        let runtime = ControllerRuntime::shared();
+        let recorder = EventRecorder::new(COMPONENT);
 
-        let manager = ControllerWatchManager::shared();
-        let mut subscription = manager.subscribe(SNAPSHOT_PREFIX, None);
-        while let Some(event) = subscription.recv().await {
-            match event.event_type {
-                KeyspaceEventType::Deleted => {
-                    let key = event.key.as_str();
-                    log_debug(COMPONENT, "VolumeSnapshot deleted", &[("key", key)]);
-                }
-                KeyspaceEventType::Added | KeyspaceEventType::Modified => {
-                    let Some(value) = event.value else {
-                        log_warn(COMPONENT, "VolumeSnapshot event missing payload", &[]);
-                        continue;
-                    };
-                    match serde_json::from_str::<VolumeSnapshot>(&value) {
-                        Ok(snapshot) => {
-                            process_snapshot(snapshot).await;
-                        }
-                        Err(err) => {
-                            log_error(
-                                COMPONENT,
-                                "Failed to decode VolumeSnapshot payload",
-                                &[("error", err.to_string().as_str())],
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        start_snapshot_executor(&runtime, recorder.clone());
+        bootstrap_snapshots(&runtime).await;
+        watch_snapshot_events(runtime, recorder).await;
     })
 }
 
-async fn process_snapshot(snapshot: VolumeSnapshot) {
+fn start_snapshot_executor(runtime: &Arc<ControllerRuntime>, recorder: EventRecorder) {
+    runtime.spawn_executor(move |item| {
+        let recorder = recorder.clone();
+        async move {
+            if let ControllerTarget::VolumeSnapshot { namespace, name } = &item.target {
+                let namespace_label = namespace.clone();
+                if let Some(snapshot) = load_snapshot(namespace_label.as_deref(), name) {
+                    process_snapshot(snapshot, &recorder).await;
+                } else {
+                    log_warn(
+                        COMPONENT,
+                        "VolumeSnapshot missing during reconciliation",
+                        &[
+                            ("namespace", namespace.as_deref().unwrap_or("default")),
+                            ("snapshot", name.as_str()),
+                        ],
+                    );
+                }
+            }
+        }
+    });
+}
+
+async fn bootstrap_snapshots(runtime: &Arc<ControllerRuntime>) {
+    match list_volume_snapshots(None) {
+        Ok(existing) => {
+            if !existing.is_empty() {
+                let count_text = existing.len().to_string();
+                log_info(
+                    COMPONENT,
+                    "Reconciling existing VolumeSnapshots on startup",
+                    &[("count", count_text.as_str())],
+                );
+            }
+            for snapshot in existing {
+                let namespace = snapshot.metadata.namespace.clone();
+                let name = snapshot
+                    .metadata
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                enqueue_snapshot(runtime, namespace, name).await;
+            }
+        }
+        Err(err) => {
+            log_error(
+                COMPONENT,
+                "Failed to list existing VolumeSnapshots",
+                &[("error", err.to_string().as_str())],
+            );
+        }
+    }
+}
+
+async fn watch_snapshot_events(runtime: Arc<ControllerRuntime>, recorder: EventRecorder) {
+    let manager = ControllerWatchManager::shared();
+    let mut subscription = manager.subscribe(SNAPSHOT_PREFIX, None);
+    while let Some(event) = subscription.recv().await {
+        match event.event_type {
+            KeyspaceEventType::Deleted => {
+                if let Some((namespace, name)) = parse_snapshot_key(event.key.as_str()) {
+                    log_debug(
+                        COMPONENT,
+                        "VolumeSnapshot deleted",
+                        &[
+                            ("namespace", namespace.as_deref().unwrap_or("default")),
+                            ("snapshot", name.as_str()),
+                        ],
+                    );
+                    enqueue_snapshot(&runtime, namespace, name).await;
+                }
+            }
+            KeyspaceEventType::Added | KeyspaceEventType::Modified => {
+                if let Some((namespace, name)) = snapshot_identity(&event) {
+                    enqueue_snapshot(&runtime, namespace, name).await;
+                } else {
+                    log_warn(
+                        COMPONENT,
+                        "VolumeSnapshot event missing payload",
+                        &[("key", event.key.as_str())],
+                    );
+                }
+            }
+        }
+    }
+
+    drop(recorder);
+}
+
+fn snapshot_identity(event: &ControllerWatchEvent) -> Option<(Option<String>, String)> {
+    if let Some(value) = event.value.as_ref() {
+        if let Ok(snapshot) = serde_json::from_str::<VolumeSnapshot>(value) {
+            let name = snapshot
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            return Some((snapshot.metadata.namespace.clone(), name));
+        }
+    }
+    parse_snapshot_key(event.key.as_str())
+}
+
+fn parse_snapshot_key(key: &str) -> Option<(Option<String>, String)> {
+    let parts: Vec<&str> = key
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if parts.len() != 3 || parts[0] != SNAPSHOT_PREFIX.trim_start_matches('/') {
+        return None;
+    }
+    let namespace = if parts[1].eq_ignore_ascii_case("default") {
+        Some("default".to_string())
+    } else {
+        Some(parts[1].to_string())
+    };
+    let name = parts[2].to_string();
+    Some((namespace, name))
+}
+
+async fn enqueue_snapshot(
+    runtime: &Arc<ControllerRuntime>,
+    namespace: Option<String>,
+    name: String,
+) {
+    let item = ControllerWorkItem::volume_snapshot(namespace.as_deref(), name.as_str());
+    match runtime.work_queue().enqueue(item).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log_debug(
+                COMPONENT,
+                "Coalesced VolumeSnapshot reconciliation request",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("snapshot", name.as_str()),
+                ],
+            );
+        }
+        Err(err) => {
+            log_warn(
+                COMPONENT,
+                "Failed to enqueue VolumeSnapshot reconciliation",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("snapshot", name.as_str()),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
+    }
+}
+
+fn load_snapshot(namespace: Option<&str>, name: &str) -> Option<VolumeSnapshot> {
+    match list_volume_snapshots(namespace) {
+        Ok(snapshots) => snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.metadata.name.as_deref() == Some(name)),
+        Err(err) => {
+            log_error(
+                COMPONENT,
+                "Failed to load VolumeSnapshots",
+                &[
+                    ("namespace", namespace.unwrap_or("default")),
+                    ("snapshot", name),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+            None
+        }
+    }
+}
+
+async fn snapshot_owner_reference(
+    namespace: Option<&str>,
+    service: &str,
+) -> Option<OwnerReference> {
+    let registry = BundleRegistry::shared();
+    let namespace_value = normalize_namespace(namespace);
+    let bundle = registry.get(&namespace_value, service).await?;
+    let uid = bundle.metadata.uid.clone()?;
+    let name = bundle.metadata.name.clone()?;
+
+    Some(OwnerReference {
+        api_version: "nanocloud.io/v1".to_string(),
+        kind: "Bundle".to_string(),
+        name,
+        uid,
+        controller: Some(false),
+        block_owner_deletion: Some(false),
+    })
+}
+
+async fn process_snapshot(snapshot: VolumeSnapshot, recorder: &EventRecorder) {
     let namespace = snapshot.metadata.namespace.clone();
     let name = snapshot
         .metadata
@@ -125,6 +281,36 @@ async fn process_snapshot(snapshot: VolumeSnapshot) {
             ],
         );
     }
+    let event_reason = if result.is_ok() {
+        "SnapshotReady"
+    } else {
+        "SnapshotFailed"
+    };
+    let event_type = if result.is_ok() { "Normal" } else { "Warning" };
+    let event_message = result
+        .as_ref()
+        .map(|_| format!("VolumeSnapshot {} reconciled", name))
+        .unwrap_or_else(|err| err.to_string());
+    let involved = InvolvedObjectRef {
+        api_version: if snapshot_for_failure.api_version.is_empty() {
+            "nanocloud.io/v1".to_string()
+        } else {
+            snapshot_for_failure.api_version.clone()
+        },
+        kind: "VolumeSnapshot".to_string(),
+        name: name.clone(),
+        uid: snapshot_for_failure.metadata.uid.clone(),
+        namespace: snapshot_for_failure.metadata.namespace.clone(),
+    };
+    recorder
+        .record(
+            snapshot_for_failure.metadata.namespace.as_deref(),
+            &involved,
+            event_reason,
+            event_type,
+            event_message.as_str(),
+        )
+        .await;
     let reconcile_outcome = if result.is_ok() {
         ControllerReconcileResult::Success
     } else {
@@ -164,6 +350,12 @@ async fn reconcile_snapshot(mut snapshot: VolumeSnapshot) -> Result<(), Snapshot
             ("claim", claim_name),
         ],
     );
+
+    if snapshot.metadata.owner_references.is_empty() {
+        if let Some(owner) = snapshot_owner_reference(namespace_ref, service_name).await {
+            snapshot.metadata.owner_references.push(owner);
+        }
+    }
 
     let base_dir = backup_directory("snapshot", Some(namespace_value), service_name);
     let snapshot_dir = base_dir.join("snapshots");

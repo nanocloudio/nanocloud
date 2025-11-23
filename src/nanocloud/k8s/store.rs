@@ -2118,6 +2118,157 @@ pub fn list_services(
     Ok(results)
 }
 
+pub fn list_endpoints(
+    namespace: Option<&str>,
+) -> Result<Vec<Endpoints>, Box<dyn Error + Send + Sync>> {
+    let mut results = Vec::new();
+    let root = Config::Keyspace.get_path().join("k8s").join("endpoints");
+
+    let mut namespaces: Vec<String> = Vec::new();
+    if let Some(ns) = namespace {
+        namespaces.push(normalize_namespace(Some(ns)));
+    } else {
+        match fs::read_dir(&root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|err| {
+                        with_context(
+                            err,
+                            format!(
+                                "Failed to iterate Endpoints namespaces in '{}'",
+                                root.display()
+                            ),
+                        )
+                    })?;
+                    if !entry
+                        .file_type()
+                        .map_err(|err| {
+                            with_context(
+                                err,
+                                format!(
+                                    "Failed to inspect Endpoints namespace entry '{}'",
+                                    entry.path().display()
+                                ),
+                            )
+                        })?
+                        .is_dir()
+                    {
+                        continue;
+                    }
+                    if let Ok(name) = entry.file_name().into_string() {
+                        namespaces.push(name);
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(results),
+            Err(err) => {
+                return Err(with_context(
+                    err,
+                    format!(
+                        "Failed to read Endpoints root directory '{}'",
+                        root.display()
+                    ),
+                ))
+            }
+        }
+    }
+
+    for ns in namespaces {
+        let namespace_path = root.join(&ns);
+        let entries = match fs::read_dir(&namespace_path) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(with_context(
+                    err,
+                    format!(
+                        "Failed to read Endpoints namespace directory '{}'",
+                        namespace_path.display()
+                    ),
+                ))
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                with_context(
+                    err,
+                    format!(
+                        "Failed to iterate Endpoints directory '{}'",
+                        namespace_path.display()
+                    ),
+                )
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|err| {
+                    with_context(
+                        err,
+                        format!(
+                            "Failed to inspect Endpoints entry '{}'",
+                            entry.path().display()
+                        ),
+                    )
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+
+            let value_path = entry.path().join(KEYSPACE_VALUE_FILE);
+            let raw = match fs::read_to_string(&value_path) {
+                Ok(contents) => contents,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(with_context(
+                        err,
+                        format!(
+                            "Failed to load Endpoints payload '{}'",
+                            value_path.display()
+                        ),
+                    ))
+                }
+            };
+
+            let mut endpoints: Endpoints = serde_json::from_str(&raw).map_err(|err| {
+                with_context(
+                    err,
+                    format!(
+                        "Failed to deserialize Endpoints '{}' from '{}'",
+                        name,
+                        value_path.display()
+                    ),
+                )
+            })?;
+
+            if endpoints.api_version.is_empty() {
+                endpoints.api_version = "nanocloud.io/v1".to_string();
+            }
+            if endpoints.kind.is_empty() {
+                endpoints.kind = "Endpoints".to_string();
+            }
+            if endpoints.metadata.name.is_none() {
+                endpoints.metadata.name = Some(name.clone());
+            }
+            if endpoints.metadata.namespace.is_none() {
+                endpoints.metadata.namespace = Some(ns.clone());
+            }
+            if endpoints.metadata.resource_version.is_none() {
+                endpoints.metadata.resource_version = Some("1".to_string());
+            }
+
+            results.push(endpoints);
+        }
+    }
+
+    Ok(results)
+}
+
 pub fn list_volume_snapshots(
     namespace: Option<&str>,
 ) -> Result<Vec<VolumeSnapshot>, Box<dyn Error + Send + Sync>> {
@@ -2720,6 +2871,26 @@ pub fn save_volume_snapshot(
     K8S_KEYSPACE
         .put(&key, &payload)
         .map_err(|err| with_context(err, format!("Failed to persist VolumeSnapshot '{}'", key)))
+}
+
+pub fn delete_volume_snapshot(
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let key = make_snapshot_key(namespace, name);
+    match K8S_KEYSPACE.delete(&key) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if is_missing_value_error(err.as_ref()) {
+                Ok(())
+            } else {
+                Err(with_context(
+                    err,
+                    format!("Failed to delete VolumeSnapshot '{}' from keyspace", key),
+                ))
+            }
+        }
+    }
 }
 
 pub fn delete_device(

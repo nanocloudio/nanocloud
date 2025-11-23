@@ -24,6 +24,7 @@ use crate::nanocloud::k8s::store::{
     normalize_namespace, save_bundle, save_bundle_field_ownership,
 };
 
+use chrono::{SecondsFormat, Utc};
 use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -32,6 +33,8 @@ use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, RwLock};
+
+pub const BUNDLE_FINALIZER: &str = "nanocloud.io/bundle-cleanup";
 
 #[derive(Debug)]
 pub enum BundleError {
@@ -186,6 +189,7 @@ fn normalize_key_new(namespace: &str, bundle: &mut Bundle) -> Result<String, Bun
         ));
     }
     ensure_name(&name, bundle)?;
+    bundle.metadata.ensure_common_fields(Some(&ns), Some(&name));
     Ok(bundle_key(&ns, &name))
 }
 
@@ -264,12 +268,24 @@ impl BundleRegistry {
             }
         }
 
+        if !payload
+            .metadata
+            .finalizers
+            .iter()
+            .any(|finalizer| finalizer == BUNDLE_FINALIZER)
+        {
+            payload
+                .metadata
+                .finalizers
+                .push(BUNDLE_FINALIZER.to_string());
+        }
+
         let resource_version = self.next_resource_version();
         payload.metadata.resource_version = Some(resource_version.clone());
 
         if payload.status.is_none() {
             payload.status = Some(BundleStatus {
-                phase: Some(BundlePhase::Pending),
+                phase: Some(BundlePhase::Installing),
                 ..Default::default()
             });
         }
@@ -506,17 +522,50 @@ impl BundleRegistry {
         Ok(bundle)
     }
 
-    pub async fn delete(&self, namespace: &str, name: &str) -> Result<(), BundleError> {
+    pub async fn delete(&self, namespace: &str, name: &str) -> Result<Bundle, BundleError> {
         let key = bundle_key(namespace, name);
 
+        let mut bundles = self.bundles.write().await;
+        let mut bundle = bundles
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| BundleError::NotFound(format!("Bundle '{}' not found", name)))?;
+
+        if !bundle
+            .metadata
+            .finalizers
+            .iter()
+            .any(|finalizer| finalizer == BUNDLE_FINALIZER)
+        {
+            bundle
+                .metadata
+                .finalizers
+                .push(BUNDLE_FINALIZER.to_string());
+        }
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        bundle
+            .metadata
+            .deletion_timestamp
+            .get_or_insert(now.clone());
+        let resource_version = self.next_resource_version();
+        bundle.metadata.resource_version = Some(resource_version.clone());
+
+        save_bundle(
+            bundle.metadata.namespace.as_deref(),
+            bundle.metadata.name.as_deref().unwrap_or(name),
+            &bundle,
+        )
+        .map_err(BundleError::persistence_box)?;
+
+        bundles.insert(key, bundle.clone());
+        Ok(bundle)
+    }
+
+    pub async fn finalize_delete(&self, namespace: &str, name: &str) -> Result<(), BundleError> {
+        let key = bundle_key(namespace, name);
         {
             let mut bundles = self.bundles.write().await;
-            if bundles.remove(&key).is_none() {
-                return Err(BundleError::NotFound(format!(
-                    "Bundle '{}' not found",
-                    name
-                )));
-            }
+            bundles.remove(&key);
         }
 
         delete_bundle(Some(namespace), name).map_err(BundleError::persistence_box)?;
@@ -640,6 +689,9 @@ fn load_initial_bundles() -> (HashMap<String, Bundle>, u64) {
             }
         }
 
+        bundle
+            .metadata
+            .ensure_common_fields(Some(namespace.as_str()), Some(name.as_str()));
         let key = bundle_key(&namespace, &name);
         items.insert(key, bundle);
     }

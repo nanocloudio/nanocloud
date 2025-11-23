@@ -22,7 +22,6 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{request::Parts, HeaderMap, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use openssl::error::ErrorStack;
@@ -37,11 +36,11 @@ use tower::layer::Layer;
 use tower::Service;
 
 use self::bootstrap::{BootstrapTokenError, BootstrapTokenService};
-use crate::nanocloud::api::types::ErrorBody;
 use crate::nanocloud::logger::{log_error, log_info, log_warn};
 use crate::nanocloud::observability::metrics::{self, BootstrapAuthOutcome};
 use crate::nanocloud::server::handlers;
 use crate::nanocloud::server::handlers::serviceaccounts::ServiceAccountClaims;
+use crate::nanocloud::server::handlers::ApiError;
 use crate::nanocloud::util::security::load_service_secret_key;
 const AUTH_LOG_COMPONENT: &str = "auth";
 #[cfg_attr(not(test), allow(dead_code))]
@@ -592,11 +591,12 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
                     ("path", matched_path.as_str()),
                 ],
             );
-            let body = Json(ErrorBody {
-                error: "authentication context missing".to_string(),
-                conflicts: None,
-            });
-            return (StatusCode::UNAUTHORIZED, body).into_response();
+            return ApiError::with_reason(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "authentication context missing",
+            )
+            .into_response();
         } else {
             log_warn(
                 AUTH_LOG_COMPONENT,
@@ -606,11 +606,12 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
                     ("path", matched_path.as_str()),
                 ],
             );
-            let body = Json(ErrorBody {
-                error: "authentication required".to_string(),
-                conflicts: None,
-            });
-            return (StatusCode::UNAUTHORIZED, body).into_response();
+            return ApiError::with_reason(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "authentication required",
+            )
+            .into_response();
         }
     }
 
@@ -629,11 +630,12 @@ pub async fn require_authenticated_subject(request: Request<Body>, next: Next) -
                         ("path", matched_path.as_str()),
                     ],
                 );
-                let body = Json(ErrorBody {
-                    error: "insufficient scope".to_string(),
-                    conflicts: None,
-                });
-                return (StatusCode::FORBIDDEN, body).into_response();
+                return ApiError::with_reason(
+                    StatusCode::FORBIDDEN,
+                    "Forbidden",
+                    "insufficient scope",
+                )
+                .into_response();
             }
         }
     }

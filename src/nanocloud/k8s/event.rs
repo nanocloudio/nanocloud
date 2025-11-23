@@ -239,6 +239,10 @@ impl EventRegistry {
             .namespace
             .clone()
             .unwrap_or_else(|| "default".to_string());
+        let name_hint = event.metadata.name.clone();
+        event
+            .metadata
+            .ensure_common_fields(Some(namespace.as_str()), name_hint.as_deref());
 
         let cloned = event.clone();
         {

@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::controller::events::{EventRecorder, InvolvedObjectRef};
+use crate::nanocloud::controller::runtime::{
+    ControllerRuntime, ControllerTarget, ControllerWorkItem,
+};
 use crate::nanocloud::controller::watch::{ControllerWatchEvent, ControllerWatchManager};
 use crate::nanocloud::k8s::networkpolicy::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -22,7 +26,7 @@ use crate::nanocloud::k8s::networkpolicy::{
 use crate::nanocloud::k8s::store::{
     list_network_policies, list_pod_manifests, normalize_namespace, StoredNetworkPolicy, StoredPod,
 };
-use crate::nanocloud::logger::log_error;
+use crate::nanocloud::logger::{log_debug, log_error, log_warn};
 use crate::nanocloud::network::policy::{
     chain_name, PolicyChain, PolicyDirection, PolicyProgrammer, PolicyRule,
 };
@@ -33,6 +37,7 @@ use crate::nanocloud::util::KeyspaceEventType;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 const POD_IP_ANNOTATION: &str = "nanocloud.io/pod-ip";
@@ -42,46 +47,136 @@ const POD_PREFIX: &str = "/pods";
 
 pub fn spawn() -> JoinHandle<()> {
     tokio::spawn(async move {
-        reconcile_with_reason("startup").await;
-        let manager = ControllerWatchManager::shared();
-        let mut policy_subscription = manager.subscribe(POLICY_PREFIX, None);
-        let mut pod_subscription = manager.subscribe(POD_PREFIX, None);
-
-        loop {
-            tokio::select! {
-                event = policy_subscription.recv() => {
-                    if !handle_watch_event("networkpolicy", event).await {
-                        break;
-                    }
-                }
-                event = pod_subscription.recv() => {
-                    if !handle_watch_event("pod", event).await {
-                        break;
-                    }
-                }
-            }
-        }
+        let runtime = ControllerRuntime::shared();
+        let recorder = EventRecorder::new(COMPONENT);
+        start_network_policy_executor(&runtime, recorder.clone());
+        enqueue_network_policy(&runtime, None, "startup".to_string()).await;
+        watch_network_policy_events(runtime, recorder).await;
     })
 }
 
-async fn handle_watch_event(kind: &'static str, event: Option<ControllerWatchEvent>) -> bool {
-    match event {
-        Some(evt) => {
-            if matches!(
-                evt.event_type,
-                KeyspaceEventType::Added | KeyspaceEventType::Modified | KeyspaceEventType::Deleted
-            ) {
-                reconcile_with_reason(kind).await;
+fn start_network_policy_executor(runtime: &Arc<ControllerRuntime>, recorder: EventRecorder) {
+    runtime.spawn_executor(move |item| {
+        let recorder = recorder.clone();
+        async move {
+            if let ControllerTarget::NetworkPolicy { namespace, name } = &item.target {
+                reconcile_with_reason(
+                    name.as_str(),
+                    &recorder,
+                    namespace.as_deref(),
+                    name.as_str(),
+                )
+                .await;
             }
-            true
         }
-        None => false,
+    });
+}
+
+async fn watch_network_policy_events(runtime: Arc<ControllerRuntime>, recorder: EventRecorder) {
+    let manager = ControllerWatchManager::shared();
+    let mut policy_subscription = manager.subscribe(POLICY_PREFIX, None);
+    let mut pod_subscription = manager.subscribe(POD_PREFIX, None);
+
+    loop {
+        tokio::select! {
+            event = policy_subscription.recv() => {
+                if let Some(evt) = event {
+                    if let Some((namespace, name)) = policy_identity(&evt) {
+                        enqueue_network_policy(&runtime, namespace, name).await;
+                    }
+                } else {
+                    break;
+                }
+            }
+            event = pod_subscription.recv() => {
+                if let Some(evt) = event {
+                    if matches!(
+                        evt.event_type,
+                        KeyspaceEventType::Added | KeyspaceEventType::Modified | KeyspaceEventType::Deleted
+                    ) {
+                        enqueue_network_policy(&runtime, None, "pods".to_string()).await;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    drop(recorder);
+}
+
+fn policy_identity(event: &ControllerWatchEvent) -> Option<(Option<String>, String)> {
+    if let Some(value) = event.value.as_ref() {
+        if let Ok(policy) = serde_json::from_str::<NetworkPolicy>(value) {
+            let name = policy
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            return Some((policy.metadata.namespace.clone(), name));
+        }
+    }
+    parse_policy_key(event.key.as_str())
+}
+
+fn parse_policy_key(key: &str) -> Option<(Option<String>, String)> {
+    let parts: Vec<&str> = key
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if parts.len() != 3 || parts[0] != POLICY_PREFIX.trim_start_matches('/') {
+        return None;
+    }
+    let namespace = if parts[1].eq_ignore_ascii_case("default") {
+        Some("default".to_string())
+    } else {
+        Some(parts[1].to_string())
+    };
+    let name = parts[2].to_string();
+    Some((namespace, name))
+}
+
+async fn enqueue_network_policy(
+    runtime: &Arc<ControllerRuntime>,
+    namespace: Option<String>,
+    name: String,
+) {
+    let item = ControllerWorkItem::network_policy(namespace.as_deref(), name.as_str());
+    match runtime.work_queue().enqueue(item).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log_debug(
+                COMPONENT,
+                "Coalesced NetworkPolicy reconciliation request",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("name", name.as_str()),
+                ],
+            );
+        }
+        Err(err) => {
+            log_warn(
+                COMPONENT,
+                "Failed to enqueue NetworkPolicy reconciliation",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("name", name.as_str()),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
     }
 }
 
-async fn reconcile_with_reason(trigger: &'static str) {
+async fn reconcile_with_reason(
+    trigger: &str,
+    recorder: &EventRecorder,
+    namespace: Option<&str>,
+    name: &str,
+) {
     let span_name = format!("trigger:{}", trigger);
-    match tracing::with_span("controller.networkpolicy", span_name, async move {
+    let outcome = match tracing::with_span("controller.networkpolicy", span_name, async move {
         tokio::task::spawn_blocking(reconcile).await
     })
     .await
@@ -91,6 +186,7 @@ async fn reconcile_with_reason(trigger: &'static str) {
                 "networkpolicy",
                 ControllerReconcileResult::Success,
             );
+            Ok(())
         }
         Ok(Err(err)) => {
             let message = err.to_string();
@@ -100,6 +196,7 @@ async fn reconcile_with_reason(trigger: &'static str) {
                 &[("trigger", trigger), ("error", message.as_str())],
             );
             metrics::record_controller_reconcile("networkpolicy", ControllerReconcileResult::Error);
+            Err(message)
         }
         Err(join_err) => {
             let message = join_err.to_string();
@@ -109,8 +206,25 @@ async fn reconcile_with_reason(trigger: &'static str) {
                 &[("trigger", trigger), ("error", message.as_str())],
             );
             metrics::record_controller_reconcile("networkpolicy", ControllerReconcileResult::Error);
+            Err(message)
         }
-    }
+    };
+
+    let event_type = if outcome.is_ok() { "Normal" } else { "Warning" };
+    let message = match outcome {
+        Ok(()) => format!("Reconciled network policies after trigger '{trigger}'"),
+        Err(err) => err,
+    };
+    let involved = InvolvedObjectRef {
+        api_version: "v1".to_string(),
+        kind: "NetworkPolicy".to_string(),
+        name: name.to_string(),
+        uid: None,
+        namespace: namespace.map(|ns| ns.to_string()),
+    };
+    recorder
+        .record(namespace, &involved, trigger, event_type, message.as_str())
+        .await;
 }
 
 #[derive(Debug, Clone)]
@@ -695,9 +809,7 @@ mod tests {
         );
         assert!(log.contains("dport 80"), "expected port match in {log}");
         assert!(
-            log.contains(&format!(
-                "nft add rule inet nanocloud {chain} counter drop"
-            )),
+            log.contains(&format!("nft add rule inet nanocloud {chain} counter drop")),
             "expected drop rule in {log}"
         );
         assert!(

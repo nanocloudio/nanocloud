@@ -107,7 +107,21 @@ pub struct ApplyConflict {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ErrorBody {
-    pub error: String,
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "error",
+        rename = "message"
+    )]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflicts: Option<Vec<ApplyConflict>>,
 }
@@ -210,7 +224,11 @@ pub struct BundleRuntimeSpec {
     pub env_from: Vec<EnvFromSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeSpec>,
-    #[serde(rename = "volumeMounts", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "volumeMounts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub volume_mounts: Vec<VolumeMount>,
 }
 
@@ -264,13 +282,11 @@ pub enum BundleSeccompProfileType {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "UPPERCASE")]
 pub enum BundlePhase {
-    Pending,
-    Validating,
-    Rendering,
-    Applying,
-    Ready,
+    Installing,
+    Running,
+    Updating,
     Failed,
-    Deleting,
+    Uninstalling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,10 +302,9 @@ pub enum BundleConditionStatus {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "PascalCase")]
 pub enum BundleConditionKind {
-    Ready,
-    Bound,
-    SecretsProvisioned,
-    ProfilePrepared,
+    InstallReady,
+    BindingsReady,
+    BackupHealthy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +341,7 @@ pub struct BundleWorkloadRef {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct BundleStatus {
     /// Observed bundle generation.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -607,4 +623,25 @@ pub struct VolumeSnapshot {
     pub spec: VolumeSnapshotSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<VolumeSnapshotStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VolumeSnapshotList {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: ListMeta,
+    pub items: Vec<VolumeSnapshot>,
+}
+
+impl Default for VolumeSnapshotList {
+    fn default() -> Self {
+        VolumeSnapshotList {
+            api_version: "nanocloud.io/v1".to_string(),
+            kind: "VolumeSnapshotList".to_string(),
+            metadata: ListMeta::default(),
+            items: Vec::new(),
+        }
+    }
 }

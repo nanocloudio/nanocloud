@@ -21,6 +21,7 @@ pub(super) mod daemonsets;
 pub(super) mod deployments;
 pub(super) mod devices;
 pub(super) mod discovery;
+pub(super) mod endpoints;
 mod error;
 pub(super) mod events;
 pub(super) mod exec;
@@ -31,19 +32,24 @@ pub(super) mod jobs;
 pub(super) mod logs;
 pub(super) mod observability;
 pub(super) mod pods;
+pub(super) mod pvcs;
+pub(super) mod rbac;
 pub(super) mod replicasets;
+pub(super) mod secrets;
 mod selectors;
+pub(super) mod service_resources;
 pub mod serviceaccounts;
 pub(super) mod services;
 pub(super) mod statefulsets;
+pub(super) mod volumesnapshots;
 mod watch;
 
+pub use self::error::ApiError;
 #[allow(unused_imports)]
 pub use pods::{list_pods_all, PodTableRow, WatchParams, TABLE_CONTENT_TYPE};
 
 use std::sync::{Arc, OnceLock};
 
-use self::error::ApiError;
 use crate::nanocloud::api::types::{
     AsyncStatus, CaRequest, LogQuery, NetworkPolicyChainDebug, NetworkPolicyDebugResponse,
     NetworkPolicyRuleDebug, NetworkPolicySummary, ServiceAccountTokenRequest,

@@ -289,6 +289,7 @@ impl Image {
             node_name: None,
             host_network,
             security: PodSecurityContext::default(),
+            node_selector: HashMap::new(),
         };
 
         Pod {
@@ -296,10 +297,8 @@ impl Image {
             kind: "Pod".to_string(),
             metadata: ObjectMeta {
                 name: Some(container_name.to_string()),
-                namespace: None,
                 labels,
-                annotations: HashMap::new(),
-                resource_version: None,
+                ..Default::default()
             },
             spec: pod_spec,
             status: None,

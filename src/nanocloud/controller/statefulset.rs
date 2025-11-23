@@ -151,6 +151,11 @@ impl StatefulSetController {
             .unwrap_or_default();
         let mut pruned_replicasets: Vec<String> = Vec::new();
 
+        if previous_state.is_none() {
+            revision_history.clear();
+            pruned_replicasets.clear();
+        }
+
         let mut replicaset_name = derive_replicaset_name(&self.name, &revision);
 
         if let Some(prev_state) = previous_state.as_ref() {
@@ -1267,6 +1272,7 @@ mod tests {
         let guard = acquire_test_lock();
         let ctx = TestContext::new();
         let controller = StatefulSetController::new("worker", Some("default".into()));
+        let _ = controller.clear_state();
         (controller, ctx, guard)
     }
 

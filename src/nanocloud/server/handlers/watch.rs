@@ -32,10 +32,15 @@ use crate::nanocloud::k8s::configmap::ConfigMap;
 use crate::nanocloud::k8s::configmap_manager::ConfigMapWatchEvent;
 use crate::nanocloud::k8s::daemonset::DaemonSet;
 use crate::nanocloud::k8s::deployment::Deployment;
+use crate::nanocloud::k8s::endpoints::{Endpoints, EndpointsWatchEvent};
 use crate::nanocloud::k8s::event::{Event, EventWatchEvent};
 use crate::nanocloud::k8s::job::Job;
 use crate::nanocloud::k8s::pod::{ObjectMeta, Pod};
 use crate::nanocloud::k8s::replicaset::ReplicaSet;
+use crate::nanocloud::k8s::secret::Secret;
+use crate::nanocloud::k8s::secret_manager::SecretWatchEvent;
+use crate::nanocloud::k8s::service::Service;
+use crate::nanocloud::k8s::service_registry::ServiceWatchEvent;
 use crate::nanocloud::k8s::statefulset::StatefulSet;
 use crate::nanocloud::kubelet::WatchEvent;
 use crate::nanocloud::logger::log_warn;
@@ -150,6 +155,24 @@ impl WatchItem for Event {
     }
 }
 
+impl WatchItem for Secret {
+    fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+}
+
+impl WatchItem for Service {
+    fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+}
+
+impl WatchItem for Endpoints {
+    fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+}
+
 impl WatchItem for StatefulSet {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
@@ -201,6 +224,30 @@ impl WatchEventLike for ConfigMapWatchEvent {
 
 impl WatchEventLike for EventWatchEvent {
     type Object = Event;
+
+    fn into_parts(self) -> (String, Self::Object) {
+        (self.event_type, self.object)
+    }
+}
+
+impl WatchEventLike for SecretWatchEvent {
+    type Object = Secret;
+
+    fn into_parts(self) -> (String, Self::Object) {
+        (self.event_type, self.object)
+    }
+}
+
+impl WatchEventLike for ServiceWatchEvent {
+    type Object = Service;
+
+    fn into_parts(self) -> (String, Self::Object) {
+        (self.event_type, self.object)
+    }
+}
+
+impl WatchEventLike for EndpointsWatchEvent {
+    type Object = Endpoints;
 
     fn into_parts(self) -> (String, Self::Object) {
         (self.event_type, self.object)
@@ -574,6 +621,7 @@ mod tests {
             labels: Default::default(),
             annotations: Default::default(),
             resource_version: Some(resource_version.to_string()),
+            ..Default::default()
         };
         WatchEvent {
             event_type: "ADDED".to_string(),

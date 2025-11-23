@@ -2,20 +2,75 @@
 
 use crate::nanocloud::controller::endpoints;
 use crate::nanocloud::k8s::service::{Service, ServiceStatus};
-use crate::nanocloud::k8s::store;
+use crate::nanocloud::k8s::store::{
+    self, normalize_namespace, paginate_entries, ListCursor, PaginatedResult,
+};
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::util::Keyspace;
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use tokio::sync::broadcast;
+
+const WATCH_BUFFER_SIZE: usize = 32;
 
 const CLUSTER_IP_KEYSPACE: Keyspace = Keyspace::new("network");
 const ALLOC_SERVICE_PREFIX: &str = "/clusterip/services";
 const ALLOC_IP_PREFIX: &str = "/clusterip/ips";
 const NEXT_IP_KEY: &str = "/clusterip/state/next";
+
+#[derive(Debug)]
+pub enum ServiceError {
+    AlreadyExists(String),
+    NotFound(String),
+    Invalid(String),
+    Persistence(Box<dyn Error + Send + Sync>),
+}
+
+impl Display for ServiceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceError::AlreadyExists(msg)
+            | ServiceError::NotFound(msg)
+            | ServiceError::Invalid(msg) => f.write_str(msg),
+            ServiceError::Persistence(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl Error for ServiceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ServiceError::Persistence(err) => Some(err.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl ServiceError {
+    pub fn persistence_box(err: Box<dyn Error + Send + Sync>) -> Self {
+        ServiceError::Persistence(err)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceWatchEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub object: Service,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+enum WatchScope {
+    Cluster,
+    Namespace(String),
+    Service(String),
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ClusterIpRange {
@@ -189,6 +244,7 @@ fn parse_ipv4(value: &str) -> Result<u32, Box<dyn Error + Send + Sync>> {
 
 pub struct ServiceRegistry {
     services: RwLock<HashMap<String, Service>>,
+    watchers: RwLock<HashMap<WatchScope, broadcast::Sender<ServiceWatchEvent>>>,
     resource_counter: AtomicU64,
     allocator: ClusterIpAllocator,
 }
@@ -202,6 +258,7 @@ impl ServiceRegistry {
                 let (initial, counter) = load_initial_services();
                 Arc::new(ServiceRegistry {
                     services: RwLock::new(initial),
+                    watchers: RwLock::new(HashMap::new()),
                     resource_counter: AtomicU64::new(counter.max(1)),
                     allocator,
                 })
@@ -209,12 +266,49 @@ impl ServiceRegistry {
             .clone()
     }
 
+    pub fn current_resource_version(&self) -> String {
+        let current = self.resource_counter.load(Ordering::SeqCst);
+        current.saturating_sub(1).to_string()
+    }
+
+    pub fn list_since(
+        &self,
+        namespace: Option<&str>,
+        resource_version: Option<u64>,
+    ) -> Vec<Service> {
+        self.collect_entries(namespace, resource_version)
+            .into_iter()
+            .map(|(_, svc, _)| svc)
+            .collect()
+    }
+
+    pub fn list_paginated(
+        &self,
+        namespace: Option<&str>,
+        resource_version: Option<u64>,
+        limit: Option<u32>,
+        cursor: Option<&ListCursor>,
+    ) -> Result<PaginatedResult<Service>, ServiceError> {
+        let entries = self.collect_entries(namespace, resource_version);
+        paginate_entries(entries, cursor, limit)
+            .map_err(|err| ServiceError::Invalid(err.to_string()))
+    }
+
     pub fn list(&self, namespace: Option<&str>) -> Vec<Service> {
+        let namespace_filter = namespace.map(|ns| normalize_namespace(Some(ns)));
         let guard = self.services.read().expect("service registry poisoned");
         guard
             .values()
-            .filter(|service| match namespace {
-                Some(ns) => service.metadata.namespace.as_deref().unwrap_or("default") == ns,
+            .filter(|service| match namespace_filter.as_ref() {
+                Some(ns) => {
+                    service
+                        .metadata
+                        .namespace
+                        .as_deref()
+                        .map(|value| normalize_namespace(Some(value)))
+                        .as_deref()
+                        == Some(ns.as_str())
+                }
                 None => true,
             })
             .cloned()
@@ -227,11 +321,7 @@ impl ServiceRegistry {
         guard.get(&key).cloned()
     }
 
-    pub fn create(
-        &self,
-        namespace: &str,
-        mut service: Service,
-    ) -> Result<Service, Box<dyn Error + Send + Sync>> {
+    pub fn create(&self, namespace: &str, mut service: Service) -> Result<Service, ServiceError> {
         if service.api_version.is_empty() {
             service.api_version = "nanocloud.io/v1".to_string();
         }
@@ -241,26 +331,32 @@ impl ServiceRegistry {
         let identity = ensure_metadata(namespace, &mut service)?;
         let key = service_key(&identity.namespace, &identity.name);
 
-        let cluster_ip = self.allocator.allocate(
-            &identity.namespace,
-            &identity.name,
-            service
-                .spec
-                .cluster_ip
-                .as_deref()
-                .filter(|ip| !ip.is_empty()),
-        )?;
+        let cluster_ip = self
+            .allocator
+            .allocate(
+                &identity.namespace,
+                &identity.name,
+                service
+                    .spec
+                    .cluster_ip
+                    .as_deref()
+                    .filter(|ip| !ip.is_empty()),
+            )
+            .map_err(ServiceError::persistence_box)?;
 
         service.spec.cluster_ip = Some(cluster_ip.clone());
         service.status = Some(ServiceStatus {
             cluster_ip: Some(cluster_ip),
         });
         service.metadata.resource_version = Some(self.next_resource_version());
+        service
+            .metadata
+            .ensure_common_fields(Some(&identity.namespace), Some(&identity.name));
 
         {
             let mut guard = self.services.write().expect("service registry poisoned");
             if guard.contains_key(&key) {
-                return Err(new_error(format!(
+                return Err(ServiceError::AlreadyExists(format!(
                     "Service '{}/{}' already exists",
                     identity.namespace, identity.name
                 )));
@@ -268,28 +364,74 @@ impl ServiceRegistry {
             guard.insert(key.clone(), service.clone());
         }
 
-        store::save_service(Some(&identity.namespace), &identity.name, &service)?;
-        endpoints::reconcile_service(&service)?;
+        let store_result = store::save_service(Some(&identity.namespace), &identity.name, &service);
+        if let Err(err) = store_result {
+            let mut guard = self.services.write().expect("service registry poisoned");
+            guard.remove(&key);
+            return Err(ServiceError::persistence_box(err));
+        }
+        if let Err(err) = endpoints::reconcile_service(&service) {
+            let mut guard = self.services.write().expect("service registry poisoned");
+            guard.remove(&key);
+            let _ = store::delete_service(Some(&identity.namespace), &identity.name);
+            return Err(ServiceError::persistence_box(err));
+        }
+        self.notify_watchers(
+            &identity.namespace,
+            &identity.name,
+            ServiceWatchEvent {
+                event_type: "ADDED".to_string(),
+                object: service.clone(),
+            },
+        );
         Ok(service)
     }
 
-    pub fn delete(&self, namespace: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let normalized = if namespace.is_empty() {
-            "default"
-        } else {
-            namespace
-        };
-        let key = service_key(normalized, name);
+    pub fn delete(&self, namespace: &str, name: &str) -> Result<Service, ServiceError> {
+        let normalized = normalize_namespace(Some(namespace));
+        let key = service_key(&normalized, name);
         let removed = {
             let mut guard = self.services.write().expect("service registry poisoned");
             guard.remove(&key)
         };
-        if let Some(service) = removed {
-            self.allocator.release(normalized, name)?;
-            store::delete_service(Some(normalized), name)?;
-            endpoints::remove_service(&service)?;
-        }
-        Ok(())
+        let Some(mut service) = removed else {
+            return Err(ServiceError::NotFound(format!(
+                "Service '{normalized}/{name}' not found"
+            )));
+        };
+        service.metadata.resource_version = Some(self.next_resource_version());
+        self.allocator
+            .release(&normalized, name)
+            .map_err(ServiceError::persistence_box)?;
+        store::delete_service(Some(&normalized), name).map_err(ServiceError::persistence_box)?;
+        endpoints::remove_service(&service).map_err(ServiceError::persistence_box)?;
+        self.notify_watchers(
+            &normalized,
+            name,
+            ServiceWatchEvent {
+                event_type: "DELETED".to_string(),
+                object: service.clone(),
+            },
+        );
+        Ok(service)
+    }
+
+    pub fn watch_cluster(&self) -> broadcast::Receiver<ServiceWatchEvent> {
+        self.ensure_watcher(WatchScope::Cluster)
+    }
+
+    pub fn watch_namespace(&self, namespace: &str) -> broadcast::Receiver<ServiceWatchEvent> {
+        let ns = normalize_namespace(Some(namespace));
+        self.ensure_watcher(WatchScope::Namespace(ns))
+    }
+
+    pub fn watch_service(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> broadcast::Receiver<ServiceWatchEvent> {
+        let ns = normalize_namespace(Some(namespace));
+        self.ensure_watcher(WatchScope::Service(service_key(&ns, name)))
     }
 
     fn next_resource_version(&self) -> String {
@@ -298,14 +440,75 @@ impl ServiceRegistry {
             .saturating_add(1)
             .to_string()
     }
+
+    pub fn collect_entries(
+        &self,
+        namespace: Option<&str>,
+        resource_version: Option<u64>,
+    ) -> Vec<(String, Service, Option<String>)> {
+        let namespace_filter = namespace.map(|ns| normalize_namespace(Some(ns)));
+        let guard = self.services.read().expect("service registry poisoned");
+        guard
+            .iter()
+            .filter_map(|(key, svc)| {
+                if let Some(target_ns) = namespace_filter.as_ref() {
+                    if svc
+                        .metadata
+                        .namespace
+                        .as_deref()
+                        .map(|ns| normalize_namespace(Some(ns)))
+                        .as_deref()
+                        != Some(target_ns.as_str())
+                    {
+                        return None;
+                    }
+                }
+
+                if let Some(threshold) = resource_version {
+                    let current = svc
+                        .metadata
+                        .resource_version
+                        .as_deref()
+                        .and_then(|rv| rv.parse::<u64>().ok());
+                    if current.map(|rv| rv <= threshold).unwrap_or(false) {
+                        return None;
+                    }
+                }
+
+                Some((
+                    key.clone(),
+                    svc.clone(),
+                    svc.metadata.resource_version.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    fn ensure_watcher(&self, scope: WatchScope) -> broadcast::Receiver<ServiceWatchEvent> {
+        let mut guard = self.watchers.write().expect("service watcher map poisoned");
+        guard
+            .entry(scope.clone())
+            .or_insert_with(|| broadcast::channel(WATCH_BUFFER_SIZE).0)
+            .subscribe()
+    }
+
+    fn notify_watchers(&self, namespace: &str, name: &str, event: ServiceWatchEvent) {
+        let guard = self.watchers.read().expect("service watcher map poisoned");
+        let scope_cluster = WatchScope::Cluster;
+        let scope_namespace = WatchScope::Namespace(namespace.to_string());
+        let scope_service =
+            WatchScope::Service(service_key(&normalize_namespace(Some(namespace)), name));
+
+        for scope in [scope_cluster, scope_namespace, scope_service] {
+            if let Some(sender) = guard.get(&scope) {
+                let _ = sender.send(event.clone());
+            }
+        }
+    }
 }
 
 fn service_key(namespace: &str, name: &str) -> String {
-    let normalized = if namespace.is_empty() {
-        "default"
-    } else {
-        namespace
-    };
+    let normalized = normalize_namespace(Some(namespace));
     format!("{}/{}", normalized, name)
 }
 
@@ -317,17 +520,17 @@ struct ServiceIdentity {
 fn ensure_metadata(
     namespace: &str,
     service: &mut Service,
-) -> Result<ServiceIdentity, Box<dyn Error + Send + Sync>> {
+) -> Result<ServiceIdentity, ServiceError> {
     let namespace_value = if let Some(ns) = service.metadata.namespace.as_deref() {
         if ns.trim().is_empty() {
             "default".to_string()
         } else {
-            ns.trim().to_string()
+            normalize_namespace(Some(ns))
         }
     } else if namespace.trim().is_empty() {
         "default".to_string()
     } else {
-        namespace.trim().to_string()
+        normalize_namespace(Some(namespace))
     };
     service.metadata.namespace = Some(namespace_value.clone());
 
@@ -347,9 +550,14 @@ fn ensure_metadata(
             .clone(),
     };
     if name_value.trim().is_empty() {
-        return Err(new_error("Service metadata.name is required"));
+        return Err(ServiceError::Invalid(
+            "Service metadata.name is required".to_string(),
+        ));
     }
     service.metadata.name = Some(name_value.clone());
+    service
+        .metadata
+        .ensure_common_fields(Some(&namespace_value), Some(&name_value));
 
     Ok(ServiceIdentity {
         namespace: namespace_value,

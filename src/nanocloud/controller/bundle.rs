@@ -15,16 +15,22 @@
  */
 
 use crate::nanocloud::api::types::{
-    BindingHistoryEntry, Bundle, BundleCondition, BundleConditionKind, BundleConditionStatus,
-    BundlePhase, BundleSnapshotSource, BundleStatus, BundleWorkloadRef,
+    BindingHistoryEntry, BindingHistoryStatus, Bundle, BundleCondition, BundleConditionKind,
+    BundleConditionStatus, BundlePhase, BundleSnapshotSource, BundleStatus, BundleWorkloadRef,
+};
+use crate::nanocloud::controller::events::{EventRecorder, InvolvedObjectRef};
+use crate::nanocloud::controller::runtime::{
+    ControllerRuntime, ControllerTarget, ControllerWorkItem,
 };
 use crate::nanocloud::controller::status::BundleConditionReason;
-use crate::nanocloud::controller::watch::ControllerWatchManager;
+use crate::nanocloud::controller::watch::{ControllerWatchEvent, ControllerWatchManager};
 use crate::nanocloud::engine::container;
 use crate::nanocloud::engine::profile::is_reserved_profile_key;
 use crate::nanocloud::events::in_memory::InMemoryEventBus;
 use crate::nanocloud::events::{EventEnvelope, EventKey, EventPublisher, EventTopic, EventType};
-use crate::nanocloud::k8s::bundle_manager::BundleRegistry;
+use crate::nanocloud::k8s::bundle_manager::{BundleRegistry, BUNDLE_FINALIZER};
+use crate::nanocloud::k8s::pod::OwnerReference;
+use crate::nanocloud::k8s::store::normalize_namespace;
 use crate::nanocloud::logger::{log_debug, log_error, log_info, log_warn};
 use crate::nanocloud::observability::{
     metrics::{self, ControllerReconcileResult},
@@ -44,70 +50,178 @@ const BUNDLE_PREFIX: &str = "/bundles";
 
 pub fn spawn() -> JoinHandle<()> {
     tokio::spawn(async move {
+        let runtime = ControllerRuntime::shared();
         let registry = BundleRegistry::shared();
         let event_bus = InMemoryEventBus::global();
-        // Ensure existing bundles are reconciled on startup.
-        for bundle in registry.list(None).await {
-            if let Err(err) = reconcile_bundle(
-                Arc::clone(&registry),
-                Arc::clone(&event_bus),
-                bundle.clone(),
-            )
-            .await
-            {
-                let message = err;
-                log_error(
-                    COMPONENT,
-                    "Failed to reconcile bundle during startup",
-                    &[("error", message.as_str())],
-                );
-            }
-        }
+        let recorder = EventRecorder::new(COMPONENT);
 
-        let manager = ControllerWatchManager::shared();
-        let mut subscription = manager.subscribe(BUNDLE_PREFIX, None);
-        while let Some(event) = subscription.recv().await {
-            match event.event_type {
-                KeyspaceEventType::Deleted => continue,
-                KeyspaceEventType::Added | KeyspaceEventType::Modified => {
-                    let Some(value) = event.value else {
-                        continue;
-                    };
-                    match serde_json::from_str::<Bundle>(&value) {
-                        Ok(bundle) => {
-                            if let Err(err) = reconcile_bundle(
-                                Arc::clone(&registry),
-                                Arc::clone(&event_bus),
-                                bundle.clone(),
-                            )
-                            .await
-                            {
-                                log_error(
-                                    COMPONENT,
-                                    "Bundle reconciliation failed",
-                                    &[
-                                        (
-                                            "bundle",
-                                            bundle.metadata.name.as_deref().unwrap_or("<unnamed>"),
-                                        ),
-                                        ("error", err.as_str()),
-                                    ],
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            let message = err.to_string();
-                            log_error(
-                                COMPONENT,
-                                "Failed to deserialize bundle from keyspace event",
-                                &[("error", message.as_str())],
-                            );
-                        }
-                    }
+        start_bundle_executor(
+            &runtime,
+            Arc::clone(&registry),
+            Arc::clone(&event_bus),
+            recorder.clone(),
+        );
+        bootstrap_existing_bundles(&runtime, &registry).await;
+        watch_bundle_events(runtime, registry, event_bus, recorder).await;
+    })
+}
+
+fn start_bundle_executor(
+    runtime: &Arc<ControllerRuntime>,
+    registry: Arc<BundleRegistry>,
+    event_bus: Arc<InMemoryEventBus>,
+    recorder: EventRecorder,
+) {
+    runtime.spawn_executor(move |item| {
+        let registry = Arc::clone(&registry);
+        let event_bus = Arc::clone(&event_bus);
+        let recorder = recorder.clone();
+        async move {
+            if let ControllerTarget::Bundle { namespace, name } = &item.target {
+                if let Err(err) = reconcile_bundle(
+                    Arc::clone(&registry),
+                    Arc::clone(&event_bus),
+                    recorder.clone(),
+                    namespace.clone(),
+                    name.clone(),
+                )
+                .await
+                {
+                    log_error(
+                        COMPONENT,
+                        "Bundle reconciliation failed",
+                        &[
+                            ("namespace", namespace.as_deref().unwrap_or("default")),
+                            ("bundle", name.as_str()),
+                            ("error", err.as_str()),
+                        ],
+                    );
                 }
             }
         }
-    })
+    });
+}
+
+async fn bootstrap_existing_bundles(
+    runtime: &Arc<ControllerRuntime>,
+    registry: &Arc<BundleRegistry>,
+) {
+    let existing = registry.list(None).await;
+    if !existing.is_empty() {
+        log_info(
+            COMPONENT,
+            "Reconciling existing Bundles on startup",
+            &[("count", existing.len().to_string().as_str())],
+        );
+    }
+    for bundle in existing {
+        let namespace = bundle.metadata.namespace.clone();
+        let name = bundle
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| bundle.spec.service.clone());
+        enqueue_bundle(runtime, namespace, name).await;
+    }
+}
+
+async fn watch_bundle_events(
+    runtime: Arc<ControllerRuntime>,
+    _registry: Arc<BundleRegistry>,
+    _event_bus: Arc<InMemoryEventBus>,
+    recorder: EventRecorder,
+) {
+    let manager = ControllerWatchManager::shared();
+    let mut subscription = manager.subscribe(BUNDLE_PREFIX, None);
+    while let Some(event) = subscription.recv().await {
+        match event.event_type {
+            KeyspaceEventType::Deleted => {
+                if let Some((ns, name)) = parse_bundle_key(event.key.as_str()) {
+                    let ns_label = ns.clone().unwrap_or_else(|| "default".to_string());
+                    log_debug(
+                        COMPONENT,
+                        "Bundle deleted",
+                        &[("namespace", ns_label.as_str()), ("bundle", name.as_str())],
+                    );
+                    // Finalizer cleanup handled in reconcile.
+                    enqueue_bundle(&runtime, ns, name).await;
+                }
+            }
+            KeyspaceEventType::Added | KeyspaceEventType::Modified => {
+                if let Some((namespace, name)) = bundle_identity(&event) {
+                    enqueue_bundle(&runtime, namespace, name).await;
+                } else {
+                    log_warn(
+                        COMPONENT,
+                        "Bundle event missing identity",
+                        &[("key", event.key.as_str())],
+                    );
+                }
+            }
+        }
+    }
+
+    // Ensure recorder stays alive for executor.
+    drop(recorder);
+}
+
+fn bundle_identity(event: &ControllerWatchEvent) -> Option<(Option<String>, String)> {
+    if let Some(value) = event.value.as_ref() {
+        if let Ok(bundle) = serde_json::from_str::<Bundle>(value) {
+            let name = bundle
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| bundle.spec.service.clone());
+            return Some((bundle.metadata.namespace.clone(), name));
+        }
+    }
+    parse_bundle_key(event.key.as_str())
+}
+
+fn parse_bundle_key(key: &str) -> Option<(Option<String>, String)> {
+    let parts: Vec<&str> = key
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if parts.len() != 3 || parts[0] != BUNDLE_PREFIX.trim_start_matches('/') {
+        return None;
+    }
+    let namespace = if parts[1].eq_ignore_ascii_case("default") {
+        Some("default".to_string())
+    } else {
+        Some(parts[1].to_string())
+    };
+    let name = parts[2].to_string();
+    Some((namespace, name))
+}
+
+async fn enqueue_bundle(runtime: &Arc<ControllerRuntime>, namespace: Option<String>, name: String) {
+    let item = ControllerWorkItem::bundle(namespace.as_deref(), name.as_str());
+    match runtime.work_queue().enqueue(item).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log_debug(
+                COMPONENT,
+                "Coalesced bundle reconciliation request",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("bundle", name.as_str()),
+                ],
+            );
+        }
+        Err(err) => {
+            log_warn(
+                COMPONENT,
+                "Failed to enqueue bundle reconciliation",
+                &[
+                    ("namespace", namespace.as_deref().unwrap_or("default")),
+                    ("bundle", name.as_str()),
+                    ("error", err.to_string().as_str()),
+                ],
+            );
+        }
+    }
 }
 
 async fn refresh_bundle_gauges(registry: &Arc<BundleRegistry>) {
@@ -118,7 +232,7 @@ async fn refresh_bundle_gauges(registry: &Arc<BundleRegistry>) {
             .status
             .as_ref()
             .and_then(|status| status.phase.as_ref());
-        if matches!(phase, Some(BundlePhase::Ready)) {
+        if matches!(phase, Some(BundlePhase::Running)) {
             ready += 1;
         } else {
             degraded += 1;
@@ -130,24 +244,32 @@ async fn refresh_bundle_gauges(registry: &Arc<BundleRegistry>) {
 async fn reconcile_bundle(
     registry: Arc<BundleRegistry>,
     event_bus: Arc<InMemoryEventBus>,
-    bundle: Bundle,
+    recorder: EventRecorder,
+    namespace: Option<String>,
+    name: String,
 ) -> Result<(), String> {
-    let span_namespace = bundle
-        .metadata
-        .namespace
-        .clone()
-        .or_else(|| bundle.spec.namespace.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let namespace_label = normalize_namespace(namespace.as_deref());
+    let Some(bundle) = registry.get(&namespace_label, &name).await else {
+        log_debug(
+            COMPONENT,
+            "Bundle missing during reconciliation",
+            &[
+                ("namespace", namespace_label.as_str()),
+                ("bundle", name.as_str()),
+            ],
+        );
+        return Ok(());
+    };
+    let bundle_for_event = bundle.clone();
     let span_name = bundle
         .metadata
         .name
         .clone()
         .unwrap_or_else(|| bundle.spec.service.clone());
-    let bundle_for_event = bundle.clone();
     let registry_for_span = Arc::clone(&registry);
     let result = tracing::with_span(
         "controller.bundle",
-        format!("{}/{}", span_namespace, span_name),
+        format!("{}/{}", namespace_label, span_name),
         reconcile_bundle_inner(registry_for_span, bundle),
     )
     .await;
@@ -155,6 +277,7 @@ async fn reconcile_bundle(
         Arc::clone(&event_bus),
         &bundle_for_event,
         result.as_ref().err().map(|e| e.as_str()),
+        &recorder,
     )
     .await;
     let controller_result = if result.is_ok() {
@@ -223,6 +346,21 @@ async fn reconcile_bundle_inner(
         Some(resolved_namespace.as_str())
     };
 
+    if bundle.metadata.deletion_timestamp.is_some() {
+        return handle_bundle_deletion(
+            Arc::clone(&registry),
+            bundle,
+            &previous_conditions,
+            next_observed_generation,
+            &resolved_namespace,
+            &bundle_name,
+            namespace_ref,
+            expected_resource_version.as_str(),
+            &latest_binding_history,
+        )
+        .await;
+    }
+
     log_info(
         COMPONENT,
         "Reconciling bundle",
@@ -256,23 +394,18 @@ async fn reconcile_bundle_inner(
                 &previous_conditions,
                 ConditionSpec::new(
                     BundleConditionStatus::False,
-                    BundleConditionReason::ProfileFailed,
+                    BundleConditionReason::InstallFailed,
                     Some(message.clone()),
                 ),
                 ConditionSpec::new(
-                    BundleConditionStatus::False,
-                    BundleConditionReason::SecretsFailed,
-                    Some("Secrets blocked by profile failure".to_string()),
+                    BundleConditionStatus::Unknown,
+                    BundleConditionReason::BindingsPending,
+                    Some("Bindings blocked until install completes".to_string()),
                 ),
                 ConditionSpec::new(
                     BundleConditionStatus::False,
-                    BundleConditionReason::WorkloadPending,
-                    Some("Workloads never applied".to_string()),
-                ),
-                ConditionSpec::new(
-                    BundleConditionStatus::False,
-                    BundleConditionReason::StartPending,
-                    Some("Bundle never started".to_string()),
+                    BundleConditionReason::BackupFailed,
+                    Some(message.clone()),
                 ),
             );
             let status = BundleStatus {
@@ -303,6 +436,7 @@ async fn reconcile_bundle_inner(
         bundle.spec.update,
         bundle.spec.security.clone(),
         bundle.spec.runtime.clone(),
+        bundle_owner_reference(&bundle),
     )
     .await
     {
@@ -318,27 +452,19 @@ async fn reconcile_bundle_inner(
                     ("error", message.as_str()),
                 ],
             );
+            let bindings_condition = bindings_condition_from_history(&latest_binding_history);
             let conditions = build_conditions(
                 &previous_conditions,
                 ConditionSpec::new(
-                    BundleConditionStatus::True,
-                    BundleConditionReason::ProfilePersisted,
-                    None,
-                ),
-                ConditionSpec::new(
-                    BundleConditionStatus::True,
-                    BundleConditionReason::SecretsDistributed,
-                    None,
-                ),
-                ConditionSpec::new(
                     BundleConditionStatus::False,
-                    BundleConditionReason::WorkloadFailed,
+                    BundleConditionReason::InstallFailed,
                     Some(message.clone()),
                 ),
+                bindings_condition,
                 ConditionSpec::new(
-                    BundleConditionStatus::False,
-                    BundleConditionReason::StartPending,
-                    Some("Bundle failed before start completed".to_string()),
+                    BundleConditionStatus::Unknown,
+                    BundleConditionReason::BackupPending,
+                    None,
                 ),
             );
             let status = BundleStatus {
@@ -363,6 +489,7 @@ async fn reconcile_bundle_inner(
     let container::InstallResult { pod, profile } = install_result;
     let binding_history_snapshot = profile.binding_history_entries();
     latest_binding_history = binding_history_snapshot.clone();
+    let bindings_condition = bindings_condition_from_history(&latest_binding_history);
     let (profile_key, persisted_options_raw) = profile
         .to_serialized_fields()
         .map_err(|err| err.to_string())?;
@@ -415,24 +542,15 @@ async fn reconcile_bundle_inner(
             let conditions = build_conditions(
                 &previous_conditions,
                 ConditionSpec::new(
-                    BundleConditionStatus::True,
-                    BundleConditionReason::ProfilePersisted,
-                    None,
-                ),
-                ConditionSpec::new(
-                    BundleConditionStatus::True,
-                    BundleConditionReason::SecretsDistributed,
-                    None,
-                ),
-                ConditionSpec::new(
-                    BundleConditionStatus::True,
-                    BundleConditionReason::WorkloadApplied,
-                    None,
-                ),
-                ConditionSpec::new(
                     BundleConditionStatus::False,
-                    BundleConditionReason::StartFailed,
-                    Some(message),
+                    BundleConditionReason::InstallFailed,
+                    Some(message.clone()),
+                ),
+                bindings_condition.clone(),
+                ConditionSpec::new(
+                    BundleConditionStatus::Unknown,
+                    BundleConditionReason::BackupPending,
+                    None,
                 ),
             );
             let status = BundleStatus {
@@ -459,42 +577,43 @@ async fn reconcile_bundle_inner(
         }
     }
 
-    let ready_condition = if bundle.spec.start {
+    let install_condition = if bundle.spec.start {
         ConditionSpec::new(
             BundleConditionStatus::True,
-            BundleConditionReason::StartCompleted,
+            BundleConditionReason::InstallReady,
             None,
         )
     } else {
         ConditionSpec::new(
             BundleConditionStatus::True,
-            BundleConditionReason::StartSkipped,
+            BundleConditionReason::InstallReady,
             Some("Bundle spec requested start=false; workload left stopped".to_string()),
         )
     };
+    let backup_condition = ConditionSpec::new(
+        BundleConditionStatus::True,
+        BundleConditionReason::BackupHealthy,
+        None,
+    );
     let conditions = build_conditions(
         &previous_conditions,
-        ConditionSpec::new(
-            BundleConditionStatus::True,
-            BundleConditionReason::ProfilePersisted,
-            None,
-        ),
-        ConditionSpec::new(
-            BundleConditionStatus::True,
-            BundleConditionReason::SecretsDistributed,
-            None,
-        ),
-        ConditionSpec::new(
-            BundleConditionStatus::True,
-            BundleConditionReason::WorkloadApplied,
-            None,
-        ),
-        ready_condition,
+        install_condition,
+        bindings_condition.clone(),
+        backup_condition.clone(),
     );
+    let phase_value = if matches!(bindings_condition.status, BundleConditionStatus::False)
+        || matches!(backup_condition.status, BundleConditionStatus::False)
+    {
+        BundlePhase::Failed
+    } else if bundle.spec.update {
+        BundlePhase::Updating
+    } else {
+        BundlePhase::Running
+    };
 
     let status = BundleStatus {
         observed_generation: Some(next_observed_generation),
-        phase: Some(BundlePhase::Ready),
+        phase: Some(phase_value.clone()),
         conditions,
         workload: Some(BundleWorkloadRef {
             name: workload_name.clone(),
@@ -514,20 +633,106 @@ async fn reconcile_bundle_inner(
     )
     .await?;
 
+    let phase_label = format!("{:?}", phase_value);
     log_info(
         COMPONENT,
         "Bundle reconciled",
         &[
             ("namespace", resolved_namespace.as_str()),
             ("name", bundle_name.as_str()),
-            ("phase", "Ready"),
+            ("phase", phase_label.as_str()),
         ],
     );
 
     Ok(())
 }
 
-async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error: Option<&str>) {
+#[allow(clippy::too_many_arguments)]
+async fn handle_bundle_deletion(
+    registry: Arc<BundleRegistry>,
+    bundle: Bundle,
+    previous_conditions: &HashMap<BundleConditionKind, BundleCondition>,
+    next_observed_generation: i64,
+    namespace: &str,
+    bundle_name: &str,
+    namespace_ref: Option<&str>,
+    expected_resource_version: &str,
+    history: &[BindingHistoryEntry],
+) -> Result<(), String> {
+    let install_condition = ConditionSpec::new(
+        BundleConditionStatus::False,
+        BundleConditionReason::Uninstalling,
+        Some("Waiting for workload cleanup".to_string()),
+    );
+    let conditions = build_conditions(
+        previous_conditions,
+        install_condition,
+        bindings_condition_from_history(history),
+        ConditionSpec::new(
+            BundleConditionStatus::Unknown,
+            BundleConditionReason::BackupPending,
+            None,
+        ),
+    );
+
+    let status = BundleStatus {
+        observed_generation: Some(next_observed_generation),
+        phase: Some(BundlePhase::Uninstalling),
+        conditions,
+        workload: None,
+        last_reconciled_time: Some(now_timestamp()),
+        binding_history: history.to_vec(),
+    };
+
+    apply_status(
+        Arc::clone(&registry),
+        namespace,
+        bundle_name,
+        status,
+        Some(expected_resource_version),
+    )
+    .await?;
+
+    if bundle
+        .metadata
+        .finalizers
+        .iter()
+        .any(|finalizer| finalizer == BUNDLE_FINALIZER)
+    {
+        let plan = container::BackupPlan {
+            owner: bundle_name.to_string(),
+            retention: 1,
+        };
+        container::uninstall(namespace_ref, &bundle.spec.service, plan)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+
+    registry
+        .finalize_delete(namespace, bundle_name)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn bundle_owner_reference(bundle: &Bundle) -> Option<OwnerReference> {
+    let uid = bundle.metadata.uid.as_ref()?.clone();
+    let name = bundle.metadata.name.clone()?;
+    Some(OwnerReference {
+        api_version: "nanocloud.io/v1".to_string(),
+        kind: "Bundle".to_string(),
+        name,
+        uid,
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    })
+}
+
+async fn publish_bundle_event(
+    bus: Arc<InMemoryEventBus>,
+    bundle: &Bundle,
+    error: Option<&str>,
+    recorder: &EventRecorder,
+) {
     let resolved_namespace = bundle
         .spec
         .namespace
@@ -646,8 +851,8 @@ async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error
         "application/json",
     )
     .with_attribute("component", COMPONENT.to_string())
-    .with_attribute("namespace", resolved_namespace)
-    .with_attribute("bundle", bundle_name)
+    .with_attribute("namespace", resolved_namespace.clone())
+    .with_attribute("bundle", bundle_name.clone())
     .with_attribute("status", status_attr.to_string());
 
     if let Err(err) = bus.publish(envelope).await {
@@ -657,6 +862,24 @@ async fn publish_bundle_event(bus: Arc<InMemoryEventBus>, bundle: &Bundle, error
             &[("error", err.to_string().as_str())],
         );
     }
+
+    let involved = InvolvedObjectRef {
+        api_version: "nanocloud.io/v1".to_string(),
+        kind: "Bundle".to_string(),
+        name: bundle_name.clone(),
+        uid: bundle.metadata.uid.clone(),
+        namespace: Some(resolved_namespace.clone()),
+    };
+    let kube_event_type = if is_failure { "Warning" } else { "Normal" };
+    recorder
+        .record(
+            Some(resolved_namespace.as_str()),
+            &involved,
+            reason_text.as_str(),
+            kube_event_type,
+            message_text.as_str(),
+        )
+        .await;
 }
 
 async fn apply_status(
@@ -763,6 +986,7 @@ fn make_condition(
     }
 }
 
+#[derive(Clone)]
 struct ConditionSpec {
     status: BundleConditionStatus,
     reason: BundleConditionReason,
@@ -785,65 +1009,50 @@ impl ConditionSpec {
 
 fn build_conditions(
     previous: &HashMap<BundleConditionKind, BundleCondition>,
-    profile: ConditionSpec,
-    secrets: ConditionSpec,
-    bound: ConditionSpec,
-    ready: ConditionSpec,
+    install: ConditionSpec,
+    bindings: ConditionSpec,
+    backup: ConditionSpec,
 ) -> Vec<BundleCondition> {
-    let mut conditions = Vec::new();
     let ConditionSpec {
         status,
         reason,
         message,
-    } = profile;
-    conditions.push(make_condition(
-        previous.get(&BundleConditionKind::ProfilePrepared),
-        BundleConditionKind::ProfilePrepared,
+    } = install;
+    let install_condition = make_condition(
+        previous.get(&BundleConditionKind::InstallReady),
+        BundleConditionKind::InstallReady,
         status,
         reason,
         message,
-    ));
+    );
 
     let ConditionSpec {
         status,
         reason,
         message,
-    } = secrets;
-    conditions.push(make_condition(
-        previous.get(&BundleConditionKind::SecretsProvisioned),
-        BundleConditionKind::SecretsProvisioned,
+    } = bindings;
+    let bindings_condition = make_condition(
+        previous.get(&BundleConditionKind::BindingsReady),
+        BundleConditionKind::BindingsReady,
         status,
         reason,
         message,
-    ));
+    );
 
     let ConditionSpec {
         status,
         reason,
         message,
-    } = bound;
-    conditions.push(make_condition(
-        previous.get(&BundleConditionKind::Bound),
-        BundleConditionKind::Bound,
+    } = backup;
+    let backup_condition = make_condition(
+        previous.get(&BundleConditionKind::BackupHealthy),
+        BundleConditionKind::BackupHealthy,
         status,
         reason,
         message,
-    ));
+    );
 
-    let ConditionSpec {
-        status,
-        reason,
-        message,
-    } = ready;
-    conditions.push(make_condition(
-        previous.get(&BundleConditionKind::Ready),
-        BundleConditionKind::Ready,
-        status,
-        reason,
-        message,
-    ));
-
-    conditions
+    vec![install_condition, bindings_condition, backup_condition]
 }
 
 fn previous_binding_history(bundle: &Bundle) -> Vec<BindingHistoryEntry> {
@@ -852,6 +1061,39 @@ fn previous_binding_history(bundle: &Bundle) -> Vec<BindingHistoryEntry> {
         .as_ref()
         .map(|status| status.binding_history.clone())
         .unwrap_or_default()
+}
+
+fn bindings_condition_from_history(history: &[BindingHistoryEntry]) -> ConditionSpec {
+    if let Some(entry) = history.iter().find(|entry| {
+        matches!(
+            entry.status,
+            BindingHistoryStatus::Failed | BindingHistoryStatus::TimedOut
+        )
+    }) {
+        let message = entry
+            .message
+            .clone()
+            .or_else(|| Some(format!("Binding {} failed", entry.binding_id.clone())));
+        return ConditionSpec::new(
+            BundleConditionStatus::False,
+            BundleConditionReason::BindingsFailed,
+            message,
+        );
+    }
+
+    if history.is_empty() {
+        ConditionSpec::new(
+            BundleConditionStatus::Unknown,
+            BundleConditionReason::BindingsPending,
+            None,
+        )
+    } else {
+        ConditionSpec::new(
+            BundleConditionStatus::True,
+            BundleConditionReason::BindingsReady,
+            None,
+        )
+    }
 }
 
 fn resolve_snapshot_source(
@@ -911,83 +1153,72 @@ mod tests {
             &previous,
             ConditionSpec::new(
                 BundleConditionStatus::False,
-                BundleConditionReason::ProfileFailed,
-                Some("profile failed".to_string()),
+                BundleConditionReason::InstallFailed,
+                Some("install failed".to_string()),
             ),
             ConditionSpec::new(
                 BundleConditionStatus::False,
-                BundleConditionReason::SecretsFailed,
-                Some("secrets blocked".to_string()),
+                BundleConditionReason::BindingsFailed,
+                Some("bindings blocked".to_string()),
             ),
             ConditionSpec::new(
                 BundleConditionStatus::False,
-                BundleConditionReason::WorkloadPending,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::False,
-                BundleConditionReason::StartPending,
-                None,
+                BundleConditionReason::BackupFailed,
+                Some("backup missing".to_string()),
             ),
         );
         assert_condition(
             &conditions,
-            BundleConditionKind::ProfilePrepared,
+            BundleConditionKind::InstallReady,
             BundleConditionStatus::False,
-            "ProfileFailed",
+            "InstallFailed",
         );
         assert_condition(
             &conditions,
-            BundleConditionKind::SecretsProvisioned,
+            BundleConditionKind::BindingsReady,
             BundleConditionStatus::False,
-            "SecretsFailed",
+            "BindingsFailed",
         );
         assert_condition(
             &conditions,
-            BundleConditionKind::Bound,
+            BundleConditionKind::BackupHealthy,
             BundleConditionStatus::False,
-            "WorkloadPending",
-        );
-        assert_condition(
-            &conditions,
-            BundleConditionKind::Ready,
-            BundleConditionStatus::False,
-            "StartPending",
+            "BackupFailed",
         );
     }
 
     #[test]
-    fn start_skipped_marks_ready_true() {
+    fn install_ready_carries_message() {
         let previous = HashMap::new();
         let conditions = build_conditions(
             &previous,
             ConditionSpec::new(
                 BundleConditionStatus::True,
-                BundleConditionReason::ProfilePersisted,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::SecretsDistributed,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::WorkloadApplied,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::StartSkipped,
+                BundleConditionReason::InstallReady,
                 Some("start disabled".to_string()),
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::BindingsPending,
+                None,
+            ),
+            ConditionSpec::new(
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::BackupPending,
+                None,
             ),
         );
         assert_condition(
             &conditions,
-            BundleConditionKind::Ready,
+            BundleConditionKind::InstallReady,
             BundleConditionStatus::True,
-            "StartSkipped",
+            "InstallReady",
         );
+        let install = conditions
+            .iter()
+            .find(|cond| cond.condition_type == BundleConditionKind::InstallReady)
+            .expect("install condition expected");
+        assert_eq!(install.message.as_deref(), Some("start disabled"));
     }
 
     #[test]
@@ -1021,83 +1252,73 @@ mod tests {
     fn last_transition_preserved_when_status_stable() {
         let previous_ts = "2025-01-10T10:00:00Z";
         let previous = condition_map(vec![sample_condition(
-            BundleConditionKind::Ready,
+            BundleConditionKind::InstallReady,
             BundleConditionStatus::True,
-            "StartCompleted",
+            "InstallReady",
             Some(previous_ts),
         )]);
         let conditions = build_conditions(
             &previous,
             ConditionSpec::new(
                 BundleConditionStatus::True,
-                BundleConditionReason::ProfilePersisted,
+                BundleConditionReason::InstallReady,
                 None,
             ),
             ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::SecretsDistributed,
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::BindingsPending,
                 None,
             ),
             ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::WorkloadApplied,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::StartCompleted,
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::BackupPending,
                 None,
             ),
         );
         let ready = conditions
             .iter()
-            .find(|cond| cond.condition_type == BundleConditionKind::Ready)
-            .expect("ready condition expected");
+            .find(|cond| cond.condition_type == BundleConditionKind::InstallReady)
+            .expect("install condition expected");
         assert_eq!(ready.last_transition_time.as_deref(), Some(previous_ts));
     }
 
     #[test]
     fn last_transition_updates_on_status_change() {
         let previous = condition_map(vec![sample_condition(
-            BundleConditionKind::Ready,
+            BundleConditionKind::InstallReady,
             BundleConditionStatus::True,
-            "StartCompleted",
+            "InstallReady",
             Some("2025-01-10T10:00:00Z"),
         )]);
         let conditions = build_conditions(
             &previous,
             ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::ProfilePersisted,
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::InstallReady,
                 None,
             ),
             ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::SecretsDistributed,
-                None,
-            ),
-            ConditionSpec::new(
-                BundleConditionStatus::True,
-                BundleConditionReason::WorkloadApplied,
+                BundleConditionStatus::Unknown,
+                BundleConditionReason::BindingsPending,
                 None,
             ),
             ConditionSpec::new(
                 BundleConditionStatus::False,
-                BundleConditionReason::StartFailed,
+                BundleConditionReason::BackupFailed,
                 Some("boom".to_string()),
             ),
         );
         let ready = conditions
             .iter()
-            .find(|cond| cond.condition_type == BundleConditionKind::Ready)
-            .expect("ready condition expected");
+            .find(|cond| cond.condition_type == BundleConditionKind::InstallReady)
+            .expect("install condition expected");
         assert_ne!(
             ready.last_transition_time.as_deref(),
             Some("2025-01-10T10:00:00Z")
         );
         assert_eq!(
             ready.reason.as_deref(),
-            Some(BundleConditionReason::StartFailed.as_str())
+            Some(BundleConditionReason::InstallReady.as_str())
         );
     }
 

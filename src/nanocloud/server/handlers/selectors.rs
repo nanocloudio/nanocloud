@@ -17,7 +17,11 @@
 use super::error::ApiError;
 use crate::nanocloud::k8s::{
     configmap::ConfigMap,
+    endpoints::Endpoints,
+    persistentvolumeclaim::PersistentVolumeClaim,
     pod::{ObjectMeta, Pod},
+    secret::Secret,
+    service::Service,
 };
 use axum::http::StatusCode;
 use std::collections::HashMap;
@@ -99,6 +103,26 @@ impl ObjectSelector {
         }
 
         true
+    }
+
+    pub fn matches_secret(&self, secret: &Secret) -> bool {
+        self.matches_metadata(&secret.metadata)
+    }
+
+    pub fn matches_service(&self, service: &Service) -> bool {
+        self.matches_metadata(&service.metadata)
+    }
+
+    pub fn matches_endpoints(&self, endpoints: &Endpoints) -> bool {
+        self.matches_metadata(&endpoints.metadata)
+    }
+
+    pub fn matches_pvc(&self, pvc: &PersistentVolumeClaim) -> bool {
+        self.matches_metadata(&pvc.metadata)
+    }
+
+    pub fn matches_object(&self, metadata: &ObjectMeta) -> bool {
+        self.matches_metadata(metadata)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -186,6 +210,36 @@ pub fn matches_pod_filter(filter: Option<&ObjectSelector>, pod: &Pod) -> bool {
 pub fn matches_config_map_filter(filter: Option<&ObjectSelector>, config_map: &ConfigMap) -> bool {
     filter
         .map(|selector| selector.matches_config_map(config_map))
+        .unwrap_or(true)
+}
+
+pub fn matches_secret_filter(filter: Option<&ObjectSelector>, secret: &Secret) -> bool {
+    filter
+        .map(|selector| selector.matches_secret(secret))
+        .unwrap_or(true)
+}
+
+pub fn matches_service_filter(filter: Option<&ObjectSelector>, service: &Service) -> bool {
+    filter
+        .map(|selector| selector.matches_service(service))
+        .unwrap_or(true)
+}
+
+pub fn matches_endpoints_filter(filter: Option<&ObjectSelector>, endpoints: &Endpoints) -> bool {
+    filter
+        .map(|selector| selector.matches_endpoints(endpoints))
+        .unwrap_or(true)
+}
+
+pub fn matches_pvc_filter(filter: Option<&ObjectSelector>, pvc: &PersistentVolumeClaim) -> bool {
+    filter
+        .map(|selector| selector.matches_pvc(pvc))
+        .unwrap_or(true)
+}
+
+pub fn matches_metadata_filter(filter: Option<&ObjectSelector>, metadata: &ObjectMeta) -> bool {
+    filter
+        .map(|selector| selector.matches_object(metadata))
         .unwrap_or(true)
 }
 
@@ -442,7 +496,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             annotations: HashMap::new(),
-            resource_version: None,
+            ..Default::default()
         }
     }
 
@@ -466,6 +520,7 @@ mod tests {
                 node_name: node_name.map(|value| value.to_string()),
                 host_network: false,
                 security: PodSecurityContext::default(),
+                node_selector: HashMap::new(),
             },
             status: phase.map(|value| PodStatus {
                 phase: Some(value.to_string()),

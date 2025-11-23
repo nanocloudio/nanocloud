@@ -384,7 +384,13 @@ async fn wait_for_pod_ready(
         let mut buffer = BytesMut::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(value) => value,
+                Err(err) => {
+                    Terminal::error(format_args!("Pod watch stream error: {}", err));
+                    break;
+                }
+            };
             buffer.extend_from_slice(&chunk);
 
             loop {

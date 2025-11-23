@@ -507,8 +507,8 @@ mod tests {
     fn reloads_secret_key_after_change() {
         clear_asset_caches();
         let dir = tempdir().expect("tempdir");
-        SecureAssets::generate(dir.path(), false).expect("generate assets");
         let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", dir.path().to_string_lossy());
+        SecureAssets::generate(dir.path(), false).expect("generate assets");
 
         let first = load_secret_key().expect("first load");
         let first_der = first.private_key_to_der().expect("serialize first key");

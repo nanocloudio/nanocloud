@@ -194,12 +194,7 @@ impl CommandRunner {
         self.ensure_table()?;
         let definition = "{ type filter hook forward priority 0; policy accept; }";
         if !self.run([
-            "add",
-            "chain",
-            NFT_FAMILY,
-            NFT_TABLE,
-            BASE_CHAIN,
-            definition,
+            "add", "chain", NFT_FAMILY, NFT_TABLE, BASE_CHAIN, definition,
         ])? {
             self.run(["flush", "chain", NFT_FAMILY, NFT_TABLE, BASE_CHAIN])?;
         }
