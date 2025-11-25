@@ -15,6 +15,8 @@
  */
 
 use crate::nanocloud::cni::{cni_plugin, CniResult};
+use crate::nanocloud::controller::runtime::ControllerRuntime;
+use crate::nanocloud::dns::DnsService;
 use crate::nanocloud::engine::log::container_log_dir;
 use crate::nanocloud::engine::Profile;
 use crate::nanocloud::k8s::pod::{ContainerProbe, PodSpec, ProbeExec};
@@ -35,6 +37,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::io::{self, BufReader, ErrorKind, Write};
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -46,6 +49,33 @@ use tokio::time::{sleep, Instant};
 
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
+
+const DEFAULT_BRIDGE_DNS_ADDR: &str = "172.20.0.1";
+
+pub fn build_resolv_conf(_host_resolv: Option<&str>) -> Option<String> {
+    if let Some(dns) = ControllerRuntime::shared().dependency::<DnsService>() {
+        let config = dns.config().clone();
+        let nameserver = match config.listen_address {
+            IpAddr::V4(addr) if !addr.is_unspecified() => addr.to_string(),
+            IpAddr::V6(addr) if !addr.is_unspecified() => addr.to_string(),
+            _ => DEFAULT_BRIDGE_DNS_ADDR.to_string(),
+        };
+        let mut contents = String::new();
+        contents.push_str(&format!("nameserver {}\n", nameserver));
+        contents.push_str(&format!(
+            "search svc.{domain} {domain}\n",
+            domain = config.cluster_domain
+        ));
+        contents.push_str("options ndots:5\n");
+        return Some(contents);
+    }
+
+    let mut contents = String::new();
+    contents.push_str(&format!("nameserver {}\n", DEFAULT_BRIDGE_DNS_ADDR));
+    contents.push_str("search svc.cluster.local cluster.local\n");
+    contents.push_str("options ndots:5\n");
+    Some(contents)
+}
 
 #[derive(Deserialize, Serialize)]
 pub struct Container {
@@ -340,7 +370,7 @@ pub async fn start_container(
     }
 
     let tls_info = generate_runtime_tls(app)?;
-    let resolv_conf_template = std::fs::read_to_string("/etc/resolv.conf").ok();
+    let resolv_conf_template = build_resolv_conf(None);
 
     let readiness_probe = container_spec
         .as_ref()

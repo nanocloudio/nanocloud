@@ -20,8 +20,8 @@ use crate::nanocloud::k8s::store::normalize_namespace;
 use serde::{Deserialize, Serialize};
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::fmt;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
@@ -126,11 +126,8 @@ struct DependencyRegistry {
     values: StdRwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
-type ExecutorHandler = Arc<
-    dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+type ExecutorHandler =
+    Arc<dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 async fn run_dispatch_loop(
     queue: KeyedWorkQueue<ControllerWorkItem>,

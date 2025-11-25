@@ -5,6 +5,7 @@ use crate::nanocloud::k8s::service::{Service, ServiceStatus};
 use crate::nanocloud::k8s::store::{
     self, normalize_namespace, paginate_entries, ListCursor, PaginatedResult,
 };
+use crate::nanocloud::logger::log_warn;
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::util::Keyspace;
 
@@ -370,11 +371,34 @@ impl ServiceRegistry {
             guard.remove(&key);
             return Err(ServiceError::persistence_box(err));
         }
-        if let Err(err) = endpoints::reconcile_service(&service) {
-            let mut guard = self.services.write().expect("service registry poisoned");
-            guard.remove(&key);
-            let _ = store::delete_service(Some(&identity.namespace), &identity.name);
-            return Err(ServiceError::persistence_box(err));
+        let service_for_dns = service.clone();
+        let ns_for_dns = identity.namespace.clone();
+        let name_for_dns = identity.name.clone();
+        let reconcile = async move {
+            if let Err(err) = endpoints::reconcile_service(&service_for_dns).await {
+                log_warn(
+                    "service-registry",
+                    "Failed to reconcile endpoints for service",
+                    &[
+                        ("service", name_for_dns.as_str()),
+                        ("namespace", ns_for_dns.as_str()),
+                        ("error", err.to_string().as_str()),
+                    ],
+                );
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(reconcile);
+            }
+            Err(_) => {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(reconcile);
+                }
+            }
         }
         self.notify_watchers(
             &identity.namespace,

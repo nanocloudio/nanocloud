@@ -1516,9 +1516,7 @@ impl NanocloudClient {
 
         let ca_bytes = kube_auth.ca.as_ref().map(|data| data.bytes.clone());
 
-        let mut client_builder = Client::builder()
-            .identity(identity)
-            .http1_only();
+        let mut client_builder = Client::builder().identity(identity).http1_only();
 
         if let Some(bytes) = ca_bytes.as_ref() {
             let ca_certificate = Certificate::from_pem(bytes)?;

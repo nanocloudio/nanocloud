@@ -59,6 +59,8 @@ static BACKUP_CAPTURE_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_CAPTURE_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static BACKUP_RESTORE_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_RESTORE_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static DNS_QUERIES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static DNS_RESPONSES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| {
@@ -489,6 +491,24 @@ fn backup_restore_duration() -> &'static HistogramVec {
     })
 }
 
+fn dns_queries_total() -> &'static IntCounterVec {
+    DNS_QUERIES_TOTAL.get_or_init(|| {
+        let opts = Opts::new("dns_queries_total", "DNS queries grouped by query type");
+        let counter =
+            IntCounterVec::new(opts, &["qtype"]).expect("failed to build dns queries counter");
+        register_collector(counter)
+    })
+}
+
+fn dns_responses_total() -> &'static IntCounterVec {
+    DNS_RESPONSES_TOTAL.get_or_init(|| {
+        let opts = Opts::new("dns_responses_total", "DNS responses grouped by rcode");
+        let counter =
+            IntCounterVec::new(opts, &["rcode"]).expect("failed to build dns responses counter");
+        register_collector(counter)
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ContainerOperation {
     Install,
@@ -844,6 +864,14 @@ pub fn record_event_stream_error(topic: &str, cause: &str) {
     events_stream_errors_total()
         .with_label_values(&[topic, cause])
         .inc();
+}
+
+pub fn record_dns_query(qtype: &str) {
+    dns_queries_total().with_label_values(&[qtype]).inc();
+}
+
+pub fn record_dns_response(rcode: &str) {
+    dns_responses_total().with_label_values(&[rcode]).inc();
 }
 
 pub fn record_controller_reconcile(controller: &str, result: ControllerReconcileResult) {

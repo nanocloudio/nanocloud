@@ -31,15 +31,18 @@ pub(crate) mod token;
 mod volume;
 
 use std::error::Error;
+use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process;
+use std::str::FromStr;
 
 use crate::nanocloud::api::client::NanocloudClient;
 use crate::nanocloud::cli::Setup;
+use crate::nanocloud::dns::DnsConfig;
 use crate::nanocloud::logger;
 use crate::nanocloud::observability::tracing;
-use crate::nanocloud::server;
+use crate::nanocloud::server::{self, ServerConfig};
 
 use super::args::Commands;
 
@@ -61,7 +64,36 @@ pub async fn run(command: &Commands) -> Result<(), Box<dyn Error + Send + Sync>>
                             format!("Invalid listen address '{}': {}", args.listen, e),
                         ))
                     })?;
-            server::serve(addr).await?;
+            let dns_listen: IpAddr =
+                args.dns_listen
+                    .parse()
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                        Box::new(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Invalid DNS listen address '{}': {}", args.dns_listen, e),
+                        ))
+                    })?;
+            let dns_upstream = if args.dns_upstream.is_empty() {
+                default_upstream_from_host()
+            } else {
+                parse_upstream(&args.dns_upstream)?
+            };
+            let dns_config = DnsConfig::new(
+                args.dns_cluster_domain.clone(),
+                dns_listen,
+                args.dns_port,
+                args.dns_default_ttl,
+                dns_upstream,
+                args.dns_max_udp_payload,
+            )
+            .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                Box::new(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+            })?;
+            server::serve(ServerConfig {
+                http_listen: addr,
+                dns: dns_config,
+            })
+            .await?;
             Ok(())
         }
         Commands::Config(args) => config::handle_config(args).await,
@@ -132,4 +164,37 @@ pub async fn run(command: &Commands) -> Result<(), Box<dyn Error + Send + Sync>>
             bundles::handle_bundle(&client, args).await
         }
     }
+}
+
+fn parse_upstream(values: &[String]) -> Result<Vec<SocketAddr>, Box<dyn Error + Send + Sync>> {
+    let mut parsed = Vec::new();
+    for entry in values {
+        let addr: SocketAddr = entry.parse().map_err(|e| -> Box<dyn Error + Send + Sync> {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid upstream server '{}': {}", entry, e),
+            ))
+        })?;
+        parsed.push(addr);
+    }
+    Ok(parsed)
+}
+
+fn default_upstream_from_host() -> Vec<SocketAddr> {
+    let resolv_conf = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    resolv_conf
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') || !line.starts_with("nameserver") {
+                return None;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            IpAddr::from_str(parts[1]).ok()
+        })
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect()
 }

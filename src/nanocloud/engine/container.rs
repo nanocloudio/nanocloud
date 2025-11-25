@@ -40,8 +40,8 @@ use crate::nanocloud::k8s::pod::{
 };
 use crate::nanocloud::k8s::store as pod_store;
 use crate::nanocloud::kubelet::runtime::{
-    create_container, exec_in_container, get_container_id_by_name, kill, remove_container,
-    setup_container_files, setup_runtime_files, start_container,
+    build_resolv_conf, create_container, exec_in_container, get_container_id_by_name, kill,
+    remove_container, setup_container_files, setup_runtime_files, start_container,
 };
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_debug, log_info, log_warn};
@@ -1140,7 +1140,7 @@ async fn install_impl(
         ("ip", ip.as_str()),
     ];
     log_info("container", "Configuring runtime files", &runtime_fields);
-    let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").ok();
+    let resolv_conf = build_resolv_conf(None);
     let app_name = app.to_string();
     let ip_for_runtime = ip.clone();
     let profile_config = profile.config.clone();

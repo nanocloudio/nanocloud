@@ -48,7 +48,9 @@ const EVENT_LOGGER_COMPONENT: &str = "server-event-listener";
 
 use self::auth::{bootstrap::spawn_bootstrap_token_maintenance, AuthLayer, ClientCertificate};
 use crate::nanocloud::cni::cni_plugin;
+use crate::nanocloud::controller::runtime::ControllerRuntime;
 use crate::nanocloud::diagnostics;
+use crate::nanocloud::dns::{self, DnsConfig, DnsService};
 use crate::nanocloud::events::in_memory::InMemoryEventBus;
 use crate::nanocloud::events::{EventSubscriber, EventTopic, EventType, SubscriptionOptions};
 use crate::nanocloud::k8s::event::{
@@ -62,6 +64,12 @@ use crate::nanocloud::server::handlers::ApiError;
 use crate::nanocloud::util::error::with_context;
 use tls::{accept_with_tls, build_tls_acceptor};
 use tower::Service;
+
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub http_listen: SocketAddr,
+    pub dns: DnsConfig,
+}
 
 async fn ensure_runtime_prerequisites() -> Result<(), Box<dyn Error + Send + Sync>> {
     const BRIDGE_NAME: &str = "nanocloud0";
@@ -416,11 +424,28 @@ where
     }
 }
 
-pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn serve(config: ServerConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     ensure_runtime_prerequisites().await?;
     diagnostics::reconcile_cni_artifacts_on_startup()
         .await
         .map_err(|e| with_context(e, "Failed to reconcile CNI artifacts during startup"))?;
+    let runtime = ControllerRuntime::shared();
+    let dns_service = Arc::new(DnsService::new(config.dns.clone()));
+    let _ = runtime.register_dependency(Arc::clone(&dns_service));
+    let dns_listen = format!("{}:{}", config.dns.listen_address, config.dns.listen_port);
+    let upstream_count = config.dns.upstream_servers.len().to_string();
+    log_info(
+        "server",
+        "DNS configuration initialized",
+        &[
+            ("cluster_domain", config.dns.cluster_domain.as_str()),
+            ("listen", dns_listen.as_str()),
+            ("upstream_servers", upstream_count.as_str()),
+        ],
+    );
+    let _dns_handle = dns::server::start(Arc::clone(&dns_service))
+        .await
+        .map_err(|e| with_context(e, "Failed to start DNS listeners"))?;
     drop(crate::nanocloud::controller::bundle::spawn());
     drop(crate::nanocloud::controller::snapshot::spawn());
     drop(crate::nanocloud::controller::endpoints::spawn());
@@ -439,15 +464,17 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync>>
             &[("env_var", "NANOCLOUD_REQUIRE_CLIENT_CERTIFICATE")],
         );
     }
-    let listener = TcpListener::bind(addr)
+    let http_addr = config.http_listen;
+    let listener = TcpListener::bind(http_addr)
         .await
-        .map_err(|e| with_context(e, format!("Failed to bind server listener at {addr}")))?;
+        .map_err(|e| with_context(e, format!("Failed to bind server listener at {http_addr}")))?;
     let tls_acceptor = Arc::new(
-        build_tls_acceptor(&addr, require_client_certificate)
-            .map_err(|e| with_context(e, format!("Failed to prepare TLS acceptor for {addr}")))?,
+        build_tls_acceptor(&http_addr, require_client_certificate).map_err(|e| {
+            with_context(e, format!("Failed to prepare TLS acceptor for {http_addr}"))
+        })?,
     );
 
-    let listen_addr_text = addr.to_string();
+    let listen_addr_text = http_addr.to_string();
     log_info(
         "server",
         "HTTP server listening",
@@ -467,7 +494,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync>>
             .map_err(|e| with_context(e, "Failed to accept incoming TCP connection"))?;
         let service = app.clone();
         let tls_acceptor = Arc::clone(&tls_acceptor);
-        let listen_addr = addr;
+        let listen_addr = http_addr;
         tokio::spawn(async move {
             match accept_with_tls(tls_acceptor.as_ref(), stream).await {
                 Ok(tls_stream) => {
@@ -634,6 +661,7 @@ fn build_router() -> Router {
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/livez", get(handlers::livez))
+        .route("/v1/dns/registry", get(handlers::dns::dump_registry))
         .route("/v1/setup", post(handlers::setup))
         .route("/v1/ca", post(handlers::issue_certificate))
         .route(

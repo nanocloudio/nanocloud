@@ -368,6 +368,30 @@ pub struct ServerArgs {
         default_value = "text"
     )]
     pub log_format: LogFormatArg,
+
+    /// DNS cluster domain suffix (without the svc. prefix)
+    #[arg(long = "dns-cluster-domain", default_value = "cluster.local")]
+    pub dns_cluster_domain: String,
+
+    /// Address to bind the DNS listener
+    #[arg(long = "dns-listen", default_value = "0.0.0.0")]
+    pub dns_listen: String,
+
+    /// Port to bind the DNS listener
+    #[arg(long = "dns-port", default_value_t = 53)]
+    pub dns_port: u16,
+
+    /// Default TTL (seconds) to apply to DNS answers when not overridden per service
+    #[arg(long = "dns-ttl", default_value_t = 30)]
+    pub dns_default_ttl: u32,
+
+    /// Upstream DNS servers to use for queries outside the cluster domain
+    #[arg(long = "dns-upstream", value_delimiter = ',', value_name = "HOST:PORT")]
+    pub dns_upstream: Vec<String>,
+
+    /// Maximum UDP payload size to accept for DNS queries
+    #[arg(long = "dns-max-udp-payload", default_value_t = 512)]
+    pub dns_max_udp_payload: u16,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

@@ -32,6 +32,7 @@ hyper = { version = "1.7.0", default-features = false, features = ["http1", "ser
 hyper-util = { version = "0.1.17", features = ["server", "http1"] }
 tokio-openssl = "0.6.5"
 tokio-tungstenite = { version = "0.28.0", features = ["url"] }
+trust-dns-proto = "0.23.2"
 qrcode = "0.14.1"
 data-encoding = "2.9.0"
 log = "0.4.28"

@@ -21,6 +21,7 @@ pub mod config;
 pub mod controller;
 pub mod csi;
 pub mod diagnostics;
+pub mod dns;
 pub mod engine;
 pub mod events;
 pub mod k8s;

@@ -4,8 +4,8 @@ use super::watch::{
     ensure_resource_version_match, parse_resource_version, resource_version_is_newer,
     ResourceVersionMatchPolicy, WatchPredicate, WatchStreamBuilder,
 };
-use crate::nanocloud::k8s::service::{Service, ServiceList};
 use crate::nanocloud::k8s::pod::ListMeta;
+use crate::nanocloud::k8s::service::{Service, ServiceList};
 use crate::nanocloud::k8s::service_registry::{ServiceError, ServiceRegistry, ServiceWatchEvent};
 use crate::nanocloud::k8s::store::{
     decode_continue_token, encode_continue_token, paginate_entries, PaginationError,

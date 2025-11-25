@@ -21,6 +21,7 @@ pub(super) mod daemonsets;
 pub(super) mod deployments;
 pub(super) mod devices;
 pub(super) mod discovery;
+pub(super) mod dns;
 pub(super) mod endpoints;
 mod error;
 pub(super) mod events;
