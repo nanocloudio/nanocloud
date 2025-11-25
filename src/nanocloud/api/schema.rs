@@ -53,13 +53,15 @@ pub struct BundleSchemaDocument {
     pub json: &'static str,
 }
 
-static BUNDLE_SCHEMA_CACHE: OnceLock<Vec<BundleSchemaDocument>> = OnceLock::new();
+static BUNDLE_SCHEMA_CACHE: OnceLock<Result<Vec<BundleSchemaDocument>, BundleSchemaError>> =
+    OnceLock::new();
 struct CompiledBundleSchema {
     version: String,
     validator: JSONSchema,
 }
 
-static COMPILED_VALIDATORS: OnceLock<Vec<CompiledBundleSchema>> = OnceLock::new();
+static COMPILED_VALIDATORS: OnceLock<Result<Vec<CompiledBundleSchema>, BundleSchemaError>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SchemaValidationError {
@@ -95,41 +97,48 @@ pub struct FriendlySchemaError {
 pub enum BundleSchemaError {
     UnsupportedVersion(String),
     Validation(Vec<SchemaValidationError>),
+    InternalSchema(String),
 }
 
-fn parse_manifest() -> Vec<BundleSchemaDocument> {
-    let manifest: RawManifest =
-        serde_json::from_str(BUNDLE_MANIFEST_JSON).expect("bundle schema manifest must be valid");
+fn parse_manifest_text(text: &str) -> Result<Vec<BundleSchemaDocument>, BundleSchemaError> {
+    let manifest: RawManifest = serde_json::from_str(text).map_err(|err| {
+        BundleSchemaError::InternalSchema(format!("bundle schema manifest invalid: {err}"))
+    })?;
     if manifest.resource != "Bundle" {
-        panic!(
+        return Err(BundleSchemaError::InternalSchema(format!(
             "expected Bundle resource manifest, got {}",
             manifest.resource
-        );
+        )));
     }
 
-    manifest
-        .versions
-        .into_iter()
-        .map(|entry| {
-            let json = resolve_schema(&entry.schema)
-                .unwrap_or_else(|| panic!("bundled schema '{}' missing", entry.schema));
-            let digest = sha256(json.as_bytes());
-            assert_eq!(
-                digest, entry.sha256,
-                "schema checksum mismatch for {}",
-                entry.version
-            );
-            BundleSchemaDocument {
-                version: entry.version,
-                api_version: entry.api_version,
-                status: entry.status,
-                description: entry.description,
-                released_at: entry.released_at,
-                sha256: entry.sha256,
-                json,
-            }
-        })
-        .collect()
+    let mut documents = Vec::new();
+    for entry in manifest.versions.into_iter() {
+        let json = resolve_schema(&entry.schema).ok_or_else(|| {
+            BundleSchemaError::InternalSchema(format!("bundled schema '{}' missing", entry.schema))
+        })?;
+        let digest = sha256(json.as_bytes());
+        if digest != entry.sha256 {
+            return Err(BundleSchemaError::InternalSchema(format!(
+                "schema checksum mismatch for {}: expected {}, got {digest}",
+                entry.version, entry.sha256
+            )));
+        }
+        documents.push(BundleSchemaDocument {
+            version: entry.version,
+            api_version: entry.api_version,
+            status: entry.status,
+            description: entry.description,
+            released_at: entry.released_at,
+            sha256: entry.sha256,
+            json,
+        });
+    }
+
+    Ok(documents)
+}
+
+fn parse_manifest() -> Result<Vec<BundleSchemaDocument>, BundleSchemaError> {
+    parse_manifest_text(BUNDLE_MANIFEST_JSON)
 }
 
 fn resolve_schema(path: &str) -> Option<&'static str> {
@@ -145,62 +154,83 @@ fn sha256(bytes: &[u8]) -> String {
     hex_encode(hasher.finalize())
 }
 
-pub fn bundle_schemas() -> &'static [BundleSchemaDocument] {
-    BUNDLE_SCHEMA_CACHE.get_or_init(parse_manifest).as_slice()
+pub fn bundle_schemas() -> Result<&'static [BundleSchemaDocument], BundleSchemaError> {
+    let cache = BUNDLE_SCHEMA_CACHE.get_or_init(parse_manifest);
+    match cache {
+        Ok(docs) => Ok(docs.as_slice()),
+        Err(err) => Err(err.clone()),
+    }
 }
 
-pub fn bundle_schema(version: &str) -> Option<&'static BundleSchemaDocument> {
-    bundle_schemas()
+pub fn bundle_schema(
+    version: &str,
+) -> Result<Option<&'static BundleSchemaDocument>, BundleSchemaError> {
+    Ok(bundle_schemas()?
         .iter()
-        .find(|document| document.version == version)
+        .find(|document| document.version == version))
 }
 
-fn compiled_bundle_validators() -> &'static [CompiledBundleSchema] {
-    COMPILED_VALIDATORS.get_or_init(|| {
-        bundle_schemas()
-            .iter()
-            .map(|doc| {
-                let schema_value: Value = serde_json::from_str(doc.json)
-                    .unwrap_or_else(|err| panic!("invalid schema json for {}: {err}", doc.version));
-                let validator =
-                    JSONSchema::options()
-                        .compile(&schema_value)
-                        .unwrap_or_else(|err| {
-                            panic!("failed to compile schema {}: {err}", doc.version)
-                        });
-                CompiledBundleSchema {
-                    version: doc.version.clone(),
-                    validator,
-                }
-            })
-            .collect()
-    })
+fn compiled_bundle_validators() -> Result<&'static [CompiledBundleSchema], BundleSchemaError> {
+    let cache = COMPILED_VALIDATORS.get_or_init(|| {
+        bundle_schemas().and_then(|docs| {
+            docs.iter()
+                .map(|doc| {
+                    let schema_value: Value = serde_json::from_str(doc.json).map_err(|err| {
+                        BundleSchemaError::InternalSchema(format!(
+                            "invalid schema json for {}: {err}",
+                            doc.version
+                        ))
+                    })?;
+                    let validator =
+                        JSONSchema::options()
+                            .compile(&schema_value)
+                            .map_err(|err| {
+                                BundleSchemaError::InternalSchema(format!(
+                                    "failed to compile schema {}: {err}",
+                                    doc.version
+                                ))
+                            })?;
+                    Ok(CompiledBundleSchema {
+                        version: doc.version.clone(),
+                        validator,
+                    })
+                })
+                .collect()
+        })
+    });
+
+    match cache {
+        Ok(validators) => Ok(validators.as_slice()),
+        Err(err) => Err(err.clone()),
+    }
 }
 
-fn validator_for_version(version: &str) -> Option<&'static JSONSchema> {
-    compiled_bundle_validators()
+fn validator_for_version(version: &str) -> Result<Option<&'static JSONSchema>, BundleSchemaError> {
+    Ok(compiled_bundle_validators()?
         .iter()
         .find(|compiled| compiled.version == version)
-        .map(|compiled| &compiled.validator)
+        .map(|compiled| &compiled.validator))
 }
 
-fn version_for_api(api_version: &str) -> Option<&'static str> {
+fn version_for_api(api_version: &str) -> Result<Option<&'static str>, BundleSchemaError> {
     match api_version {
-        "nanocloud.io/v1" | "" => Some("v1alpha1"),
+        "nanocloud.io/v1" | "" => Ok(Some("v1alpha1")),
         other => {
             // allow explicit schema versions later (nanocloud.io/v1alpha2 etc.)
-            bundle_schema(other).map(|doc| doc.version.as_str())
+            Ok(bundle_schema(other)?.map(|doc| doc.version.as_str()))
         }
     }
 }
 
 pub fn validate_bundle(bundle: &Bundle) -> Result<(), BundleSchemaError> {
     let api_version = bundle.api_version.as_str();
-    let schema_version = version_for_api(api_version)
+    let schema_version = version_for_api(api_version)?
         .ok_or_else(|| BundleSchemaError::UnsupportedVersion(api_version.to_string()))?;
-    let validator = validator_for_version(schema_version)
+    let validator = validator_for_version(schema_version)?
         .ok_or_else(|| BundleSchemaError::UnsupportedVersion(api_version.to_string()))?;
-    let value = serde_json::to_value(bundle).expect("Bundle should be serialisable");
+    let value = serde_json::to_value(bundle).map_err(|err| {
+        BundleSchemaError::InternalSchema(format!("Bundle should be serialisable: {err}"))
+    })?;
     let result = validator.validate(&value);
     if let Err(errors) = result {
         let issues = errors.map(schema_error_from_validation).collect::<Vec<_>>();
@@ -512,5 +542,139 @@ pub fn format_bundle_error_summary(errors: &[SchemaValidationError]) -> String {
             .collect::<Vec<_>>()
             .join("\n");
         format!("Bundle failed schema validation:\n{details}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_with_wrong_resource_yields_internal_error() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(BUNDLE_MANIFEST_JSON).expect("valid manifest json");
+        manifest["resource"] = serde_json::Value::String("NotBundle".to_string());
+        let text = serde_json::to_string(&manifest).unwrap();
+        let err = parse_manifest_text(&text).expect_err("should fail with internal schema error");
+        match err {
+            BundleSchemaError::InternalSchema(message) => {
+                assert!(
+                    message.contains("NotBundle"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_checksum_mismatch_is_reported() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(BUNDLE_MANIFEST_JSON).expect("valid manifest json");
+        // Corrupt the checksum for the first entry.
+        if let Some(first) = manifest["versions"]
+            .as_array_mut()
+            .and_then(|arr| arr.first_mut())
+        {
+            first["sha256"] = serde_json::Value::String("deadbeef".to_string());
+        }
+        let text = serde_json::to_string(&manifest).unwrap();
+        let err = parse_manifest_text(&text).expect_err("should fail with checksum mismatch");
+        match err {
+            BundleSchemaError::InternalSchema(message) => {
+                assert!(
+                    message.contains("checksum mismatch"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn friendly_errors_and_summary_formatting() {
+        let issues = vec![
+            SchemaValidationError {
+                instance_path: "/spec/service".to_string(),
+                schema_path: "".to_string(),
+                actual_type: Some("integer".to_string()),
+                message: "type mismatch".to_string(),
+                kind: SchemaErrorKind::Type {
+                    expected: "string".to_string(),
+                },
+            },
+            SchemaValidationError {
+                instance_path: "".to_string(),
+                schema_path: "".to_string(),
+                actual_type: None,
+                message: "missing service".to_string(),
+                kind: SchemaErrorKind::MissingProperty {
+                    property: "service".to_string(),
+                },
+            },
+        ];
+
+        let friendly = friendly_bundle_errors(&issues);
+        assert_eq!(friendly.len(), 2);
+        assert_eq!(friendly[0].field, "spec.service");
+        assert!(friendly[0].message.contains("expected string"));
+        assert_eq!(friendly[1].field, "service");
+        assert!(friendly[1].message.contains("is required"));
+
+        let summary = format_bundle_error_summary(&issues);
+        assert!(summary.contains("Bundle failed schema validation"));
+        assert!(summary.contains("- spec.service"));
+        assert!(summary.contains("- service"));
+    }
+
+    #[test]
+    fn security_profile_validation_catches_duplicates_and_seccomp() {
+        use crate::nanocloud::api::types::{
+            Bundle, BundleSeccompProfile, BundleSeccompProfileType, BundleSecurityProfile,
+            BundleSpec,
+        };
+        use crate::nanocloud::k8s::pod::ObjectMeta;
+        use std::collections::HashMap;
+
+        let bundle = Bundle {
+            api_version: "nanocloud.io/v1".to_string(),
+            kind: "Bundle".to_string(),
+            metadata: ObjectMeta::default(),
+            spec: BundleSpec {
+                service: "svc".to_string(),
+                namespace: None,
+                options: HashMap::new(),
+                profile_key: None,
+                snapshot: None,
+                start: true,
+                update: true,
+                security: Some(BundleSecurityProfile {
+                    allow_privileged: false,
+                    extra_capabilities: vec!["CAP_SYS_ADMIN".into(), "CAP_SYS_ADMIN".into()],
+                    seccomp_profile: Some(BundleSeccompProfile {
+                        profile_type: BundleSeccompProfileType::Localhost,
+                        localhost_profile: None,
+                    }),
+                }),
+                runtime: None,
+            },
+            status: None,
+        };
+
+        let err =
+            validate_security_profile(&bundle).expect_err("expected security validation error");
+        match err {
+            BundleSchemaError::Validation(issues) => {
+                assert!(issues.len() >= 2);
+                let joined = issues
+                    .iter()
+                    .map(|issue| issue.message.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(joined.contains("declared multiple times"));
+                assert!(joined.contains("localhostProfile must be set"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

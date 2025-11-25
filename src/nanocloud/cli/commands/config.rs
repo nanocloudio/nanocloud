@@ -29,6 +29,7 @@ use reqwest::Url;
 
 use crate::nanocloud::api::client::{EphemeralCertificate, NanocloudClient};
 use crate::nanocloud::cli::args::KubeConfigArgs;
+use crate::nanocloud::cli::curl::print_curl_request_with_type;
 use crate::nanocloud::cli::Terminal;
 
 pub(super) async fn handle_config(
@@ -115,12 +116,12 @@ pub(super) async fn handle_config(
 }
 
 fn emit_certificate_curl(client: &NanocloudClient) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let token_value = client.bearer_token().ok_or_else(|| {
-        Box::new(io::Error::new(
+    if client.bearer_token().is_none() {
+        return Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidInput,
             "token is required to render the curl request",
-        )) as Box<dyn Error + Send + Sync>
-    })?;
+        )) as Box<dyn Error + Send + Sync>);
+    }
     let url = client
         .url_from_segments(&["apis", "nanocloud.io", "v1", "certificates"])?
         .to_string();
@@ -132,22 +133,7 @@ fn emit_certificate_curl(client: &NanocloudClient) -> Result<(), Box<dyn Error +
         }
     });
     let body = serde_json::to_string_pretty(&payload)?;
-
-    Terminal::stdout(format_args!(
-        "SINGLE_USE_TOKEN='{}'",
-        token_value.replace('\'', "'\"'\"'")
-    ));
-    Terminal::stdout(format_args!(
-        r#"curl --fail --silent --show-error \
--H "Authorization: Bearer $SINGLE_USE_TOKEN" \
--H 'Content-Type: application/json' \
-'{}' \
---data-binary @- <<'EOF'"#,
-        url
-    ));
-    Terminal::stdout(format_args!("{}", body));
-    Terminal::stdout(format_args!("EOF"));
-    Ok(())
+    print_curl_request_with_type(client, "POST", &url, Some(&body), "application/json")
 }
 
 fn read_token_input(args: &KubeConfigArgs) -> Result<String, Box<dyn Error + Send + Sync>> {

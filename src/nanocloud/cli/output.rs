@@ -21,6 +21,7 @@ use crate::nanocloud::api::types::{
     BindingHistoryEntry, BindingHistoryStatus, Bundle, BundleCondition, BundleConditionKind,
     BundleConditionStatus, PodTable,
 };
+pub(super) use crate::nanocloud::cli::service_display_name;
 use crate::nanocloud::cli::Terminal;
 
 const CONDITION_DISPLAY_ORDER: [BundleConditionKind; 3] = [
@@ -28,13 +29,6 @@ const CONDITION_DISPLAY_ORDER: [BundleConditionKind; 3] = [
     BundleConditionKind::BindingsReady,
     BundleConditionKind::BackupHealthy,
 ];
-
-pub(super) fn service_display_name(namespace: Option<&str>, service: &str) -> String {
-    namespace
-        .filter(|value| !value.is_empty())
-        .map(|ns| format!("{ns}-{service}"))
-        .unwrap_or_else(|| service.to_string())
-}
 
 pub(super) fn print_pod_table(table: &PodTable) {
     if table.column_definitions.is_empty() {

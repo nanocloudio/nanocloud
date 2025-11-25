@@ -9,6 +9,7 @@ Nanocloud is a single-binary container platform that delivers a Kubernetes-flavo
 - **Dockyard images** – curated images hosted at `registry.nanocloud.io` advertise options, defaults, and bindings through the `io.nanocloud.options` label.
 - **Bindings-first configuration** – service relationships (database, TLS, identity) are expressed once in image metadata and enforced during reconciliation.
 - **Operational safety** – TLS-only APIs, client-certificate bootstrap flows, exec/session metrics, and declarative backup retention ship out of the box.
+- **In-cluster DNS** – an embedded authoritative DNS server answers `*.svc.<cluster_domain>` and headless endpoint hostnames with automatic `resolv.conf` injection for pods.
 - **Event stream CLI & metrics** – `nanocloud events` mirrors Kubernetes watches, supports `--since`, `--level`, and `--reason` filters plus `--follow`, and the control plane emits Prometheus metrics and structured logs that align with the stream semantics.
 
 ## Architecture in Brief
@@ -90,6 +91,7 @@ sudo nanocloud server --listen 0.0.0.0:6443
 
 # Install a Dockyard workload with default
 nanocloud install kafka
+# DNS inside pods resolves services at <name>.<namespace>.svc.cluster.local
 
 # Monitor the service
 nanocloud status

@@ -151,6 +151,9 @@ fn schema_error(err: BundleSchemaError) -> BundleError {
             let detail = format_bundle_error_summary(&issues);
             BundleError::Invalid(detail)
         }
+        BundleSchemaError::InternalSchema(message) => {
+            BundleError::Invalid(format!("internal schema error: {message}"))
+        }
     }
 }
 

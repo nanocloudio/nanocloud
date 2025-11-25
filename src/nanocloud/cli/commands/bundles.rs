@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use bytes::Bytes;
 use reqwest::StatusCode;
 
 use crate::nanocloud::api::client::{
@@ -40,7 +41,7 @@ async fn handle_apply(
             args.namespace.as_deref(),
             &args.service,
             ApplyBundleOptions {
-                payload: &payload,
+                payload: Bytes::from(payload.clone()),
                 content_type: format.content_type(),
                 field_manager: &args.field_manager,
                 force: args.force,

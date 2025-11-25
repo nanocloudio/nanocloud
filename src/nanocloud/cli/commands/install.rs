@@ -16,24 +16,24 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::ops::ControlFlow;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use tokio::fs;
-use tokio::io::{self as tokio_io, AsyncWriteExt};
-use tokio::time::{sleep, timeout};
-use tokio_util::sync::CancellationToken;
+use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
+use super::{parse_json_lines, WatchParseError};
 use crate::nanocloud::api::client::{BundleExportOptions, HttpError, NanocloudClient};
-use crate::nanocloud::api::types::{Bundle, BundleSnapshotSource, BundleSpec};
 use crate::nanocloud::cli::args::{InstallArgs, UninstallArgs};
 use crate::nanocloud::cli::curl::print_curl_request;
-use crate::nanocloud::cli::output::service_display_name;
-use crate::nanocloud::cli::Terminal;
-use crate::nanocloud::k8s::pod::{ObjectMeta, Pod};
+use crate::nanocloud::cli::{
+    bundle_payload, profile_export_path, service_display_name, workload_name, Terminal,
+};
+use crate::nanocloud::k8s::pod::Pod;
 use crate::nanocloud::kubelet::WatchEvent;
 use crate::nanocloud::util::security::{SecureAssets, VolumeKeyMetadata};
 use crate::nanocloud::Config;
@@ -317,39 +317,16 @@ async fn export_profile_snapshot(
     Ok(())
 }
 
-fn profile_export_path(snapshot_target: &Path, service: &str) -> PathBuf {
-    let parent = snapshot_target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf());
-    let stem = snapshot_target
-        .file_stem()
-        .and_then(|s| {
-            let value = s.to_string_lossy();
-            if value.is_empty() {
-                None
-            } else {
-                Some(value.into_owned())
-            }
-        })
-        .unwrap_or_else(|| service.to_string());
-    let file_name = format!("{}.profile.tar", stem);
-    if let Some(dir) = parent {
-        dir.join(&file_name)
-    } else {
-        PathBuf::from(file_name)
-    }
-}
-
 async fn wait_for_pod_ready(
     client: &NanocloudClient,
     namespace: Option<&str>,
     pod_name: &str,
 ) -> Result<Pod, Box<dyn Error + Send + Sync>> {
-    const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
-    let deadline = Instant::now() + OVERALL_TIMEOUT;
+    const POD_READY_TIMEOUT: Duration = Duration::from_secs(120);
+    const POD_WATCH_BUFFER_LIMIT: usize = 64 * 1024;
+    const POD_WATCH_SLICE: Duration = Duration::from_secs(5);
 
-    let mut resource_version: Option<String> = None;
+    let deadline = Instant::now() + POD_READY_TIMEOUT;
 
     if let Some(pod) = client.get_pod(namespace, pod_name).await? {
         if is_pod_ready(&pod) {
@@ -358,93 +335,67 @@ async fn wait_for_pod_ready(
         if let Some(reason) = pod_failure_message(&pod) {
             return Err(reason.into());
         }
-        resource_version = pod.metadata.resource_version.clone();
     }
 
+    let mut attempts: u32 = 0;
     loop {
         if Instant::now() >= deadline {
             return Err("Timed out waiting for pod to become Ready".into());
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let watch_timeout = remaining
-            .min(Duration::from_secs(30))
-            .max(Duration::from_secs(1));
-
         let response = client
             .watch_pod(
                 namespace,
                 pod_name,
-                Some(watch_timeout.as_secs()),
-                resource_version.as_deref(),
+                Some(POD_WATCH_SLICE.as_secs()),
+                None,
             )
             .await?;
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = BytesMut::new();
+        let mut ready_pod: Option<Pod> = None;
+        let mut failure_reason: Option<String> = None;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(value) => value,
-                Err(err) => {
-                    Terminal::error(format_args!("Pod watch stream error: {}", err));
-                    break;
-                }
-            };
-            buffer.extend_from_slice(&chunk);
-
-            loop {
-                let Some(pos) = buffer.iter().position(|b| *b == b'\n') else {
-                    break;
-                };
-                let line = buffer.split_to(pos + 1);
-                if line.len() <= 1 {
-                    continue;
-                }
-                let mut line_vec = line[..line.len() - 1].to_vec();
-                if let Some(last) = line_vec.last() {
-                    if *last == b'\r' {
-                        line_vec.pop();
-                    }
-                }
-                if line_vec.is_empty() {
-                    continue;
-                }
-                let parsed = match std::str::from_utf8(&line_vec) {
-                    Ok(text) => text.trim(),
-                    Err(_) => continue,
-                };
-                if parsed.is_empty() {
-                    continue;
-                }
-
-                let event: WatchEvent<Pod> = match serde_json::from_str(parsed) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        Terminal::error(format_args!("Failed to parse pod watch event: {}", err));
-                        continue;
-                    }
-                };
-
+        let parse_result = parse_json_lines::<_, WatchEvent<Pod>, _>(
+            response.bytes_stream(),
+            POD_WATCH_BUFFER_LIMIT,
+            None,
+            |event| {
                 let pod = event.object;
-                resource_version = pod.metadata.resource_version.clone();
-
                 if is_pod_ready(&pod) {
-                    return Ok(pod);
+                    ready_pod = Some(pod);
+                    return ControlFlow::Break(());
                 }
                 if let Some(reason) = pod_failure_message(&pod) {
+                    failure_reason = Some(reason);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        )
+        .await;
+
+        match parse_result {
+            Ok(()) => {
+                if let Some(pod) = ready_pod {
+                    return Ok(pod);
+                }
+                if let Some(reason) = failure_reason {
                     return Err(reason.into());
                 }
             }
-
-            if Instant::now() >= deadline {
-                return Err("Timed out waiting for pod to become Ready".into());
+            Err(WatchParseError::Stream(err)) => {
+                attempts = attempts.saturating_add(1);
+                let backoff = backoff_duration(attempts);
+                Terminal::stderr(format_args!(
+                    "Pod watch stream failed (attempt {}): {}; retrying in {:?}",
+                    attempts, err, backoff
+                ));
+                sleep(backoff.min(deadline.saturating_duration_since(Instant::now()))).await;
             }
+            Err(err) => return Err(Box::new(err)),
         }
 
-        // If the stream closed without delivering readiness, poll once more before retrying.
         if let Some(pod) = client.get_pod(namespace, pod_name).await? {
-            resource_version = pod.metadata.resource_version.clone();
             if is_pod_ready(&pod) {
                 return Ok(pod);
             }
@@ -476,6 +427,11 @@ async fn wait_for_service_termination(
     }
 }
 
+fn backoff_duration(attempts: u32) -> Duration {
+    let capped = attempts.min(6);
+    Duration::from_millis(500u64.saturating_mul(1u64 << capped)).min(Duration::from_secs(10))
+}
+
 fn is_pod_ready(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -500,130 +456,16 @@ fn pod_failure_message(pod: &Pod) -> Option<String> {
     }
 }
 
-fn workload_name(namespace: Option<&str>, service: &str) -> String {
-    namespace
-        .filter(|ns| !ns.is_empty())
-        .map(|ns| format!("{}-{}", ns, service))
-        .unwrap_or_else(|| service.to_string())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn bundle_payload(
-    namespace: Option<&str>,
-    service: &str,
-    options: HashMap<String, String>,
-    snapshot: Option<&str>,
-    start: bool,
-    update: bool,
-) -> Bundle {
-    let namespace_value = namespace.filter(|ns| !ns.is_empty());
-    let path_namespace = namespace_value.unwrap_or("default");
-
-    let metadata = ObjectMeta {
-        name: Some(service.to_string()),
-        namespace: Some(path_namespace.to_string()),
-        ..Default::default()
-    };
-
-    let spec = BundleSpec {
-        service: service.to_string(),
-        namespace: namespace_value.map(|ns| ns.to_string()),
-        options,
-        profile_key: None,
-        snapshot: snapshot.map(|path| BundleSnapshotSource {
-            source: path.to_string(),
-            media_type: None,
-        }),
-        start,
-        update,
-        security: None,
-        runtime: None,
-    };
-
-    Bundle {
-        api_version: "nanocloud.io/v1".to_string(),
-        kind: "Bundle".to_string(),
-        metadata,
-        spec,
-        status: None,
-    }
-}
-
-pub(super) async fn stream_logs_to_terminal(
-    client: NanocloudClient,
-    namespace: Option<String>,
-    service: String,
-    follow: bool,
-    cancel: CancellationToken,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut retry_backoff = Duration::from_millis(500);
-    let max_backoff = Duration::from_secs(5);
-
-    loop {
-        match client
-            .logs_stream(namespace.as_deref(), &service, follow)
-            .await
-        {
-            Ok(response) => {
-                let mut stdout = tokio_io::stdout();
-                let mut stream = response.bytes_stream();
-                loop {
-                    tokio::select! {
-                        biased;
-                        chunk = stream.next() => {
-                            match chunk {
-                                Some(data) => {
-                                    let bytes = data?;
-                                    stdout.write_all(&bytes).await?;
-                                    stdout.flush().await?;
-                                }
-                                None => return Ok(()),
-                            }
-                        }
-                        _ = cancel.cancelled() => {
-                            let mut drain_deadline = Instant::now() + Duration::from_secs(2);
-                            loop {
-                                let now = Instant::now();
-                                if now >= drain_deadline {
-                                    break;
-                                }
-                                let remaining = drain_deadline.saturating_duration_since(now);
-                                match timeout(remaining, stream.next()).await {
-                                    Ok(Some(chunk)) => {
-                                        let bytes = chunk?;
-                                        stdout.write_all(&bytes).await?;
-                                        stdout.flush().await?;
-                                        drain_deadline = Instant::now() + Duration::from_secs(2);
-                                    }
-                                    Ok(None) => return Ok(()),
-                                    Err(_) => break,
-                                }
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Err(err) => match err.downcast::<HttpError>() {
-                Ok(http_err) => {
-                    if http_err.status == StatusCode::NOT_FOUND && follow {
-                        sleep(retry_backoff).await;
-                        retry_backoff = (retry_backoff * 2).min(max_backoff);
-                        continue;
-                    }
-                    return Err(http_err);
-                }
-                Err(err) => match err.downcast::<reqwest::Error>() {
-                    Ok(req_err) => {
-                        if follow && (req_err.is_connect() || req_err.is_timeout()) {
-                            sleep(retry_backoff).await;
-                            retry_backoff = (retry_backoff * 2).min(max_backoff);
-                            continue;
-                        }
-                        return Err(req_err.into());
-                    }
-                    Err(other) => return Err(other),
-                },
-            },
-        }
+    #[test]
+    fn backoff_duration_exponentially_increases_until_cap() {
+        assert_eq!(backoff_duration(0), Duration::from_millis(500));
+        assert_eq!(backoff_duration(1), Duration::from_millis(1000));
+        assert_eq!(backoff_duration(2), Duration::from_millis(2000));
+        assert_eq!(backoff_duration(6), Duration::from_secs(10));
+        assert_eq!(backoff_duration(10), Duration::from_secs(10));
     }
 }

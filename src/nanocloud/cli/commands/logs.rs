@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
+use std::env;
 use std::error::Error;
+use std::time::Duration;
 
 use crate::nanocloud::api::client::NanocloudClient;
 use crate::nanocloud::cli::args::LogsArgs;
+use crate::nanocloud::cli::commands::{stream_logs_to_terminal, LogStreamConfig};
 use crate::nanocloud::cli::curl::print_curl_request;
+use tokio::signal;
 use tokio_util::sync::CancellationToken;
-
-use super::install::stream_logs_to_terminal;
 
 pub(super) async fn handle_logs(
     client: &NanocloudClient,
@@ -39,12 +41,78 @@ pub(super) async fn handle_logs(
         return Ok(());
     }
 
+    let cancel = CancellationToken::new();
+    let cancel_token = cancel.clone();
+    tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        cancel_token.cancel();
+    });
+
     stream_logs_to_terminal(
         client.clone(),
         args.namespace.clone(),
         args.service.clone(),
         args.follow,
-        CancellationToken::new(),
+        cancel,
+        log_stream_config_from_env(),
     )
     .await
+}
+
+fn log_stream_config_from_env() -> LogStreamConfig {
+    let mut config = LogStreamConfig::default();
+    if let Ok(value) = env::var("NANOCLOUD_LOG_BACKOFF_MS") {
+        if let Ok(ms) = value.parse::<u64>() {
+            config.retry_backoff = Duration::from_millis(ms.max(1));
+        }
+    }
+    if let Ok(value) = env::var("NANOCLOUD_LOG_MAX_BACKOFF_MS") {
+        if let Ok(ms) = value.parse::<u64>() {
+            config.max_backoff = Duration::from_millis(ms.max(1));
+        }
+    }
+    if let Ok(value) = env::var("NANOCLOUD_LOG_MAX_RETRIES") {
+        if let Ok(limit) = value.parse::<u32>() {
+            config.max_retries = Some(limit);
+        }
+    }
+    if let Ok(value) = env::var("NANOCLOUD_LOG_DRAIN_MS") {
+        if let Ok(ms) = value.parse::<u64>() {
+            config.drain_timeout = Duration::from_millis(ms);
+        }
+    }
+    if let Ok(value) = env::var("NANOCLOUD_LOG_FLUSH_MS") {
+        if let Ok(ms) = value.parse::<u64>() {
+            config.flush_interval = Duration::from_millis(ms.max(1));
+        }
+    }
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn config_reads_env_with_defaults() {
+        env::set_var("NANOCLOUD_LOG_BACKOFF_MS", "150");
+        env::set_var("NANOCLOUD_LOG_MAX_BACKOFF_MS", "4000");
+        env::set_var("NANOCLOUD_LOG_MAX_RETRIES", "3");
+        env::set_var("NANOCLOUD_LOG_DRAIN_MS", "0");
+        env::set_var("NANOCLOUD_LOG_FLUSH_MS", "50");
+
+        let config = log_stream_config_from_env();
+        assert_eq!(config.retry_backoff, Duration::from_millis(150));
+        assert_eq!(config.max_backoff, Duration::from_millis(4000));
+        assert_eq!(config.max_retries, Some(3));
+        assert_eq!(config.drain_timeout, Duration::from_millis(0));
+        assert_eq!(config.flush_interval, Duration::from_millis(50));
+
+        env::remove_var("NANOCLOUD_LOG_BACKOFF_MS");
+        env::remove_var("NANOCLOUD_LOG_MAX_BACKOFF_MS");
+        env::remove_var("NANOCLOUD_LOG_MAX_RETRIES");
+        env::remove_var("NANOCLOUD_LOG_DRAIN_MS");
+        env::remove_var("NANOCLOUD_LOG_FLUSH_MS");
+    }
 }

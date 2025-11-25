@@ -508,6 +508,12 @@ mod tests {
         clear_asset_caches();
         let dir = tempdir().expect("tempdir");
         let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", dir.path().to_string_lossy());
+        let resolved = Config::SecureAssets.get_path();
+        assert!(
+            resolved.starts_with(dir.path()),
+            "secure assets path should respect env override (got {})",
+            resolved.display()
+        );
         SecureAssets::generate(dir.path(), false).expect("generate assets");
 
         let first = load_secret_key().expect("first load");

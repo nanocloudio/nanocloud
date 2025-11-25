@@ -63,6 +63,8 @@ required-features = ["openapi"]
 [dev-dependencies]
 tempfile = "3.23.0"
 serde_urlencoded = "0.7.1"
+http = "0.2"
+hyper = { version = "0.14", features = ["stream"] }
 serial_test = "3.1.1"
 walkdir = "2.5.0"
 

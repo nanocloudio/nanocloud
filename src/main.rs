@@ -18,14 +18,25 @@ mod nanocloud;
 
 use clap::Parser;
 
-use nanocloud::cli::{run, NanoCtl, Terminal};
+use nanocloud::cli::{bootstrap, run, NanoCtl, Terminal};
 
 #[tokio::main]
 async fn main() {
     let cli = NanoCtl::parse();
 
-    if let Err(e) = run(&cli.command).await {
-        Terminal::error(format_args!("Error: {}", e));
-        std::process::exit(1);
-    }
+    let context = match bootstrap(&cli.command) {
+        Ok(value) => value,
+        Err(err) => {
+            Terminal::error(format_args!("Error: {}", err));
+            std::process::exit(1);
+        }
+    };
+
+    match run(&cli.command, context).await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            Terminal::error(format_args!("Error: {}", e));
+            std::process::exit(1);
+        }
+    };
 }

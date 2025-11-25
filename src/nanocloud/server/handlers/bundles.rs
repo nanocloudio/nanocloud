@@ -284,6 +284,9 @@ fn map_schema_error(err: BundleSchemaError) -> ApiError {
             let message = format_bundle_error_summary(&issues);
             ApiError::bad_request(message)
         }
+        BundleSchemaError::InternalSchema(message) => {
+            ApiError::internal_error(format!("bundle schema error: {message}").into())
+        }
     }
 }
 

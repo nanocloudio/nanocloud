@@ -1,20 +1,24 @@
+use std::env;
 use std::error::Error;
 use std::io;
 use std::io::ErrorKind;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use chrono::DateTime;
-use futures_util::StreamExt;
 use humantime::parse_duration;
-use serde_json;
+use tokio::signal;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::nanocloud::api::client::{EventLevel, EventQuery, NanocloudClient};
 use crate::nanocloud::cli::args::{EventLevelArg, EventsArgs};
+use crate::nanocloud::cli::commands::{parse_json_lines, WatchParseError};
 use crate::nanocloud::cli::Terminal;
 use crate::nanocloud::k8s::event::{Event, EventWatchEvent};
 
 const WATCH_TIMEOUT_SECONDS: u64 = 30;
+const EVENTS_WATCH_BUFFER_LIMIT: usize = 64 * 1024;
 
 pub async fn handle_events(
     client: &NanocloudClient,
@@ -67,7 +71,21 @@ pub async fn handle_events(
         if !header_printed {
             render_event_header();
         }
-        follow_events(client, namespace, &query, cursor).await?;
+        let cancel = CancellationToken::new();
+        let cancel_token = cancel.clone();
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            cancel_token.cancel();
+        });
+        follow_events(
+            client,
+            namespace,
+            &query,
+            cursor,
+            cancel,
+            event_retry_limit(),
+        )
+        .await?;
     }
 
     Ok(())
@@ -151,9 +169,14 @@ async fn follow_events(
     namespace: Option<&str>,
     base_query: &EventQuery,
     mut cursor: Option<String>,
+    cancel: CancellationToken,
+    max_retries: Option<u32>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut attempts: u32 = 0;
     loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let mut watch_query = base_query.clone();
         watch_query.resource_version = cursor.clone();
         let response = match client.watch_events(namespace, &watch_query).await {
@@ -169,12 +192,24 @@ async fn follow_events(
             }
         };
 
-        match consume_watch_stream(response, &mut cursor).await {
+        match consume_watch_stream(response, &mut cursor, &cancel).await {
             Ok(()) => attempts = 0,
-            Err(err) => {
+            Err(WatchParseError::Stream(err)) => {
                 attempts = attempts.saturating_add(1);
-                Terminal::error(format_args!("events stream error: {}", err));
+                if let Some(limit) = max_retries {
+                    if attempts > limit {
+                        return Err(
+                            format!("events stream failed after {} retries: {}", limit, err)
+                                .into(),
+                        );
+                    }
+                }
+                Terminal::error(format_args!(
+                    "events stream error (attempt {}): {}",
+                    attempts, err
+                ));
             }
+            Err(err) => return Err(Box::new(err)),
         }
 
         if attempts > 0 {
@@ -186,35 +221,21 @@ async fn follow_events(
 async fn consume_watch_stream(
     response: reqwest::Response,
     cursor: &mut Option<String>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut stream = response.bytes_stream();
-    let mut buffer: Vec<u8> = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        buffer.extend_from_slice(&bytes);
-        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-            let line = buffer.drain(..=pos).collect::<Vec<u8>>();
-            process_watch_line(&line, cursor)?;
-        }
-    }
-
-    if !buffer.is_empty() {
-        process_watch_line(&buffer, cursor)?;
-    }
-
-    Ok(())
+    cancel: &CancellationToken,
+) -> Result<(), WatchParseError> {
+    parse_json_lines::<_, EventWatchEvent, _>(
+        response.bytes_stream(),
+        EVENTS_WATCH_BUFFER_LIMIT,
+        Some(cancel),
+        |event| {
+            process_watch_event(event, cursor);
+            ControlFlow::Continue(())
+        },
+    )
+    .await
 }
 
-fn process_watch_line(
-    line: &[u8],
-    cursor: &mut Option<String>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let text = std::str::from_utf8(line)?.trim();
-    if text.is_empty() {
-        return Ok(());
-    }
-    let event: EventWatchEvent = serde_json::from_str(text)?;
+fn process_watch_event(event: EventWatchEvent, cursor: &mut Option<String>) {
     match event.event_type.as_str() {
         "BOOKMARK" => {
             if let Some(rv) = event.object.metadata.resource_version {
@@ -228,7 +249,12 @@ fn process_watch_line(
             }
         }
     }
-    Ok(())
+}
+
+fn event_retry_limit() -> Option<u32> {
+    env::var("NANOCLOUD_EVENTS_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
 }
 
 fn backoff_duration(attempts: u32) -> Duration {
@@ -309,9 +335,8 @@ mod tests {
             event_type: "ADDED".to_string(),
             object: sample_event("42", "BundleReconciled", "Normal"),
         };
-        let json = serde_json::to_string(&event).expect("json");
         let mut cursor = None;
-        process_watch_line(json.as_bytes(), &mut cursor).expect("process");
+        process_watch_event(event, &mut cursor);
         assert_eq!(cursor.as_deref(), Some("42"));
     }
 
@@ -327,9 +352,8 @@ mod tests {
                 ..sample_event("0", "BundleReconciled", "Normal")
             },
         };
-        let json = serde_json::to_string(&bookmark).expect("json");
         let mut cursor = Some("1".to_string());
-        process_watch_line(json.as_bytes(), &mut cursor).expect("process");
+        process_watch_event(bookmark, &mut cursor);
         assert_eq!(cursor.as_deref(), Some("99"));
     }
 

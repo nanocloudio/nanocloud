@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use std::process;
+use std::fmt;
 
 use crate::nanocloud::cli::args::TokenArgs;
 use crate::nanocloud::cli::commands::token;
@@ -45,17 +45,57 @@ const DEFAULT_BACKUP_RETENTION: usize = 3;
 
 pub struct Setup;
 
+#[derive(Debug, Clone, Copy)]
+pub enum SetupStage {
+    SecureAssetsVerify,
+    SecureAssetsGenerate,
+    NetworkBridge,
+    BackupConfig,
+    Token,
+}
+
+#[derive(Debug)]
+pub struct SetupError {
+    stage: SetupStage,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl SetupError {
+    fn new(stage: SetupStage, source: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self { stage, source }
+    }
+}
+
+impl fmt::Display for SetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "setup step '{}' failed: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for SetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl fmt::Display for SetupStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            SetupStage::SecureAssetsVerify => "secure-assets-verify",
+            SetupStage::SecureAssetsGenerate => "secure-assets-generate",
+            SetupStage::NetworkBridge => "network-bridge",
+            SetupStage::BackupConfig => "backup-configmap",
+            SetupStage::Token => "token-qr",
+        };
+        write!(f, "{label}")
+    }
+}
+
 impl Setup {
-    /// Execute the setup steps for a new Nanocloud
-    pub fn run(repair: bool) {
+    /// Execute the setup pipeline (secure assets, bridge, backup config, onboarding token) with stage-labeled logging.
+    /// Each failure is wrapped with the stage name so operators can see which phase needs attention; usable for install or repair flows.
+    pub fn run(repair: bool) -> Result<(), SetupError> {
         let mode = if repair { "repair" } else { "install" };
-        let exit_on_error =
-            |step: &str, result: Result<(), Box<dyn std::error::Error + Send + Sync>>| {
-                if let Err(err) = result {
-                    Terminal::error(format_args!("[setup::{mode}] step '{step}' failed: {err}"));
-                    process::exit(1);
-                }
-            };
 
         Terminal::stdout(format_args!("{}", BANNER.trim_end_matches('\n')));
         Terminal::stdout(format_args!("[setup::{mode}] Starting Nanocloud setup"));
@@ -67,35 +107,41 @@ impl Setup {
             "[setup::{mode}] Verifying secure assets at {}",
             secure_assets_display
         ));
-        exit_on_error(
-            "secure-assets-verify",
-            Config::SecureAssets.verify(None, !repair).map(|_| ()),
-        );
+        run_step(SetupStage::SecureAssetsVerify, || {
+            Config::SecureAssets
+                .verify(None, !repair)
+                .map(|_| ())
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err })?;
+            Ok(())
+        })?;
 
         Terminal::stdout(format_args!(
             "[setup::{mode}] Generating secure assets at {}",
             secure_assets_display
         ));
-        exit_on_error(
-            "secure-assets-generate",
-            SecureAssets::generate(&secure_assets, repair),
-        );
+        run_step(SetupStage::SecureAssetsGenerate, || {
+            SecureAssets::generate(&secure_assets, repair)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err })?;
+            Ok(())
+        })?;
         Terminal::stdout(format_args!("[setup::{mode}] Secure assets ready"));
 
         Terminal::stdout(format_args!(
             "[setup::{mode}] Ensuring network bridge nanocloud0 (172.20.0.1/16)"
         ));
-        exit_on_error(
-            "network-bridge",
-            cni_plugin().bridge("nanocloud0", "172.20.0.1/16"),
-        );
+        run_step(SetupStage::NetworkBridge, || {
+            cni_plugin()
+                .bridge("nanocloud0", "172.20.0.1/16")
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err })?;
+            Ok(())
+        })?;
         Terminal::stdout(format_args!("[setup::{mode}] Network bridge available"));
 
         Terminal::stdout(format_args!(
             "[setup::{mode}] Ensuring backup retention configmap {}/{}",
             BACKUP_CONFIG_NAMESPACE, BACKUP_CONFIG_NAME
         ));
-        exit_on_error("backup-configmap", ensure_backup_configmap());
+        run_step(SetupStage::BackupConfig, ensure_backup_configmap)?;
         Terminal::stdout(format_args!(
             "[setup::{mode}] Backup retention config ready"
         ));
@@ -103,17 +149,19 @@ impl Setup {
         Terminal::stdout(format_args!(
             "[setup::{mode}] Generating onboarding token (nanocloud token --qr)"
         ));
-        exit_on_error(
-            "token-qr",
+        run_step(SetupStage::Token, || {
             token::handle_token(&TokenArgs {
                 user: "admin".to_string(),
                 cluster: None,
                 curl: false,
                 qr: true,
-            }),
-        );
+            })
+            .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err })?;
+            Ok(())
+        })?;
 
         Terminal::stdout(format_args!("[setup::{mode}] Nanocloud setup complete"));
+        Ok(())
     }
 }
 
@@ -141,4 +189,42 @@ fn ensure_backup_configmap() -> Result<(), Box<dyn std::error::Error + Send + Sy
     }
 
     Ok(())
+}
+
+fn run_step<F>(stage: SetupStage, action: F) -> Result<(), SetupError>
+where
+    F: FnOnce() -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+{
+    action().map_err(|err| SetupError::new(stage, err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_stage_display_matches_labels() {
+        assert_eq!(
+            SetupStage::SecureAssetsVerify.to_string(),
+            "secure-assets-verify"
+        );
+        assert_eq!(
+            SetupStage::SecureAssetsGenerate.to_string(),
+            "secure-assets-generate"
+        );
+        assert_eq!(SetupStage::NetworkBridge.to_string(), "network-bridge");
+        assert_eq!(SetupStage::BackupConfig.to_string(), "backup-configmap");
+        assert_eq!(SetupStage::Token.to_string(), "token-qr");
+    }
+
+    #[test]
+    fn run_step_wraps_errors_with_stage() {
+        let err = run_step(SetupStage::NetworkBridge, || {
+            Err(Box::new(std::io::Error::other("boom")))
+        })
+        .expect_err("should fail");
+
+        assert!(format!("{err}").contains("network-bridge"));
+        assert!(format!("{err}").contains("boom"));
+    }
 }
