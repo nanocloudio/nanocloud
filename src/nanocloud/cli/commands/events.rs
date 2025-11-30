@@ -198,10 +198,11 @@ async fn follow_events(
                 attempts = attempts.saturating_add(1);
                 if let Some(limit) = max_retries {
                     if attempts > limit {
-                        return Err(
-                            format!("events stream failed after {} retries: {}", limit, err)
-                                .into(),
-                        );
+                        return Err(format!(
+                            "events stream failed after {} retries: {}",
+                            limit, err
+                        )
+                        .into());
                     }
                 }
                 Terminal::error(format_args!(

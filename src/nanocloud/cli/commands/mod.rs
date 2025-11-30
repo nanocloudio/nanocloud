@@ -132,8 +132,7 @@ pub async fn run(
 ) -> Result<i32, Box<dyn Error + Send + Sync>> {
     match command {
         Commands::Setup(args) => unit_to_exit(
-            Setup::run(args.repair)
-                .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>),
+            Setup::run(args.repair).map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>),
         ),
         Commands::Server(_) => {
             let server_ctx = context
@@ -207,9 +206,7 @@ pub async fn run(
             let client = NanocloudClient::new()?;
             unit_to_exit(devices::handle_devices(&client, args).await)
         }
-        Commands::Volume(args) => {
-            unit_to_exit(volume::handle_volume(args).await)
-        }
+        Commands::Volume(args) => unit_to_exit(volume::handle_volume(args).await),
         Commands::Bundle(args) => {
             let client = NanocloudClient::new()?;
             unit_to_exit(bundles::handle_bundle(&client, args).await)
@@ -293,14 +290,14 @@ mod tests {
         assert_eq!(ok_result, 0);
 
         let err = unit_to_exit(Err(Box::new(io::Error::other("boom"))))
-        .expect_err("error should propagate");
+            .expect_err("error should propagate");
         assert!(format!("{err}").contains("boom"));
     }
 
     #[test]
     fn parse_upstream_rejects_invalid_entries() {
-        let err = parse_upstream(&["not-an-addr".to_string()])
-            .expect_err("invalid address should fail");
+        let err =
+            parse_upstream(&["not-an-addr".to_string()]).expect_err("invalid address should fail");
         assert!(err.to_string().contains("Invalid upstream server"));
     }
 
@@ -335,7 +332,11 @@ mod tests {
 
         let servers = default_upstream_from_path(&path).expect("parse upstreams");
         assert_eq!(servers.len(), 2);
-        assert!(servers.iter().any(|addr| addr.ip().to_string() == "8.8.8.8"));
-        assert!(servers.iter().any(|addr| addr.ip().to_string() == "1.1.1.1"));
+        assert!(servers
+            .iter()
+            .any(|addr| addr.ip().to_string() == "8.8.8.8"));
+        assert!(servers
+            .iter()
+            .any(|addr| addr.ip().to_string() == "1.1.1.1"));
     }
 }

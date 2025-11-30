@@ -120,10 +120,7 @@ impl NanocloudClient {
                     KubeFieldSource::FilePath
                 }
             }),
-            ca_path: kube_auth
-                .ca
-                .as_ref()
-                .and_then(|ca| ca.source_path.clone()),
+            ca_path: kube_auth.ca.as_ref().and_then(|ca| ca.source_path.clone()),
             ca_data: kube_auth.ca.as_ref().map(|ca| ca.bytes.clone()),
             cert_source: if kube_auth.cert.from_data_field {
                 KubeFieldSource::InlineData

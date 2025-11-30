@@ -76,11 +76,20 @@ fn log_report(report: &CniReconciliationReport) {
         log_warn("diagnostics", warning, &[]);
     }
 
+    for err in &report.errors {
+        log_warn("diagnostics", err, &[]);
+    }
+
     for cleanup in &report.stale_containers {
         for err in &cleanup.errors {
             let metadata = vec![("container_id".to_string(), cleanup.container_id.clone())];
             let metadata_refs = metadata_to_refs(&metadata);
             log_warn("diagnostics", err, &metadata_refs);
+        }
+        for warning in &cleanup.warnings {
+            let metadata = vec![("container_id".to_string(), cleanup.container_id.clone())];
+            let metadata_refs = metadata_to_refs(&metadata);
+            log_warn("diagnostics", warning, &metadata_refs);
         }
     }
 

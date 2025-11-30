@@ -71,7 +71,8 @@ pub(super) fn print_curl_request_with_type(
         bearer_token: client.bearer_token().map(|value| value.to_string()),
         auth: client.curl_identity(),
     };
-    let lines = build_curl_request_lines(&context, method, url, body, content_type, detect_tooling())?;
+    let lines =
+        build_curl_request_lines(&context, method, url, body, content_type, detect_tooling())?;
     for line in lines {
         Terminal::stdout(format_args!("{}", line));
     }
@@ -139,9 +140,7 @@ fn build_auth_plan(
                 missing.join(", ")
             ));
         } else {
-            notes.push(
-                "# Using portable auth files to avoid shell-specific features.".to_string(),
-            );
+            notes.push("# Using portable auth files to avoid shell-specific features.".to_string());
         }
 
         let file_plan = build_file_auth_plan(auth);
@@ -183,7 +182,10 @@ fn render_curl_command(
             if !headers.is_empty() {
                 parts.push(headers.join(" "));
             }
-            parts.push(format!("-H 'Content-Type: {}' --data-binary @-", content_type));
+            parts.push(format!(
+                "-H 'Content-Type: {}' --data-binary @-",
+                content_type
+            ));
             let mut lines = vec![parts.join(" ")];
             lines.push(payload.to_string());
             lines.push("EOF".to_string());
@@ -255,11 +257,7 @@ fn process_substitution_prefix(base_parts: Vec<String>, auth: &CurlAuthData) -> 
     parts.join(" ")
 }
 
-fn file_auth_prefix(
-    mut parts: Vec<String>,
-    plan: &FileAuthPlan,
-    include_ca: bool,
-) -> String {
+fn file_auth_prefix(mut parts: Vec<String>, plan: &FileAuthPlan, include_ca: bool) -> String {
     if include_ca {
         if let Some(ca_var) = &plan.ca_var {
             parts.push(format!("--cacert {}", ca_var));
@@ -279,9 +277,8 @@ fn build_file_auth_plan(auth: &CurlAuthData) -> FileAuthPlan {
     let use_tmp_dir = needs_inline_cert || needs_inline_key || needs_inline_ca;
 
     if use_tmp_dir {
-        setup.push(
-            "NC_TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t nanocloud-curl)".to_string(),
-        );
+        setup
+            .push("NC_TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t nanocloud-curl)".to_string());
         cleanup.push("# Cleanup credentials after running: rm -rf \"$NC_TMP_DIR\"".to_string());
     }
 
@@ -309,9 +306,7 @@ fn build_file_auth_plan(auth: &CurlAuthData) -> FileAuthPlan {
             auth.ca_path.as_deref(),
             use_tmp_dir,
             "nanocloud-ca.pem",
-            auth.ca_data
-                .as_deref()
-                .unwrap_or_else(|| "".as_bytes()),
+            auth.ca_data.as_deref().unwrap_or_else(|| "".as_bytes()),
             "CA",
         );
         setup.extend(lines);
@@ -527,7 +522,9 @@ mod tests {
         .expect("curl lines");
 
         assert!(
-            lines.iter().any(|line| line.contains("process substitution")),
+            lines
+                .iter()
+                .any(|line| line.contains("process substitution")),
             "expected prerequisite note in output"
         );
         assert!(
@@ -574,9 +571,7 @@ mod tests {
             "expected temporary directory setup"
         );
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("BEGIN PRIVATE KEY")),
+            lines.iter().any(|line| line.contains("BEGIN PRIVATE KEY")),
             "expected inline credential payload"
         );
         assert!(

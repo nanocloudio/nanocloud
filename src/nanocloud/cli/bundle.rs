@@ -105,8 +105,14 @@ mod tests {
     fn bundle_payload_sets_defaults() {
         let mut options = HashMap::new();
         options.insert("size".into(), "small".into());
-        let bundle =
-            bundle_payload(Some("demo"), "svc", options.clone(), Some("snap.tar"), true, false);
+        let bundle = bundle_payload(
+            Some("demo"),
+            "svc",
+            options.clone(),
+            Some("snap.tar"),
+            true,
+            false,
+        );
 
         assert_eq!(bundle.metadata.namespace.as_deref(), Some("demo"));
         assert_eq!(bundle.metadata.name.as_deref(), Some("svc"));

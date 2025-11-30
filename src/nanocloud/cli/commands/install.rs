@@ -344,12 +344,7 @@ async fn wait_for_pod_ready(
         }
 
         let response = client
-            .watch_pod(
-                namespace,
-                pod_name,
-                Some(POD_WATCH_SLICE.as_secs()),
-                None,
-            )
+            .watch_pod(namespace, pod_name, Some(POD_WATCH_SLICE.as_secs()), None)
             .await?;
 
         let mut ready_pod: Option<Pod> = None;

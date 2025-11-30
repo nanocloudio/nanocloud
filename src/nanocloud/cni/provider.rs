@@ -23,6 +23,11 @@ type DynError = Box<dyn Error + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
 
 /// Interface for pluggable CNI implementations.
+///
+/// Implementations expect the host to provide the `ip` and `nft` binaries in `PATH`
+/// and to run with root privileges (unless `NANOCLOUD_CNI_ALLOW_UNPRIVILEGED=1` is set for tests).
+/// State is persisted in the configured keyspace partition under the `/allocations`, `/ip-pool`,
+/// and `/port-forwards` prefixes with the formats documented in `network.rs`.
 pub trait CniPlugin: Send + Sync {
     fn reconcile_cni_artifacts(&self) -> DynResult<CniReconciliationReport>;
     fn bridge(&self, name: &str, cidr: &str) -> DynResult<()>;
