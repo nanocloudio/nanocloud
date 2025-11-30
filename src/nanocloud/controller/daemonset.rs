@@ -410,12 +410,8 @@ impl Reconciler for DaemonSetController {
         target: &ControllerTarget,
     ) -> Result<Option<ReconcileData<Self::Desired, Self::Observed>>, Self::Error> {
         let fetcher = ctx
-            .dependency::<DependencyHandle<DaemonSetFetcher>>()
-            .ok_or_else(|| {
-                DaemonSetError::Dependency(
-                    "DaemonSet fetcher dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<DaemonSetFetcher>>()
+            .map_err(|err| DaemonSetError::Dependency(err.to_string()))?
             .get();
 
         let ControllerTarget::DaemonSet { .. } = target else {

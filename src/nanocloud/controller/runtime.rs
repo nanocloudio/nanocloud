@@ -17,19 +17,149 @@
 use crate::nanocloud::controller::reconcile::ReconcileContext;
 use crate::nanocloud::k8s::pod::Pod;
 use crate::nanocloud::k8s::store::normalize_namespace;
+use crate::nanocloud::logger::{log_error, log_warn};
+use crate::nanocloud::observability::metrics;
 use serde::{Deserialize, Serialize};
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_QUEUE_WARN_AT: usize = 192;
+const COMPONENT: &str = "controller-runtime";
+
+pub type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
+type HandlerErrorHook = Arc<dyn Fn(&ControllerWorkItem, &str) + Send + Sync>;
+
+#[derive(Clone, Copy, Debug)]
+/// Snapshot of pending queue items used for observability hooks.
+pub struct QueueDepth {
+    pub queued: usize,
+    pub capacity: usize,
+}
+
+type QueueDepthHook = Arc<dyn Fn(QueueDepth) + Send + Sync>;
+
+#[derive(Clone, Default)]
+/// Optional callbacks used to surface dispatcher metrics and failures.
+pub struct DispatcherHooks {
+    pub queue_depth: Option<QueueDepthHook>,
+    pub handler_error: Option<HandlerErrorHook>,
+}
+
+#[derive(Clone)]
+/// Configuration for dispatcher queue sizing and observability.
+pub struct ControllerRuntimeConfig {
+    pub queue_capacity: usize,
+    pub queue_warn_at: usize,
+    pub hooks: DispatcherHooks,
+}
+
+impl Default for ControllerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            queue_warn_at: DEFAULT_QUEUE_WARN_AT,
+            hooks: DispatcherHooks::default(),
+        }
+    }
+}
+
+impl ControllerRuntimeConfig {
+    #[allow(dead_code)]
+    /// Overrides the bounded queue capacity while keeping backpressure warnings aligned.
+    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity.max(1);
+        self.queue_warn_at = capacity.saturating_sub(capacity / 4).max(1);
+        self
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+/// Handle returned by `spawn_executor` that can initiate shutdown and await completion.
+pub struct DispatcherHandle {
+    shutdown: CancellationToken,
+    queue: KeyedWorkQueue<ControllerWorkItem>,
+    join: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl DispatcherHandle {
+    fn new(
+        queue: KeyedWorkQueue<ControllerWorkItem>,
+        join: JoinHandle<()>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            shutdown,
+            queue,
+            join: Arc::new(Mutex::new(Some(join))),
+        }
+    }
+
+    #[allow(dead_code)]
+    /// Signals dispatcher shutdown and closes the work queue.
+    pub fn shutdown(&self) {
+        self.queue.close();
+        self.shutdown.cancel();
+    }
+
+    #[allow(dead_code)]
+    /// Awaits dispatcher completion, draining any remaining work.
+    pub async fn join(&self) {
+        if let Some(handle) = self.join.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+/// Error raised when a dependency lookup fails.
+pub struct DependencyError {
+    type_name: &'static str,
+}
+
+impl DependencyError {
+    fn missing(type_name: &'static str) -> Self {
+        Self { type_name }
+    }
+}
+
+impl fmt::Display for DependencyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "missing dependency: {}", self.type_name)
+    }
+}
+
+impl Error for DependencyError {}
+
+#[derive(Debug)]
+/// Errors emitted when initializing or starting the controller runtime.
+pub enum ControllerRuntimeError {
+    MissingDependencies(Vec<&'static str>),
+}
+
+impl fmt::Display for ControllerRuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ControllerRuntimeError::MissingDependencies(types) => {
+                write!(f, "missing dependencies: {}", types.join(", "))
+            }
+        }
+    }
+}
+
+impl Error for ControllerRuntimeError {}
 
 /// Generic Kubernetes-style watch event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,12 +170,15 @@ pub struct WatchEvent<T> {
 }
 
 /// Controller manager runtime that offers informers, a work queue, and shared dependencies.
+/// Dispatcher tasks can be shut down and awaited via the returned `DispatcherHandle`.
 pub struct ControllerRuntime {
     dependencies: DependencyRegistry,
+    required_dependencies: StdRwLock<HashMap<TypeId, &'static str>>,
     work_queue: KeyedWorkQueue<ControllerWorkItem>,
     pods: PodInformer,
-    handlers: Arc<StdRwLock<Vec<ExecutorHandler>>>,
-    dispatcher: OnceLock<Arc<JoinHandle<()>>>,
+    handlers: Arc<StdRwLock<Arc<[ExecutorHandler]>>>,
+    dispatcher: StdMutex<Option<DispatcherHandle>>,
+    hooks: Arc<StdRwLock<DispatcherHooks>>,
 }
 
 impl ControllerRuntime {
@@ -56,16 +189,54 @@ impl ControllerRuntime {
 
     /// Creates a standalone controller runtime with default queue sizing.
     pub fn new() -> Arc<Self> {
-        Arc::new(ControllerRuntime::with_capacity(DEFAULT_QUEUE_CAPACITY))
+        Arc::new(ControllerRuntime::with_config(
+            ControllerRuntimeConfig::default(),
+        ))
     }
 
-    fn with_capacity(capacity: usize) -> Self {
+    /// Builds a runtime with custom queue sizing and hooks. Useful for isolated tests.
+    pub fn with_config(config: ControllerRuntimeConfig) -> Self {
+        let hooks = Arc::new(StdRwLock::new(config.hooks.clone()));
+        let warn_at = config.queue_warn_at;
+        let queue_capacity = config.queue_capacity;
+        let depth_hooks: QueueDepthHook = {
+            let hooks = Arc::clone(&hooks);
+            Arc::new(move |depth: QueueDepth| {
+                if depth.queued >= warn_at {
+        let metadata = [
+            ("queued".to_string(), depth.queued.to_string()),
+            ("capacity".to_string(), depth.capacity.to_string()),
+        ];
+        let metadata_refs = [
+            (metadata[0].0.as_str(), metadata[0].1.as_str()),
+            (metadata[1].0.as_str(), metadata[1].1.as_str()),
+        ];
+        log_warn(
+            COMPONENT,
+            "controller work queue nearing capacity",
+            &metadata_refs,
+        );
+                }
+
+                if let Some(callback) = hooks
+                    .read()
+                    .expect("dispatcher hooks poisoned")
+                    .queue_depth
+                    .as_ref()
+                {
+                    callback(depth);
+                }
+            })
+        };
+
         Self {
             dependencies: DependencyRegistry::new(),
-            work_queue: KeyedWorkQueue::new(capacity),
+            required_dependencies: StdRwLock::new(HashMap::new()),
+            work_queue: KeyedWorkQueue::with_options(queue_capacity, Some(depth_hooks)),
             pods: PodInformer::new(),
-            handlers: Arc::new(StdRwLock::new(Vec::new())),
-            dispatcher: OnceLock::new(),
+            handlers: Arc::new(StdRwLock::new(Arc::from([]))),
+            dispatcher: StdMutex::new(None),
+            hooks,
         }
     }
 
@@ -83,6 +254,60 @@ impl ControllerRuntime {
         self.dependencies.get::<T>()
     }
 
+    pub fn require_dependency<T>(&self) -> Result<Arc<T>, DependencyError>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.dependencies
+            .get::<T>()
+            .ok_or_else(|| DependencyError::missing(std::any::type_name::<T>()))
+    }
+
+    /// Declares that `T` must be registered before dispatchers start, enabling eager validation.
+    pub fn declare_required_dependency<T>(&self)
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut required = self
+            .required_dependencies
+            .write()
+            .expect("required dependency registry poisoned");
+        required.insert(TypeId::of::<T>(), std::any::type_name::<T>());
+    }
+
+    fn validate_required_dependencies(&self) -> Result<(), ControllerRuntimeError> {
+        let required = self
+            .required_dependencies
+            .read()
+            .expect("required dependency registry poisoned");
+        if required.is_empty() {
+            return Ok(());
+        }
+
+        let missing: Vec<&'static str> = required
+            .iter()
+            .filter_map(|(id, name)| {
+                if self.dependencies.contains(*id) {
+                    None
+                } else {
+                    Some(*name)
+                }
+            })
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(ControllerRuntimeError::MissingDependencies(missing))
+        }
+    }
+
+    /// Replaces dispatcher hooks, allowing observers to receive queue depth or error notifications.
+    #[allow(dead_code)]
+    pub fn set_dispatcher_hooks(&self, hooks: DispatcherHooks) {
+        let mut guard = self.hooks.write().expect("dispatcher hooks poisoned");
+        *guard = hooks;
+    }
+
     pub fn pods(&self) -> &PodInformer {
         &self.pods
     }
@@ -95,29 +320,52 @@ impl ControllerRuntime {
         self.work_queue.clone()
     }
 
-    pub fn spawn_executor<H, Fut>(&self, handler: H) -> JoinHandle<()>
+    /// Registers a new handler and starts the dispatcher if needed, returning a joinable handle.
+    ///
+    /// Handlers should return `HandlerResult` to propagate failures into the dispatcher hooks.
+    pub fn spawn_executor<H, Fut>(&self, handler: H) -> Result<DispatcherHandle, ControllerRuntimeError>
     where
         H: Fn(ControllerWorkItem) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = HandlerResult> + Send + 'static,
     {
         {
             let mut guard = self.handlers.write().expect("handler registry poisoned");
-            guard.push(Arc::new(move |item| Box::pin(handler(item))));
+            let mut handlers: Vec<ExecutorHandler> = guard.iter().cloned().collect();
+            handlers.push(Arc::new(move |item| Box::pin(handler(item))));
+            *guard = Arc::from(handlers.into_boxed_slice());
         }
-        self.ensure_dispatcher();
-        // The dispatcher runs in the background; this handle is a no-op placeholder
-        // to keep the signature stable for callers that previously awaited it.
-        tokio::spawn(async {})
+        self.ensure_dispatcher()
     }
 
-    fn ensure_dispatcher(&self) {
-        self.dispatcher.get_or_init(|| {
-            let queue = self.work_queue.clone();
-            let handlers = Arc::clone(&self.handlers);
-            Arc::new(tokio::spawn(async move {
-                run_dispatch_loop(queue, handlers).await;
-            }))
+    fn ensure_dispatcher(&self) -> Result<DispatcherHandle, ControllerRuntimeError> {
+        if let Some(handle) = self
+            .dispatcher
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .as_ref()
+        {
+            return Ok(handle.clone());
+        }
+
+        self.validate_required_dependencies()?;
+
+        let queue = self.work_queue.clone();
+        let queue_for_task = queue.clone();
+        let handlers = Arc::clone(&self.handlers);
+        let hooks = Arc::clone(&self.hooks);
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let join = tokio::spawn(async move {
+            run_dispatch_loop(queue_for_task, handlers, hooks, shutdown_for_task).await;
         });
+
+        let mut guard = self
+            .dispatcher
+            .lock()
+            .expect("dispatcher lock poisoned");
+        let handle = DispatcherHandle::new(queue, join, shutdown);
+        *guard = Some(handle.clone());
+        Ok(handle)
     }
 }
 
@@ -127,19 +375,59 @@ struct DependencyRegistry {
 }
 
 type ExecutorHandler =
-    Arc<dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    Arc<
+        dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
+            + Send
+            + Sync,
+    >;
 
 async fn run_dispatch_loop(
     queue: KeyedWorkQueue<ControllerWorkItem>,
-    handlers: Arc<StdRwLock<Vec<ExecutorHandler>>>,
+    handlers: Arc<StdRwLock<Arc<[ExecutorHandler]>>>,
+    hooks: Arc<StdRwLock<DispatcherHooks>>,
+    shutdown: CancellationToken,
 ) {
-    while let Some(item) = queue.next().await {
-        let listeners = {
-            let guard = handlers.read().expect("handler registry poisoned");
-            guard.clone()
-        };
-        for handler in listeners {
-            handler(item.clone()).await;
+    let mut shutdown_triggered = false;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled(), if !shutdown_triggered => {
+                shutdown_triggered = true;
+                queue.close();
+                continue;
+            }
+            maybe_item = queue.next() => {
+                let Some(item) = maybe_item else { break; };
+                let listeners = {
+                    let guard = handlers.read().expect("handler registry poisoned");
+                    guard.clone()
+                };
+                for handler in listeners.iter() {
+                    if let Err(err) = handler(item.clone()).await {
+                        let error_text = err.to_string();
+                        let target_label = item.target.to_string();
+                        metrics::record_controller_handler_error(target_label.as_str());
+                        if let Some(callback) = hooks
+                            .read()
+                            .expect("dispatcher hooks poisoned")
+                            .handler_error
+                            .as_ref()
+                        {
+                            callback(&item, &error_text);
+                        }
+
+                        let metadata = [
+                            ("target".to_string(), item.target.to_string()),
+                            ("error".to_string(), error_text),
+                        ];
+                        let metadata_refs = [
+                            (metadata[0].0.as_str(), metadata[0].1.as_str()),
+                            (metadata[1].0.as_str(), metadata[1].1.as_str()),
+                        ];
+                        log_error(COMPONENT, "controller handler failed", &metadata_refs);
+                    }
+                }
+            }
         }
     }
 }
@@ -172,6 +460,11 @@ impl DependencyRegistry {
             .get(&TypeId::of::<T>())
             .and_then(|arc| arc.clone().downcast::<T>().ok())
     }
+
+    fn contains(&self, type_id: TypeId) -> bool {
+        let guard = self.values.read().expect("dependency registry poisoned");
+        guard.contains_key(&type_id)
+    }
 }
 
 #[derive(Clone)]
@@ -180,31 +473,86 @@ pub struct WorkQueue<T> {
 }
 
 struct WorkQueueInner<T> {
-    sender: mpsc::Sender<T>,
+    sender: Mutex<mpsc::Sender<T>>,
     receiver: Mutex<mpsc::Receiver<T>>,
+    pending: AtomicUsize,
+    capacity: usize,
+    depth_hook: QueueDepthHook,
+    shutdown: CancellationToken,
 }
 
 impl<T> WorkQueue<T>
 where
     T: Send + 'static,
 {
+    #[allow(dead_code)]
     pub fn new(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        Self::with_hook(capacity, None)
+    }
+
+    pub fn with_hook(capacity: usize, depth_hook: Option<QueueDepthHook>) -> Self {
+        let capacity = capacity.max(1);
+        let (sender, receiver) = mpsc::channel(capacity);
         Self {
             inner: Arc::new(WorkQueueInner {
-                sender,
+                sender: Mutex::new(sender),
                 receiver: Mutex::new(receiver),
+                pending: AtomicUsize::new(0),
+                capacity,
+                depth_hook: depth_hook.unwrap_or_else(|| Arc::new(|_| {})),
+                shutdown: CancellationToken::new(),
             }),
         }
     }
 
     pub async fn enqueue(&self, item: T) -> Result<(), mpsc::error::SendError<T>> {
-        self.inner.sender.send(item).await
+        let sender = { self.inner.sender.lock().await.clone() };
+        sender.send(item).await?;
+        let pending = self.inner.pending.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner.observe_depth(pending);
+        Ok(())
     }
 
     pub async fn next(&self) -> Option<T> {
         let mut guard = self.inner.receiver.lock().await;
-        guard.recv().await
+        let shutdown = self.inner.shutdown.clone();
+        let pending = self.inner.pending.load(Ordering::SeqCst);
+        tokio::select! {
+            _ = shutdown.cancelled(), if pending == 0 => None,
+            item = guard.recv() => {
+                drop(guard);
+                if let Some(value) = item {
+                    let previous = self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+                    let pending = previous.saturating_sub(1);
+                    self.inner.observe_depth(pending);
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn close(&self) {
+        self.inner.shutdown.cancel();
+    }
+
+    #[allow(dead_code)]
+    pub fn depth(&self) -> QueueDepth {
+        QueueDepth {
+            queued: self.inner.pending.load(Ordering::SeqCst),
+            capacity: self.inner.capacity,
+        }
+    }
+}
+
+impl<T> WorkQueueInner<T> {
+    fn observe_depth(&self, pending: usize) {
+        metrics::set_controller_dispatcher_queue_depth(pending as i64);
+        (self.depth_hook)(QueueDepth {
+            queued: pending,
+            capacity: self.capacity,
+        });
     }
 }
 
@@ -229,10 +577,15 @@ impl<T> KeyedWorkQueue<T>
 where
     T: Clone + Eq + Hash + Send + 'static,
 {
+    #[allow(dead_code)]
     pub fn new(capacity: usize) -> Self {
+        Self::with_options(capacity, None)
+    }
+
+    pub fn with_options(capacity: usize, depth_hook: Option<QueueDepthHook>) -> Self {
         Self {
             inner: Arc::new(KeyedWorkQueueInner {
-                queue: WorkQueue::new(capacity),
+                queue: WorkQueue::with_hook(capacity, depth_hook),
                 in_flight: Mutex::new(HashSet::new()),
             }),
         }
@@ -241,11 +594,20 @@ where
     /// Enqueues the item if it is not already pending; returns true when the item
     /// was enqueued and false when it was coalesced with an existing entry.
     pub async fn enqueue(&self, item: T) -> Result<bool, mpsc::error::SendError<T>> {
-        let mut guard = self.inner.in_flight.lock().await;
-        if !guard.insert(item.clone()) {
-            return Ok(false);
+        {
+            let mut guard = self.inner.in_flight.lock().await;
+            if !guard.insert(item.clone()) {
+                return Ok(false);
+            }
         }
-        self.inner.queue.enqueue(item).await.map(|_| true)
+
+        if let Err(err) = self.inner.queue.enqueue(item.clone()).await {
+            let mut guard = self.inner.in_flight.lock().await;
+            guard.remove(&item);
+            return Err(err);
+        }
+
+        Ok(true)
     }
 
     pub async fn next(&self) -> Option<T> {
@@ -253,6 +615,15 @@ where
         let mut guard = self.inner.in_flight.lock().await;
         guard.remove(&item);
         Some(item)
+    }
+
+    pub fn close(&self) {
+        self.inner.queue.close();
+    }
+
+    #[allow(dead_code)]
+    pub fn depth(&self) -> QueueDepth {
+        self.inner.queue.depth()
     }
 }
 
@@ -617,6 +988,8 @@ enum PodScope {
 mod tests {
     use super::*;
     use crate::nanocloud::k8s::pod::{ContainerSpec, PodSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tokio::time::{timeout, Duration};
 
     fn sample_pod(namespace: Option<&str>, name: &str) -> Pod {
@@ -716,5 +1089,194 @@ mod tests {
             .expect("pod delete timeout")
             .expect("pod delete event");
         assert_eq!(event.event_type, "DELETED");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_shutdown_drains_queue() {
+        let runtime = Arc::new(ControllerRuntime::with_config(
+            ControllerRuntimeConfig::default().with_queue_capacity(8),
+        ));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handler_count = handled.clone();
+        let handle = runtime
+            .spawn_executor(move |_item| {
+                let handler_count = handler_count.clone();
+                async move {
+                    handler_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("dispatcher handle");
+
+        for idx in 0..4 {
+            let item = ControllerWorkItem::statefulset(Some("default"), &format!("demo-{idx}"));
+            assert!(runtime.work_queue().enqueue(item).await.expect("enqueue"));
+        }
+
+        timeout(Duration::from_secs(1), async {
+            while handled.load(Ordering::SeqCst) < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatcher should drain");
+
+        handle.shutdown();
+        handle.join().await;
+        assert_eq!(
+            runtime.work_queue().depth().queued,
+            0,
+            "queue should be empty after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_error_is_reported_and_dispatch_continues() {
+        let runtime = Arc::new(ControllerRuntime::with_config(
+            ControllerRuntimeConfig::default().with_queue_capacity(4),
+        ));
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let depth_events: Arc<Mutex<Vec<QueueDepth>>> = Arc::new(Mutex::new(Vec::new()));
+
+        runtime.set_dispatcher_hooks(DispatcherHooks {
+            queue_depth: Some({
+                let depth_events = depth_events.clone();
+                Arc::new(move |depth| {
+                    depth_events.lock().unwrap().push(depth);
+                })
+            }),
+            handler_error: Some({
+                let errors = errors.clone();
+                Arc::new(move |item, err| {
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{}", item.target, err));
+                })
+            }),
+        });
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let success_clone = success_count.clone();
+        let _ = runtime
+            .spawn_executor(move |_item| {
+                let success_clone = success_clone.clone();
+                async move {
+                    success_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("dispatcher handle");
+
+        let _ = runtime
+            .spawn_executor(|item| async move {
+                let message = format!("boom:{}", item.target);
+                Err(message.into())
+            })
+            .expect("error handler");
+
+        let item = ControllerWorkItem::deployment(Some("default"), "demo");
+        runtime
+            .work_queue()
+            .enqueue(item.clone())
+            .await
+            .expect("enqueue");
+
+        timeout(Duration::from_secs(1), async {
+            while success_count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("success handler should run");
+
+        let captured_errors = errors.lock().unwrap();
+        assert!(
+            captured_errors.iter().any(|err| err.contains("Deployment/")),
+            "handler error hook should capture target"
+        );
+        drop(captured_errors);
+
+        assert!(
+            !depth_events.lock().unwrap().is_empty(),
+            "queue depth hook should be invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_snapshot_updates_across_dispatches() {
+        let runtime = Arc::new(ControllerRuntime::with_config(
+            ControllerRuntimeConfig::default().with_queue_capacity(4),
+        ));
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+
+        let first_clone = first_hits.clone();
+        runtime
+            .spawn_executor(move |_item| {
+                let first_clone = first_clone.clone();
+                async move {
+                    first_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("first handler");
+
+        let item1 = ControllerWorkItem::bundle(Some("default"), "one");
+        runtime.work_queue().enqueue(item1).await.expect("enqueue 1");
+
+        timeout(Duration::from_secs(1), async {
+            while first_hits.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first handler should process first item");
+
+        let second_clone = second_hits.clone();
+        runtime
+            .spawn_executor(move |_item| {
+                let second_clone = second_clone.clone();
+                async move {
+                    second_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("second handler");
+
+        let item2 = ControllerWorkItem::bundle(Some("default"), "two");
+        runtime.work_queue().enqueue(item2).await.expect("enqueue 2");
+
+        timeout(Duration::from_secs(1), async {
+            while second_hits.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second handler should observe later items");
+
+        assert_eq!(first_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dependency_validation_reports_missing() {
+        let runtime = ControllerRuntime::new();
+        assert!(
+            runtime.require_dependency::<String>().is_err(),
+            "missing dependency should error"
+        );
+
+        runtime.declare_required_dependency::<String>();
+        let result = runtime.spawn_executor(|_item| async { Ok(()) });
+        assert!(
+            result.is_err(),
+            "dispatcher startup should fail when required dependency absent"
+        );
+
+        assert!(
+            runtime.dependency::<String>().is_none(),
+            "optional lookup should remain None"
+        );
     }
 }

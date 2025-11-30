@@ -536,12 +536,8 @@ impl Reconciler for DeploymentController {
         target: &ControllerTarget,
     ) -> Result<Option<ReconcileData<Self::Desired, Self::Observed>>, Self::Error> {
         let fetcher = ctx
-            .dependency::<DependencyHandle<DeploymentFetcher>>()
-            .ok_or_else(|| {
-                DeploymentError::Dependency(
-                    "Deployment fetcher dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<DeploymentFetcher>>()
+            .map_err(|err| DeploymentError::Dependency(err.to_string()))?
             .get();
 
         let ControllerTarget::Deployment { .. } = target else {

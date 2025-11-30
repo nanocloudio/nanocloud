@@ -453,12 +453,8 @@ impl Reconciler for StatefulSetController {
         target: &ControllerTarget,
     ) -> Result<Option<ReconcileData<Self::Desired, Self::Observed>>, Self::Error> {
         let fetcher = ctx
-            .dependency::<DependencyHandle<StatefulSetFetcher>>()
-            .ok_or_else(|| {
-                StatefulSetError::Dependency(
-                    "StatefulSet fetcher dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<StatefulSetFetcher>>()
+            .map_err(|err| StatefulSetError::Dependency(err.to_string()))?
             .get();
 
         let ControllerTarget::StatefulSet { .. } = target else {
@@ -504,12 +500,8 @@ impl Reconciler for StatefulSetController {
         self.persist_state(&plan)?;
 
         let scheduler = ctx
-            .dependency::<DependencyHandle<dyn ReplicaSetScheduler>>()
-            .ok_or_else(|| {
-                StatefulSetError::Dependency(
-                    "ReplicaSet scheduler dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<dyn ReplicaSetScheduler>>()
+            .map_err(|err| StatefulSetError::Dependency(err.to_string()))?
             .get();
 
         let replicaset_target_name = if plan.replicaset_name.is_empty() {
@@ -869,6 +861,7 @@ pub fn spawn() -> JoinHandle<()> {
 }
 
 fn register_fetcher(runtime: &Arc<ControllerRuntime>, kubelet: Arc<Kubelet>) {
+    runtime.declare_required_dependency::<DependencyHandle<StatefulSetFetcher>>();
     let fetcher: Arc<StatefulSetFetcher> = Arc::new(KeyspaceStatefulSetFetcher::new(kubelet));
     let handle = Arc::new(DependencyHandle::new(fetcher));
     let _ = runtime.register_dependency::<DependencyHandle<StatefulSetFetcher>>(handle);
@@ -876,24 +869,19 @@ fn register_fetcher(runtime: &Arc<ControllerRuntime>, kubelet: Arc<Kubelet>) {
 
 fn start_statefulset_executor(runtime: &Arc<ControllerRuntime>) {
     let exec_runtime = Arc::clone(runtime);
-    runtime.spawn_executor(move |item| {
+    if let Err(err) = runtime.spawn_executor(move |item| {
         let runtime = Arc::clone(&exec_runtime);
         async move {
             if let ControllerTarget::StatefulSet { namespace, name } = &item.target {
                 let controller = StatefulSetController::new(name.clone(), namespace.clone());
                 let reconcile_result =
                     controller.reconcile_and_apply(&runtime.context(), &item.target);
-                if reconcile_result.is_ok() {
-                    metrics::record_controller_reconcile(
-                        "statefulset",
-                        ControllerReconcileResult::Success,
-                    );
+                let reconcile_outcome = if reconcile_result.is_ok() {
+                    ControllerReconcileResult::Success
                 } else {
-                    metrics::record_controller_reconcile(
-                        "statefulset",
-                        ControllerReconcileResult::Error,
-                    );
-                }
+                    ControllerReconcileResult::Error
+                };
+                metrics::record_controller_reconcile("statefulset", reconcile_outcome);
                 if let Err(err) = reconcile_result {
                     let error_text = err.to_string();
                     log_error(
@@ -908,10 +896,18 @@ fn start_statefulset_executor(runtime: &Arc<ControllerRuntime>) {
                             ("error", error_text.as_str()),
                         ],
                     );
+                    return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
                 }
             }
+            Ok(())
         }
-    });
+    }) {
+        log_error(
+            COMPONENT,
+            "Failed to start StatefulSet dispatcher",
+            &[("error", err.to_string().as_str())],
+        );
+    }
 }
 
 async fn bootstrap_existing_statefulsets(runtime: &Arc<ControllerRuntime>) {

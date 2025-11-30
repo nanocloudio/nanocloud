@@ -1,7 +1,7 @@
 use crate::nanocloud::api::types::{VolumeSnapshot, VolumeSnapshotPhase, VolumeSnapshotStatus};
 use crate::nanocloud::controller::events::{EventRecorder, InvolvedObjectRef};
 use crate::nanocloud::controller::runtime::{
-    ControllerRuntime, ControllerTarget, ControllerWorkItem,
+    ControllerRuntime, ControllerTarget, ControllerWorkItem, HandlerResult,
 };
 use crate::nanocloud::controller::watch::{ControllerWatchEvent, ControllerWatchManager};
 use crate::nanocloud::engine::container::backup_directory;
@@ -43,26 +43,35 @@ pub fn spawn() -> JoinHandle<()> {
 }
 
 fn start_snapshot_executor(runtime: &Arc<ControllerRuntime>, recorder: EventRecorder) {
-    runtime.spawn_executor(move |item| {
+    let recorder = recorder.clone();
+    if let Err(err) = runtime.spawn_executor(move |item| {
         let recorder = recorder.clone();
         async move {
             if let ControllerTarget::VolumeSnapshot { namespace, name } = &item.target {
                 let namespace_label = namespace.clone();
                 if let Some(snapshot) = load_snapshot(namespace_label.as_deref(), name) {
-                    process_snapshot(snapshot, &recorder).await;
-                } else {
-                    log_warn(
-                        COMPONENT,
-                        "VolumeSnapshot missing during reconciliation",
-                        &[
-                            ("namespace", namespace.as_deref().unwrap_or("default")),
-                            ("snapshot", name.as_str()),
-                        ],
-                    );
+                    return process_snapshot(snapshot, &recorder).await;
                 }
+
+                log_warn(
+                    COMPONENT,
+                    "VolumeSnapshot missing during reconciliation",
+                    &[
+                        ("namespace", namespace.as_deref().unwrap_or("default")),
+                        ("snapshot", name.as_str()),
+                    ],
+                );
             }
+
+            Ok(())
         }
-    });
+    }) {
+        log_error(
+            COMPONENT,
+            "Failed to start snapshot controller dispatcher",
+            &[("error", err.to_string().as_str())],
+        );
+    }
 }
 
 async fn bootstrap_snapshots(runtime: &Arc<ControllerRuntime>) {
@@ -234,7 +243,7 @@ async fn snapshot_owner_reference(
     })
 }
 
-async fn process_snapshot(snapshot: VolumeSnapshot, recorder: &EventRecorder) {
+async fn process_snapshot(snapshot: VolumeSnapshot, recorder: &EventRecorder) -> HandlerResult {
     let namespace = snapshot.metadata.namespace.clone();
     let name = snapshot
         .metadata
@@ -317,6 +326,7 @@ async fn process_snapshot(snapshot: VolumeSnapshot, recorder: &EventRecorder) {
         ControllerReconcileResult::Error
     };
     metrics::record_controller_reconcile("snapshot", reconcile_outcome);
+    result.map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)
 }
 
 async fn reconcile_snapshot(mut snapshot: VolumeSnapshot) -> Result<(), SnapshotError> {

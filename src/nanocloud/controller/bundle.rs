@@ -42,6 +42,7 @@ use crate::nanocloud::util::KeyspaceEventType;
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -72,7 +73,7 @@ fn start_bundle_executor(
     event_bus: Arc<InMemoryEventBus>,
     recorder: EventRecorder,
 ) {
-    runtime.spawn_executor(move |item| {
+    if let Err(err) = runtime.spawn_executor(move |item| {
         let registry = Arc::clone(&registry);
         let event_bus = Arc::clone(&event_bus);
         let recorder = recorder.clone();
@@ -96,10 +97,18 @@ fn start_bundle_executor(
                             ("error", err.as_str()),
                         ],
                     );
+                    return Err(Box::new(io::Error::other(err)) as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
+            Ok(())
         }
-    });
+    }) {
+        log_error(
+            COMPONENT,
+            "Failed to start bundle dispatcher",
+            &[("error", err.to_string().as_str())],
+        );
+    }
 }
 
 async fn bootstrap_existing_bundles(

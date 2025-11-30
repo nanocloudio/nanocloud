@@ -37,6 +37,7 @@ use crate::nanocloud::util::KeyspaceEventType;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+use std::io;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -56,20 +57,30 @@ pub fn spawn() -> JoinHandle<()> {
 }
 
 fn start_network_policy_executor(runtime: &Arc<ControllerRuntime>, recorder: EventRecorder) {
-    runtime.spawn_executor(move |item| {
+    let recorder = recorder.clone();
+    if let Err(err) = runtime.spawn_executor(move |item| {
         let recorder = recorder.clone();
         async move {
             if let ControllerTarget::NetworkPolicy { namespace, name } = &item.target {
-                reconcile_with_reason(
+                let outcome = reconcile_with_reason(
                     name.as_str(),
                     &recorder,
                     namespace.as_deref(),
                     name.as_str(),
                 )
                 .await;
+                return outcome
+                    .map_err(|err| Box::new(io::Error::other(err)) as Box<dyn Error + Send + Sync>);
             }
+            Ok(())
         }
-    });
+    }) {
+        log_error(
+            COMPONENT,
+            "Failed to start NetworkPolicy dispatcher",
+            &[("error", err.to_string().as_str())],
+        );
+    }
 }
 
 async fn watch_network_policy_events(runtime: Arc<ControllerRuntime>, recorder: EventRecorder) {
@@ -174,7 +185,7 @@ async fn reconcile_with_reason(
     recorder: &EventRecorder,
     namespace: Option<&str>,
     name: &str,
-) {
+) -> Result<(), String> {
     let span_name = format!("trigger:{}", trigger);
     let outcome = match tracing::with_span("controller.networkpolicy", span_name, async move {
         tokio::task::spawn_blocking(reconcile).await
@@ -211,9 +222,9 @@ async fn reconcile_with_reason(
     };
 
     let event_type = if outcome.is_ok() { "Normal" } else { "Warning" };
-    let message = match outcome {
+    let message = match &outcome {
         Ok(()) => format!("Reconciled network policies after trigger '{trigger}'"),
-        Err(err) => err,
+        Err(err) => err.clone(),
     };
     let involved = InvolvedObjectRef {
         api_version: "v1".to_string(),
@@ -225,6 +236,7 @@ async fn reconcile_with_reason(
     recorder
         .record(namespace, &involved, trigger, event_type, message.as_str())
         .await;
+    outcome
 }
 
 #[derive(Debug, Clone)]

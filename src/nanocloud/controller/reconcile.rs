@@ -16,7 +16,9 @@
  * limitations under the License.
  */
 
-use crate::nanocloud::controller::runtime::{ControllerRuntime, ControllerTarget};
+use crate::nanocloud::controller::runtime::{
+    ControllerRuntime, ControllerTarget, DependencyError,
+};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -45,6 +47,13 @@ impl<'a> ReconcileContext<'a> {
         T: Send + Sync + 'static,
     {
         self.runtime.dependency::<T>()
+    }
+
+    pub fn require_dependency<T>(&self) -> Result<Arc<T>, DependencyError>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.runtime.require_dependency::<T>()
     }
 }
 
@@ -199,8 +208,8 @@ mod tests {
             target: &ControllerTarget,
         ) -> Result<Option<ReconcileData<Self::Desired, Self::Observed>>, Self::Error> {
             let fetcher = ctx
-                .dependency::<DependencyHandle<DynFetcher>>()
-                .expect("missing fetcher dependency")
+                .require_dependency::<DependencyHandle<DynFetcher>>()
+                .map_err(|_| DummyError)?
                 .get();
             let desired = fetcher.desired(target)?.expect("desired missing");
             let observed = fetcher.observed(target)?;

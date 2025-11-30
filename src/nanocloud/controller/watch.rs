@@ -16,8 +16,10 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::observability::metrics;
 use crate::nanocloud::scheduler::{JobResult, ScheduleSpec, ScheduledTaskHandle, Scheduler};
 use crate::nanocloud::util::{Keyspace, KeyspaceEvent};
+use crate::nanocloud::logger::log_warn;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -28,11 +30,42 @@ use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-const WATCH_BUFFER_SIZE: usize = 64;
-const BACKOFF_INITIAL_MS: u64 = 200;
-const BACKOFF_MAX_MS: u64 = 10_000;
+const DEFAULT_WATCH_BUFFER_SIZE: usize = 64;
+const DEFAULT_BACKOFF_INITIAL_MS: u64 = 200;
+const DEFAULT_BACKOFF_MAX_MS: u64 = 10_000;
+const COMPONENT: &str = "controller-watch";
 
 pub type ControllerWatchEvent = KeyspaceEvent;
+
+#[derive(Clone, Default)]
+/// Optional callbacks that surface watch lag/backoff for metrics or tests.
+pub struct WatchHooks {
+    pub on_backoff: Option<WatchBackoffHook>,
+    pub on_lagged: Option<WatchLagHook>,
+}
+
+type WatchBackoffHook = Arc<dyn Fn(&str, Duration) + Send + Sync>;
+type WatchLagHook = Arc<dyn Fn(&str, u64) + Send + Sync>;
+
+#[derive(Clone)]
+/// Tuning knobs for watch buffer sizing, backoff, and observability.
+pub struct WatchConfig {
+    pub buffer_size: usize,
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+    pub hooks: WatchHooks,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: DEFAULT_WATCH_BUFFER_SIZE,
+            backoff_initial: Duration::from_millis(DEFAULT_BACKOFF_INITIAL_MS),
+            backoff_max: Duration::from_millis(DEFAULT_BACKOFF_MAX_MS),
+            hooks: WatchHooks::default(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ControllerWatchManager {
@@ -42,6 +75,8 @@ pub struct ControllerWatchManager {
 struct Inner {
     keyspace: Keyspace,
     watches: Mutex<HashMap<WatchKey, Arc<WatchState>>>,
+    config: Arc<WatchConfig>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,17 +123,19 @@ struct WatchState {
     shutdown: CancellationToken,
     task: Mutex<Option<ScheduledTaskHandle>>,
     path: String,
+    config: Arc<WatchConfig>,
 }
 
 impl WatchState {
-    fn new(path: String) -> Self {
-        let (sender, _) = broadcast::channel(WATCH_BUFFER_SIZE);
+    fn new(path: String, config: Arc<WatchConfig>, manager_shutdown: CancellationToken) -> Self {
+        let (sender, _) = broadcast::channel(config.buffer_size.max(1));
         Self {
             sender,
             subscribers: AtomicUsize::new(0),
-            shutdown: CancellationToken::new(),
+            shutdown: manager_shutdown.child_token(),
             task: Mutex::new(None),
             path,
+            config,
         }
     }
 
@@ -151,17 +188,51 @@ pub struct ControllerWatchSubscription {
     receiver: broadcast::Receiver<ControllerWatchEvent>,
     inner: Arc<Inner>,
     state: Arc<WatchState>,
+    shutdown: CancellationToken,
 }
 
 impl ControllerWatchSubscription {
+    /// Receives the next watch event, exiting when the subscription is shut down.
     pub async fn recv(&mut self) -> Option<ControllerWatchEvent> {
         loop {
-            match self.receiver.recv().await {
-                Ok(event) => return Some(event),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return None,
+                result = self.receiver.recv() => match result {
+                    Ok(event) => return Some(event),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        self.report_lag(skipped);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
             }
         }
+    }
+
+    fn report_lag(&self, skipped: u64) {
+        if skipped == 0 {
+            return;
+        }
+
+        metrics::record_controller_watch_lagged(&self.state.path, skipped);
+
+        if let Some(callback) = self.state.config.hooks.on_lagged.as_ref() {
+            callback(&self.state.path, skipped);
+        }
+
+        let metadata = [
+            ("path".to_string(), self.state.path.clone()),
+            ("skipped".to_string(), skipped.to_string()),
+        ];
+        let metadata_refs = [
+            (metadata[0].0.as_str(), metadata[0].1.as_str()),
+            (metadata[1].0.as_str(), metadata[1].1.as_str()),
+        ];
+        log_warn(
+            COMPONENT,
+            "controller watch subscriber lagged",
+            &metadata_refs,
+        );
     }
 }
 
@@ -182,41 +253,76 @@ impl ControllerWatchManager {
     pub fn shared() -> Self {
         static INSTANCE: OnceLock<ControllerWatchManager> = OnceLock::new();
         INSTANCE
-            .get_or_init(|| ControllerWatchManager::create(Keyspace::new("k8s")))
+            .get_or_init(|| ControllerWatchManager::create(Keyspace::new("k8s"), WatchConfig::default()))
             .clone()
     }
 
     pub fn controllers() -> Self {
         static INSTANCE: OnceLock<ControllerWatchManager> = OnceLock::new();
         INSTANCE
-            .get_or_init(|| ControllerWatchManager::create(Keyspace::new("controllers")))
+            .get_or_init(|| {
+                ControllerWatchManager::create(Keyspace::new("controllers"), WatchConfig::default())
+            })
             .clone()
     }
 
-    fn create(keyspace: Keyspace) -> Self {
+    fn create(keyspace: Keyspace, config: WatchConfig) -> Self {
         Self {
             inner: Arc::new(Inner {
                 keyspace,
                 watches: Mutex::new(HashMap::new()),
+                config: Arc::new(config),
+                shutdown: CancellationToken::new(),
             }),
         }
     }
 
+    pub fn with_config(keyspace: Keyspace, config: WatchConfig) -> Self {
+        Self::create(keyspace, config)
+    }
+
+    /// Subscribes to a prefix within the watch keyspace.
+    ///
+    /// Subscriptions are lightweight and should be dropped when no longer needed to free
+    /// background tasks. Example:
+    ///
+    /// ```ignore
+    /// let manager = ControllerWatchManager::shared();
+    /// let mut sub = manager.subscribe("/statefulsets", Some("default"));
+    /// while let Some(event) = sub.recv().await {
+    ///     handle(event);
+    /// }
+    /// ```
     pub fn subscribe(&self, prefix: &str, namespace: Option<&str>) -> ControllerWatchSubscription {
         let key = WatchKey::new(prefix, namespace);
         let state = self.inner.get_or_create_state(&key);
         let receiver = state.subscribe();
+        let shutdown = state.shutdown.child_token();
         ControllerWatchSubscription {
             key,
             receiver,
             inner: Arc::clone(&self.inner),
             state,
+            shutdown,
         }
+    }
+
+    /// Cancels all active watches and closes subscriptions.
+    pub fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        let mut watches = self.inner.watches.lock().unwrap();
+        for state in watches.values() {
+            state.shutdown.cancel();
+            if let Some(handle) = state.task.lock().unwrap().take() {
+                handle.cancel_and_abort();
+            }
+        }
+        watches.clear();
     }
 
     #[cfg(test)]
     pub fn with_keyspace(keyspace: Keyspace) -> Self {
-        Self::create(keyspace)
+        Self::create(keyspace, WatchConfig::default())
     }
 
     #[cfg(test)]
@@ -231,7 +337,11 @@ impl Inner {
         match watches.entry(key.clone()) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                let state = Arc::new(WatchState::new(key.watch_path()));
+                let state = Arc::new(WatchState::new(
+                    key.watch_path(),
+                    Arc::clone(&self.config),
+                    self.shutdown.clone(),
+                ));
                 state.start(self.keyspace);
                 entry.insert(state.clone());
                 state
@@ -242,7 +352,7 @@ impl Inner {
 
 async fn run_watch_loop(state: Arc<WatchState>, keyspace: Keyspace) {
     let mut last_version = 0u64;
-    let mut backoff = Duration::from_millis(BACKOFF_INITIAL_MS);
+    let mut backoff = state.config.backoff_initial;
 
     loop {
         let mut stream = keyspace.watch(
@@ -259,9 +369,23 @@ async fn run_watch_loop(state: Arc<WatchState>, keyspace: Keyspace) {
                 _ = state.shutdown.cancelled() => return,
                 event = stream.next() => match event {
                     Some(event) => {
-                        backoff = Duration::from_millis(BACKOFF_INITIAL_MS);
+                        backoff = state.config.backoff_initial;
                         last_version = event.resource_version;
-                        let _ = state.sender.send(event);
+                        if let Err(err) = state.sender.send(event) {
+                        let metadata = [
+                            ("path".to_string(), state.path.clone()),
+                            ("error".to_string(), err.to_string()),
+                        ];
+                        let metadata_refs = [
+                            (metadata[0].0.as_str(), metadata[0].1.as_str()),
+                            (metadata[1].0.as_str(), metadata[1].1.as_str()),
+                        ];
+                            log_warn(
+                                COMPONENT,
+                                "controller watch fanout failed",
+                                &metadata_refs,
+                            );
+                        }
                     }
                     None => break,
                 }
@@ -272,9 +396,13 @@ async fn run_watch_loop(state: Arc<WatchState>, keyspace: Keyspace) {
             _ = state.shutdown.cancelled() => return,
             _ = sleep(backoff) => {}
         }
-        let next = backoff * 2;
-        backoff = if next > Duration::from_millis(BACKOFF_MAX_MS) {
-            Duration::from_millis(BACKOFF_MAX_MS)
+        metrics::record_controller_watch_backoff(&state.path, backoff);
+        if let Some(callback) = state.config.hooks.on_backoff.as_ref() {
+            callback(&state.path, backoff);
+        }
+        let next = backoff.saturating_mul(2);
+        backoff = if next > state.config.backoff_max {
+            state.config.backoff_max
         } else {
             next
         };
@@ -285,10 +413,14 @@ async fn run_watch_loop(state: Arc<WatchState>, keyspace: Keyspace) {
 mod tests {
     use super::*;
     use crate::nanocloud::test_support::keyspace_lock;
+    use crate::nanocloud::util::KeyspaceEventType;
+    use futures_core::Stream;
     use std::env;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{MutexGuard, OnceLock};
     use tokio::sync::Mutex;
+    use tokio_stream::{iter, StreamExt};
     use tokio::time::{sleep, timeout, Duration};
 
     struct EnvGuard {
@@ -419,5 +551,149 @@ mod tests {
         // Allow the cleanup to run.
         sleep(Duration::from_millis(50)).await;
         assert_eq!(manager.active_watches(), 0);
+    }
+
+    #[tokio::test]
+    async fn lagged_subscribers_report_skips() {
+        let _env = TestEnv::new();
+        let _lock = test_guard().lock().await;
+        let lagged = Arc::new(AtomicUsize::new(0));
+        let config = WatchConfig {
+            buffer_size: 1,
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            hooks: WatchHooks {
+                on_lagged: Some({
+                    let lagged = lagged.clone();
+                    Arc::new(move |_, skipped| {
+                        lagged.fetch_add(skipped as usize, Ordering::SeqCst);
+                    })
+                }),
+                ..Default::default()
+            },
+        };
+        let manager = ControllerWatchManager::with_config(
+            Keyspace::new("controller-watch-lag"),
+            config,
+        );
+
+        let mut sub = manager.subscribe("/deployments", Some("default"));
+        let keyspace = Keyspace::new("controller-watch-lag");
+        for idx in 0..3 {
+            keyspace
+                .put(&format!("/deployments/default/demo-{idx}"), "value")
+                .expect("put deployment");
+        }
+
+        let _ = timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("recv should complete");
+
+        assert!(
+            lagged.load(Ordering::SeqCst) > 0,
+            "lag hook should be invoked when receiver skips events"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_backoff_hook_fires_on_stream_restart() {
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let config = Arc::new(WatchConfig {
+            buffer_size: 4,
+            backoff_initial: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(5),
+            hooks: WatchHooks {
+                on_backoff: Some({
+                    let backoff_calls = backoff_calls.clone();
+                    Arc::new(move |_, _| {
+                        backoff_calls.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+                ..Default::default()
+            },
+        });
+        let state = Arc::new(WatchState::new(
+            "/backoff".to_string(),
+            Arc::clone(&config),
+            CancellationToken::new(),
+        ));
+        let mut receiver = state.subscribe();
+
+        let event = ControllerWatchEvent {
+            event_type: KeyspaceEventType::Added,
+            key: "/backoff/default/demo".to_string(),
+            value: Some("value".to_string()),
+            resource_version: 1,
+        };
+
+        let shutdown = state.shutdown.clone();
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_state_with_stream(state_clone, iter(vec![event])).await;
+        });
+
+        let received = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("receive event")
+            .expect("event present");
+        assert_eq!(received.key, "/backoff/default/demo");
+
+        // Allow one backoff cycle to execute, then stop the loop.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.cancel();
+        handle.await.expect("watch loop");
+
+        assert!(
+            backoff_calls.load(Ordering::SeqCst) > 0,
+            "backoff hook should be invoked after stream completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_cleans_active_watches() {
+        let _env = TestEnv::new();
+        let _lock = test_guard().lock().await;
+        let manager = ControllerWatchManager::with_keyspace(Keyspace::new("controller-watch-shutdown"));
+        let _sub = manager.subscribe("/pods", Some("default"));
+        assert_eq!(manager.active_watches(), 1);
+        manager.shutdown();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(manager.active_watches(), 0);
+    }
+
+    async fn run_state_with_stream<S>(state: Arc<WatchState>, mut stream: S)
+    where
+        S: Stream<Item = ControllerWatchEvent> + Unpin + Send + 'static,
+    {
+        let mut backoff = state.config.backoff_initial;
+        loop {
+            loop {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => return,
+                    maybe_event = stream.next() => match maybe_event {
+                        Some(event) => {
+                            backoff = state.config.backoff_initial;
+                            let _ = state.sender.send(event);
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = state.shutdown.cancelled() => return,
+                _ = sleep(backoff) => {}
+            }
+            metrics::record_controller_watch_backoff(&state.path, backoff);
+            if let Some(callback) = state.config.hooks.on_backoff.as_ref() {
+                callback(&state.path, backoff);
+            }
+            let next = backoff.saturating_mul(2);
+            backoff = if next > state.config.backoff_max {
+                state.config.backoff_max
+            } else {
+                next
+            };
+        }
     }
 }

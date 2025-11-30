@@ -61,6 +61,10 @@ static BACKUP_RESTORE_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_RESTORE_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static DNS_QUERIES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static DNS_RESPONSES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static CONTROLLER_DISPATCHER_QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
+static CONTROLLER_DISPATCHER_HANDLER_ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static CONTROLLER_WATCH_BACKOFF_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
+static CONTROLLER_WATCH_LAGGED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| {
@@ -123,6 +127,60 @@ fn restarts_total() -> &'static IntCounterVec {
         );
         let counter = IntCounterVec::new(opts, &["namespace", "service", "reason"])
             .expect("failed to build restarts counter");
+        register_collector(counter)
+    })
+}
+
+fn controller_dispatcher_queue_depth() -> &'static IntGauge {
+    CONTROLLER_DISPATCHER_QUEUE_DEPTH.get_or_init(|| {
+        let gauge = IntGauge::new(
+            "controller_dispatcher_queue_depth",
+            "Pending controller work items in the dispatcher queue",
+        )
+        .expect("controller_dispatcher_queue_depth");
+        register_collector(gauge)
+    })
+}
+
+fn controller_dispatcher_handler_errors_total() -> &'static IntCounterVec {
+    CONTROLLER_DISPATCHER_HANDLER_ERRORS_TOTAL.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "controller_dispatcher_handler_errors_total",
+                "Total controller handler errors grouped by target",
+            ),
+            &["target"],
+        )
+        .expect("controller_dispatcher_handler_errors_total");
+        register_collector(counter)
+    })
+}
+
+fn controller_watch_backoff_seconds() -> &'static HistogramVec {
+    CONTROLLER_WATCH_BACKOFF_SECONDS.get_or_init(|| {
+        let histogram = HistogramVec::new(
+            HistogramOpts::new(
+                "controller_watch_backoff_seconds",
+                "Backoff delays applied when watch streams restart",
+            )
+            .buckets(prometheus::exponential_buckets(0.1, 2.0, 8).expect("watch backoff buckets")),
+            &["path"],
+        )
+        .expect("controller_watch_backoff_seconds");
+        register_collector(histogram)
+    })
+}
+
+fn controller_watch_lagged_total() -> &'static IntCounterVec {
+    CONTROLLER_WATCH_LAGGED_TOTAL.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "controller_watch_lagged_total",
+                "Total dropped watch events due to lagging subscribers",
+            ),
+            &["path"],
+        )
+        .expect("controller_watch_lagged_total");
         register_collector(counter)
     })
 }
@@ -878,6 +936,32 @@ pub fn record_controller_reconcile(controller: &str, result: ControllerReconcile
     controller_reconciles_total()
         .with_label_values(&[controller, result.as_label()])
         .inc();
+}
+
+/// Updates the dispatcher queue depth gauge.
+pub fn set_controller_dispatcher_queue_depth(depth: i64) {
+    controller_dispatcher_queue_depth().set(depth);
+}
+
+/// Records a controller handler error for the given target identifier.
+pub fn record_controller_handler_error(target: &str) {
+    controller_dispatcher_handler_errors_total()
+        .with_label_values(&[target])
+        .inc();
+}
+
+/// Records a watch backoff duration for a given path.
+pub fn record_controller_watch_backoff(path: &str, delay: Duration) {
+    controller_watch_backoff_seconds()
+        .with_label_values(&[path])
+        .observe(delay.as_secs_f64());
+}
+
+/// Records watch lag/drop occurrences for a given path.
+pub fn record_controller_watch_lagged(path: &str, skipped: u64) {
+    controller_watch_lagged_total()
+        .with_label_values(&[path])
+        .inc_by(skipped);
 }
 
 pub fn record_binding_execution(service: &str, result: BindingExecutionResult) {

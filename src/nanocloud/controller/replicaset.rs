@@ -408,12 +408,8 @@ impl Reconciler for ReplicaSetController {
         target: &ControllerTarget,
     ) -> Result<Option<ReconcileData<Self::Desired, Self::Observed>>, Self::Error> {
         let fetcher = ctx
-            .dependency::<DependencyHandle<ReplicaSetFetcher>>()
-            .ok_or_else(|| {
-                ReplicaSetError::Dependency(
-                    "ReplicaSet fetcher dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<ReplicaSetFetcher>>()
+            .map_err(|err| ReplicaSetError::Dependency(err.to_string()))?
             .get();
 
         let ControllerTarget::ReplicaSet { .. } = target else {
@@ -461,12 +457,8 @@ impl Reconciler for ReplicaSetController {
         self.persist_state(&plan)?;
 
         let scheduler = ctx
-            .dependency::<DependencyHandle<dyn ReplicaSetScheduler>>()
-            .ok_or_else(|| {
-                ReplicaSetError::Dependency(
-                    "ReplicaSet scheduler dependency not registered with runtime".to_string(),
-                )
-            })?
+            .require_dependency::<DependencyHandle<dyn ReplicaSetScheduler>>()
+            .map_err(|err| ReplicaSetError::Dependency(err.to_string()))?
             .get();
 
         let namespace_label = normalize_namespace(namespace.as_deref());
