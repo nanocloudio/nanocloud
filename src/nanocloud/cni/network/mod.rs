@@ -484,12 +484,12 @@ pub(crate) fn ensure_privileged(operation: &str) -> Result<(), Box<dyn Error + S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nanocloud::cni::network::nat::configure_port_forwards;
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::sync::{Mutex, OnceLock};
     use std::{fs, os::unix::process::ExitStatusExt};
     use tempfile::tempdir;
-    use crate::nanocloud::cni::network::nat::configure_port_forwards;
 
     #[test]
     fn subnet_iterator_skips_gateway_and_broadcast() {
@@ -817,8 +817,16 @@ mod tests {
             .with_status("ip", &[], 0)
             .with_status("ip", &[], 0)
             .with_status("ip", &[], 0)
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""));
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            );
 
         let mut env: HashMap<String, String> = HashMap::new();
         env.insert("CNI_COMMAND".into(), "ADD".into());
@@ -900,12 +908,8 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("rename"));
 
-        assert!(CNI_KEYSPACE
-            .get(&ip_pool_path("172.20.0.2"))
-            .is_err());
-        assert!(CNI_KEYSPACE
-            .get(&allocation_path(container_id))
-            .is_err());
+        assert!(CNI_KEYSPACE.get(&ip_pool_path("172.20.0.2")).is_err());
+        assert!(CNI_KEYSPACE.get(&allocation_path(container_id)).is_err());
 
         let calls = runner.calls();
         assert!(calls
@@ -926,7 +930,10 @@ mod tests {
         let container_id = "del-test";
         let host_if = host_interface_name(container_id);
         CNI_KEYSPACE
-            .put(&allocation_path(container_id), &format!("10.0.0.2 {} 1", host_if))
+            .put(
+                &allocation_path(container_id),
+                &format!("10.0.0.2 {} 1", host_if),
+            )
             .expect("alloc");
         CNI_KEYSPACE
             .put(&ip_pool_path("10.0.0.2"), container_id)
@@ -939,8 +946,16 @@ mod tests {
             .with_status("ip", &[], 0)
             .with_status("ip", &[], 0)
             .with_status("ip", &[], 0)
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""));
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            );
 
         let mut env: HashMap<String, String> = HashMap::new();
         env.insert("CNI_COMMAND".into(), "DEL".into());
@@ -948,15 +963,9 @@ mod tests {
 
         delete_with_runner(&runner, &env).expect("delete ok");
 
-        assert!(CNI_KEYSPACE
-            .get(&allocation_path(container_id))
-            .is_err());
-        assert!(CNI_KEYSPACE
-            .get(&ip_pool_path("10.0.0.2"))
-            .is_err());
-        assert!(CNI_KEYSPACE
-            .get(&port_forward_path(container_id))
-            .is_err());
+        assert!(CNI_KEYSPACE.get(&allocation_path(container_id)).is_err());
+        assert!(CNI_KEYSPACE.get(&ip_pool_path("10.0.0.2")).is_err());
+        assert!(CNI_KEYSPACE.get(&port_forward_path(container_id)).is_err());
 
         let calls = runner.calls();
         assert!(calls
@@ -979,8 +988,16 @@ mod tests {
             protocol: "tcp".to_string(),
         };
         let runner = FakeCommandRunner::default()
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""))
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""))
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""))
@@ -1000,10 +1017,7 @@ mod tests {
             .expect("prerouting rule");
         assert!(prerouting.1.contains(&"192.168.1.10".to_string()));
         assert!(prerouting.1.contains(&"br0".to_string()));
-        assert!(prerouting
-            .1
-            .iter()
-            .any(|arg| arg == "10.0.0.2:80"));
+        assert!(prerouting.1.iter().any(|arg| arg == "10.0.0.2:80"));
 
         let stored = CNI_KEYSPACE
             .get(&port_forward_path(container_id))
@@ -1024,17 +1038,23 @@ mod tests {
             protocol: "tcp".to_string(),
         };
         let runner = FakeCommandRunner::default()
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""))
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""))
             .with_output("nft", &[], FakeCommandRunner::output(0, "", ""));
 
         let err = configure_port_forwards(&runner, container_id, "br0", vec![rule]).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
-        assert!(CNI_KEYSPACE
-            .get(&port_forward_path(container_id))
-            .is_err());
+        assert!(CNI_KEYSPACE.get(&port_forward_path(container_id)).is_err());
         reset_cni_keyspace();
     }
 
@@ -1067,8 +1087,16 @@ mod tests {
         let runner = FakeCommandRunner::default()
             .with_output("ip", &[], FakeCommandRunner::output(0, "", ""))
             .with_output("ip", &[], FakeCommandRunner::output(0, "", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
-            .with_output("nft", &[], FakeCommandRunner::output(0, "{\"nftables\":[]}", ""))
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
+            .with_output(
+                "nft",
+                &[],
+                FakeCommandRunner::output(0, "{\"nftables\":[]}", ""),
+            )
             .with_status("ip", &[], 1);
 
         let report = reconcile::reconcile(&runner, false).expect("reconcile ok");
@@ -1547,7 +1575,6 @@ impl Network {
         let runner = SystemCommandRunner;
         delete_with_runner(&runner, env)
     }
-
 }
 
 pub(crate) fn ensure_sysctl_value(

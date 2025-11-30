@@ -53,7 +53,12 @@ pub(crate) fn add_with_runner<R: Read>(
         .map_err(|e| with_context(e, "Failed to record IP allocation"))?;
     apply_guard.mark_allocation_recorded();
 
-    configure_port_forwards(runner, &request.container_id, &bridge_name, port_forward_rules)?;
+    configure_port_forwards(
+        runner,
+        &request.container_id,
+        &bridge_name,
+        port_forward_rules,
+    )?;
 
     apply_guard.disable();
     Ok(result)
@@ -377,11 +382,10 @@ impl<'a> Drop for AddRollback<'a> {
 
         if let Some(ip) = self.ip {
             let ip_str = ip.to_string();
-            let (status, detail) =
-                match CNI_KEYSPACE.delete(&ip_pool_path(&ip_str)).map(|_| ()) {
-                    Ok(_) => ("ok".to_string(), String::new()),
-                    Err(err) => ("error".to_string(), err.to_string()),
-                };
+            let (status, detail) = match CNI_KEYSPACE.delete(&ip_pool_path(&ip_str)).map(|_| ()) {
+                Ok(_) => ("ok".to_string(), String::new()),
+                Err(err) => ("error".to_string(), err.to_string()),
+            };
             log_info(
                 "cni",
                 "Rolled back IP allocation",

@@ -16,10 +16,10 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::logger::log_warn;
 use crate::nanocloud::observability::metrics;
 use crate::nanocloud::scheduler::{JobResult, ScheduleSpec, ScheduledTaskHandle, Scheduler};
 use crate::nanocloud::util::{Keyspace, KeyspaceEvent};
-use crate::nanocloud::logger::log_warn;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -253,7 +253,9 @@ impl ControllerWatchManager {
     pub fn shared() -> Self {
         static INSTANCE: OnceLock<ControllerWatchManager> = OnceLock::new();
         INSTANCE
-            .get_or_init(|| ControllerWatchManager::create(Keyspace::new("k8s"), WatchConfig::default()))
+            .get_or_init(|| {
+                ControllerWatchManager::create(Keyspace::new("k8s"), WatchConfig::default())
+            })
             .clone()
     }
 
@@ -420,8 +422,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{MutexGuard, OnceLock};
     use tokio::sync::Mutex;
-    use tokio_stream::{iter, StreamExt};
     use tokio::time::{sleep, timeout, Duration};
+    use tokio_stream::{iter, StreamExt};
 
     struct EnvGuard {
         key: &'static str,
@@ -572,10 +574,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let manager = ControllerWatchManager::with_config(
-            Keyspace::new("controller-watch-lag"),
-            config,
-        );
+        let manager =
+            ControllerWatchManager::with_config(Keyspace::new("controller-watch-lag"), config);
 
         let mut sub = manager.subscribe("/deployments", Some("default"));
         let keyspace = Keyspace::new("controller-watch-lag");
@@ -653,7 +653,8 @@ mod tests {
     async fn manager_shutdown_cleans_active_watches() {
         let _env = TestEnv::new();
         let _lock = test_guard().lock().await;
-        let manager = ControllerWatchManager::with_keyspace(Keyspace::new("controller-watch-shutdown"));
+        let manager =
+            ControllerWatchManager::with_keyspace(Keyspace::new("controller-watch-shutdown"));
         let _sub = manager.subscribe("/pods", Some("default"));
         assert_eq!(manager.active_watches(), 1);
         manager.shutdown();

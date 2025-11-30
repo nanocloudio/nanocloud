@@ -16,9 +16,7 @@
  * limitations under the License.
  */
 
-use crate::nanocloud::controller::runtime::{
-    ControllerRuntime, ControllerTarget, DependencyError,
-};
+use crate::nanocloud::controller::runtime::{ControllerRuntime, ControllerTarget, DependencyError};
 use std::error::Error;
 use std::sync::Arc;
 

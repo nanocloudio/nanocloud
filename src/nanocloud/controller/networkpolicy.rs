@@ -69,8 +69,9 @@ fn start_network_policy_executor(runtime: &Arc<ControllerRuntime>, recorder: Eve
                     name.as_str(),
                 )
                 .await;
-                return outcome
-                    .map_err(|err| Box::new(io::Error::other(err)) as Box<dyn Error + Send + Sync>);
+                return outcome.map_err(|err| {
+                    Box::new(io::Error::other(err)) as Box<dyn Error + Send + Sync>
+                });
             }
             Ok(())
         }

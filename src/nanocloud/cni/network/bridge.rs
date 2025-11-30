@@ -40,7 +40,8 @@ impl<'a> Drop for BridgeRollback<'a> {
             &args(&["link", "delete", self.bridge]),
             "Failed to roll back bridge creation",
         )
-        .and_then(|status| ensure_success(status, "Failed to delete bridge")) {
+        .and_then(|status| ensure_success(status, "Failed to delete bridge"))
+        {
             status = err.to_string();
         }
         log_info(

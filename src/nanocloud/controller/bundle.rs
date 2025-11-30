@@ -97,7 +97,9 @@ fn start_bundle_executor(
                             ("error", err.as_str()),
                         ],
                     );
-                    return Err(Box::new(io::Error::other(err)) as Box<dyn std::error::Error + Send + Sync>);
+                    return Err(
+                        Box::new(io::Error::other(err)) as Box<dyn std::error::Error + Send + Sync>
+                    );
                 }
             }
             Ok(())

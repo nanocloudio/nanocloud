@@ -203,19 +203,19 @@ impl ControllerRuntime {
             let hooks = Arc::clone(&hooks);
             Arc::new(move |depth: QueueDepth| {
                 if depth.queued >= warn_at {
-        let metadata = [
-            ("queued".to_string(), depth.queued.to_string()),
-            ("capacity".to_string(), depth.capacity.to_string()),
-        ];
-        let metadata_refs = [
-            (metadata[0].0.as_str(), metadata[0].1.as_str()),
-            (metadata[1].0.as_str(), metadata[1].1.as_str()),
-        ];
-        log_warn(
-            COMPONENT,
-            "controller work queue nearing capacity",
-            &metadata_refs,
-        );
+                    let metadata = [
+                        ("queued".to_string(), depth.queued.to_string()),
+                        ("capacity".to_string(), depth.capacity.to_string()),
+                    ];
+                    let metadata_refs = [
+                        (metadata[0].0.as_str(), metadata[0].1.as_str()),
+                        (metadata[1].0.as_str(), metadata[1].1.as_str()),
+                    ];
+                    log_warn(
+                        COMPONENT,
+                        "controller work queue nearing capacity",
+                        &metadata_refs,
+                    );
                 }
 
                 if let Some(callback) = hooks
@@ -323,7 +323,10 @@ impl ControllerRuntime {
     /// Registers a new handler and starts the dispatcher if needed, returning a joinable handle.
     ///
     /// Handlers should return `HandlerResult` to propagate failures into the dispatcher hooks.
-    pub fn spawn_executor<H, Fut>(&self, handler: H) -> Result<DispatcherHandle, ControllerRuntimeError>
+    pub fn spawn_executor<H, Fut>(
+        &self,
+        handler: H,
+    ) -> Result<DispatcherHandle, ControllerRuntimeError>
     where
         H: Fn(ControllerWorkItem) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = HandlerResult> + Send + 'static,
@@ -359,10 +362,7 @@ impl ControllerRuntime {
             run_dispatch_loop(queue_for_task, handlers, hooks, shutdown_for_task).await;
         });
 
-        let mut guard = self
-            .dispatcher
-            .lock()
-            .expect("dispatcher lock poisoned");
+        let mut guard = self.dispatcher.lock().expect("dispatcher lock poisoned");
         let handle = DispatcherHandle::new(queue, join, shutdown);
         *guard = Some(handle.clone());
         Ok(handle)
@@ -374,12 +374,9 @@ struct DependencyRegistry {
     values: StdRwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
-type ExecutorHandler =
-    Arc<
-        dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
-            + Send
-            + Sync,
-    >;
+type ExecutorHandler = Arc<
+    dyn Fn(ControllerWorkItem) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>> + Send + Sync,
+>;
 
 async fn run_dispatch_loop(
     queue: KeyedWorkQueue<ControllerWorkItem>,
@@ -1192,7 +1189,9 @@ mod tests {
 
         let captured_errors = errors.lock().unwrap();
         assert!(
-            captured_errors.iter().any(|err| err.contains("Deployment/")),
+            captured_errors
+                .iter()
+                .any(|err| err.contains("Deployment/")),
             "handler error hook should capture target"
         );
         drop(captured_errors);
@@ -1223,7 +1222,11 @@ mod tests {
             .expect("first handler");
 
         let item1 = ControllerWorkItem::bundle(Some("default"), "one");
-        runtime.work_queue().enqueue(item1).await.expect("enqueue 1");
+        runtime
+            .work_queue()
+            .enqueue(item1)
+            .await
+            .expect("enqueue 1");
 
         timeout(Duration::from_secs(1), async {
             while first_hits.load(Ordering::SeqCst) < 1 {
@@ -1245,7 +1248,11 @@ mod tests {
             .expect("second handler");
 
         let item2 = ControllerWorkItem::bundle(Some("default"), "two");
-        runtime.work_queue().enqueue(item2).await.expect("enqueue 2");
+        runtime
+            .work_queue()
+            .enqueue(item2)
+            .await
+            .expect("enqueue 2");
 
         timeout(Duration::from_secs(1), async {
             while second_hits.load(Ordering::SeqCst) < 1 {
