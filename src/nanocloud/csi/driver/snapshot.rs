@@ -108,7 +108,7 @@ impl CsiDriver {
                 archive_path: stored_snapshot.archive_path,
             })
         }
-            .await;
+        .await;
 
         match result {
             Ok(resp) => {

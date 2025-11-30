@@ -23,10 +23,11 @@ mod types;
 pub use driver::{CsiDriver, StoredVolume};
 #[allow(unused_imports)]
 // Re-exported for downstream crates/tests that depend on the public CSI API.
-pub use provider::{csi_plugin, register_csi_plugin, CsiPlugin};
+pub use provider::{csi_plugin, register_csi_plugin, CsiFuture, CsiPlugin};
 #[allow(unused_imports)]
 // Re-exported so external callers can build CSI requests without reaching into submodules.
 pub use types::{
-    CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest, DeleteVolumeRequest,
-    NodePublishVolumeRequest, NodeUnpublishVolumeRequest, Volume as CsiVolume,
+    CreateSnapshotRequest, CreateSnapshotResponse, CreateVolumeRequest, CreateVolumeResponse,
+    DeleteSnapshotRequest, DeleteVolumeRequest, NodePublishVolumeRequest,
+    NodePublishVolumeResponse, NodeUnpublishVolumeRequest, Volume as CsiVolume,
 };

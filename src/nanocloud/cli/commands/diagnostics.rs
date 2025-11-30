@@ -16,6 +16,7 @@
 
 use humantime::parse_duration;
 use std::error::Error;
+use std::time::Duration;
 
 use crate::nanocloud::cli::args::DiagnosticsArgs;
 use crate::nanocloud::cli::Terminal;
@@ -23,7 +24,7 @@ use crate::nanocloud::cni::{
     cni_plugin, CniContainerCleanup, CniReconciliationReport, NftRuleCleanup,
 };
 use crate::nanocloud::diagnostics::loopback::{
-    run_loopback_probe, LoopbackProbeConfig, LoopbackProbeResult,
+    run_loopback_probe, LoopbackPhaseTimeouts, LoopbackProbeConfig, LoopbackProbeResult,
 };
 
 pub(super) async fn handle_diagnostics(
@@ -158,7 +159,54 @@ fn build_loopback_config(
             .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
         config.timeout = duration;
     }
+    config.serialize_probes = args.loopback_serialize;
+    config.log_dir = args.loopback_log_dir.clone();
+
+    let mut phase_timeouts = LoopbackPhaseTimeouts::default();
+    let mut has_override = false;
+    if let Some(duration) = parse_optional_duration(&args.loopback_pull_timeout)? {
+        phase_timeouts.pull = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_cni_timeout)? {
+        phase_timeouts.cni = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_csi_timeout)? {
+        phase_timeouts.csi = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_dns_timeout)? {
+        phase_timeouts.dns = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_volume_timeout)? {
+        phase_timeouts.volume = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_log_timeout)? {
+        phase_timeouts.log = duration;
+        has_override = true;
+    }
+    if let Some(duration) = parse_optional_duration(&args.loopback_cleanup_timeout)? {
+        phase_timeouts.cleanup = duration;
+        has_override = true;
+    }
+    if has_override {
+        config.phase_timeouts = Some(phase_timeouts);
+    }
     Ok(config)
+}
+
+fn parse_optional_duration(
+    raw: &Option<String>,
+) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+    match raw.as_deref() {
+        Some(value) => parse_duration(value)
+            .map(Some)
+            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>),
+        None => Ok(None),
+    }
 }
 
 fn print_loopback_summary(image: &str, result: &LoopbackProbeResult, outcome: &LoopbackOutcome) {

@@ -38,6 +38,7 @@ data-encoding = "2.9.0"
 log = "0.4.28"
 jsonwebtoken = { version = "10.0.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 sha1 = "0.10.6"
+tempfile = "3.23.0"
 hex = "0.4.3"
 jsonschema = "0.17.1"
 sha2 = "0.10.8"
@@ -54,6 +55,7 @@ tracing-opentelemetry = { version = "0.26.0", optional = true }
 [features]
 default = []
 openapi = ["dep:utoipa"]
+diagnostics-bench = []
 
 [[bin]]
 name = "openapi_gen"
@@ -61,7 +63,6 @@ path = "tools/openapi_gen.rs"
 required-features = ["openapi"]
 
 [dev-dependencies]
-tempfile = "3.23.0"
 serde_urlencoded = "0.7.1"
 http = "0.2"
 hyper = { version = "0.14", features = ["stream"] }

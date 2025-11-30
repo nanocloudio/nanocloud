@@ -67,9 +67,7 @@ impl CsiDriver {
                     snapshot_options: SNAPSHOT_OPTIONS
                         .get_or_init(SnapshotOptions::default)
                         .clone(),
-                    observer: OBSERVER
-                        .get_or_init(observer::NoopObserver::arc)
-                        .clone(),
+                    observer: OBSERVER.get_or_init(observer::NoopObserver::arc).clone(),
                 })
             })
             .clone()
@@ -118,9 +116,7 @@ impl CsiDriver {
     /// Configure global snapshot options (limits, symlink policy, throttling) for the shared driver.
     /// Call before `CsiDriver::shared()`; subsequent calls are ignored.
     #[allow(dead_code)]
-    pub fn configure_snapshot_options(
-        options: SnapshotOptions,
-    ) -> Result<(), SnapshotOptions> {
+    pub fn configure_snapshot_options(options: SnapshotOptions) -> Result<(), SnapshotOptions> {
         SNAPSHOT_OPTIONS.set(options)
     }
 

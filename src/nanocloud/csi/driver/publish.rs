@@ -164,7 +164,7 @@ impl CsiDriver {
                 publish_path: publish_path.display().to_string(),
             })
         }
-            .await;
+        .await;
 
         match result {
             Ok(resp) => {

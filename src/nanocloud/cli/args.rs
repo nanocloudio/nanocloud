@@ -303,6 +303,42 @@ pub struct DiagnosticsArgs {
     /// Override the loopback probe timeout (e.g. 60s, 2m, 500ms)
     #[arg(long = "loopback-timeout", value_name = "DURATION")]
     pub loopback_timeout: Option<String>,
+
+    /// Serialize loopback probes to avoid overlapping runs
+    #[arg(long = "loopback-serialize")]
+    pub loopback_serialize: bool,
+
+    /// Store loopback probe logs in this directory (per-run subdirectories are created)
+    #[arg(long = "loopback-log-dir", value_name = "PATH")]
+    pub loopback_log_dir: Option<PathBuf>,
+
+    /// Override the image pull timeout for the loopback probe
+    #[arg(long = "loopback-pull-timeout", value_name = "DURATION")]
+    pub loopback_pull_timeout: Option<String>,
+
+    /// Override the CNI setup timeout for the loopback probe
+    #[arg(long = "loopback-cni-timeout", value_name = "DURATION")]
+    pub loopback_cni_timeout: Option<String>,
+
+    /// Override the CSI lifecycle timeout for the loopback probe
+    #[arg(long = "loopback-csi-timeout", value_name = "DURATION")]
+    pub loopback_csi_timeout: Option<String>,
+
+    /// Override the DNS check timeout for the loopback probe
+    #[arg(long = "loopback-dns-timeout", value_name = "DURATION")]
+    pub loopback_dns_timeout: Option<String>,
+
+    /// Override the volume check timeout for the loopback probe
+    #[arg(long = "loopback-volume-timeout", value_name = "DURATION")]
+    pub loopback_volume_timeout: Option<String>,
+
+    /// Override the log persistence timeout for the loopback probe
+    #[arg(long = "loopback-log-timeout", value_name = "DURATION")]
+    pub loopback_log_timeout: Option<String>,
+
+    /// Override the cleanup timeout for the loopback probe
+    #[arg(long = "loopback-cleanup-timeout", value_name = "DURATION")]
+    pub loopback_cleanup_timeout: Option<String>,
 }
 
 #[derive(Args)]

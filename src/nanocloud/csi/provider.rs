@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 type DynError = Box<dyn Error + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
-type CsiFuture<T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send>>;
+pub type CsiFuture<T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send>>;
 
 /// Interface for pluggable CSI implementations.
 pub trait CsiPlugin: Send + Sync {
