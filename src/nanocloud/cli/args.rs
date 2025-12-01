@@ -77,7 +77,7 @@ pub enum Commands {
     Status(StatusArgs),
 
     /// Reconcile host-side CNI artifacts and report findings
-    Diagnostics(DiagnosticsArgs),
+    Diagnostics,
 
     /// Inspect NetworkPolicy state and debugging details
     Policy(PolicyArgs),
@@ -285,62 +285,6 @@ pub struct StatusArgs {
     pub curl: bool,
 }
 
-/// Run host-side diagnostics and cleanup for Nanocloud CNI artifacts
-#[derive(Args)]
-pub struct DiagnosticsArgs {
-    /// Run the loopback probe (set --no-loopback to skip)
-    #[arg(long = "loopback", default_value_t = true)]
-    pub loopback: bool,
-
-    /// Skip the loopback probe even when enabled by default
-    #[arg(long = "no-loopback")]
-    pub no_loopback: bool,
-
-    /// Override the diagnostics image used for the loopback probe
-    #[arg(long = "loopback-image", value_name = "IMAGE")]
-    pub loopback_image: Option<String>,
-
-    /// Override the loopback probe timeout (e.g. 60s, 2m, 500ms)
-    #[arg(long = "loopback-timeout", value_name = "DURATION")]
-    pub loopback_timeout: Option<String>,
-
-    /// Serialize loopback probes to avoid overlapping runs
-    #[arg(long = "loopback-serialize")]
-    pub loopback_serialize: bool,
-
-    /// Store loopback probe logs in this directory (per-run subdirectories are created)
-    #[arg(long = "loopback-log-dir", value_name = "PATH")]
-    pub loopback_log_dir: Option<PathBuf>,
-
-    /// Override the image pull timeout for the loopback probe
-    #[arg(long = "loopback-pull-timeout", value_name = "DURATION")]
-    pub loopback_pull_timeout: Option<String>,
-
-    /// Override the CNI setup timeout for the loopback probe
-    #[arg(long = "loopback-cni-timeout", value_name = "DURATION")]
-    pub loopback_cni_timeout: Option<String>,
-
-    /// Override the CSI lifecycle timeout for the loopback probe
-    #[arg(long = "loopback-csi-timeout", value_name = "DURATION")]
-    pub loopback_csi_timeout: Option<String>,
-
-    /// Override the DNS check timeout for the loopback probe
-    #[arg(long = "loopback-dns-timeout", value_name = "DURATION")]
-    pub loopback_dns_timeout: Option<String>,
-
-    /// Override the volume check timeout for the loopback probe
-    #[arg(long = "loopback-volume-timeout", value_name = "DURATION")]
-    pub loopback_volume_timeout: Option<String>,
-
-    /// Override the log persistence timeout for the loopback probe
-    #[arg(long = "loopback-log-timeout", value_name = "DURATION")]
-    pub loopback_log_timeout: Option<String>,
-
-    /// Override the cleanup timeout for the loopback probe
-    #[arg(long = "loopback-cleanup-timeout", value_name = "DURATION")]
-    pub loopback_cleanup_timeout: Option<String>,
-}
-
 #[derive(Args)]
 pub struct EventsArgs {
     /// Only include events from this namespace
@@ -409,25 +353,17 @@ pub struct ServerArgs {
     #[arg(long = "dns-cluster-domain", default_value = "cluster.local")]
     pub dns_cluster_domain: String,
 
-    /// Address to bind the DNS listener
-    #[arg(long = "dns-listen", default_value = "0.0.0.0")]
+    /// Address to bind the DNS listener (e.g. 0.0.0.0:53)
+    #[arg(long = "dns-listen", default_value = "0.0.0.0:53")]
     pub dns_listen: String,
-
-    /// Port to bind the DNS listener
-    #[arg(long = "dns-port", default_value_t = 53)]
-    pub dns_port: u16,
-
-    /// Default TTL (seconds) to apply to DNS answers when not overridden per service
-    #[arg(long = "dns-ttl", default_value_t = 30)]
-    pub dns_default_ttl: u32,
 
     /// Upstream DNS servers to use for queries outside the cluster domain
     #[arg(long = "dns-upstream", value_delimiter = ',', value_name = "HOST:PORT")]
     pub dns_upstream: Vec<String>,
 
-    /// Maximum UDP payload size to accept for DNS queries
-    #[arg(long = "dns-max-udp-payload", default_value_t = 512)]
-    pub dns_max_udp_payload: u16,
+    /// Maximum concurrent DNS handlers (0 disables the cap)
+    #[arg(long = "dns-handler-concurrency", default_value_t = 128)]
+    pub dns_handler_concurrency: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

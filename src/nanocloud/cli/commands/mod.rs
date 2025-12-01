@@ -73,13 +73,16 @@ pub fn bootstrap(command: &Commands) -> Result<CommandContext, Box<dyn Error + S
                             format!("Invalid listen address '{}': {}", args.listen, e),
                         ))
                     })?;
-            let dns_listen: IpAddr =
+            let dns_listen: SocketAddr =
                 args.dns_listen
                     .parse()
                     .map_err(|e| -> Box<dyn Error + Send + Sync> {
                         Box::new(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("Invalid DNS listen address '{}': {}", args.dns_listen, e),
+                            format!(
+                            "Invalid DNS listen address '{}'. Use HOST:PORT (e.g. 0.0.0.0:53): {}",
+                            args.dns_listen, e
+                        ),
                         ))
                     })?;
             let dns_upstream = if args.dns_upstream.is_empty() {
@@ -96,14 +99,20 @@ pub fn bootstrap(command: &Commands) -> Result<CommandContext, Box<dyn Error + S
             } else {
                 parse_upstream(&args.dns_upstream)?
             };
+            let defaults = DnsConfig::default();
             let dns_config = DnsConfig::new(
                 args.dns_cluster_domain.clone(),
-                dns_listen,
-                args.dns_port,
-                args.dns_default_ttl,
+                dns_listen.ip(),
+                dns_listen.port(),
+                defaults.default_ttl_seconds,
                 dns_upstream,
-                args.dns_max_udp_payload,
+                defaults.max_udp_payload_size,
             )
+            .map(|mut cfg| {
+                cfg.handler_concurrency = args.dns_handler_concurrency;
+                cfg
+            })
+            .and_then(|cfg| cfg.validate().map(|_| cfg))
             .map_err(|e| -> Box<dyn Error + Send + Sync> {
                 Box::new(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
             })?;
@@ -193,7 +202,7 @@ pub async fn run(
             let client = NanocloudClient::new()?;
             unit_to_exit(status::handle_status(&client, args).await)
         }
-        Commands::Diagnostics(args) => diagnostics::handle_diagnostics(args).await,
+        Commands::Diagnostics => diagnostics::handle_diagnostics().await,
         Commands::Policy(args) => {
             let client = NanocloudClient::new()?;
             unit_to_exit(policy::handle_policy(&client, args).await)

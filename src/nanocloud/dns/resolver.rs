@@ -16,9 +16,15 @@
 
 use super::config::DnsConfig;
 use super::registry::{DnsProtocol, DnsRegistry, PortKey, RegistrySnapshot, ServiceSnapshot};
+use crate::nanocloud::logger::log_warn;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const RESOLVER_COMPONENT: &str = "dns-resolver";
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,21 +105,135 @@ pub enum Resolution {
     Forward(Vec<SocketAddr>),
 }
 
+#[derive(Clone, Debug)]
+struct CachedResponse {
+    response: DnsResponse,
+    expires_at: Instant,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedName {
+    normalized: String,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct DnsResolver {
     config: DnsConfig,
     registry: Arc<DnsRegistry>,
+    response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    name_cache: Arc<Mutex<HashMap<String, CachedName>>>,
+    last_generation: Arc<AtomicU64>,
 }
 
 impl DnsResolver {
     pub fn new(config: DnsConfig, registry: Arc<DnsRegistry>) -> Self {
-        Self { config, registry }
+        let generation = registry.shared_snapshot().generation();
+        Self {
+            config,
+            registry,
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
+            name_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_generation: Arc::new(AtomicU64::new(generation)),
+        }
     }
 
     pub fn resolve(&self, question: &DnsQuestion) -> Resolution {
-        let snapshot = self.registry.snapshot();
-        resolve_question(&self.config, &snapshot, question)
+        let snapshot = self.registry.shared_snapshot();
+        self.reset_caches_if_stale(snapshot.generation());
+        let normalized_name = self.normalized_name(&question.name);
+        let cache_key = response_cache_key(&normalized_name, question.qtype);
+        if let Some(response) = self.cached_response(&cache_key, snapshot.generation()) {
+            return response;
+        }
+
+        let normalized_question = DnsQuestion {
+            name: normalized_name,
+            qtype: question.qtype,
+        };
+        let resolution = resolve_question(
+            &self.config,
+            snapshot.as_ref(),
+            &normalized_question,
+            &normalized_question.name,
+        );
+        if let Resolution::Answer(ref response) = resolution {
+            self.insert_cached_response(cache_key, response.clone(), snapshot.generation());
+        }
+        resolution
     }
+
+    fn reset_caches_if_stale(&self, generation: u64) {
+        let last = self.last_generation.load(Ordering::SeqCst);
+        if last != generation {
+            self.last_generation.store(generation, Ordering::SeqCst);
+            if let Ok(mut cache) = self.response_cache.lock() {
+                cache.clear();
+            }
+            if let Ok(mut cache) = self.name_cache.lock() {
+                cache.clear();
+            }
+        }
+    }
+
+    fn normalized_name(&self, raw: &str) -> String {
+        let ttl = Duration::from_secs(self.config.normalized_cache_ttl_seconds);
+        let now = Instant::now();
+        if let Ok(mut cache) = self.name_cache.lock() {
+            if let Some(entry) = cache.get(raw) {
+                if entry.expires_at > now {
+                    return entry.normalized.clone();
+                }
+            }
+            let normalized = normalize_question_name(raw);
+            cache.insert(
+                raw.to_string(),
+                CachedName {
+                    normalized: normalized.clone(),
+                    expires_at: now + ttl,
+                },
+            );
+            normalized
+        } else {
+            normalize_question_name(raw)
+        }
+    }
+
+    fn cached_response(&self, key: &str, generation: u64) -> Option<Resolution> {
+        let now = Instant::now();
+        let cache = self.response_cache.lock().ok()?;
+        let entry = cache.get(key)?;
+        if entry.generation == generation && entry.expires_at > now {
+            Some(Resolution::Answer(entry.response.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn insert_cached_response(&self, key: String, response: DnsResponse, generation: u64) {
+        if self.config.response_cache_max_entries == 0 {
+            return;
+        }
+        if let Ok(mut cache) = self.response_cache.lock() {
+            if cache.len() >= self.config.response_cache_max_entries {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                CachedResponse {
+                    response,
+                    expires_at: Instant::now()
+                        + Duration::from_secs(self.config.response_cache_ttl_seconds),
+                    generation,
+                },
+            );
+        }
+    }
+}
+
+fn response_cache_key(name: &str, qtype: QueryType) -> String {
+    format!("{}|{:?}", name, qtype)
 }
 
 enum ParsedName {
@@ -141,9 +261,17 @@ fn resolve_question(
     config: &DnsConfig,
     snapshot: &RegistrySnapshot,
     question: &DnsQuestion,
+    normalized_name: &str,
 ) -> Resolution {
-    let normalized_name = normalize_question_name(&question.name);
-    if !is_in_zone(config, &normalized_name) {
+    if let Err(reason) = validate_name(normalized_name) {
+        log_warn(
+            RESOLVER_COMPONENT,
+            "Refusing invalid DNS question",
+            &[("name", normalized_name), ("reason", reason.as_str())],
+        );
+        return Resolution::Answer(empty_response(config, ResponseCode::Refused));
+    }
+    if !is_in_zone(config, normalized_name) {
         if config.upstream_servers.is_empty() {
             return Resolution::Answer(DnsResponse {
                 code: ResponseCode::Refused,
@@ -155,7 +283,7 @@ fn resolve_question(
         return Resolution::Forward(config.upstream_servers.clone());
     }
 
-    let parsed = parse_in_zone_name(config, &normalized_name, &question.qtype);
+    let parsed = parse_in_zone_name(config, normalized_name, &question.qtype);
     match parsed {
         ParsedName::ZoneRoot => resolve_zone_root(config, question),
         ParsedName::Service { namespace, service } => {
@@ -474,6 +602,35 @@ fn normalize_question_name(name: &str) -> String {
     trimmed.to_ascii_lowercase()
 }
 
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty name".to_string());
+    }
+    if name.len() > 253 {
+        return Err("name exceeds 253 characters".to_string());
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Err("empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("label exceeds 63 characters".to_string());
+        }
+        let bytes = label.as_bytes();
+        let valid_edge = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+        if !valid_edge(&bytes[0]) || !valid_edge(&bytes[label.len() - 1]) {
+            return Err("label must start and end with alphanumeric or '_'".to_string());
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+        {
+            return Err("label contains invalid characters".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn is_in_zone(config: &DnsConfig, name: &str) -> bool {
     let zone = config.zone_root();
     name == zone || name.ends_with(&format!(".{}", zone))
@@ -788,6 +945,50 @@ mod tests {
         match response {
             Resolution::Answer(resp) => assert_eq!(resp.code, ResponseCode::Refused),
             _ => panic!("expected direct answer"),
+        }
+    }
+
+    #[test]
+    fn response_cache_invalidates_on_registry_change() {
+        let (registry, resolver) = build_resolver();
+        registry.register_service(headless_service()).unwrap();
+        registry
+            .register_endpoint(endpoint("pod-1", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))))
+            .unwrap();
+
+        let question = DnsQuestion {
+            name: "web.default.svc.cluster.local.".to_string(),
+            qtype: QueryType::A,
+        };
+        let first = resolver.resolve(&question);
+        let first_count = match first {
+            Resolution::Answer(resp) => resp.answers.len(),
+            _ => panic!("expected answer"),
+        };
+        assert_eq!(first_count, 1);
+
+        registry
+            .register_endpoint(endpoint("pod-2", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11))))
+            .unwrap();
+
+        let second = resolver.resolve(&question);
+        let second_count = match second {
+            Resolution::Answer(resp) => resp.answers.len(),
+            _ => panic!("expected answer"),
+        };
+        assert_eq!(second_count, 2);
+    }
+
+    #[test]
+    fn refuses_invalid_names() {
+        let (_, resolver) = build_resolver();
+        let response = resolver.resolve(&DnsQuestion {
+            name: "-bad..name".to_string(),
+            qtype: QueryType::A,
+        });
+        match response {
+            Resolution::Answer(resp) => assert_eq!(resp.code, ResponseCode::Refused),
+            _ => panic!("expected answer"),
         }
     }
 }

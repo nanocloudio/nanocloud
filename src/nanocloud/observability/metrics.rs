@@ -61,6 +61,8 @@ static BACKUP_RESTORE_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_RESTORE_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static DNS_QUERIES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static DNS_RESPONSES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static DNS_DROPS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static DNS_UPSTREAM_ATTEMPTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTROLLER_DISPATCHER_QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static CONTROLLER_DISPATCHER_HANDLER_ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTROLLER_WATCH_BACKOFF_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
@@ -567,6 +569,30 @@ fn dns_responses_total() -> &'static IntCounterVec {
     })
 }
 
+fn dns_drops_total() -> &'static IntCounterVec {
+    DNS_DROPS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "dns_drops_total",
+            "Dropped DNS queries grouped by reason (rate_limit, saturated, malformed, too_short)",
+        );
+        let counter =
+            IntCounterVec::new(opts, &["reason"]).expect("failed to build dns drops counter");
+        register_collector(counter)
+    })
+}
+
+fn dns_upstream_attempts_total() -> &'static IntCounterVec {
+    DNS_UPSTREAM_ATTEMPTS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "dns_upstream_attempts_total",
+            "Upstream DNS forwarding attempts grouped by outcome",
+        );
+        let counter = IntCounterVec::new(opts, &["outcome"])
+            .expect("failed to build dns upstream attempts counter");
+        register_collector(counter)
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ContainerOperation {
     Install,
@@ -930,6 +956,16 @@ pub fn record_dns_query(qtype: &str) {
 
 pub fn record_dns_response(rcode: &str) {
     dns_responses_total().with_label_values(&[rcode]).inc();
+}
+
+pub fn record_dns_drop(reason: &str) {
+    dns_drops_total().with_label_values(&[reason]).inc();
+}
+
+pub fn record_dns_upstream_attempt(outcome: &str) {
+    dns_upstream_attempts_total()
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 pub fn record_controller_reconcile(controller: &str, result: ControllerReconcileResult) {

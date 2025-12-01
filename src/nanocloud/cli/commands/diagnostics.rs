@@ -14,34 +14,25 @@
  * limitations under the License.
  */
 
-use humantime::parse_duration;
 use std::error::Error;
-use std::time::Duration;
 
-use crate::nanocloud::cli::args::DiagnosticsArgs;
 use crate::nanocloud::cli::Terminal;
 use crate::nanocloud::cni::{
     cni_plugin, CniContainerCleanup, CniReconciliationReport, NftRuleCleanup,
 };
 use crate::nanocloud::diagnostics::loopback::{
-    run_loopback_probe, LoopbackPhaseTimeouts, LoopbackProbeConfig, LoopbackProbeResult,
+    run_loopback_probe, LoopbackProbeConfig, LoopbackProbeResult,
 };
 
-pub(super) async fn handle_diagnostics(
-    args: &DiagnosticsArgs,
-) -> Result<i32, Box<dyn Error + Send + Sync>> {
+pub(super) async fn handle_diagnostics() -> Result<i32, Box<dyn Error + Send + Sync>> {
     let report = cni_plugin().reconcile_cni_artifacts()?;
     print_report(&report);
 
     let mut exit_code = 0;
-    let loopback_enabled = if args.no_loopback {
-        false
-    } else {
-        args.loopback
-    };
+    let loopback_enabled = false;
 
     if loopback_enabled {
-        let config = build_loopback_config(args)?;
+        let config = LoopbackProbeConfig::default();
         match run_loopback_probe(config.clone()).await {
             Ok(result) => {
                 let outcome = summarize_loopback_outcome(&result);
@@ -56,7 +47,7 @@ pub(super) async fn handle_diagnostics(
         }
     } else {
         Terminal::stdout(format_args!(
-            "Loopback probe skipped (enable with --loopback)."
+            "Loopback probe skipped (disabled by default)."
         ));
     }
 
@@ -145,68 +136,6 @@ fn print_cleanup(cleanup: &CniContainerCleanup) {
         "    port-forward record: {}",
         port_forward_status
     ));
-}
-
-fn build_loopback_config(
-    args: &DiagnosticsArgs,
-) -> Result<LoopbackProbeConfig, Box<dyn Error + Send + Sync>> {
-    let mut config = LoopbackProbeConfig::default();
-    if let Some(image) = args.loopback_image.as_deref() {
-        config.image = image.to_string();
-    }
-    if let Some(raw_timeout) = args.loopback_timeout.as_deref() {
-        let duration = parse_duration(raw_timeout)
-            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
-        config.timeout = duration;
-    }
-    config.serialize_probes = args.loopback_serialize;
-    config.log_dir = args.loopback_log_dir.clone();
-
-    let mut phase_timeouts = LoopbackPhaseTimeouts::default();
-    let mut has_override = false;
-    if let Some(duration) = parse_optional_duration(&args.loopback_pull_timeout)? {
-        phase_timeouts.pull = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_cni_timeout)? {
-        phase_timeouts.cni = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_csi_timeout)? {
-        phase_timeouts.csi = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_dns_timeout)? {
-        phase_timeouts.dns = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_volume_timeout)? {
-        phase_timeouts.volume = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_log_timeout)? {
-        phase_timeouts.log = duration;
-        has_override = true;
-    }
-    if let Some(duration) = parse_optional_duration(&args.loopback_cleanup_timeout)? {
-        phase_timeouts.cleanup = duration;
-        has_override = true;
-    }
-    if has_override {
-        config.phase_timeouts = Some(phase_timeouts);
-    }
-    Ok(config)
-}
-
-fn parse_optional_duration(
-    raw: &Option<String>,
-) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
-    match raw.as_deref() {
-        Some(value) => parse_duration(value)
-            .map(Some)
-            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>),
-        None => Ok(None),
-    }
 }
 
 fn print_loopback_summary(image: &str, result: &LoopbackProbeResult, outcome: &LoopbackOutcome) {

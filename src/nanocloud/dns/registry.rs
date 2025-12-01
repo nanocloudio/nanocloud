@@ -198,6 +198,7 @@ pub struct ServiceSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct RegistrySnapshot {
     services: HashMap<ServiceKey, ServiceSnapshot>,
+    generation: u64,
 }
 
 impl RegistrySnapshot {
@@ -208,6 +209,10 @@ impl RegistrySnapshot {
 
     pub fn services(&self) -> Vec<ServiceSnapshot> {
         self.services.values().cloned().collect()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -231,6 +236,8 @@ struct RegistryState {
 pub struct DnsRegistry {
     state: Arc<RwLock<RegistryState>>,
     next_endpoint_id: Arc<AtomicU64>,
+    snapshot: Arc<RwLock<Arc<RegistrySnapshot>>>,
+    snapshot_generation: Arc<AtomicU64>,
 }
 
 impl Default for DnsRegistry {
@@ -244,7 +251,34 @@ impl DnsRegistry {
         Self {
             state: Arc::new(RwLock::new(RegistryState::default())),
             next_endpoint_id: Arc::new(AtomicU64::new(1)),
+            snapshot: Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default()))),
+            snapshot_generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    fn rebuild_snapshot_from_state(&self, state: &RegistryState) {
+        let generation = self.snapshot_generation.fetch_add(1, Ordering::SeqCst);
+        let mut services = HashMap::new();
+        for (key, svc) in state.services.iter() {
+            let snapshot = ServiceSnapshot {
+                name: svc.name.clone(),
+                namespace: svc.namespace.clone(),
+                cluster_ip: svc.cluster_ip,
+                ports: svc.ports.clone(),
+                ttl_seconds: svc.ttl_seconds,
+                endpoints: svc.endpoints.values().cloned().collect(),
+            };
+            services.insert(key.clone(), snapshot);
+        }
+        let snapshot = Arc::new(RegistrySnapshot {
+            services,
+            generation,
+        });
+        let mut guard = self
+            .snapshot
+            .write()
+            .expect("DNS registry snapshot lock poisoned");
+        *guard = snapshot;
     }
 
     pub fn register_service(&self, description: ServiceDescription) -> Result<(), RegistryError> {
@@ -273,6 +307,7 @@ impl DnsRegistry {
                     ("service", key.name.as_str()),
                 ],
             );
+            self.rebuild_snapshot_from_state(&guard);
             Ok(true)
         } else {
             Ok(false)
@@ -314,6 +349,7 @@ impl DnsRegistry {
 
         if let Some(existing_id) = existing_id {
             guard.endpoint_index.insert(existing_id, key);
+            self.rebuild_snapshot_from_state(&guard);
             return Ok(existing_id);
         }
 
@@ -346,6 +382,7 @@ impl DnsRegistry {
                 ("hostname", hostname_for_log.as_str()),
             ],
         );
+        self.rebuild_snapshot_from_state(&guard);
         Ok(id)
     }
 
@@ -397,6 +434,7 @@ impl DnsRegistry {
         if let Some(overrides) = patch.port_overrides {
             endpoint.port_overrides = normalize_overrides(overrides)?;
         }
+        self.rebuild_snapshot_from_state(&guard);
         Ok(())
     }
 
@@ -421,6 +459,7 @@ impl DnsRegistry {
                         ("endpoint_id", endpoint_id_text.as_str()),
                     ],
                 );
+                self.rebuild_snapshot_from_state(&guard);
             }
             Ok(removed)
         } else {
@@ -479,6 +518,7 @@ impl DnsRegistry {
             .map_err(|_| RegistryError::Persistence(new_error("DNS registry lock poisoned")))?;
         *guard = new_state;
         self.next_endpoint_id.store(next_id, Ordering::SeqCst);
+        self.rebuild_snapshot_from_state(&guard);
         let services_count = guard.services.len().to_string();
         let next_id_text = next_id.to_string();
         log_info(
@@ -493,23 +533,14 @@ impl DnsRegistry {
     }
 
     pub fn snapshot(&self) -> RegistrySnapshot {
-        let guard = self
-            .state
+        self.shared_snapshot().as_ref().clone()
+    }
+
+    pub fn shared_snapshot(&self) -> Arc<RegistrySnapshot> {
+        self.snapshot
             .read()
-            .expect("DNS registry lock poisoned during snapshot");
-        let mut services = HashMap::new();
-        for (key, state) in guard.services.iter() {
-            let snapshot = ServiceSnapshot {
-                name: state.name.clone(),
-                namespace: state.namespace.clone(),
-                cluster_ip: state.cluster_ip,
-                ports: state.ports.clone(),
-                ttl_seconds: state.ttl_seconds,
-                endpoints: state.endpoints.values().cloned().collect(),
-            };
-            services.insert(key.clone(), snapshot);
-        }
-        RegistrySnapshot { services }
+            .expect("DNS registry snapshot lock poisoned")
+            .clone()
     }
 
     fn upsert_service(&self, description: ServiceDescription) -> Result<(), RegistryError> {
@@ -547,6 +578,7 @@ impl DnsRegistry {
                 ("cluster_ip", cluster_ip_text.as_str()),
             ],
         );
+        self.rebuild_snapshot_from_state(&guard);
         Ok(())
     }
 
