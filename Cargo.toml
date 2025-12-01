@@ -27,7 +27,7 @@ serde_yaml = "0.9.34"
 tar = "0.4.44"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net", "signal", "process"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-util = { version = "0.7.16", features = ["io"] }
+tokio-util = { version = "0.7.16", features = ["io", "rt"] }
 hyper = { version = "1.7.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.17", features = ["server", "http1"] }
 tokio-openssl = "0.6.5"

@@ -195,7 +195,7 @@ impl Stream for InstrumentedBackupStream {
                         continue;
                     }
                     self.bytes_sent += chunk.bytes.len() as u64;
-                    return Poll::Ready(Some(Ok(chunk.bytes)));
+                    return Poll::Ready(Some(Ok(chunk.bytes.clone())));
                 }
                 Poll::Ready(Some(Err(err))) => {
                     self.finish(Some(err.to_string()));

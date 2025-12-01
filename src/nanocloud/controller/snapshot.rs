@@ -396,7 +396,17 @@ async fn reconcile_snapshot(mut snapshot: VolumeSnapshot) -> Result<(), Snapshot
 
     if streaming_backup_enabled() {
         let label = format!("{}/{}", namespace_value, service_name);
-        register_streaming_backup(label, &artifact_path);
+        if let Err(err) = register_streaming_backup(label, &artifact_path) {
+            let error_text = err.to_string();
+            log_warn(
+                COMPONENT,
+                "Failed to register streaming backup",
+                &[
+                    ("path", artifact_str.as_str()),
+                    ("error", error_text.as_str()),
+                ],
+            );
+        }
     }
 
     let entry = summary

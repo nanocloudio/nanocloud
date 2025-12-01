@@ -2147,7 +2147,20 @@ async fn uninstall_impl(
     );
     if streaming_backup_enabled() {
         let label = format!("{}/{}", namespace_value, app);
-        register_streaming_backup(label, &snapshot_path);
+        if let Err(err) = register_streaming_backup(label, &snapshot_path) {
+            let error_text = err.to_string();
+            let path_text = snapshot_path.display().to_string();
+            log_warn(
+                "container",
+                "Failed to register streaming snapshot",
+                &[
+                    ("namespace", namespace_value),
+                    ("service", app),
+                    ("path", path_text.as_str()),
+                    ("error", error_text.as_str()),
+                ],
+            );
+        }
     }
     prune_backups(&service_dir, plan.retention())?;
 
@@ -2583,7 +2596,9 @@ mod tests {
         for (index, name) in files.iter().enumerate() {
             let path = dir.join(name);
             fs::write(&path, format!("payload-{index}")).expect("write backup file");
-            register_streaming_backup(format!("svc-{name}"), &path);
+            register_streaming_backup(format!("svc-{name}"), &path)
+                .expect("register streaming backup")
+                .expect("missing registration handle");
             paths.push(path);
         }
 
