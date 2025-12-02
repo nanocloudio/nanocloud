@@ -57,6 +57,7 @@ default = []
 openapi = ["dep:utoipa"]
 diagnostics-bench = []
 dns-bench = []
+events-bench = []
 
 [[bin]]
 name = "openapi_gen"

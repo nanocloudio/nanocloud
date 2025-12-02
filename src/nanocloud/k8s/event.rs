@@ -392,6 +392,7 @@ impl EventRegistry {
 
 #[cfg(test)]
 impl EventRegistry {
+    #[allow(dead_code)]
     pub async fn clear(&self) {
         {
             let mut store = self.store.write().await;

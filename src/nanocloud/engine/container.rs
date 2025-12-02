@@ -2908,7 +2908,7 @@ mod tests {
         let event_bus = InMemoryEventBus::global();
         let topic = EventTopic::new("controller", "bindings.lifecycle");
         let subscription = event_bus
-            .subscribe(&topic, SubscriptionOptions)
+            .subscribe(&topic, SubscriptionOptions::default())
             .expect("subscribe to events");
         let mut stream = subscription.stream;
 

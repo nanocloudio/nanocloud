@@ -52,7 +52,9 @@ use crate::nanocloud::controller::runtime::ControllerRuntime;
 use crate::nanocloud::diagnostics;
 use crate::nanocloud::dns::{self, DnsConfig, DnsService};
 use crate::nanocloud::events::in_memory::InMemoryEventBus;
-use crate::nanocloud::events::{EventSubscriber, EventTopic, EventType, SubscriptionOptions};
+use crate::nanocloud::events::{
+    EventError, EventSubscriber, EventTopic, EventType, SubscriptionOptions,
+};
 use crate::nanocloud::k8s::event::{
     Event as KubeEvent, EventRegistry, EventSource, ObjectReference,
 };
@@ -233,7 +235,7 @@ fn spawn_event_logger() {
     let bus = InMemoryEventBus::global();
     let topic = EventTopic::new("controller", "bundles.reconcile");
     let topic_label = topic.full_name();
-    let subscription = match bus.subscribe(&topic, SubscriptionOptions) {
+    let subscription = match bus.subscribe(&topic, SubscriptionOptions::default()) {
         Ok(subscription) => subscription,
         Err(err) => {
             log_warn(
@@ -349,6 +351,7 @@ fn spawn_event_logger() {
                     );
                     registry.record(kube_event).await;
                 }
+                Err(EventError::Canceled) => break,
                 Err(err) => {
                     metrics::record_event_stream_error(&topic_label, "consumer_error");
                     log_warn(

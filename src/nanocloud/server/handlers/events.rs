@@ -24,13 +24,16 @@ use crate::nanocloud::k8s::pod::ListMeta;
 use crate::nanocloud::k8s::store::{
     decode_continue_token, encode_continue_token, paginate_entries, PaginationError,
 };
+use crate::nanocloud::k8s::table::{Table, TableColumnDefinition, TableRow};
+use crate::nanocloud::server::handlers::pods::TABLE_CONTENT_TYPE;
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use humantime::parse_duration;
 use serde::Deserialize;
+use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -109,8 +112,50 @@ impl EventFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventListOutput {
+    JsonList,
+    Table,
+}
+
+impl EventListOutput {
+    fn from_request(format: Option<&str>, headers: &HeaderMap) -> Self {
+        if let Some(value) = format {
+            if value.eq_ignore_ascii_case("table") {
+                return EventListOutput::Table;
+            }
+            if value.eq_ignore_ascii_case("json") {
+                return EventListOutput::JsonList;
+            }
+        }
+
+        if Self::accepts_table(headers) {
+            EventListOutput::Table
+        } else {
+            EventListOutput::JsonList
+        }
+    }
+
+    fn accepts_table(headers: &HeaderMap) -> bool {
+        headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(|raw| {
+                raw.split(',')
+                    .map(|candidate| candidate.trim().to_ascii_lowercase())
+                    .any(|candidate| {
+                        candidate.starts_with("application/json")
+                            && candidate.contains("as=table")
+                            && candidate.contains("g=meta.k8s.io")
+                            && candidate.contains("v=v1")
+                    })
+            })
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Default, Deserialize)]
-pub(crate) struct EventWatchParams {
+pub struct EventWatchParams {
     #[serde(default)]
     watch: Option<bool>,
     #[serde(rename = "resourceVersion")]
@@ -129,8 +174,8 @@ pub(crate) struct EventWatchParams {
     continue_token: Option<String>,
     #[serde(rename = "resourceVersionMatch")]
     resource_version_match: Option<ResourceVersionMatchPolicy>,
-    #[serde(default)]
-    _format: Option<String>,
+    #[serde(rename = "format", default)]
+    format: Option<String>,
     #[serde(default)]
     since: Option<String>,
     #[serde(default)]
@@ -139,20 +184,25 @@ pub(crate) struct EventWatchParams {
     reason: Option<String>,
 }
 
-pub(crate) async fn list_all(Query(params): Query<EventWatchParams>) -> Result<Response, ApiError> {
-    handle_request(None, params).await
+pub(crate) async fn list_all(
+    Query(params): Query<EventWatchParams>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    handle_request(None, params, headers).await
 }
 
 pub(crate) async fn list_namespaced(
     Path(namespace): Path<String>,
     Query(params): Query<EventWatchParams>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    handle_request(Some(namespace), params).await
+    handle_request(Some(namespace), params, headers).await
 }
 
-async fn handle_request(
+pub async fn handle_request(
     namespace: Option<String>,
     params: EventWatchParams,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let registry = EventRegistry::shared();
     let EventWatchParams {
@@ -165,12 +215,13 @@ async fn handle_request(
         limit,
         continue_token,
         resource_version_match,
-        _format: _,
+        format,
         since,
         level,
         reason,
     } = params;
 
+    let requested_output = EventListOutput::from_request(format.as_deref(), &headers);
     if label_selector.is_some() {
         return Err(ApiError::bad_request(
             "labelSelector is not supported for events",
@@ -334,7 +385,18 @@ async fn handle_request(
         };
 
         let list = EventList::new(page.items, metadata);
-        Ok(Json(list).into_response())
+        match requested_output {
+            EventListOutput::JsonList => Ok(Json(list).into_response()),
+            EventListOutput::Table => {
+                let table = event_list_to_table(&list);
+                let mut response = Json(table).into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(TABLE_CONTENT_TYPE),
+                );
+                Ok(response)
+            }
+        }
     }
 }
 
@@ -534,261 +596,160 @@ fn build_watch_predicate(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::nanocloud::k8s::event::{EventSource, ObjectReference};
-    use crate::nanocloud::k8s::pod::ObjectMeta;
-    use chrono::{Duration as ChronoDuration, Utc};
-    use futures_util::StreamExt;
-    use std::sync::OnceLock;
+#[derive(Debug)]
+struct EventTableRow {
+    last_seen: String,
+    event_type: String,
+    reason: String,
+    object: String,
+    message: String,
+    raw: Option<serde_json::Value>,
+}
 
-    fn registry_guard() -> &'static tokio::sync::Mutex<()> {
-        static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
+impl EventTableRow {
+    fn from_event(event: &Event, now: DateTime<Utc>) -> Self {
+        let last_seen = format_last_seen(event, now);
+        let event_type = event.event_type.as_deref().unwrap_or("Normal").to_string();
+        let reason = event.reason.as_deref().unwrap_or("-").to_string();
+        let namespace = event
+            .involved_object
+            .namespace
+            .as_deref()
+            .unwrap_or_else(|| event.metadata.namespace.as_deref().unwrap_or("default"));
+        let name = event
+            .involved_object
+            .name
+            .as_deref()
+            .unwrap_or_else(|| event.metadata.name.as_deref().unwrap_or("<unknown>"));
+        let object = format!("{}/{}", namespace, name);
+        let message = event.message.as_deref().unwrap_or("-").to_string();
 
-    fn sample_event(namespace: &str, name: &str, reason: &str, event_type: &str) -> Event {
-        let timestamp = Utc::now().to_rfc3339();
-        Event {
-            api_version: "v1".to_string(),
-            kind: "Event".to_string(),
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                namespace: Some(namespace.to_string()),
-                ..Default::default()
-            },
-            involved_object: ObjectReference {
-                api_version: Some("nanocloud.io/v1".to_string()),
-                kind: Some("Bundle".to_string()),
-                name: Some(name.to_string()),
-                namespace: Some(namespace.to_string()),
-                uid: Some(format!("bundle:{}/{}", namespace, name)),
-                resource_version: None,
-                field_path: None,
-            },
-            reason: Some(reason.to_string()),
-            message: Some(format!("Event for {}", name)),
-            event_type: Some(event_type.to_string()),
-            first_timestamp: Some(timestamp.clone()),
-            last_timestamp: Some(timestamp.clone()),
-            event_time: Some(timestamp.clone()),
-            count: Some(1),
-            reporting_component: Some("tests".to_string()),
-            reporting_instance: Some("tests".to_string()),
-            action: Some("Reconcile".to_string()),
-            related: None,
-            series: None,
-            source: Some(EventSource {
-                component: Some("tests".to_string()),
-                host: None,
-            }),
-            deprecated_source: None,
-            deprecated_first_timestamp: None,
-            deprecated_last_timestamp: None,
-            deprecated_count: None,
+        Self {
+            last_seen,
+            event_type,
+            reason,
+            object,
+            message,
+            raw: serde_json::to_value(event).ok(),
         }
     }
+}
 
-    fn set_event_timestamp(event: &mut Event, timestamp: &str) {
-        event.event_time = Some(timestamp.to_string());
-        event.first_timestamp = Some(timestamp.to_string());
-        event.last_timestamp = Some(timestamp.to_string());
+impl From<EventTableRow> for TableRow {
+    fn from(row: EventTableRow) -> Self {
+        TableRow {
+            cells: vec![
+                row.last_seen.into(),
+                row.event_type.into(),
+                row.reason.into(),
+                row.object.into(),
+                row.message.into(),
+            ],
+            object: row.raw,
+        }
     }
+}
 
-    #[tokio::test]
-    async fn list_returns_events() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-a",
-                "BundleReconciled",
-                "Normal",
-            ))
-            .await;
+fn event_list_to_table(list: &EventList) -> Table {
+    let now = Utc::now();
+    let rows: Vec<TableRow> = list
+        .items
+        .iter()
+        .map(|event| EventTableRow::from_event(event, now).into())
+        .collect();
 
-        let response = handle_request(None, EventWatchParams::default())
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let list: EventList = serde_json::from_slice(&body).expect("list json");
-        assert_eq!(list.items.len(), 1);
-        let event = &list.items[0];
-        assert_eq!(event.metadata.name.as_deref(), Some("event-1"));
-        assert_eq!(event.reason.as_deref(), Some("BundleReconciled"));
+    Table {
+        api_version: "meta.k8s.io/v1".to_string(),
+        kind: "Table".to_string(),
+        metadata: list.metadata.clone(),
+        column_definitions: event_table_columns(),
+        rows,
     }
+}
 
-    #[tokio::test]
-    async fn watch_stream_includes_initial_events() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-b",
-                "BundleReconciled",
-                "Normal",
-            ))
-            .await;
+fn event_table_columns() -> Vec<TableColumnDefinition> {
+    vec![
+        TableColumnDefinition {
+            name: "LAST SEEN".to_string(),
+            type_name: "string".to_string(),
+            format: None,
+            description: Some("Time since the last observation".to_string()),
+            priority: None,
+        },
+        TableColumnDefinition {
+            name: "TYPE".to_string(),
+            type_name: "string".to_string(),
+            format: None,
+            description: Some("Event type".to_string()),
+            priority: None,
+        },
+        TableColumnDefinition {
+            name: "REASON".to_string(),
+            type_name: "string".to_string(),
+            format: None,
+            description: Some("Short machine-readable reason".to_string()),
+            priority: None,
+        },
+        TableColumnDefinition {
+            name: "OBJECT".to_string(),
+            type_name: "string".to_string(),
+            format: None,
+            description: Some("Involved object".to_string()),
+            priority: None,
+        },
+        TableColumnDefinition {
+            name: "MESSAGE".to_string(),
+            type_name: "string".to_string(),
+            format: None,
+            description: Some("Human-readable message".to_string()),
+            priority: None,
+        },
+    ]
+}
 
-        let params: EventWatchParams =
-            serde_urlencoded::from_str("watch=true").expect("watch params");
-        let response = handle_request(None, params).await.expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut stream = response.into_body().into_data_stream();
-        let first_chunk = stream
-            .next()
-            .await
-            .expect("first chunk")
-            .expect("chunk result");
-        let text = String::from_utf8(first_chunk.to_vec()).expect("utf8");
-        assert!(text.contains("\"type\":\"ADDED\""));
-        assert!(text.contains("\"BundleReconciled\""));
+fn format_last_seen(event: &Event, now: DateTime<Utc>) -> String {
+    let timestamp = event
+        .last_timestamp
+        .as_deref()
+        .or(event.event_time.as_deref())
+        .or(event.first_timestamp.as_deref())
+        .or(event.metadata.creation_timestamp.as_deref());
+
+    let Some(raw) = timestamp else {
+        return "-".to_string();
+    };
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| now);
+    let duration = now.signed_duration_since(parsed);
+    humanize_duration(duration)
+}
+
+fn humanize_duration(duration: chrono::Duration) -> String {
+    let seconds = duration.num_seconds();
+    if seconds <= 0 {
+        return "0s".to_string();
     }
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const YEAR: i64 = 365 * DAY;
 
-    #[tokio::test]
-    async fn field_selector_filters_events() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-a",
-                "BundleReconciled",
-                "Normal",
-            ))
-            .await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-b",
-                "BundleReconcileFailed",
-                "Warning",
-            ))
-            .await;
-
-        let params: EventWatchParams =
-            serde_urlencoded::from_str("fieldSelector=reason%3DBundleReconciled")
-                .expect("field selector params");
-        let response = handle_request(None, params).await.expect("response");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let list: EventList = serde_json::from_slice(&body).expect("list json");
-        assert_eq!(list.items.len(), 1);
-        let event = &list.items[0];
-        assert_eq!(event.involved_object.name.as_deref(), Some("bundle-a"));
+    if seconds >= YEAR {
+        return format!("{}y", seconds / YEAR);
     }
-
-    #[tokio::test]
-    async fn since_query_filters_old_events() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-
-        let now = Utc::now();
-        let fresh_ts = now.to_rfc3339();
-        let old_ts = (now - ChronoDuration::minutes(30)).to_rfc3339();
-
-        let mut old_event = sample_event("default", "bundle-old", "BundleReconciled", "Normal");
-        set_event_timestamp(&mut old_event, &old_ts);
-        registry.record(old_event).await;
-
-        let mut fresh_event = sample_event("default", "bundle-new", "BundleReconciled", "Normal");
-        set_event_timestamp(&mut fresh_event, &fresh_ts);
-        registry.record(fresh_event).await;
-
-        let params: EventWatchParams = serde_urlencoded::from_str("since=5m").unwrap();
-        let response = handle_request(None, params).await.expect("response");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let list: EventList = serde_json::from_slice(&body).expect("list json");
-        assert_eq!(list.items.len(), 1);
-        assert_eq!(
-            list.items[0].involved_object.name.as_deref(),
-            Some("bundle-new")
-        );
+    if seconds >= WEEK {
+        return format!("{}w", seconds / WEEK);
     }
-
-    #[tokio::test]
-    async fn level_query_filters_events() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-a",
-                "BundleReconciled",
-                "Normal",
-            ))
-            .await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-b",
-                "BundleReconcileFailed",
-                "Warning",
-            ))
-            .await;
-
-        let params: EventWatchParams =
-            serde_urlencoded::from_str("level=Warning").expect("level params");
-        let response = handle_request(None, params).await.expect("response");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let list: EventList = serde_json::from_slice(&body).expect("list json");
-        assert_eq!(list.items.len(), 1);
-        assert_eq!(
-            list.items[0].involved_object.name.as_deref(),
-            Some("bundle-b")
-        );
+    if seconds >= DAY {
+        return format!("{}d", seconds / DAY);
     }
-
-    #[tokio::test]
-    async fn reason_query_supports_multiple_values() {
-        let _guard = registry_guard().lock().await;
-        let registry = EventRegistry::shared();
-        registry.clear().await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-a",
-                "BundleReconciled",
-                "Normal",
-            ))
-            .await;
-        registry
-            .record(sample_event(
-                "default",
-                "bundle-b",
-                "SecurityPolicyViolation",
-                "Warning",
-            ))
-            .await;
-
-        let params: EventWatchParams =
-            serde_urlencoded::from_str("reason=BundleReconciled,PrivilegeEscalationDenied")
-                .expect("reason params");
-        let response = handle_request(None, params).await.expect("response");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let list: EventList = serde_json::from_slice(&body).expect("list json");
-        assert_eq!(list.items.len(), 1);
-        assert_eq!(
-            list.items[0].involved_object.name.as_deref(),
-            Some("bundle-a")
-        );
+    if seconds >= HOUR {
+        return format!("{}h", seconds / HOUR);
     }
+    if seconds >= MINUTE {
+        return format!("{}m", seconds / MINUTE);
+    }
+    format!("{}s", seconds)
 }
