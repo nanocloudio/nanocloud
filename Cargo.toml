@@ -58,6 +58,7 @@ openapi = ["dep:utoipa"]
 diagnostics-bench = []
 dns-bench = []
 events-bench = []
+k8s-store-bench = []
 
 [[bin]]
 name = "openapi_gen"

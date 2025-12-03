@@ -48,6 +48,10 @@ pub struct EndpointSubset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Endpoints resource generated from Service selectors.
+///
+/// When persisted, `metadata.name`/`namespace` should match the owning Service.
+/// Empty subsets represent a Service with no ready backends.
 pub struct Endpoints {
     #[serde(rename = "apiVersion")]
     pub api_version: String,

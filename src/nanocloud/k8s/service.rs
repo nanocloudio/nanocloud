@@ -20,6 +20,11 @@ pub struct ServicePort {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Subset of Service spec supported by the in-process registry.
+///
+/// At least one port should be provided for proxy programming. The registry
+/// defaults the service type to `ClusterIP` and will allocate a ClusterIP when
+/// `cluster_ip` is omitted.
 pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub selector: HashMap<String, String>,
@@ -44,6 +49,7 @@ impl Default for ServiceSpec {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Observed cluster IP assignment for a Service.
 pub struct ServiceStatus {
     #[serde(rename = "clusterIP", skip_serializing_if = "Option::is_none")]
     pub cluster_ip: Option<String>,
@@ -51,6 +57,11 @@ pub struct ServiceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Service resource persisted in the keyspace store.
+///
+/// `metadata.name` and `metadata.namespace` are required; the registry sets
+/// sensible defaults for `api_version`, `kind`, and `status.cluster_ip` during
+/// creation.
 pub struct Service {
     #[serde(rename = "apiVersion")]
     pub api_version: String,

@@ -473,6 +473,11 @@ pub struct BundleProfileArtifactIntegrity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Declarative description of a workload bundle.
+///
+/// `spec.service` and `metadata.name` must align; namespaces default to
+/// `default` when omitted. The store persists bundles as JSON alongside field
+/// ownership metadata to support server-side apply.
 pub struct Bundle {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -540,6 +545,10 @@ pub struct DeviceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Persisted device identity resource.
+///
+/// `spec.hash` must be stable and matches the canonical `metadata.name`
+/// (`device-<hash>`). Namespaces default to the request namespace when unset.
 pub struct Device {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -615,6 +624,10 @@ pub struct VolumeSnapshotStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Snapshot resource capturing PVC data for a workload service.
+///
+/// `spec.service` and `spec.volume_claim` are required. Metadata defaults are
+/// filled during persistence; payloads are stored as JSON in the keyspace.
 pub struct VolumeSnapshot {
     #[serde(rename = "apiVersion")]
     pub api_version: String,

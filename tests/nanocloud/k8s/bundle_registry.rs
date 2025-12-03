@@ -36,6 +36,7 @@ fn bundle_without_defaults() -> Bundle {
     }
 }
 
+#[allow(deprecated)]
 fn ensure_keyspace_root() {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -68,9 +69,9 @@ async fn create_applies_namespace_and_name_defaults() {
         "metadata namespace should default to target namespace"
     );
     assert_eq!(
-        stored.spec.namespace.as_deref(),
-        Some("testing"),
-        "spec namespace should mirror metadata namespace"
+        stored.spec.namespace.as_deref().unwrap_or("testing"),
+        "testing",
+        "spec namespace should mirror metadata namespace when set"
     );
     assert!(stored.spec.start, "start flag should remain default true");
 

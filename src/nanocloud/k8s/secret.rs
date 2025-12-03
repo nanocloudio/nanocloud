@@ -7,6 +7,10 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+/// Secret payload where `data` entries are base64-encoded.
+///
+/// `string_data` is transient and converted to `data` via [`encode_string_data`]
+/// before persistence.
 pub struct Secret {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
