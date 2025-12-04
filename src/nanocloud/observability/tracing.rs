@@ -20,13 +20,21 @@
 //! can attach `trace_id` / `span_id` pairs to every log line without forcing
 //! a wholesale logging rewrite.
 
+use crate::nanocloud::observability::{
+    TelemetryError, TracingConfig, TracingFormat, TracingOutput,
+};
 use rand::{rngs::OsRng, RngCore};
 use std::fmt::Write;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::task_local;
-use tracing_subscriber::registry::Registry;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::{Context as LayerContext, Layer};
+use tracing_subscriber::registry::Registry as SubscriberRegistry;
+use tracing_subscriber::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct TraceContext {
@@ -48,15 +56,89 @@ task_local! {
     static ACTIVE_TRACE: TraceContext;
 }
 
-static TRACING_INIT: OnceLock<()> = OnceLock::new();
+static TRACING_STATE: OnceLock<TracingHandle> = OnceLock::new();
 
-/// Initialize the global tracing subscriber exactly once.
-pub fn init() {
-    TRACING_INIT.get_or_init(|| {
-        let subscriber = Registry::default();
-        // It's fine if another component already installed a subscriber.
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
+#[derive(Clone, Debug)]
+pub struct TracingHandle;
+
+impl TracingHandle {
+    /// Flush or teardown any tracing exporters. The current implementation uses
+    /// synchronous writers so there is nothing to drain, but the hook is kept
+    /// for future async exporters.
+    pub fn shutdown(&self) {
+        tracing::debug!(
+            target: "nanocloud::telemetry",
+            "tracing shutdown requested; no buffered exporters to flush"
+        );
+    }
+}
+
+/// Initialize the global tracing subscriber exactly once with the provided
+/// configuration. Returns an error if called multiple times.
+pub fn init_with_config(config: TracingConfig) -> Result<TracingHandle, TelemetryError> {
+    config.validate()?;
+
+    if TRACING_STATE.get().is_some() {
+        return Err(TelemetryError::AlreadyInitialized("tracing"));
+    }
+
+    let handle = if config.is_enabled() {
+        let subscriber = build_subscriber(&config)?;
+        tracing::subscriber::set_global_default(subscriber).map_err(|err| {
+            TelemetryError::InitializationFailed("tracing", err.to_string())
+        })?;
+        tracing::info!(
+            target: "nanocloud::telemetry",
+            format = ?config.format,
+            sample_rate = config.sample_rate,
+            "installed tracing subscriber"
+        );
+        TracingHandle
+    } else {
+        let subscriber = SubscriberRegistry::default();
+        tracing::subscriber::set_global_default(subscriber).map_err(|err| {
+            TelemetryError::InitializationFailed("tracing", err.to_string())
+        })?;
+        tracing::info!(
+            target: "nanocloud::telemetry",
+            "tracing disabled via configuration; using no-op subscriber"
+        );
+        TracingHandle
+    };
+
+    TRACING_STATE
+        .set(handle.clone())
+        .map_err(|_| TelemetryError::AlreadyInitialized("tracing"))?;
+
+    Ok(handle)
+}
+
+fn build_subscriber(
+    config: &TracingConfig,
+) -> Result<impl tracing::Subscriber + Send + Sync, TelemetryError> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+        .parse(config.filter_directives.clone())
+        .map_err(|err| {
+            TelemetryError::InvalidConfig(format!("invalid tracing filter directives: {err}"))
+        })?;
+
+    let fmt_layer = match config.format {
+        TracingFormat::Json => fmt::layer()
+            .with_target(false)
+            .with_writer(make_writer(&config.output))
+            .json()
+            .boxed(),
+        TracingFormat::Pretty => fmt::layer()
+            .with_target(false)
+            .with_writer(make_writer(&config.output))
+            .pretty()
+            .boxed(),
+    };
+
+    let sampler = SamplingLayer::new(config.sample_rate);
+
+    Ok(SubscriberRegistry::default().with(filter).with(sampler).with(fmt_layer))
 }
 
 /// Returns the currently active [`TraceContext`], if any.
@@ -114,4 +196,47 @@ fn random_hex(bytes: usize) -> String {
         let _ = write!(&mut output, "{:02x}", byte);
     }
     output
+}
+
+fn make_writer(output: &TracingOutput) -> BoxMakeWriter {
+    match output {
+        TracingOutput::Stdout => BoxMakeWriter::new(std::io::stdout),
+        TracingOutput::Stderr => BoxMakeWriter::new(std::io::stderr),
+        TracingOutput::Disabled => BoxMakeWriter::new(std::io::sink),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SamplingLayer {
+    rate: f64,
+}
+
+impl SamplingLayer {
+    fn new(rate: f64) -> Self {
+        SamplingLayer { rate }
+    }
+
+    fn allow(&self) -> bool {
+        if self.rate >= 1.0 {
+            return true;
+        }
+        if self.rate <= 0.0 {
+            return false;
+        }
+        rand::random::<f64>() <= self.rate
+    }
+}
+
+impl<S> Layer<S> for SamplingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: LayerContext<'_, S>) -> bool {
+        // Always allow span creation so downstream instrumentation can attach identifiers,
+        // but probabilistically drop events to reduce overhead on hot paths.
+        if metadata.is_span() {
+            return true;
+        }
+        self.allow()
+    }
 }

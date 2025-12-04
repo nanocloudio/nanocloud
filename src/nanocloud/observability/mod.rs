@@ -21,8 +21,35 @@
 //! counters ending with `_total`, and duration histograms ending with
 //! `_seconds`. Label keys mirror Kubernetes resource identifiers such as
 //! `namespace` and `workload` so metrics can be correlated with familiar
-//! dashboards and alerting rules.
+//! dashboards and alerting rules. Telemetry initialization is explicitly
+//! guarded to avoid accidental double-installation of subscribers or
+//! exporters.
 
+pub mod config;
 pub mod health;
 pub mod metrics;
 pub mod tracing;
+
+pub use config::{
+    MetricsConfig, TelemetryConfig, TelemetryError, TracingConfig, TracingFormat, TracingOutput,
+};
+
+#[derive(Clone, Debug)]
+pub struct TelemetryHandle {
+    tracing: tracing::TracingHandle,
+    metrics: metrics::MetricsHandle,
+}
+
+impl TelemetryHandle {
+    pub fn shutdown(&self) {
+        self.tracing.shutdown();
+        self.metrics.shutdown();
+    }
+}
+
+/// Initialize tracing and metrics exporters using the provided configuration.
+pub fn init(config: &TelemetryConfig) -> Result<TelemetryHandle, TelemetryError> {
+    let tracing = tracing::init_with_config(config.tracing.clone())?;
+    let metrics = metrics::init(config.metrics.clone())?;
+    Ok(TelemetryHandle { tracing, metrics })
+}

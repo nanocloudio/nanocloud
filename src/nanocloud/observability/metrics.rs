@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use crate::nanocloud::observability::{MetricsConfig, TelemetryError};
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -25,9 +27,73 @@ use prometheus::{
     TextEncoder,
 };
 
+// Kubernetes-aligned metric label conventions:
+// - namespace defaults to "default" when unspecified
+// - empty resource identifiers fall back to "unknown"
+// - duration histograms always use `_seconds` suffix for units.
 const DEFAULT_NAMESPACE: &str = "default";
+const UNKNOWN_LABEL: &str = "unknown";
 
-static REGISTRY: OnceLock<Registry> = OnceLock::new();
+#[derive(Clone)]
+struct MetricsState {
+    registry: Registry,
+    enabled: bool,
+}
+
+static METRICS_STATE: OnceLock<MetricsState> = OnceLock::new();
+
+fn metrics_state() -> &'static MetricsState {
+    METRICS_STATE.get_or_init(|| {
+        MetricsState::from_config(MetricsConfig::from_env())
+            .unwrap_or_else(|err| panic!("failed to initialize metrics registry: {err}"))
+    })
+}
+
+impl MetricsState {
+    fn from_config(config: MetricsConfig) -> Result<Self, TelemetryError> {
+        let labels = if config.default_labels.is_empty() {
+            None
+        } else {
+            Some(config.default_labels.clone().into_iter().collect::<HashMap<_, _>>())
+        };
+
+        let registry = Registry::new_custom(Some(config.namespace.clone()), labels)
+            .map_err(|err| TelemetryError::InitializationFailed("metrics", err.to_string()))?;
+
+        Ok(MetricsState {
+            registry,
+            enabled: config.is_enabled(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricsHandle;
+
+impl MetricsHandle {
+    pub fn shutdown(&self) {}
+}
+
+pub fn init(config: MetricsConfig) -> Result<MetricsHandle, TelemetryError> {
+    if METRICS_STATE.get().is_some() {
+        return Err(TelemetryError::AlreadyInitialized("metrics"));
+    }
+
+    let namespace = config.namespace.clone();
+    let enabled = config.is_enabled();
+    let state = MetricsState::from_config(config)?;
+    METRICS_STATE
+        .set(state)
+        .map_err(|_| TelemetryError::AlreadyInitialized("metrics"))?;
+    tracing::info!(
+        target: "nanocloud::telemetry",
+        enabled,
+        namespace = namespace.as_str(),
+        "initialized metrics registry"
+    );
+    Ok(MetricsHandle)
+}
+
 static CONTAINER_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTAINER_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static CONTAINER_READY: OnceLock<IntGaugeVec> = OnceLock::new();
@@ -51,8 +117,10 @@ static SNAPSHOT_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static SNAPSHOT_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static POLICY_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static POLICY_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static POLICY_ERROR_CLASSIFICATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static PROXY_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static PROXY_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static PROXY_ERROR_CLASSIFICATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_STREAM_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BACKUP_STREAM_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static KEYSPACE_BLOCKING_QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
@@ -73,19 +141,20 @@ static CONTROLLER_WATCH_BACKOFF_SECONDS: OnceLock<HistogramVec> = OnceLock::new(
 static CONTROLLER_WATCH_LAGGED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 fn registry() -> &'static Registry {
-    REGISTRY.get_or_init(|| {
-        Registry::new_custom(Some("nanocloud".to_string()), None)
-            .expect("failed to initialise nanocloud metrics registry")
-    })
+    &metrics_state().registry
 }
 
 fn register_collector<C>(collector: C) -> C
 where
     C: Clone + Collector + Send + Sync + 'static,
 {
-    registry()
-        .register(Box::new(collector.clone()))
-        .expect("failed to register nanocloud metric collector");
+    let state = metrics_state();
+    if state.enabled {
+        state
+            .registry
+            .register(Box::new(collector.clone()))
+            .expect("failed to register nanocloud metric collector");
+    }
     collector
 }
 
@@ -439,6 +508,19 @@ fn policy_operation_duration() -> &'static HistogramVec {
     })
 }
 
+fn policy_error_classification_total() -> &'static IntCounterVec {
+    POLICY_ERROR_CLASSIFICATION_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "error_classifications_total",
+            "Network policy failures grouped by classification",
+        )
+        .subsystem("policy");
+        let counter = IntCounterVec::new(opts, &["classification", "namespace", "pod"])
+            .expect("failed to build policy error classification counter");
+        register_collector(counter)
+    })
+}
+
 fn proxy_operation_total() -> &'static IntCounterVec {
     PROXY_OPERATION_TOTAL.get_or_init(|| {
         let opts = Opts::new(
@@ -463,6 +545,19 @@ fn proxy_operation_duration() -> &'static HistogramVec {
         let histogram = HistogramVec::new(opts, &["operation", "result", "namespace", "service"])
             .expect("failed to build proxy operation histogram");
         register_collector(histogram)
+    })
+}
+
+fn proxy_error_classification_total() -> &'static IntCounterVec {
+    PROXY_ERROR_CLASSIFICATION_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "error_classifications_total",
+            "Network proxy failures grouped by classification",
+        )
+        .subsystem("proxy");
+        let counter = IntCounterVec::new(opts, &["classification", "namespace", "service"])
+            .expect("failed to build proxy error classification counter");
+        register_collector(counter)
     })
 }
 
@@ -767,9 +862,17 @@ fn namespace_label(namespace: Option<&str>) -> &str {
 
 fn owner_label(owner: &str) -> &str {
     if owner.is_empty() {
-        "unknown"
+        UNKNOWN_LABEL
     } else {
         owner
+    }
+}
+
+fn resource_label(resource: &str) -> &str {
+    if resource.is_empty() {
+        UNKNOWN_LABEL
+    } else {
+        resource
     }
 }
 
@@ -784,7 +887,7 @@ fn record_operation(
         operation.as_label(),
         outcome.as_label(),
         namespace_label(namespace),
-        workload,
+        resource_label(workload),
     ];
 
     container_operation_total().with_label_values(&labels).inc();
@@ -812,7 +915,7 @@ fn record_policy_operation(
         operation.as_label(),
         outcome.as_label(),
         namespace_label(namespace),
-        pod,
+        resource_label(pod),
     ];
     policy_operation_total().with_label_values(&labels).inc();
     policy_operation_duration()
@@ -909,6 +1012,19 @@ where
     }
 }
 
+/// Records a policy error classification without emitting latency metrics.
+pub fn record_policy_error_classification(
+    namespace: Option<&str>,
+    pod: &str,
+    classification: impl Into<String>,
+) {
+    let classification = classification.into();
+    let namespace = namespace_label(namespace);
+    policy_error_classification_total()
+        .with_label_values(&[classification.as_str(), namespace, resource_label(pod)])
+        .inc();
+}
+
 fn record_proxy_operation(
     namespace: Option<&str>,
     service: &str,
@@ -920,7 +1036,7 @@ fn record_proxy_operation(
         operation.as_label(),
         outcome.as_label(),
         namespace_label(namespace),
-        service,
+        resource_label(service),
     ];
 
     proxy_operation_total().with_label_values(&labels).inc();
@@ -937,7 +1053,11 @@ pub fn record_backup_stream(
     bytes: u64,
     duration: Duration,
 ) {
-    let labels = [owner_label(owner), namespace_label(namespace), service];
+    let labels = [
+        owner_label(owner),
+        namespace_label(namespace),
+        resource_label(service),
+    ];
     backup_stream_bytes_total()
         .with_label_values(&labels)
         .inc_by(bytes);
@@ -954,7 +1074,7 @@ pub fn record_backup_capture(
     bytes: u64,
     duration: Duration,
 ) {
-    let labels = [namespace_label(namespace), service];
+    let labels = [namespace_label(namespace), resource_label(service)];
     backup_capture_bytes_total()
         .with_label_values(&labels)
         .inc_by(bytes);
@@ -971,7 +1091,7 @@ pub fn record_backup_restore(
     bytes: u64,
     duration: Duration,
 ) {
-    let labels = [namespace_label(namespace), service];
+    let labels = [namespace_label(namespace), resource_label(service)];
     backup_restore_bytes_total()
         .with_label_values(&labels)
         .inc_by(bytes);
@@ -1035,6 +1155,19 @@ where
     }
 }
 
+/// Records a proxy error classification without emitting latency metrics.
+pub fn record_proxy_error_classification(
+    namespace: Option<&str>,
+    service: &str,
+    classification: impl Into<String>,
+) {
+    let classification = classification.into();
+    let namespace = namespace_label(namespace);
+    proxy_error_classification_total()
+        .with_label_values(&[classification.as_str(), namespace, resource_label(service)])
+        .inc();
+}
+
 fn record_snapshot_operation(
     namespace: Option<&str>,
     snapshot: &str,
@@ -1046,7 +1179,7 @@ fn record_snapshot_operation(
         operation.as_label(),
         outcome.as_label(),
         namespace_label(namespace),
-        snapshot,
+        resource_label(snapshot),
     ];
 
     snapshot_operation_total().with_label_values(&labels).inc();
@@ -1166,7 +1299,7 @@ pub fn record_controller_watch_lagged(path: &str, skipped: u64) {
 
 pub fn record_binding_execution(service: &str, result: BindingExecutionResult) {
     binding_executions_total()
-        .with_label_values(&[service, result.as_label()])
+        .with_label_values(&[resource_label(service), result.as_label()])
         .inc();
 }
 
@@ -1178,7 +1311,7 @@ pub fn record_image_pull(cache_hit: bool) {
 pub fn record_restart(namespace: Option<&str>, service: &str, reason: &str) {
     let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
     restarts_total()
-        .with_label_values(&[ns, service, reason])
+        .with_label_values(&[ns, resource_label(service), reason])
         .inc();
 }
 
@@ -1192,7 +1325,9 @@ pub fn set_pod_gauges(counts: &[(String, i64)]) {
     let gauge = pod_counts_gauge();
     gauge.reset();
     for (namespace, count) in counts {
-        gauge.with_label_values(&[namespace.as_str()]).set(*count);
+        gauge
+            .with_label_values(&[namespace_label(Some(namespace.as_str()))])
+            .set(*count);
     }
 }
 
@@ -1204,7 +1339,7 @@ pub fn record_statefulset_status(
     current: i32,
     progressing: bool,
 ) {
-    let labels = [namespace_label(namespace), name];
+    let labels = [namespace_label(namespace), resource_label(name)];
     statefulset_ready()
         .with_label_values(&labels)
         .set(i64::from(ready));
@@ -1219,14 +1354,15 @@ pub fn record_statefulset_status(
 /// Marks a container as ready (1) or not ready (0) in the Prometheus gauge
 /// mirroring `kube_pod_container_status_ready`.
 pub fn set_container_ready(namespace: Option<&str>, workload: &str, ready: bool) {
-    let gauge = container_ready().with_label_values(&[namespace_label(namespace), workload]);
+    let gauge =
+        container_ready().with_label_values(&[namespace_label(namespace), resource_label(workload)]);
     gauge.set(if ready { 1 } else { 0 });
 }
 
 /// Removes per-container gauges once a workload is fully deprovisioned to
 /// prevent stale time series.
 pub fn clear_container(namespace: Option<&str>, workload: &str) {
-    let labels = [namespace_label(namespace), workload];
+    let labels = [namespace_label(namespace), resource_label(workload)];
     if container_ready().remove_label_values(&labels).is_err() {
         container_ready().with_label_values(&labels).set(0);
     }
@@ -1269,6 +1405,9 @@ pub fn record_exec_handshake_failure(transport: ExecTransport, reason: ExecHands
 /// Encodes all registered metrics using the Prometheus text exposition
 /// format.
 pub fn gather() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if !metrics_state().enabled {
+        return Ok(Vec::new());
+    }
     let metric_families = registry().gather();
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();

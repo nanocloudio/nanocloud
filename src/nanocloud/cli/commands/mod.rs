@@ -43,7 +43,7 @@ use crate::nanocloud::api::client::NanocloudClient;
 use crate::nanocloud::cli::{Setup, Terminal};
 use crate::nanocloud::dns::DnsConfig;
 use crate::nanocloud::logger;
-use crate::nanocloud::observability::tracing;
+use crate::nanocloud::observability::{self, TelemetryConfig};
 use crate::nanocloud::server::{self, ServerConfig};
 
 use super::args::Commands;
@@ -52,6 +52,7 @@ pub(crate) use watch_parser::{parse_json_lines, WatchParseError};
 
 pub struct CommandContext {
     pub server: Option<ServerBootstrap>,
+    pub telemetry: Option<observability::TelemetryHandle>,
 }
 
 pub struct ServerBootstrap {
@@ -62,7 +63,15 @@ pub fn bootstrap(command: &Commands) -> Result<CommandContext, Box<dyn Error + S
     match command {
         Commands::Server(args) => {
             logger::set_log_format(args.log_format.into());
-            tracing::init();
+            let telemetry_config = TelemetryConfig::from_env();
+            let telemetry = observability::init(&telemetry_config).map_err(
+                |err| -> Box<dyn Error + Send + Sync> {
+                    Box::new(io::Error::other(format!(
+                        "telemetry initialization failed: {}",
+                        err
+                    )))
+                },
+            )?;
 
             let addr: SocketAddr =
                 args.listen
@@ -123,9 +132,16 @@ pub fn bootstrap(command: &Commands) -> Result<CommandContext, Box<dyn Error + S
                         dns: dns_config,
                     },
                 }),
+                telemetry: Some(telemetry),
             })
         }
-        _ => Ok(CommandContext { server: None }),
+        _ => {
+            let telemetry = observability::init(&TelemetryConfig::noop()).ok();
+            Ok(CommandContext {
+                server: None,
+                telemetry,
+            })
+        }
     }
 }
 
@@ -144,15 +160,18 @@ pub async fn run(
             Setup::run(args.repair).map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>),
         ),
         Commands::Server(_) => {
-            let server_ctx = context
-                .server
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-                    Box::new(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "server configuration was not prepared",
-                    ))
-                })?;
-            unit_to_exit(server::serve(server_ctx.config).await)
+            let CommandContext { server, telemetry } = context;
+            let server_ctx = server.ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "server configuration was not prepared",
+                ))
+            })?;
+            let result = server::serve(server_ctx.config).await;
+            if let Some(handle) = telemetry.as_ref() {
+                handle.shutdown();
+            }
+            unit_to_exit(result)
         }
         Commands::Config(args) => unit_to_exit(config::handle_config(args).await),
         Commands::Token(args) => unit_to_exit(token::handle_token(args)),

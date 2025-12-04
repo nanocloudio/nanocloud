@@ -2,10 +2,11 @@
 
 use crate::nanocloud::k8s::endpoints::Endpoints;
 use crate::nanocloud::k8s::service::{Service, ServicePort};
+use crate::nanocloud::network::config::{NetworkErrorClass, NetworkInstrumentation};
 use crate::nanocloud::observability::metrics::{self, ProxyOperation};
 use crate::nanocloud::util::error::{new_error, with_context};
 
-use log::{debug, info};
+use log::{debug, error, info, Level};
 use sha1::{Digest, Sha1};
 use std::env;
 use std::error::Error;
@@ -13,11 +14,70 @@ use std::fmt::{self, Write as _};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const PRIMARY_CHAIN: &str = "NCLD-SERVICES";
 
 type AnyError = Box<dyn Error + Send + Sync>;
+
+/// Configuration for iptables proxy programming.
+#[derive(Debug, Clone)]
+pub struct ProxyConfig {
+    pub iptables_binary: String,
+    pub record_path: Option<PathBuf>,
+    pub instrumentation: NetworkInstrumentation,
+}
+
+impl ProxyConfig {
+    /// Loads configuration from environment variables and validates inputs.
+    ///
+    /// - `NANOCLOUD_IPTABLES` optionally overrides the iptables binary.
+    /// - `NANOCLOUD_IPTABLES_RECORD` records commands instead of executing them.
+    /// - Instrumentation knobs are shared with the policy module.
+    pub fn from_env() -> ProxyResult<Self> {
+        let instrumentation = NetworkInstrumentation::from_env()
+            .map_err(|err| ProxyError::validation("network instrumentation", err))?;
+        let record_path = env::var("NANOCLOUD_IPTABLES_RECORD")
+            .ok()
+            .map(PathBuf::from);
+        let iptables_binary =
+            env::var("NANOCLOUD_IPTABLES").unwrap_or_else(|_| "iptables".to_string());
+        let config = Self {
+            iptables_binary,
+            record_path,
+            instrumentation,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> ProxyResult<()> {
+        if self.iptables_binary.trim().is_empty() {
+            return Err(ProxyError::validation(
+                "NANOCLOUD_IPTABLES",
+                "iptables binary path must not be empty",
+            ));
+        }
+        if let Some(path) = self.record_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    return Err(ProxyError::validation(
+                        path.display().to_string(),
+                        "record path parent directory does not exist",
+                    ));
+                }
+                if !parent.is_dir() {
+                    return Err(ProxyError::validation(
+                        path.display().to_string(),
+                        "record path parent is not a directory",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Structured errors for proxy programming operations.
 #[derive(Debug)]
@@ -46,6 +106,15 @@ impl ProxyError {
         ProxyError::Io {
             context: context.into(),
             source,
+        }
+    }
+
+    /// Returns a coarse classification for instrumentation.
+    pub fn classification(&self) -> NetworkErrorClass {
+        match self {
+            ProxyError::Validation { .. } => NetworkErrorClass::Validation,
+            ProxyError::Command { .. } => NetworkErrorClass::Command,
+            ProxyError::Io { .. } => NetworkErrorClass::Io,
         }
     }
 }
@@ -140,51 +209,163 @@ fn validate_endpoints(endpoints: &Endpoints) -> ProxyResult<usize> {
     Ok(valid)
 }
 
-/// Programs proxy rules for a service and its endpoints.
-pub fn program_service(service: &Service, endpoints: &Endpoints) -> ProxyResult<()> {
-    let namespace = service.metadata.namespace.as_deref();
-    let service_name = service.metadata.name.as_deref().unwrap_or("service");
-    metrics::observe_proxy_operation(namespace, service_name, ProxyOperation::Program, || {
-        program_service_inner(service, endpoints)
-    })
+fn log_proxy_failure(
+    namespace: Option<&str>,
+    service: &str,
+    instrumentation: &NetworkInstrumentation,
+    err: &ProxyError,
+) {
+    if instrumentation.metrics_enabled {
+        metrics::record_proxy_error_classification(
+            namespace,
+            service,
+            err.classification().as_str(),
+        );
+    }
+    if instrumentation.should_log(Level::Error) {
+        error!(
+            "proxy operation failed namespace={} service={} classification={} error={}",
+            namespace.unwrap_or("default"),
+            service,
+            err.classification().as_str(),
+            err
+        );
+    }
 }
 
-fn program_service_inner(service: &Service, endpoints: &Endpoints) -> ProxyResult<()> {
+/// Programs proxy rules for a service and its endpoints.
+///
+/// Requires iptables access (typically `CAP_NET_ADMIN`); set
+/// `NANOCLOUD_IPTABLES_RECORD` to capture commands without executing them.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use nanocloud::nanocloud::network::proxy;
+/// # use nanocloud::nanocloud::k8s::service::{Service, ServicePort, ServiceSpec, ServiceStatus};
+/// # use nanocloud::nanocloud::k8s::endpoints::{EndpointAddress, EndpointSubset, Endpoints};
+/// # use nanocloud::nanocloud::k8s::pod::ObjectMeta;
+/// # let service = Service {
+/// #     metadata: ObjectMeta {
+/// #         name: Some("svc".into()),
+/// #         namespace: Some("default".into()),
+/// #         ..Default::default()
+/// #     },
+/// #     spec: ServiceSpec {
+/// #         ports: vec![ServicePort {
+/// #             name: Some("http".into()),
+/// #             port: 80,
+/// #             target_port: Some(8080),
+/// #             protocol: Some("TCP".into()),
+/// #         }],
+/// #         ..Default::default()
+/// #     },
+/// #     status: Some(ServiceStatus {
+/// #         cluster_ip: Some("10.203.0.12".into()),
+/// #     }),
+/// #     ..Default::default()
+/// # };
+/// # let endpoints = Endpoints {
+/// #     metadata: ObjectMeta {
+/// #         name: Some("svc".into()),
+/// #         namespace: Some("default".into()),
+/// #         ..Default::default()
+/// #     },
+/// #     subsets: vec![EndpointSubset {
+/// #         addresses: vec![EndpointAddress {
+/// #             ip: "10.1.0.30".into(),
+/// #         }],
+/// #         ports: Vec::new(),
+/// #     }],
+/// #     ..Default::default()
+/// # };
+/// proxy::program_service(&service, &endpoints)?;
+/// # Ok::<(), nanocloud::nanocloud::network::proxy::ProxyError>(())
+/// ```
+pub fn program_service(service: &Service, endpoints: &Endpoints) -> ProxyResult<()> {
+    let config = ProxyConfig::from_env()?;
+    let namespace = service.metadata.namespace.as_deref();
+    let service_name = service.metadata.name.as_deref().unwrap_or("service");
+    let instrumentation = &config.instrumentation;
+    let action = || program_service_inner(&config, service, endpoints);
+    let result = if instrumentation.metrics_enabled {
+        metrics::observe_proxy_operation(namespace, service_name, ProxyOperation::Program, action)
+    } else {
+        action()
+    };
+
+    if let Err(ref err) = result {
+        log_proxy_failure(namespace, service_name, instrumentation, err);
+    }
+
+    result
+}
+
+fn program_service_inner(
+    config: &ProxyConfig,
+    service: &Service,
+    endpoints: &Endpoints,
+) -> ProxyResult<()> {
     let cluster_ip = validate_service(service)?;
     let endpoints_count = validate_endpoints(endpoints)?;
-    info!(
-        "Programming proxy rules for {}/{} with {} endpoint(s)",
-        service.metadata.namespace.as_deref().unwrap_or("default"),
-        service.metadata.name.as_deref().unwrap_or("service"),
-        endpoints_count
-    );
-    let runner = CommandRunner::new();
+    let runner = CommandRunner::new(config.clone());
+    runner.health_check()?;
+    if config.instrumentation.should_log(Level::Info) {
+        info!(
+            "Programming proxy rules namespace={} service={} endpoints={} ports={}",
+            service.metadata.namespace.as_deref().unwrap_or("default"),
+            service.metadata.name.as_deref().unwrap_or("service"),
+            endpoints_count,
+            service_ports(service).len()
+        );
+    }
     runner.ensure_primary_chain()?;
 
     let ports = service_ports(service);
     for port in ports.iter() {
-        program_port(&runner, service, cluster_ip, port, endpoints)?;
+        program_port(
+            &runner,
+            &config.instrumentation,
+            service,
+            cluster_ip,
+            port,
+            endpoints,
+        )?;
     }
     Ok(())
 }
 
 /// Removes proxy rules for a service.
 pub fn remove_service(service: &Service) -> ProxyResult<()> {
+    let config = ProxyConfig::from_env()?;
     let namespace = service.metadata.namespace.as_deref();
     let service_name = service.metadata.name.as_deref().unwrap_or("service");
-    metrics::observe_proxy_operation(namespace, service_name, ProxyOperation::Remove, || {
-        remove_service_inner(service)
-    })
+    let instrumentation = &config.instrumentation;
+    let action = || remove_service_inner(&config, service);
+    let result = if instrumentation.metrics_enabled {
+        metrics::observe_proxy_operation(namespace, service_name, ProxyOperation::Remove, action)
+    } else {
+        action()
+    };
+
+    if let Err(ref err) = result {
+        log_proxy_failure(namespace, service_name, instrumentation, err);
+    }
+
+    result
 }
 
-fn remove_service_inner(service: &Service) -> ProxyResult<()> {
+fn remove_service_inner(config: &ProxyConfig, service: &Service) -> ProxyResult<()> {
     let cluster_ip = validate_service(service)?;
-    info!(
-        "Removing proxy rules for {}/{}",
-        service.metadata.namespace.as_deref().unwrap_or("default"),
-        service.metadata.name.as_deref().unwrap_or("service"),
-    );
-    let runner = CommandRunner::new();
+    let runner = CommandRunner::new(config.clone());
+    runner.health_check()?;
+    if config.instrumentation.should_log(Level::Info) {
+        info!(
+            "Removing proxy rules namespace={} service={}",
+            service.metadata.namespace.as_deref().unwrap_or("default"),
+            service.metadata.name.as_deref().unwrap_or("service"),
+        );
+    }
     let ports = service_ports(service);
     for port in ports {
         let chain = chain_name(service, port.port);
@@ -196,6 +377,7 @@ fn remove_service_inner(service: &Service) -> ProxyResult<()> {
 
 fn program_port(
     runner: &CommandRunner,
+    instrumentation: &NetworkInstrumentation,
     service: &Service,
     cluster_ip: &str,
     port: &ServicePort,
@@ -208,12 +390,14 @@ fn program_port(
     runner.install_service_rule(&chain, cluster_ip, port.port)?;
 
     let addresses = collect_addresses(endpoints);
-    debug!(
-        "Programming proxy chain {} for port {} with {} target(s)",
-        chain,
-        port.port,
-        addresses.len()
-    );
+    if instrumentation.should_log(Level::Debug) {
+        debug!(
+            "Programming proxy chain {} port={} targets={}",
+            chain,
+            port.port,
+            addresses.len()
+        );
+    }
     if addresses.is_empty() {
         return Ok(());
     }
@@ -305,35 +489,44 @@ fn chain_name(service: &Service, port: u16) -> String {
     format!("NCLD-{}", &digest[..12]).to_uppercase()
 }
 
+#[derive(Debug, Clone)]
 struct CommandRunner {
-    binary: String,
-    record_path: Option<String>,
+    config: ProxyConfig,
 }
 
 impl CommandRunner {
-    fn new() -> Self {
-        let binary = env::var("NANOCLOUD_IPTABLES").unwrap_or_else(|_| "iptables".to_string());
-        let record_path = env::var("NANOCLOUD_IPTABLES_RECORD").ok();
-        CommandRunner {
-            binary,
-            record_path,
-        }
+    fn new(config: ProxyConfig) -> Self {
+        Self { config }
+    }
+
+    fn record_path(&self) -> Option<String> {
+        env::var("NANOCLOUD_IPTABLES_RECORD").ok().or_else(|| {
+            self.config
+                .record_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into())
+        })
+    }
+
+    fn iptables_binary(&self) -> String {
+        env::var("NANOCLOUD_IPTABLES").unwrap_or_else(|_| self.config.iptables_binary.clone())
     }
 
     fn health_check(&self) -> ProxyResult<()> {
-        if let Some(record_path) = self.record_path.as_ref() {
+        if let Some(record_path) = self.record_path() {
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(record_path)
+                .open(&record_path)
                 .map_err(|e| ProxyError::io("Failed to open iptables record log", Box::new(e)))?;
-            writeln!(file, "{} --version", self.binary)
+            writeln!(file, "{} --version", self.iptables_binary())
                 .map_err(|e| ProxyError::io("Failed to write iptables record", Box::new(e)))?;
             return Ok(());
         }
 
-        let command_line = format!("{} --version", self.binary);
-        let status = Command::new(&self.binary)
+        let binary = self.iptables_binary();
+        let command_line = format!("{} --version", binary);
+        let status = Command::new(&binary)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -341,7 +534,7 @@ impl CommandRunner {
             .map_err(|e| {
                 ProxyError::command(
                     command_line.clone(),
-                    with_context(e, format!("Failed to execute {}", self.binary)),
+                    with_context(e, format!("Failed to execute {}", binary)),
                 )
             })?;
         if status.success() {
@@ -443,8 +636,9 @@ impl CommandRunner {
         S: AsRef<str>,
     {
         let args_vec: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
-        let command_line = format!("{} {}", self.binary, args_vec.join(" "));
-        if let Some(ref record_path) = self.record_path {
+        let binary = self.iptables_binary();
+        let command_line = format!("{} {}", binary, args_vec.join(" "));
+        if let Some(record_path) = self.record_path() {
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -456,7 +650,7 @@ impl CommandRunner {
             return Ok(!is_delete);
         }
 
-        let output = Command::new(&self.binary)
+        let output = Command::new(&binary)
             .args(&args_vec)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -464,7 +658,7 @@ impl CommandRunner {
             .map_err(|e| {
                 ProxyError::command(
                     command_line.clone(),
-                    with_context(e, format!("Failed to execute {}", self.binary)),
+                    with_context(e, format!("Failed to execute {}", binary)),
                 )
             })?;
         if output.status.success() {
@@ -499,7 +693,7 @@ impl CommandRunner {
             with_context(
                 new_error(format!(
                     "{} exited with status {:?}: {}",
-                    self.binary,
+                    binary,
                     exit_code,
                     stderr.trim()
                 )),
@@ -511,7 +705,8 @@ impl CommandRunner {
 
 /// Verifies iptables is reachable or records a dry-run log entry.
 pub fn health_check() -> ProxyResult<()> {
-    CommandRunner::new().health_check()
+    let config = ProxyConfig::from_env()?;
+    CommandRunner::new(config).health_check()
 }
 
 #[cfg(test)]
@@ -522,6 +717,7 @@ mod tests {
     use crate::nanocloud::network::policy::{
         PolicyChain, PolicyDirection, PolicyProgrammer, PolicyRule,
     };
+    use crate::nanocloud::observability::metrics;
     use crate::nanocloud::test_support::keyspace_lock;
     use serial_test::serial;
     use std::env;
@@ -640,6 +836,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn proxy_records_error_classification_metrics() {
+        let dir = tempdir().expect("tempdir");
+        let log_path = dir.path().join("iptables-validation.log");
+        let previous_record = env::var("NANOCLOUD_IPTABLES_RECORD").ok();
+        let previous_binary = env::var("NANOCLOUD_IPTABLES").ok();
+        env::set_var("NANOCLOUD_IPTABLES_RECORD", &log_path);
+        env::set_var("NANOCLOUD_IPTABLES", "/sbin/iptables");
+
+        let mut service = make_service();
+        service.spec.ports.clear();
+        let endpoints = make_endpoints();
+
+        let result = program_service(&service, &endpoints);
+        assert!(
+            matches!(result, Err(ProxyError::Validation { .. })),
+            "expected validation error for missing ports"
+        );
+
+        let metrics_text =
+            String::from_utf8(metrics::gather().expect("gather metrics")).expect("utf8 metrics");
+        assert!(
+            metrics_text.contains("proxy_error_classifications_total")
+                && metrics_text.contains("classification=\"validation\""),
+            "expected proxy error classification metric: {metrics_text}"
+        );
+
+        env::remove_var("NANOCLOUD_IPTABLES_RECORD");
+        env::remove_var("NANOCLOUD_IPTABLES");
+        restore_env("NANOCLOUD_IPTABLES_RECORD", previous_record);
+        restore_env("NANOCLOUD_IPTABLES", previous_binary);
+    }
+
+    #[test]
+    #[serial]
     fn proxy_handles_empty_endpoints() {
         let dir = tempdir().expect("tempdir");
         let log_path = dir.path().join("iptables-empty.log");
@@ -727,7 +957,7 @@ mod tests {
         env::set_var("NANOCLOUD_IPTABLES_RECORD", &ipt_log);
         env::set_var("NANOCLOUD_IPTABLES", "/sbin/iptables");
 
-        let policy_programmer = PolicyProgrammer::shared();
+        let policy_programmer = PolicyProgrammer::shared().expect("policy programmer");
         policy_programmer
             .sync(&[])
             .expect("clear existing policy chains");

@@ -24,7 +24,7 @@
 //!         port: Some(80),
 //!     }],
 //! )];
-//! PolicyProgrammer::shared().sync(&chains)?;
+//! PolicyProgrammer::shared()?.sync(&chains)?;
 //! # Ok::<(), nanocloud::nanocloud::network::policy::PolicyError>(())
 //! ```
 //!
@@ -73,6 +73,14 @@
 //! proxy::remove_service(&service)?;
 //! # Ok::<(), nanocloud::nanocloud::network::proxy::ProxyError>(())
 //! ```
+//!
+//! ## Guardrails for future growth
+//! - Prefer small, purpose-built submodules over growing `policy.rs`/`proxy.rs`.
+//! - Add shared helpers (configuration, validation, instrumentation) under
+//!   `network::config` to avoid duplication.
+//! - Keep public APIs documented with runnable examples; add doc tests alongside
+//!   new entry points to catch drift.
 
+pub mod config;
 pub mod policy;
 pub mod proxy;

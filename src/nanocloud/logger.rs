@@ -219,10 +219,11 @@ fn take_test_logs() -> Vec<(EngineLogLevel, String)> {
 mod tests {
     use super::*;
     use crate::nanocloud::observability::tracing;
+    use crate::nanocloud::observability::TracingConfig;
 
     #[tokio::test]
     async fn text_logs_include_trace_ids() {
-        tracing::init();
+        let _ = tracing::init_with_config(TracingConfig::from_env());
         set_log_format(LogFormat::Text);
         take_test_logs();
         tracing::with_span("test.component", "text-log", async {
@@ -245,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_logs_include_trace_ids() {
-        tracing::init();
+        let _ = tracing::init_with_config(TracingConfig::from_env());
         set_log_format(LogFormat::Json);
         take_test_logs();
         tracing::with_span("test.component", "json-log", async {

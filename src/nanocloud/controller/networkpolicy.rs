@@ -342,11 +342,11 @@ pub fn compile_plan(
 pub fn reconcile() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (policies, plan) = compile_plan()?;
     if policies.is_empty() {
-        PolicyProgrammer::shared().sync(&[])?;
+        PolicyProgrammer::shared()?.sync(&[])?;
         return Ok(());
     }
 
-    PolicyProgrammer::shared().sync(&plan)?;
+    PolicyProgrammer::shared()?.sync(&plan)?;
     Ok(())
 }
 
@@ -808,6 +808,7 @@ mod tests {
         std::fs::File::create(&log_path).expect("touch iptables log");
 
         PolicyProgrammer::shared()
+            .expect("policy programmer")
             .sync(&[])
             .expect("reset policy state");
         reconcile().expect("reconcile policies");
