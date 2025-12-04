@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ use tokio::time::{sleep, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::nanocloud::logger::log_error;
-use crate::nanocloud::oci::runtime::container_root_path;
+use crate::nanocloud::oci::runtime::container_base_dir;
 use crate::nanocloud::util::error::with_context;
 
 pub type LogError = Box<dyn Error + Send + Sync>;
@@ -40,6 +41,7 @@ pub type LogResult<T> = Result<T, LogError>;
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
+static LOG_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct LogEntry {
@@ -652,8 +654,46 @@ fn format_rfc3339_nanos(t: SystemTime) -> String {
     }
 }
 
+fn container_log_root() -> PathBuf {
+    if let Some(root) = LOG_ROOT_OVERRIDE.get() {
+        return root.clone();
+    }
+    if let Ok(root) = std::env::var("NANOCLOUD_LOG_ROOT") {
+        return PathBuf::from(root);
+    }
+    container_base_dir()
+}
+
+pub fn set_container_log_root<P: Into<PathBuf>>(root: P) -> LogResult<()> {
+    let root = root.into();
+    std::fs::create_dir_all(&root).map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to create container log root {}", root.display()),
+        )
+    })?;
+
+    if let Some(existing) = LOG_ROOT_OVERRIDE.get() {
+        if existing != &root {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Container log root already set to {}", existing.display()),
+            )));
+        }
+        return Ok(());
+    }
+
+    LOG_ROOT_OVERRIDE.set(root).map_err(|existing| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("Container log root already set to {}", existing.display()),
+        )) as LogError
+    })?;
+    Ok(())
+}
+
 pub fn container_log_dir(container_id: &str) -> PathBuf {
-    container_root_path(container_id).join("logs")
+    container_log_root().join(container_id).join("logs")
 }
 
 pub fn container_log_path(container_id: &str) -> PathBuf {

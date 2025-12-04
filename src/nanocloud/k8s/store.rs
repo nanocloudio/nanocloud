@@ -50,9 +50,7 @@ pub use deployments::{
     delete_deployment, get_deployment, list_deployments, list_deployments_for, StoredDeployment,
 };
 pub use devices::{delete_device, list_devices, save_device};
-pub use endpoints::{
-    delete_endpoints, endpoints_cache_metrics, list_endpoints, save_endpoints,
-};
+pub use endpoints::{delete_endpoints, endpoints_cache_metrics, list_endpoints, save_endpoints};
 pub use jobs::{delete_job, get_job, list_jobs, list_jobs_for, StoredJob};
 pub use network_policies::{list_network_policies, StoredNetworkPolicy};
 pub use pagination::{

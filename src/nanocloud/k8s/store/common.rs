@@ -109,8 +109,9 @@ pub fn deserialize_from_store<T: DeserializeOwned>(
     context: &str,
 ) -> Result<T, Box<dyn Error + Send + Sync>> {
     match serialization_format_for(resource) {
-        SerializationFormat::Json => serde_json::from_str(raw)
-            .map_err(|err| with_context(err, format!("{context} (json)"))),
+        SerializationFormat::Json => {
+            serde_json::from_str(raw).map_err(|err| with_context(err, format!("{context} (json)")))
+        }
         SerializationFormat::Base64Json => {
             let decoded = BASE64_STANDARD
                 .decode(raw)
@@ -201,7 +202,12 @@ pub struct HotResourceCacheMetrics {
 impl<T: Clone> HotResourceCache<T> {
     pub fn new(name: &'static str, env_var: &'static str) -> Self {
         let enabled = env::var(env_var)
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
 
         HotResourceCache {

@@ -22,8 +22,10 @@ use tokio_openssl::SslStream;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::http::HeaderMap;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -604,8 +606,8 @@ impl ExecChannelMultiplexer {
                 result = stdin_rx.recv(), if stdin_open => {
                     match result {
                         Some(data) => {
-                            if let Err(err) = send_channel_frame(&mut sink, CHANNEL_STDIN, data).await {
-                                record_channel_error(&error_tx, "stdin", err);
+                            let result = send_channel_frame(&mut sink, CHANNEL_STDIN, data).await;
+                            if handle_send_result("stdin", result, &error_tx) {
                                 break;
                             }
                         }
@@ -617,8 +619,8 @@ impl ExecChannelMultiplexer {
                 result = resize_rx.recv(), if resize_open => {
                     match result {
                         Some(data) => {
-                            if let Err(err) = send_channel_frame(&mut sink, CHANNEL_RESIZE, data).await {
-                                record_channel_error(&error_tx, "resize", err);
+                            let result = send_channel_frame(&mut sink, CHANNEL_RESIZE, data).await;
+                            if handle_send_result("resize", result, &error_tx) {
                                 break;
                             }
                         }
@@ -630,8 +632,8 @@ impl ExecChannelMultiplexer {
                 result = control_rx.recv(), if control_open => {
                     match result {
                         Some(WriterCommand::Raw(message)) => {
-                            if let Err(err) = sink.send(message).await {
-                                record_channel_error(&error_tx, "control", err);
+                            let result = sink.send(message).await;
+                            if handle_send_result("control", result, &error_tx) {
                                 break;
                             }
                         }
@@ -724,6 +726,26 @@ impl ExecChannelMultiplexer {
     }
 }
 
+fn is_send_after_close_error(err: &WsError) -> bool {
+    matches!(err, WsError::Protocol(ProtocolError::SendAfterClosing))
+}
+
+/// Returns `true` when the writer loop should stop after attempting a send.
+fn handle_send_result(
+    channel: &str,
+    result: Result<(), WsError>,
+    error_tx: &mpsc::Sender<io::Error>,
+) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(err) if is_send_after_close_error(&err) => true,
+        Err(err) => {
+            record_channel_error(error_tx, channel, err);
+            true
+        }
+    }
+}
+
 fn record_channel_error<E: std::fmt::Display>(tx: &mpsc::Sender<io::Error>, channel: &str, err: E) {
     let _ = tx.try_send(io::Error::other(format!(
         "exec {channel} channel error: {err}"
@@ -738,7 +760,7 @@ async fn send_channel_frame<S>(
     sink: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     channel: u8,
     data: Vec<u8>,
-) -> Result<(), tokio_tungstenite::tungstenite::Error>
+) -> Result<(), WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1172,6 +1194,7 @@ mod tests {
     use reqwest::Url;
     use std::path::PathBuf;
     use tokio::io::duplex;
+    use tokio::time::{timeout, Duration};
     use tokio_tungstenite::tungstenite::protocol::Role;
     use tokio_tungstenite::WebSocketStream;
 
@@ -1294,6 +1317,28 @@ mod tests {
             err.to_string().contains("unexpected exec channel"),
             "unexpected error text: {err}"
         );
+
+        mux.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn multiplexer_treats_close_frame_as_clean_shutdown() {
+        let (client_ws, mut server_ws) = websocket_pair().await;
+        let mut mux = ExecChannelMultiplexer::new_for_tests(client_ws);
+
+        let mut close = mux.take_close().expect("close receiver");
+        let mut errors = mux.take_errors().expect("errors receiver");
+
+        server_ws.send(Message::Close(None)).await.unwrap();
+
+        timeout(Duration::from_secs(1), close.recv())
+            .await
+            .expect("close signal") // timeout
+            .expect("close message");
+
+        if let Ok(Some(err)) = timeout(Duration::from_millis(100), errors.recv()).await {
+            panic!("unexpected exec error after websocket close: {err}");
+        }
 
         mux.shutdown().await;
     }

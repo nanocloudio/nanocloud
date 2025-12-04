@@ -3,8 +3,8 @@ use std::env;
 use std::sync::MutexGuard;
 
 use nanocloud::nanocloud::api::types::{
-    Bundle, BundleSpec, Device, DeviceSpec, VolumeSnapshot, VolumeSnapshotPhase, VolumeSnapshotSpec,
-    VolumeSnapshotStatus,
+    Bundle, BundleSpec, Device, DeviceSpec, VolumeSnapshot, VolumeSnapshotPhase,
+    VolumeSnapshotSpec, VolumeSnapshotStatus,
 };
 use nanocloud::nanocloud::k8s::bundle_manager::{BundleApplyOptions, BundleRegistry};
 use nanocloud::nanocloud::k8s::device_manager::DeviceRegistry;
@@ -13,8 +13,8 @@ use nanocloud::nanocloud::k8s::store::{
     delete_volume_snapshot, list_volume_snapshots, save_volume_snapshot,
 };
 use nanocloud::nanocloud::test_support::keyspace_lock;
-use serial_test::serial;
 use serde_json::json;
+use serial_test::serial;
 use tempfile::TempDir;
 
 struct ManagerEnv {
@@ -182,11 +182,14 @@ async fn bundle_device_snapshot_lifecycle() {
         "device should have a resourceVersion"
     );
     let listed_devices = devices.list(Some(namespace)).await;
-    assert_eq!(listed_devices.len(), 1, "device listing should include new item");
+    assert_eq!(
+        listed_devices.len(),
+        1,
+        "device listing should include new item"
+    );
 
     let snapshot = snapshot_fixture(service, namespace);
-    save_volume_snapshot(Some(namespace), "snap-integration", &snapshot)
-        .expect("persist snapshot");
+    save_volume_snapshot(Some(namespace), "snap-integration", &snapshot).expect("persist snapshot");
     let stored_snapshots = list_volume_snapshots(Some(namespace)).expect("list snapshots");
     let stored = stored_snapshots
         .iter()

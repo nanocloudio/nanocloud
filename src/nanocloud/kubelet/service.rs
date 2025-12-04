@@ -130,20 +130,74 @@ struct ReplicaPlanWork {
     plan: ReplicaSetDesiredState,
 }
 
+/// Tunable restart backoff policy applied to failing pods.
 #[derive(Clone, Debug)]
+pub struct RestartBackoffConfig {
+    /// Starting delay before the first retry.
+    pub initial_delay: Duration,
+    /// Maximum delay enforced between retries.
+    pub max_delay: Duration,
+    /// Multiplicative factor applied after each failure.
+    pub backoff_factor: u32,
+}
+
+impl Default for RestartBackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(32),
+            backoff_factor: 2,
+        }
+    }
+}
+
+impl RestartBackoffConfig {
+    fn validate(self) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        if self.initial_delay.is_zero() {
+            return Err(new_error(
+                "restart backoff initial delay must be greater than zero",
+            ));
+        }
+        if self.max_delay < self.initial_delay {
+            return Err(new_error(
+                "restart backoff max delay must be greater than or equal to initial delay",
+            ));
+        }
+        if self.backoff_factor == 0 {
+            return Err(new_error(
+                "restart backoff factor must be greater than or equal to 1",
+            ));
+        }
+
+        Ok(self)
+    }
+
+    fn default_initial_ms() -> u64 {
+        RestartBackoffConfig::default().initial_delay.as_millis() as u64
+    }
+
+    fn default_max_ms() -> u64 {
+        RestartBackoffConfig::default().max_delay.as_millis() as u64
+    }
+
+    fn default_factor() -> u32 {
+        RestartBackoffConfig::default().backoff_factor
+    }
+}
+
+#[derive(Clone, Debug)]
+/// Tracks exponential restart backoff using validated configuration.
 pub struct RestartBackoff {
     attempt: u32,
     next_attempt: Instant,
     last_error: Option<String>,
+    config: RestartBackoffConfig,
 }
 
 impl Default for RestartBackoff {
     fn default() -> Self {
-        Self {
-            attempt: 0,
-            next_attempt: Instant::now(),
-            last_error: None,
-        }
+        RestartBackoff::from_config(RestartBackoffConfig::default())
+            .expect("default restart backoff config must be valid")
     }
 }
 
@@ -152,6 +206,12 @@ struct RestartBackoffState {
     attempt: u32,
     next_allowed_at_ms: Option<u64>,
     last_error: Option<String>,
+    #[serde(default = "RestartBackoffConfig::default_initial_ms")]
+    initial_delay_ms: u64,
+    #[serde(default = "RestartBackoffConfig::default_max_ms")]
+    max_delay_ms: u64,
+    #[serde(default = "RestartBackoffConfig::default_factor")]
+    backoff_factor: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +220,16 @@ struct DesiredStateRecord {
 }
 
 impl RestartBackoff {
+    pub fn from_config(config: RestartBackoffConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let validated = config.validate()?;
+        Ok(Self {
+            attempt: 0,
+            next_attempt: Instant::now(),
+            last_error: None,
+            config: validated,
+        })
+    }
+
     pub fn should_retry(&self, now: Instant) -> bool {
         now >= self.next_attempt
     }
@@ -172,8 +242,16 @@ impl RestartBackoff {
 
     pub fn on_failure(&mut self, now: Instant, message: String) {
         self.attempt = self.attempt.saturating_add(1);
-        let exponent = self.attempt.saturating_sub(1).min(5);
-        let delay = Duration::from_secs(1u64 << exponent);
+        let mut delay = self.config.initial_delay;
+        let factor = self.config.backoff_factor.max(1);
+        for _ in 1..self.attempt {
+            delay = delay.checked_mul(factor).unwrap_or(self.config.max_delay);
+            if delay >= self.config.max_delay {
+                delay = self.config.max_delay;
+                break;
+            }
+        }
+        delay = delay.min(self.config.max_delay);
         self.next_attempt = now + delay;
         self.last_error = Some(message);
     }
@@ -194,6 +272,9 @@ impl RestartBackoff {
             attempt: self.attempt,
             next_allowed_at_ms,
             last_error: self.last_error.clone(),
+            initial_delay_ms: self.config.initial_delay.as_millis() as u64,
+            max_delay_ms: self.config.max_delay.as_millis() as u64,
+            backoff_factor: self.config.backoff_factor,
         }
     }
 
@@ -211,14 +292,24 @@ impl RestartBackoff {
             })
             .unwrap_or(now);
 
+        let config = RestartBackoffConfig {
+            initial_delay: Duration::from_millis(state.initial_delay_ms.max(1)),
+            max_delay: Duration::from_millis(state.max_delay_ms.max(1)),
+            backoff_factor: state.backoff_factor,
+        }
+        .validate()
+        .unwrap_or_default();
+
         RestartBackoff {
             attempt: state.attempt,
             next_attempt,
             last_error: state.last_error,
+            config,
         }
     }
 }
 
+/// Coordinates pod lifecycles on the node, wiring container runtime events and restart policies.
 pub struct Kubelet {
     runtime: Arc<ControllerRuntime>,
     pods: RwLock<HashMap<String, Arc<PodRegistration>>>,
@@ -1734,6 +1825,35 @@ mod tests {
     }
 
     #[test]
+    fn restart_backoff_respects_custom_factor_and_cap() {
+        let mut backoff = RestartBackoff::from_config(RestartBackoffConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            backoff_factor: 3,
+        })
+        .expect("valid backoff config");
+        let now = Instant::now();
+
+        backoff.on_failure(now, "first".into());
+        assert!(
+            backoff.should_retry(now + Duration::from_millis(10)),
+            "first failure should use initial delay"
+        );
+
+        backoff.on_failure(now, "second".into());
+        assert!(
+            backoff.should_retry(now + Duration::from_millis(40)),
+            "second failure should scale delay by factor"
+        );
+
+        backoff.on_failure(now, "third".into());
+        assert!(
+            backoff.should_retry(now + Duration::from_millis(50)),
+            "cap should clamp delays to configured maximum"
+        );
+    }
+
+    #[test]
     fn restart_backoff_state_round_trip_preserves_fields() {
         let mut backoff = RestartBackoff::default();
         let now = Instant::now();
@@ -1743,6 +1863,12 @@ mod tests {
         assert_eq!(state.attempt, 1);
         assert_eq!(state.last_error.as_deref(), Some("error"));
         assert!(state.next_allowed_at_ms.is_some());
+        assert_eq!(
+            state.initial_delay_ms,
+            RestartBackoffConfig::default_initial_ms()
+        );
+        assert_eq!(state.max_delay_ms, RestartBackoffConfig::default_max_ms());
+        assert_eq!(state.backoff_factor, RestartBackoffConfig::default_factor());
 
         let restored = RestartBackoff::from_state(state);
         assert_eq!(restored.attempt, 1);
@@ -1750,6 +1876,11 @@ mod tests {
         assert!(
             !restored.should_retry(Instant::now()),
             "restored backoff should respect pending delay"
+        );
+        let restored_state = restored.to_state();
+        assert_eq!(
+            restored_state.backoff_factor,
+            RestartBackoffConfig::default_factor()
         );
     }
 
@@ -1768,6 +1899,30 @@ mod tests {
             backoff.should_retry(Instant::now()),
             "successful restart should allow immediate retries"
         );
+    }
+
+    #[test]
+    fn restart_backoff_config_validation_rejects_invalid_values() {
+        let invalid_zero = RestartBackoffConfig {
+            initial_delay: Duration::from_secs(0),
+            max_delay: Duration::from_secs(1),
+            backoff_factor: 1,
+        };
+        assert!(invalid_zero.validate().is_err());
+
+        let invalid_factor = RestartBackoffConfig {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(1),
+            backoff_factor: 0,
+        };
+        assert!(invalid_factor.validate().is_err());
+
+        let inverted = RestartBackoffConfig {
+            initial_delay: Duration::from_secs(5),
+            max_delay: Duration::from_secs(1),
+            backoff_factor: 2,
+        };
+        assert!(inverted.validate().is_err());
     }
 
     #[test]

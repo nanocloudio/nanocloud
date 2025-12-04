@@ -214,12 +214,9 @@ pub fn save_bundle(
             &payload,
             &format!("Failed to serialize Bundle for key '{}'", key),
         )?;
-        K8S_KEYSPACE.put(&key, &payload).map_err(|err| {
-            with_context(
-                err,
-                format!("Failed to persist Bundle '{}'", key),
-            )
-        })
+        K8S_KEYSPACE
+            .put(&key, &payload)
+            .map_err(|err| with_context(err, format!("Failed to persist Bundle '{}'", key)))
     })
 }
 

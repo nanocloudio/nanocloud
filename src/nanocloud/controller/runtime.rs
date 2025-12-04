@@ -263,6 +263,14 @@ impl ControllerRuntime {
             .ok_or_else(|| DependencyError::missing(std::any::type_name::<T>()))
     }
 
+    #[cfg(test)]
+    pub fn clear_dependency<T>(&self)
+    where
+        T: Send + Sync + 'static,
+    {
+        self.dependencies.remove::<T>();
+    }
+
     /// Declares that `T` must be registered before dispatchers start, enabling eager validation.
     pub fn declare_required_dependency<T>(&self)
     where
@@ -456,6 +464,15 @@ impl DependencyRegistry {
         guard
             .get(&TypeId::of::<T>())
             .and_then(|arc| arc.clone().downcast::<T>().ok())
+    }
+
+    #[cfg(test)]
+    fn remove<T>(&self)
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut guard = self.values.write().expect("dependency registry poisoned");
+        guard.remove(&TypeId::of::<T>());
     }
 
     fn contains(&self, type_id: TypeId) -> bool {

@@ -32,6 +32,8 @@ static CONTAINER_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTAINER_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static CONTAINER_READY: OnceLock<IntGaugeVec> = OnceLock::new();
 static EXEC_HANDSHAKE_FAILURES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static CNI_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static CNI_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static STATEFULSET_READY: OnceLock<IntGaugeVec> = OnceLock::new();
 static STATEFULSET_CURRENT: OnceLock<IntGaugeVec> = OnceLock::new();
 static STATEFULSET_PROGRESSING: OnceLock<IntGaugeVec> = OnceLock::new();
@@ -47,6 +49,8 @@ static BUNDLE_STATE_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
 static POD_COUNTS_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
 static SNAPSHOT_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static SNAPSHOT_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static POLICY_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static POLICY_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static PROXY_OPERATION_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static PROXY_OPERATION_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 static BACKUP_STREAM_BYTES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
@@ -250,6 +254,31 @@ fn container_ready() -> &'static IntGaugeVec {
     })
 }
 
+fn cni_operation_total() -> &'static IntCounterVec {
+    CNI_OPERATION_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "cni_operations_total",
+            "CNI provisioning operations grouped by outcome",
+        );
+        let counter =
+            IntCounterVec::new(opts, &["operation", "result"]).expect("cni_operations_total");
+        register_collector(counter)
+    })
+}
+
+fn cni_operation_duration() -> &'static HistogramVec {
+    CNI_OPERATION_DURATION.get_or_init(|| {
+        let opts = HistogramOpts::new(
+            "cni_operation_duration_seconds",
+            "Latency distribution for CNI provisioning and teardown",
+        )
+        .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0]);
+        let histogram =
+            HistogramVec::new(opts, &["operation", "result"]).expect("cni_operation_duration");
+        register_collector(histogram)
+    })
+}
+
 fn exec_handshake_failures_total() -> &'static IntCounterVec {
     EXEC_HANDSHAKE_FAILURES_TOTAL.get_or_init(|| {
         let opts = Opts::new(
@@ -379,6 +408,33 @@ fn snapshot_operation_duration() -> &'static HistogramVec {
         .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]);
         let histogram = HistogramVec::new(opts, &["operation", "result", "namespace", "snapshot"])
             .expect("failed to build snapshot operation histogram");
+        register_collector(histogram)
+    })
+}
+
+fn policy_operation_total() -> &'static IntCounterVec {
+    POLICY_OPERATION_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "operations_total",
+            "Network policy programming operations grouped by outcome",
+        )
+        .subsystem("policy");
+        let counter = IntCounterVec::new(opts, &["operation", "result", "namespace", "pod"])
+            .expect("failed to build policy operations counter");
+        register_collector(counter)
+    })
+}
+
+fn policy_operation_duration() -> &'static HistogramVec {
+    POLICY_OPERATION_DURATION.get_or_init(|| {
+        let opts = HistogramOpts::new(
+            "operation_duration_seconds",
+            "Network policy programming operation latency distribution",
+        )
+        .subsystem("policy")
+        .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0]);
+        let histogram = HistogramVec::new(opts, &["operation", "result", "namespace", "pod"])
+            .expect("failed to build policy operation histogram");
         register_collector(histogram)
     })
 }
@@ -613,6 +669,21 @@ impl ContainerOperation {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum CniOperation {
+    Add,
+    Delete,
+}
+
+impl CniOperation {
+    fn as_label(self) -> &'static str {
+        match self {
+            CniOperation::Add => "add",
+            CniOperation::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum SnapshotOperation {
     Reconcile,
 }
@@ -621,6 +692,19 @@ impl SnapshotOperation {
     fn as_label(self) -> &'static str {
         match self {
             SnapshotOperation::Reconcile => "reconcile",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PolicyOperation {
+    Sync,
+}
+
+impl PolicyOperation {
+    fn as_label(self) -> &'static str {
+        match self {
+            PolicyOperation::Sync => "sync",
         }
     }
 }
@@ -709,6 +793,33 @@ fn record_operation(
         .observe(duration.as_secs_f64());
 }
 
+fn record_cni_operation(operation: CniOperation, outcome: OperationOutcome, duration: Duration) {
+    let labels = [operation.as_label(), outcome.as_label()];
+    cni_operation_total().with_label_values(&labels).inc();
+    cni_operation_duration()
+        .with_label_values(&labels)
+        .observe(duration.as_secs_f64());
+}
+
+fn record_policy_operation(
+    namespace: Option<&str>,
+    pod: &str,
+    operation: PolicyOperation,
+    outcome: OperationOutcome,
+    duration: Duration,
+) {
+    let labels = [
+        operation.as_label(),
+        outcome.as_label(),
+        namespace_label(namespace),
+        pod,
+    ];
+    policy_operation_total().with_label_values(&labels).inc();
+    policy_operation_duration()
+        .with_label_values(&labels)
+        .observe(duration.as_secs_f64());
+}
+
 /// Wraps a future representing a container lifecycle operation and records
 /// Kubernetes-style Prometheus metrics for the outcome and latency.
 pub async fn observe_container_operation<F, T, E>(
@@ -736,6 +847,59 @@ where
             record_operation(
                 namespace,
                 workload,
+                operation,
+                OperationOutcome::Error,
+                start.elapsed(),
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Wraps a synchronous CNI operation and records its latency and outcome.
+pub fn observe_cni_operation<F, T, E>(operation: CniOperation, f: F) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    let start = Instant::now();
+    match f() {
+        Ok(value) => {
+            record_cni_operation(operation, OperationOutcome::Success, start.elapsed());
+            Ok(value)
+        }
+        Err(err) => {
+            record_cni_operation(operation, OperationOutcome::Error, start.elapsed());
+            Err(err)
+        }
+    }
+}
+
+/// Wraps a synchronous network policy operation and records its latency/outcome.
+pub fn observe_policy_operation<F, T, E>(
+    namespace: Option<&str>,
+    pod: &str,
+    operation: PolicyOperation,
+    f: F,
+) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    let start = Instant::now();
+    match f() {
+        Ok(value) => {
+            record_policy_operation(
+                namespace,
+                pod,
+                operation,
+                OperationOutcome::Success,
+                start.elapsed(),
+            );
+            Ok(value)
+        }
+        Err(err) => {
+            record_policy_operation(
+                namespace,
+                pod,
                 operation,
                 OperationOutcome::Error,
                 start.elapsed(),

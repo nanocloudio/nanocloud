@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use nanocloud::nanocloud::api::types::{Bundle, BundleSpec, Device, DeviceSpec, VolumeSnapshot};
+use nanocloud::nanocloud::api::types::{VolumeSnapshotSpec, VolumeSnapshotStatus};
 use nanocloud::nanocloud::k8s::bundle_manager::{BundleApplyOptions, BundleRegistry};
 use nanocloud::nanocloud::k8s::configmap::ConfigMap;
 use nanocloud::nanocloud::k8s::configmap_manager::ConfigMapRegistry;
@@ -14,7 +15,6 @@ use nanocloud::nanocloud::k8s::store::{
     save_bundle_field_ownership, save_pod_manifest, save_volume_snapshot,
 };
 use serial_test::serial;
-use nanocloud::nanocloud::api::types::{VolumeSnapshotSpec, VolumeSnapshotStatus};
 use tempfile::TempDir;
 use tokio::task;
 
@@ -221,16 +221,12 @@ async fn ownership_and_version_tracking_for_bundles() {
         .await
         .expect("load ownership");
     ownership.set_owner("/spec/options", "manager/test");
-    save_bundle_field_ownership(Some("own-ns"), "svc-a", &ownership)
-        .expect("persist ownership");
-    let persisted =
-        load_bundle_field_ownership(Some("own-ns"), "svc-a").expect("reload ownership");
-    assert!(
-        persisted
-            .manager_for("/spec/options")
-            .map(|o| o == "manager/test")
-            .unwrap_or(false)
-    );
+    save_bundle_field_ownership(Some("own-ns"), "svc-a", &ownership).expect("persist ownership");
+    let persisted = load_bundle_field_ownership(Some("own-ns"), "svc-a").expect("reload ownership");
+    assert!(persisted
+        .manager_for("/spec/options")
+        .map(|o| o == "manager/test")
+        .unwrap_or(false));
 
     bundle.spec.update = true;
     let updated = registry

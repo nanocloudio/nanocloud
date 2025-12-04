@@ -42,6 +42,7 @@ use crate::nanocloud::k8s::store as pod_store;
 use crate::nanocloud::kubelet::runtime::{
     build_resolv_conf, create_container, exec_in_container, get_container_id_by_name, kill,
     remove_container, setup_container_files, setup_runtime_files, start_container,
+    KubeletPathConfig,
 };
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_debug, log_info, log_warn};
@@ -635,6 +636,7 @@ async fn install_impl(
     let restore_requested = snapshot_name.is_some();
     let binding_policy = BindingEnvelopePolicy::from_environment()
         .map_err(|e| with_context(e, "Failed to apply binding envelope policy"))?;
+    let path_cfg = KubeletPathConfig::load()?;
 
     // Read snapshot if provided
     let snapshot = snapshot_name
@@ -1140,12 +1142,14 @@ async fn install_impl(
         ("ip", ip.as_str()),
     ];
     log_info("container", "Configuring runtime files", &runtime_fields);
-    let resolv_conf = build_resolv_conf(None);
+    let resolv_conf = build_resolv_conf(None)
+        .ok_or_else(|| new_error("Unable to generate resolv.conf for container runtime"))?;
     let app_name = app.to_string();
     let ip_for_runtime = ip.clone();
     let profile_config = profile.config.clone();
     let tls_info = image.config.tls_info.clone();
-    let resolv_conf_owned = resolv_conf.clone();
+    let resolv_conf_owned = Some(resolv_conf.clone());
+    let path_cfg_clone = path_cfg.clone();
     exec_in_container(&container.id, move || {
         setup_runtime_files(
             &app_name,
@@ -1153,6 +1157,7 @@ async fn install_impl(
             &profile_config,
             &tls_info,
             resolv_conf_owned.as_deref(),
+            &path_cfg_clone,
         )
     })
     .map_err(|e| with_context(e, "Failed to configure runtime files"))?;

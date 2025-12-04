@@ -284,7 +284,7 @@ const EXEC_PROC_MOUNTED: u8 = 1;
 const EXEC_PROC_UNKNOWN: u8 = 2;
 const CONTAINER_BASE_DIR: &str = "/var/lib/nanocloud.io/container/sha256";
 
-fn container_base_dir() -> PathBuf {
+pub fn container_base_dir() -> PathBuf {
     env::var("NANOCLOUD_CONTAINER_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(CONTAINER_BASE_DIR))

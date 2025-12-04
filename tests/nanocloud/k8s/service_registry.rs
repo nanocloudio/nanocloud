@@ -142,7 +142,10 @@ async fn service_registry_paginates_and_caches_results() {
     let _ = list_services(None).expect("list services populates cache");
     let _ = list_services(None).expect("cache hit");
     let cache_metrics = service_cache_metrics();
-    assert!(cache_metrics.enabled, "service cache should be enabled for test");
+    assert!(
+        cache_metrics.enabled,
+        "service cache should be enabled for test"
+    );
     assert!(
         cache_metrics.hits >= 1,
         "expected at least one cache hit after repeat list"
@@ -173,8 +176,14 @@ async fn endpoints_registry_versions_and_cache_hits() {
         ports: vec![EndpointPort::new(Some("http".to_string()), 80, None)],
     });
 
-    let created = registry.upsert(endpoints.clone()).expect("upsert endpoints");
-    let initial_rv = created.metadata.resource_version.clone().unwrap_or_default();
+    let created = registry
+        .upsert(endpoints.clone())
+        .expect("upsert endpoints");
+    let initial_rv = created
+        .metadata
+        .resource_version
+        .clone()
+        .unwrap_or_default();
 
     let listed = registry
         .list_paginated(Some("dns"), None, Some(1), None)
@@ -190,7 +199,9 @@ async fn endpoints_registry_versions_and_cache_hits() {
         "expected cache hits after repeat endpoints list"
     );
 
-    let removed = registry.remove("dns", "svc-cache").expect("remove endpoints");
+    let removed = registry
+        .remove("dns", "svc-cache")
+        .expect("remove endpoints");
     assert_ne!(
         removed.metadata.resource_version.as_deref(),
         Some(initial_rv.as_str()),

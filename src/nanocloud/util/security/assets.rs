@@ -507,14 +507,15 @@ mod tests {
     fn reloads_secret_key_after_change() {
         clear_asset_caches();
         let dir = tempdir().expect("tempdir");
-        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", dir.path().to_string_lossy());
+        let secure_path = dir.path().join("secure");
+        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", secure_path.display().to_string());
         let resolved = Config::SecureAssets.get_path();
         assert!(
             resolved.starts_with(dir.path()),
             "secure assets path should respect env override (got {})",
             resolved.display()
         );
-        SecureAssets::generate(dir.path(), false).expect("generate assets");
+        SecureAssets::generate(&resolved, false).expect("generate assets");
 
         let first = load_secret_key().expect("first load");
         let first_der = first.private_key_to_der().expect("serialize first key");
@@ -524,7 +525,7 @@ mod tests {
         let new_key = Rsa::generate(2048).expect("generate rsa");
         let pkey = PKey::from_rsa(new_key).expect("pkey from rsa");
         let pem = pkey.private_key_to_pem_pkcs8().expect("encode private key");
-        let secret_path = dir.path().join("secret.key");
+        let secret_path = resolved.join("secret.key");
         fs::remove_file(&secret_path).expect("remove existing secret key");
         write_private_key(&secret_path, &pem);
 
@@ -539,8 +540,10 @@ mod tests {
     fn reloads_ca_after_change() {
         clear_asset_caches();
         let dir = tempdir().expect("tempdir");
-        SecureAssets::generate(dir.path(), false).expect("generate assets");
-        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", dir.path().to_string_lossy());
+        let secure_path = dir.path().join("secure");
+        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", secure_path.display().to_string());
+        let resolved = Config::SecureAssets.get_path();
+        SecureAssets::generate(&resolved, false).expect("generate assets");
 
         let (_, first_key) = load_ca().expect("load ca");
         let first_der = first_key
@@ -553,7 +556,7 @@ mod tests {
         let ecc_key = EcKey::generate(&group).expect("generate ecc key");
         let pkey = PKey::from_ec_key(ecc_key).expect("pkey from ecc");
         let pem = pkey.private_key_to_pem_pkcs8().expect("encode ecc key");
-        let ca_key_path = dir.path().join("ca.key");
+        let ca_key_path = resolved.join("ca.key");
         fs::remove_file(&ca_key_path).expect("remove existing ca key");
         write_private_key(&ca_key_path, &pem);
 

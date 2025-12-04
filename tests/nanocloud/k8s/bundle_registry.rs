@@ -8,9 +8,9 @@ use nanocloud::nanocloud::k8s::bundle_manager::{
     BundleApplyError, BundleApplyOptions, BundleRegistry,
 };
 use nanocloud::nanocloud::k8s::pod::ObjectMeta;
+use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
-use serde_json::json;
 
 fn bundle_without_defaults() -> Bundle {
     Bundle {
@@ -189,11 +189,7 @@ async fn apply_dry_run_does_not_persist_mutations() {
         .expect("dry-run should succeed");
 
     assert_eq!(
-        updated
-            .spec
-            .options
-            .get("current")
-            .map(String::as_str),
+        updated.spec.options.get("current").map(String::as_str),
         Some("new"),
         "returned bundle should include staged value"
     );
@@ -207,11 +203,7 @@ async fn apply_dry_run_does_not_persist_mutations() {
         .await
         .expect("bundle exists");
     assert_eq!(
-        stored
-            .spec
-            .options
-            .get("current")
-            .map(String::as_str),
+        stored.spec.options.get("current").map(String::as_str),
         Some("old"),
         "persistent spec should remain unchanged after dry-run"
     );
