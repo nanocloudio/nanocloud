@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use serde::Serialize;
@@ -28,6 +32,9 @@ use std::time::Duration;
 use crate::nanocloud::kubelet::Kubelet;
 use crate::nanocloud::logger::{log_error, log_warn};
 use crate::nanocloud::network::proxy;
+use crate::nanocloud::observability::metrics::{
+    record_telemetry_failure, TelemetryComponent, TelemetryFailureKind,
+};
 use crate::nanocloud::oci::container_runtime;
 use crate::nanocloud::server::bridge::{self, BridgeReadinessSnapshot};
 
@@ -52,16 +59,25 @@ impl Default for HealthDependencies {
     fn default() -> Self {
         HealthDependencies::new()
             .with_bridge_check(Box::new(|| bridge::readiness_snapshot().map(Ok).boxed()))
-            .with_proxy_check(Box::new(|| proxy::health_check().map_err(|err| err.to_string())))
-            .with_runtime_check(Box::new(|| container_runtime().list().map(|_| ()).map_err(|err| err.to_string())))
-            .with_kubelet_check(Box::new(|| async {
-                Kubelet::shared()
-                    .list_pods(None)
-                    .await
+            .with_proxy_check(Box::new(|| {
+                proxy::health_check().map_err(|err| err.to_string())
+            }))
+            .with_runtime_check(Box::new(|| {
+                container_runtime()
+                    .list()
                     .map(|_| ())
                     .map_err(|err| err.to_string())
-            }
-            .boxed()))
+            }))
+            .with_kubelet_check(Box::new(|| {
+                async {
+                    Kubelet::shared()
+                        .list_pods(None)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                }
+                .boxed()
+            }))
     }
 }
 
@@ -75,10 +91,7 @@ impl HealthDependencies {
         }
     }
 
-    pub fn with_bridge_check(
-        mut self,
-        check: AsyncCheck<Option<BridgeReadinessSnapshot>>,
-    ) -> Self {
+    pub fn with_bridge_check(mut self, check: AsyncCheck<Option<BridgeReadinessSnapshot>>) -> Self {
         self.bridge = check;
         self
     }
@@ -195,6 +208,10 @@ pub async fn readiness_report_with(dependencies: &HealthDependencies) -> HealthR
         HealthStatus::Degraded
     };
 
+    if status == HealthStatus::Degraded {
+        record_telemetry_failure(TelemetryComponent::Health, TelemetryFailureKind::Check);
+    }
+
     HealthReport { status, components }
 }
 
@@ -204,6 +221,35 @@ pub fn liveness_report() -> HealthReport {
     HealthReport {
         status: HealthStatus::Ready,
         components: vec![ComponentHealth::healthy("process")],
+    }
+}
+
+/// Ready-made handlers for Axum services exposing `/readyz` and `/healthz`.
+#[allow(dead_code)]
+pub fn axum_routes() -> Router {
+    Router::new()
+        .route("/readyz", get(readiness_response))
+        .route("/healthz", get(liveness_response))
+}
+
+/// Returns an Axum response for the readiness endpoint.
+pub async fn readiness_response() -> impl IntoResponse {
+    let report = readiness_report().await;
+    let status = readiness_status(&report);
+    (status, Json(report))
+}
+
+/// Returns an Axum response for the liveness endpoint.
+pub async fn liveness_response() -> impl IntoResponse {
+    let report = liveness_report();
+    (StatusCode::OK, Json(report))
+}
+
+pub fn readiness_status(report: &HealthReport) -> StatusCode {
+    if report.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

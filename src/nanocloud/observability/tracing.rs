@@ -23,18 +23,39 @@
 use crate::nanocloud::observability::{
     TelemetryError, TracingConfig, TracingFormat, TracingOutput,
 };
+#[cfg(feature = "telemetry-otlp")]
+use opentelemetry::trace::TracerProvider;
 use rand::{rngs::OsRng, RngCore};
 use std::fmt::Write;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 use tokio::task_local;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
-use tracing_subscriber::registry::Registry as SubscriberRegistry;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::Registry as SubscriberRegistry;
+
+type BoxedSubscriber = Box<dyn tracing::Subscriber + Send + Sync>;
+
+#[cfg(feature = "telemetry-otlp")]
+type OtlpLayer = tracing_opentelemetry::OpenTelemetryLayer<
+    tracing_subscriber::layer::Layered<
+        SamplingLayer,
+        tracing_subscriber::layer::Layered<EnvFilter, SubscriberRegistry>,
+    >,
+    opentelemetry_sdk::trace::Tracer,
+>;
+
+struct BuiltSubscriber {
+    subscriber: BoxedSubscriber,
+    #[cfg(feature = "telemetry-otlp")]
+    otlp_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
 
 #[derive(Clone, Debug)]
 pub struct TraceContext {
@@ -57,18 +78,29 @@ task_local! {
 }
 
 static TRACING_STATE: OnceLock<TracingHandle> = OnceLock::new();
+const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
 
 #[derive(Clone, Debug)]
-pub struct TracingHandle;
+pub struct TracingHandle {
+    otlp_installed: bool,
+    #[cfg(feature = "telemetry-otlp")]
+    otlp_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
 
 impl TracingHandle {
     /// Flush or teardown any tracing exporters. The current implementation uses
     /// synchronous writers so there is nothing to drain, but the hook is kept
     /// for future async exporters.
     pub fn shutdown(&self) {
+        #[cfg(feature = "telemetry-otlp")]
+        if let Some(ref provider) = self.otlp_provider {
+            // Flush OTLP exporters before exit.
+            let _ = provider.shutdown();
+        }
         tracing::debug!(
             target: "nanocloud::telemetry",
-            "tracing shutdown requested; no buffered exporters to flush"
+            otlp = self.otlp_installed,
+            "tracing shutdown requested"
         );
     }
 }
@@ -83,27 +115,39 @@ pub fn init_with_config(config: TracingConfig) -> Result<TracingHandle, Telemetr
     }
 
     let handle = if config.is_enabled() {
-        let subscriber = build_subscriber(&config)?;
-        tracing::subscriber::set_global_default(subscriber).map_err(|err| {
-            TelemetryError::InitializationFailed("tracing", err.to_string())
-        })?;
-        tracing::info!(
+        let built = build_subscriber(&config)?;
+        tracing::subscriber::set_global_default(built.subscriber)
+            .map_err(|err| TelemetryError::InitializationFailed("tracing", err.to_string()))?;
+        tracing::debug!(
             target: "nanocloud::telemetry",
             format = ?config.format,
+            output = ?config.output,
             sample_rate = config.sample_rate,
+            rate_limit_per_sec = config.rate_limit_per_sec,
+            otlp_endpoint = config
+                .otlp_endpoint
+                .as_deref()
+                .unwrap_or(DEFAULT_OTLP_ENDPOINT),
             "installed tracing subscriber"
         );
-        TracingHandle
+        TracingHandle {
+            otlp_installed: matches!(config.output, TracingOutput::Otlp),
+            #[cfg(feature = "telemetry-otlp")]
+            otlp_provider: built.otlp_provider,
+        }
     } else {
         let subscriber = SubscriberRegistry::default();
-        tracing::subscriber::set_global_default(subscriber).map_err(|err| {
-            TelemetryError::InitializationFailed("tracing", err.to_string())
-        })?;
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|err| TelemetryError::InitializationFailed("tracing", err.to_string()))?;
         tracing::info!(
             target: "nanocloud::telemetry",
             "tracing disabled via configuration; using no-op subscriber"
         );
-        TracingHandle
+        TracingHandle {
+            otlp_installed: false,
+            #[cfg(feature = "telemetry-otlp")]
+            otlp_provider: None,
+        }
     };
 
     TRACING_STATE
@@ -115,7 +159,7 @@ pub fn init_with_config(config: TracingConfig) -> Result<TracingHandle, Telemetr
 
 fn build_subscriber(
     config: &TracingConfig,
-) -> Result<impl tracing::Subscriber + Send + Sync, TelemetryError> {
+) -> Result<BuiltSubscriber, TelemetryError> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .parse(config.filter_directives.clone())
@@ -123,27 +167,92 @@ fn build_subscriber(
             TelemetryError::InvalidConfig(format!("invalid tracing filter directives: {err}"))
         })?;
 
-    let fmt_layer = match config.format {
-        TracingFormat::Json => fmt::layer()
-            .with_target(false)
-            .with_writer(make_writer(&config.output))
-            .json()
-            .boxed(),
-        TracingFormat::Pretty => fmt::layer()
-            .with_target(false)
-            .with_writer(make_writer(&config.output))
-            .pretty()
-            .boxed(),
-    };
+    let sampler = SamplingLayer::new(config.sample_rate, config.rate_limit_per_sec);
+    let registry = SubscriberRegistry::default().with(filter).with(sampler);
 
-    let sampler = SamplingLayer::new(config.sample_rate);
-
-    Ok(SubscriberRegistry::default().with(filter).with(sampler).with(fmt_layer))
+    match config.output {
+        TracingOutput::Otlp => {
+            #[cfg(feature = "telemetry-otlp")]
+            {
+                let (otlp_layer, provider) = build_otlp_layer(config)?;
+                Ok(BuiltSubscriber {
+                    subscriber: Box::new(registry.with(otlp_layer)),
+                    otlp_provider: Some(provider),
+                })
+            }
+            #[cfg(not(feature = "telemetry-otlp"))]
+            {
+                Err(TelemetryError::InitializationFailed(
+                    "tracing",
+                    "OTLP output requested but feature `telemetry-otlp` is not enabled".to_string(),
+                ))
+            }
+        }
+        _ => {
+            let fmt_layer = match config.format {
+                TracingFormat::Json => fmt::layer()
+                    .with_target(false)
+                    .with_writer(make_writer(&config.output))
+                    .with_ansi(false)
+                    .json()
+                    .boxed(),
+                TracingFormat::Pretty => fmt::layer()
+                    .with_target(false)
+                    .with_writer(make_writer(&config.output))
+                    .with_ansi(false)
+                    .pretty()
+                    .boxed(),
+            };
+            Ok(BuiltSubscriber {
+                subscriber: Box::new(registry.with(fmt_layer)),
+                #[cfg(feature = "telemetry-otlp")]
+                otlp_provider: None,
+            })
+        }
+    }
 }
 
 /// Returns the currently active [`TraceContext`], if any.
 pub fn current_context() -> Option<TraceContext> {
     ACTIVE_TRACE.try_with(|ctx| ctx.clone()).ok()
+}
+
+#[cfg(feature = "telemetry-otlp")]
+fn build_otlp_layer(
+    config: &TracingConfig,
+) -> Result<
+    (
+        OtlpLayer,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    ),
+    TelemetryError,
+> {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let endpoint = config
+        .otlp_endpoint
+        .clone()
+        .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string());
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|err| {
+            TelemetryError::InitializationFailed(
+                "tracing",
+                format!("failed to build OTLP exporter: {err}"),
+            )
+        })?;
+
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .build();
+
+    let tracer = tracer_provider.tracer("nanocloud");
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+
+    Ok((tracing_opentelemetry::layer().with_tracer(tracer), tracer_provider))
 }
 
 /// Execute `fut` while publishing a tracing span whose identifiers are
@@ -202,6 +311,7 @@ fn make_writer(output: &TracingOutput) -> BoxMakeWriter {
     match output {
         TracingOutput::Stdout => BoxMakeWriter::new(std::io::stdout),
         TracingOutput::Stderr => BoxMakeWriter::new(std::io::stderr),
+        TracingOutput::Otlp => BoxMakeWriter::new(std::io::sink),
         TracingOutput::Disabled => BoxMakeWriter::new(std::io::sink),
     }
 }
@@ -209,14 +319,23 @@ fn make_writer(output: &TracingOutput) -> BoxMakeWriter {
 #[derive(Clone, Debug)]
 struct SamplingLayer {
     rate: f64,
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl SamplingLayer {
-    fn new(rate: f64) -> Self {
-        SamplingLayer { rate }
+    fn new(rate: f64, rate_limit_per_sec: Option<u64>) -> Self {
+        SamplingLayer {
+            rate,
+            rate_limiter: rate_limit_per_sec.map(RateLimiter::new),
+        }
     }
 
     fn allow(&self) -> bool {
+        if let Some(ref limiter) = self.rate_limiter {
+            if !limiter.allow() {
+                return false;
+            }
+        }
         if self.rate >= 1.0 {
             return true;
         }
@@ -238,5 +357,112 @@ where
             return true;
         }
         self.allow()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RateLimiter {
+    limit: u64,
+    state: Arc<RateLimiterState>,
+}
+
+#[derive(Debug)]
+struct RateLimiterState {
+    window_start: AtomicU64,
+    count: AtomicU64,
+}
+
+impl RateLimiter {
+    fn new(limit: u64) -> Self {
+        RateLimiter {
+            limit,
+            state: Arc::new(RateLimiterState {
+                window_start: AtomicU64::new(current_second()),
+                count: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn allow(&self) -> bool {
+        let now = current_second();
+        let window_start = self.state.window_start.load(Ordering::Relaxed);
+        if now != window_start {
+            self.state.window_start.store(now, Ordering::Relaxed);
+            self.state.count.store(0, Ordering::Relaxed);
+        }
+
+        let previous = self.state.count.fetch_add(1, Ordering::Relaxed);
+        previous < self.limit
+    }
+}
+
+fn current_second() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_layer_honors_rate_limit() {
+        let layer = SamplingLayer::new(1.0, Some(2));
+        assert!(layer.allow());
+        assert!(layer.allow());
+        assert!(!layer.allow());
+    }
+
+    #[test]
+    #[cfg(not(feature = "telemetry-otlp"))]
+    fn otlp_output_without_feature_is_rejected() {
+        let config = TracingConfig {
+            filter_directives: "info".to_string(),
+            format: TracingFormat::Pretty,
+            output: TracingOutput::Otlp,
+            sample_rate: 1.0,
+            rate_limit_per_sec: None,
+            otlp_endpoint: Some("http://localhost:4317".to_string()),
+        };
+
+        let result = build_subscriber(&config);
+        assert!(matches!(
+            result,
+            Err(TelemetryError::InitializationFailed("tracing", _))
+        ));
+    }
+
+    #[test]
+    fn invalid_sample_rate_is_rejected() {
+        let mut config = TracingConfig::disabled();
+        config.sample_rate = 1.5;
+        assert!(config.validate().is_err());
+
+        config.sample_rate = 0.5;
+        config.rate_limit_per_sec = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_filter_directives_error() {
+        let mut config = TracingConfig::disabled();
+        config.sample_rate = 1.0;
+        config.output = TracingOutput::Stdout;
+        config.filter_directives = "nanocloud=notalevel".to_string();
+
+        let err = build_subscriber(&config);
+        assert!(matches!(err, Err(TelemetryError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn shutdown_is_noop_without_otlp() {
+        TracingHandle {
+            otlp_installed: false,
+            #[cfg(feature = "telemetry-otlp")]
+            otlp_provider: None,
+        }
+        .shutdown();
     }
 }

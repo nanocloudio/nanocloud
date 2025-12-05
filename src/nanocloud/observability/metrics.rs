@@ -41,6 +41,7 @@ struct MetricsState {
 }
 
 static METRICS_STATE: OnceLock<MetricsState> = OnceLock::new();
+static TELEMETRY_FAILURES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 fn metrics_state() -> &'static MetricsState {
     METRICS_STATE.get_or_init(|| {
@@ -54,7 +55,13 @@ impl MetricsState {
         let labels = if config.default_labels.is_empty() {
             None
         } else {
-            Some(config.default_labels.clone().into_iter().collect::<HashMap<_, _>>())
+            Some(
+                config
+                    .default_labels
+                    .clone()
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+            )
         };
 
         let registry = Registry::new_custom(Some(config.namespace.clone()), labels)
@@ -81,6 +88,7 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, TelemetryError> {
 
     let namespace = config.namespace.clone();
     let enabled = config.is_enabled();
+    let default_labels = config.default_labels.clone();
     let state = MetricsState::from_config(config)?;
     METRICS_STATE
         .set(state)
@@ -89,6 +97,7 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, TelemetryError> {
         target: "nanocloud::telemetry",
         enabled,
         namespace = namespace.as_str(),
+        default_labels = ?default_labels,
         "initialized metrics registry"
     );
     Ok(MetricsHandle)
@@ -156,6 +165,28 @@ where
             .expect("failed to register nanocloud metric collector");
     }
     collector
+}
+
+fn telemetry_failures_total(state: &MetricsState) -> &'static IntCounterVec {
+    TELEMETRY_FAILURES_TOTAL.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "telemetry_failures_total",
+                "Telemetry failures grouped by component and kind",
+            ),
+            &["component", "kind"],
+        )
+        .expect("failed to build telemetry failures counter");
+
+        if state.enabled {
+            state
+                .registry
+                .register(Box::new(counter.clone()))
+                .expect("failed to register telemetry failures counter");
+        }
+
+        counter
+    })
 }
 
 fn controller_reconciles_total() -> &'static IntCounterVec {
@@ -745,6 +776,40 @@ fn dns_upstream_attempts_total() -> &'static IntCounterVec {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum TelemetryComponent {
+    Tracing,
+    Metrics,
+    Health,
+}
+
+impl TelemetryComponent {
+    fn as_label(self) -> &'static str {
+        match self {
+            TelemetryComponent::Tracing => "tracing",
+            TelemetryComponent::Metrics => "metrics",
+            TelemetryComponent::Health => "health",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TelemetryFailureKind {
+    Init,
+    Exporter,
+    Check,
+}
+
+impl TelemetryFailureKind {
+    fn as_label(self) -> &'static str {
+        match self {
+            TelemetryFailureKind::Init => "init",
+            TelemetryFailureKind::Exporter => "exporter",
+            TelemetryFailureKind::Check => "check",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum ContainerOperation {
     Install,
     Start,
@@ -1265,6 +1330,15 @@ pub fn record_dns_upstream_attempt(outcome: &str) {
         .inc();
 }
 
+/// Records telemetry failures (initialization, exporter, or health check errors).
+pub fn record_telemetry_failure(component: TelemetryComponent, kind: TelemetryFailureKind) {
+    if let Some(state) = METRICS_STATE.get() {
+        telemetry_failures_total(state)
+            .with_label_values(&[component.as_label(), kind.as_label()])
+            .inc();
+    }
+}
+
 pub fn record_controller_reconcile(controller: &str, result: ControllerReconcileResult) {
     controller_reconciles_total()
         .with_label_values(&[controller, result.as_label()])
@@ -1354,8 +1428,8 @@ pub fn record_statefulset_status(
 /// Marks a container as ready (1) or not ready (0) in the Prometheus gauge
 /// mirroring `kube_pod_container_status_ready`.
 pub fn set_container_ready(namespace: Option<&str>, workload: &str, ready: bool) {
-    let gauge =
-        container_ready().with_label_values(&[namespace_label(namespace), resource_label(workload)]);
+    let gauge = container_ready()
+        .with_label_values(&[namespace_label(namespace), resource_label(workload)]);
     gauge.set(if ready { 1 } else { 0 });
 }
 
@@ -1516,6 +1590,24 @@ mod tests {
         assert!(text.contains("nanocloud_keyspace_blocking_active_tasks 2"));
         assert!(text.contains("nanocloud_keyspace_blocking_wait_duration_seconds_sum"));
         assert!(text.contains("operation=\"put\""));
+    }
+
+    #[test]
+    fn telemetry_failure_metric_records_counts() {
+        // Ensure the metrics registry is initialized for this binary.
+        let _ = metrics_state();
+        record_telemetry_failure(TelemetryComponent::Tracing, TelemetryFailureKind::Init);
+
+        let snapshot = gather().expect("metrics encoded");
+        let text = String::from_utf8(snapshot).expect("utf8");
+        assert!(text.contains("nanocloud_telemetry_failures_total"));
+        assert!(text.contains("component=\"tracing\""));
+        assert!(text.contains("kind=\"init\""));
+    }
+
+    #[test]
+    fn metrics_handle_shutdown_is_noop() {
+        MetricsHandle.shutdown();
     }
 }
 #[derive(Copy, Clone, Debug)]

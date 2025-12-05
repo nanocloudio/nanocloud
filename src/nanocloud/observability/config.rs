@@ -46,6 +46,7 @@ impl TelemetryConfig {
 pub enum TracingOutput {
     Stdout,
     Stderr,
+    Otlp,
     Disabled,
 }
 
@@ -63,6 +64,10 @@ pub struct TracingConfig {
     pub output: TracingOutput,
     /// Probability (0.0 - 1.0) that an event/span is recorded.
     pub sample_rate: f64,
+    /// Optional per-second event rate limit for non-span events.
+    pub rate_limit_per_sec: Option<u64>,
+    /// Endpoint used when OTLP output is selected.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl TracingConfig {
@@ -82,6 +87,7 @@ impl TracingConfig {
             .and_then(|value| match value.to_ascii_lowercase().as_str() {
                 "stderr" => Some(TracingOutput::Stderr),
                 "stdout" => Some(TracingOutput::Stdout),
+                "otlp" => Some(TracingOutput::Otlp),
                 "off" | "disabled" | "none" => Some(TracingOutput::Disabled),
                 _ => None,
             })
@@ -90,12 +96,19 @@ impl TracingConfig {
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(1.0);
+        let rate_limit_per_sec = env::var("NANOCLOUD_TRACING_RATE_LIMIT_PER_SEC")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0);
+        let otlp_endpoint = env::var("NANOCLOUD_TRACING_OTLP_ENDPOINT").ok();
 
         TracingConfig {
             filter_directives,
             format,
             output,
             sample_rate,
+            rate_limit_per_sec,
+            otlp_endpoint,
         }
     }
 
@@ -105,6 +118,8 @@ impl TracingConfig {
             format: TracingFormat::Pretty,
             output: TracingOutput::Disabled,
             sample_rate: 0.0,
+            rate_limit_per_sec: None,
+            otlp_endpoint: None,
         }
     }
 
@@ -112,6 +127,24 @@ impl TracingConfig {
         if !(0.0..=1.0).contains(&self.sample_rate) {
             return Err(TelemetryError::InvalidConfig(
                 "tracing sample rate must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+        if let Some(rate_limit) = self.rate_limit_per_sec {
+            if rate_limit == 0 {
+                return Err(TelemetryError::InvalidConfig(
+                    "tracing rate limit must be greater than zero".to_string(),
+                ));
+            }
+        }
+        if matches!(self.output, TracingOutput::Otlp)
+            && self
+                .otlp_endpoint
+                .as_ref()
+                .map(|value| value.is_empty())
+                .unwrap_or(false)
+        {
+            return Err(TelemetryError::InvalidConfig(
+                "OTLP output selected but NANOCLOUD_TRACING_OTLP_ENDPOINT is empty".to_string(),
             ));
         }
         Ok(())

@@ -17,7 +17,6 @@
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::nanocloud::observability::{health, metrics};
 
@@ -33,27 +32,26 @@ pub(super) async fn metrics() -> Response {
             );
             response
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to encode metrics: {err}"),
-        )
-            .into_response(),
+        Err(err) => {
+            metrics::record_telemetry_failure(
+                metrics::TelemetryComponent::Metrics,
+                metrics::TelemetryFailureKind::Exporter,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to encode metrics: {err}"),
+            )
+                .into_response()
+        }
     }
 }
 
 pub(super) async fn readiness() -> Response {
-    let report = health::readiness_report().await;
-    let status = if report.is_ready() {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(report)).into_response()
+    health::readiness_response().await.into_response()
 }
 
 pub(super) async fn liveness() -> Response {
-    let report = health::liveness_report();
-    (StatusCode::OK, Json(report)).into_response()
+    health::liveness_response().await.into_response()
 }
 
 pub(super) async fn combined_health() -> Response {

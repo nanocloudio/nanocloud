@@ -24,10 +24,35 @@
 //! dashboards and alerting rules. Telemetry initialization is explicitly
 //! guarded to avoid accidental double-installation of subscribers or
 //! exporters.
+//!
+//! # Examples
+//! Initialize tracing and metrics with a custom filter:
+//! ```
+//! use nanocloud::nanocloud::observability;
+//! use nanocloud::nanocloud::observability::TelemetryConfig;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut config = TelemetryConfig::noop();
+//! config.tracing.filter_directives = "nanocloud=info".to_string();
+//! let handle = observability::init(&config)?;
+//! handle.shutdown();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Expose standard health endpoints with Axum:
+//! ```
+//! use axum::Router;
+//! use nanocloud::nanocloud::observability::health;
+//!
+//! let app = Router::new().merge(health::axum_routes());
+//! # let _ = app;
+//! ```
 
 pub mod config;
 pub mod health;
 pub mod metrics;
+pub mod testing;
 pub mod tracing;
 
 pub use config::{
@@ -49,7 +74,15 @@ impl TelemetryHandle {
 
 /// Initialize tracing and metrics exporters using the provided configuration.
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryHandle, TelemetryError> {
-    let tracing = tracing::init_with_config(config.tracing.clone())?;
     let metrics = metrics::init(config.metrics.clone())?;
-    Ok(TelemetryHandle { tracing, metrics })
+    match tracing::init_with_config(config.tracing.clone()) {
+        Ok(tracing) => Ok(TelemetryHandle { tracing, metrics }),
+        Err(err) => {
+            metrics::record_telemetry_failure(
+                metrics::TelemetryComponent::Tracing,
+                metrics::TelemetryFailureKind::Init,
+            );
+            Err(err)
+        }
+    }
 }
