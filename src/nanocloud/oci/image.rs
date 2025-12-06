@@ -69,7 +69,7 @@ pub struct HistoryEntry {
 
 impl OciImage {
     pub fn load(digest: &str) -> Result<OciImage, Box<dyn Error + Send + Sync>> {
-        let file_path = image_store_root()
+        let file_path = image_store_root()?
             .join("blobs")
             .join("sha256")
             .join(&digest[7..]);

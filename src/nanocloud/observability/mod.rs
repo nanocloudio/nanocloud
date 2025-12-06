@@ -52,6 +52,7 @@
 pub mod config;
 pub mod health;
 pub mod metrics;
+pub mod oci;
 pub mod testing;
 pub mod tracing;
 
@@ -76,7 +77,10 @@ impl TelemetryHandle {
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryHandle, TelemetryError> {
     let metrics = metrics::init(config.metrics.clone())?;
     match tracing::init_with_config(config.tracing.clone()) {
-        Ok(tracing) => Ok(TelemetryHandle { tracing, metrics }),
+        Ok(tracing) => {
+            oci::install_oci_telemetry_hooks();
+            Ok(TelemetryHandle { tracing, metrics })
+        }
         Err(err) => {
             metrics::record_telemetry_failure(
                 metrics::TelemetryComponent::Tracing,

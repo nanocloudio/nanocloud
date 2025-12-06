@@ -52,10 +52,15 @@ impl Image {
         app: &str,
         provided_options: HashMap<String, String>,
         force_update: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Image, Box<dyn Error + Send + Sync>> {
         // Pull image
-        let oci_manifest =
-            Registry::pull(&format!("registry.nanocloud.io/{}", app), force_update).await?;
+        let oci_manifest = Registry::pull(
+            &format!("registry.nanocloud.io/{}", app),
+            force_update,
+            cancel,
+        )
+        .await?;
         let oci_image = OciImage::load(&oci_manifest.config.digest)?;
 
         // Parse options

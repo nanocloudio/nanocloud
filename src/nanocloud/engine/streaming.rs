@@ -370,6 +370,61 @@ impl StreamingSnapshotInner {
         }
     }
 
+    async fn broadcast_best_effort(&self, event: SnapshotChunkResult) -> BroadcastReport {
+        let subscribers = {
+            let state = self
+                .state
+                .lock()
+                .expect("streaming snapshot subscriber lock poisoned");
+            if state.closing {
+                return BroadcastReport::default();
+            }
+            state.subscribers.clone()
+        };
+
+        let mut dropped = Vec::new();
+        let mut failed = 0usize;
+        for subscriber in subscribers {
+            match subscriber.sender.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {
+                    failed += 1;
+                    dropped.push(subscriber.id);
+                }
+                Err(TrySendError::Full(_)) => {
+                    failed += 1;
+                    dropped.push(subscriber.id);
+                    log_warn(
+                        STREAMING_COMPONENT,
+                        "Dropping slow subscriber due to backpressure",
+                        &[("stream_id", &self.id.to_string())],
+                    );
+                }
+            }
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("streaming snapshot subscriber lock poisoned");
+        if !dropped.is_empty() {
+            state
+                .subscribers
+                .retain(|subscriber| !dropped.contains(&subscriber.id));
+        }
+
+        if !dropped.is_empty() {
+            with_hooks(|hooks| {
+                hooks.on_backpressure_drop(&self.path, self.id, dropped.len(), failed)
+            });
+        }
+
+        BroadcastReport {
+            dropped: dropped.len(),
+            failed,
+        }
+    }
+
     async fn close(&self) {
         {
             let mut state = self
@@ -735,7 +790,7 @@ impl StreamingSnapshot {
                     }
                 }, if cancellation.is_some() => {
                     let err = StreamingSnapshotError::cancelled(path.clone());
-                    let _ = self.inner.broadcast(Err(err.clone())).await;
+                    let _ = self.inner.broadcast_best_effort(Err(err.clone())).await;
                     return self.finish_run(path.clone(), start, stats, Some(err)).await;
                 }
                 result = reader.next() => {

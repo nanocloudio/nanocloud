@@ -29,7 +29,7 @@ async fn fake_registry_pull_reuses_cache_without_source_blobs() {
     let _image_guard = EnvGuard::set("NANOCLOUD_IMAGE_ROOT", image_root.path());
     let _registry_guard = fake_registry.activate();
 
-    Registry::pull(fake_registry.image(), false)
+    Registry::pull(fake_registry.image(), false, None)
         .await
         .expect("initial pull should succeed");
 
@@ -38,12 +38,14 @@ async fn fake_registry_pull_reuses_cache_without_source_blobs() {
         fake_registry.remove_blob(&digest);
     }
 
-    Registry::pull(fake_registry.image(), false)
+    Registry::pull(fake_registry.image(), false, None)
         .await
         .expect("cached pull should succeed even when fake blobs removed");
 
     assert!(
-        Registry::pull(fake_registry.image(), true).await.is_err(),
+        Registry::pull(fake_registry.image(), true, None)
+            .await
+            .is_err(),
         "force update must fail when fake blobs are missing"
     );
     artifacts.write_text(
@@ -64,7 +66,13 @@ async fn macro_defaults_expand_expected_values() {
     SecureAssets::generate(secure_dir.path(), false).expect("generate secure assets");
     let _secure_guard = EnvGuard::set("NANOCLOUD_SECURE_ASSETS", secure_dir.path());
 
-    let image = Image::load(None, "conformance/fake-loop", HashMap::new(), false)
+    let image = Image::load(
+        None,
+        "conformance/fake-loop",
+        HashMap::new(),
+        false,
+        None,
+    )
         .await
         .expect("image load succeeds");
 

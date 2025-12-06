@@ -15,6 +15,7 @@
  */
 
 pub mod distribution;
+pub mod hooks;
 pub mod image;
 pub mod runtime;
 pub mod runtime_provider;
@@ -22,6 +23,8 @@ pub mod store;
 
 pub use distribution::OciManifest;
 pub use distribution::Registry;
+#[allow(unused_imports)]
+pub use hooks::{set_oci_hooks, OciHooks};
 pub use image::OciImage;
 #[allow(unused_imports)]
 pub use runtime::EncryptedVolumeMount;
@@ -29,6 +32,8 @@ pub use runtime::EncryptedVolumeMount;
 pub use runtime::Runtime;
 #[allow(unused_imports)]
 pub use runtime_provider::{
-    container_runtime, register_container_runtime, ContainerRuntime, ExecPrepare, NamespaceAction,
+    container_runtime, register_container_runtime, runtime_capabilities, scoped_runtime_provider,
+    shutdown_container_runtime, try_container_runtime, ContainerRuntime, ExecPrepare,
+    NamespaceAction, RuntimeCapabilities, RuntimeError, RuntimeProviderGuard,
 };
 pub use store::{fake_registry_root, image_store_root};

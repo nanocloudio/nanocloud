@@ -221,7 +221,11 @@ impl Error for LoopbackProbeError {}
 
 /// OCI interface used by the probe, abstracted for tests.
 pub trait OciClient: Send + Sync {
-    fn pull<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), LoopbackProbeError>>;
+    fn pull<'a>(
+        &'a self,
+        image: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), LoopbackProbeError>>;
 }
 
 /// DNS check interface, injectable for tests.
@@ -249,9 +253,13 @@ impl LoopbackMetrics for NoopLoopbackMetrics {}
 struct DefaultOciClient;
 
 impl OciClient for DefaultOciClient {
-    fn pull<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), LoopbackProbeError>> {
+    fn pull<'a>(
+        &'a self,
+        image: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), LoopbackProbeError>> {
         Box::pin(async move {
-            Registry::pull(image, true)
+            Registry::pull(image, true, Some(cancel))
                 .await
                 .map(|_| ())
                 .map_err(|err| {
@@ -734,8 +742,11 @@ impl ProbeRunner {
         let mut notes = Vec::new();
         let image = self.config.image.clone();
         let oci = self.deps.oci.clone();
-        self.run_phase(ProbePhase::PullImage, async move { oci.pull(&image).await })
-            .await?;
+        let cancel = self.cancel.clone();
+        self.run_phase(ProbePhase::PullImage, async move {
+            oci.pull(&image, &cancel).await
+        })
+        .await?;
         notes.push(format!("Pulled diagnostics image {}", self.config.image));
 
         let run_id = self.run_id.clone();
@@ -1221,7 +1232,11 @@ mod tests {
     }
 
     impl OciClient for MockOci {
-        fn pull<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), LoopbackProbeError>> {
+        fn pull<'a>(
+            &'a self,
+            image: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Result<(), LoopbackProbeError>> {
             let image = image.to_string();
             Box::pin(async move {
                 if let Ok(mut guard) = self.pulls.lock() {

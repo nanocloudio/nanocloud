@@ -15,10 +15,13 @@
  */
 
 use crate::nanocloud::logger::log_info;
+use crate::nanocloud::oci::hooks::emit_registry_event;
 use crate::nanocloud::oci::{fake_registry_root, image_store_root};
 use crate::nanocloud::util::error::{new_error, with_context};
+use std::borrow::Cow;
 use flate2::read::GzDecoder;
 use futures_util::stream::StreamExt;
+use log::warn;
 use openssl::hash::{Hasher, MessageDigest};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -132,6 +136,19 @@ pub struct ImageReference {
 impl ImageReference {
     pub fn tag_or_default(&self) -> &str {
         self.tag.as_deref().unwrap_or("latest")
+    }
+
+    /// Returns a human-friendly representation of the image reference.
+    pub fn display_name(&self) -> String {
+        match &self.digest {
+            Some(digest) => format!("{}/{}@{}", self.registry, self.repository, digest),
+            None => format!(
+                "{}/{}:{}",
+                self.registry,
+                self.repository,
+                self.tag_or_default()
+            ),
+        }
     }
 }
 
@@ -244,28 +261,34 @@ fn validate_digest(digest: &str, original: &str) -> Result<(), Box<dyn Error + S
     Ok(())
 }
 
+fn check_cancel(cancel: Option<&CancellationToken>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if let Some(token) = cancel {
+        if token.is_cancelled() {
+            return Err(new_error("Registry operation cancelled"));
+        }
+    }
+    Ok(())
+}
+
+fn cache_ttl_seconds() -> Result<Option<u64>, Box<dyn Error + Send + Sync>> {
+    match std::env::var("NANOCLOUD_IMAGE_CACHE_TTL_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|e| with_context(e, "Invalid NANOCLOUD_IMAGE_CACHE_TTL_SECS")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(with_context(
+            err,
+            "Failed to read NANOCLOUD_IMAGE_CACHE_TTL_SECS",
+        )),
+    }
+}
+
 pub fn load_manifest_from_store(
     reference: &ImageReference,
 ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
-    let image_root = image_store_root();
-    let manifest_path = if let Some(digest) = &reference.digest {
-        if !digest.starts_with("sha256:") || digest.len() != 71 {
-            return Err(new_error(format!(
-                "Unsupported manifest digest format: {digest}"
-            )));
-        }
-        image_root.join("blobs").join("sha256").join(&digest[7..])
-    } else {
-        let tag = reference
-            .tag
-            .as_ref()
-            .ok_or_else(|| new_error("Image reference missing tag and digest"))?;
-        image_root
-            .join("refs")
-            .join(&reference.registry)
-            .join(&reference.repository)
-            .join(tag)
-    };
+    let image_root = image_store_root()?;
+    let manifest_path = manifest_path_for(reference, &image_root)?;
 
     let file = File::open(&manifest_path).map_err(|e| {
         with_context(
@@ -285,37 +308,100 @@ pub fn load_manifest_from_store(
     })
 }
 
+fn manifest_path_for(
+    reference: &ImageReference,
+    image_root: &Path,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    if let Some(digest) = &reference.digest {
+        if !digest.starts_with("sha256:") || digest.len() != 71 {
+            return Err(new_error(format!(
+                "Unsupported manifest digest format: {digest}"
+            )));
+        }
+        Ok(image_root.join("blobs").join("sha256").join(&digest[7..]))
+    } else {
+        let tag = reference
+            .tag
+            .as_ref()
+            .ok_or_else(|| new_error("Image reference missing tag and digest"))?;
+        Ok(image_root
+            .join("refs")
+            .join(&reference.registry)
+            .join(&reference.repository)
+            .join(tag))
+    }
+}
+
 pub struct Registry {}
 
 impl Registry {
     pub async fn pull(
         image: &str,
         force_update: bool,
+        cancel: Option<&CancellationToken>,
     ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
+        check_cancel(cancel)?;
         let reference = parse_image_reference(image)?;
-        if let Some(fake_root) = fake_registry_root() {
-            return pull_from_fake_registry(&reference, &fake_root, force_update);
+        let image_label = reference.display_name();
+        if let Some(fake_root) = fake_registry_root()? {
+            check_cancel(cancel)?;
+            return pull_from_fake_registry(&reference, &fake_root, force_update, cancel);
         }
+        emit_registry_event(
+            "pull.start",
+            &[("image", Cow::Borrowed(image_label.as_str()))],
+        );
         let registry = reference.registry.clone();
         let repository = reference.repository.clone();
         let tag = reference.tag_or_default().to_string();
         let mut manifest_ref = reference.digest.clone().unwrap_or_else(|| tag.clone());
 
-        let image_dir = image_store_root();
+        let image_dir = image_store_root()?;
         let blobs_dir = image_dir.join("blobs/sha256");
         let refs_dir = image_dir.join("refs").join(&registry).join(&repository);
         let overlay_dir = image_dir.join("overlay");
         for dir in [&blobs_dir, &refs_dir, &overlay_dir] {
             create_dir_all(dir).map_err(|e| {
-                with_context(e, format!("Failed to create directory {}", dir.display()))
+                with_context(
+                    e,
+                    format!(
+                        "Failed to create directory {} for image {image_label}",
+                        dir.display()
+                    ),
+                )
             })?;
         }
 
+        if !force_update {
+            if let Some(manifest) = load_cached_manifest(&reference, &image_dir)? {
+                log_info(
+                    "oci",
+                    "Using cached manifest",
+                    &[("image", image_label.as_str())],
+                );
+                return Ok(manifest);
+            }
+        }
+
         let client = Client::new();
-        let manifest = match get_manifest(&client, &registry, &repository, &manifest_ref).await? {
+        let manifest = match get_manifest(&client, &registry, &repository, &manifest_ref, cancel)
+            .await
+            .map_err(|e| {
+                with_context(
+                    e,
+                    format!("Failed to resolve manifest {manifest_ref} for {image_label}"),
+                )
+            })? {
             ImageDescriptor::Index(index) => {
                 manifest_ref = get_digest(&index)?;
-                match get_manifest(&client, &registry, &repository, &manifest_ref).await? {
+                match get_manifest(&client, &registry, &repository, &manifest_ref, cancel)
+                    .await
+                    .map_err(|e| {
+                        with_context(
+                            e,
+                            format!("Failed to resolve manifest {manifest_ref} for {image_label}"),
+                        )
+                    })? {
                     ImageDescriptor::Index(_) => None,
                     ImageDescriptor::Manifest(manifest) => Some(manifest),
                 }
@@ -373,8 +459,10 @@ impl Registry {
             &manifest.config,
             &blobs_dir,
             force_update,
+            cancel,
         )
-        .await?;
+        .await
+        .map_err(|e| with_context(e, format!("Failed to fetch config for {image_label}")))?;
         for layer in &manifest.layers {
             let layer_excerpt = &layer.digest[7..19];
             log_info(
@@ -392,20 +480,131 @@ impl Registry {
                 layer,
                 &blobs_dir,
                 force_update,
+                cancel,
             )
-            .await?;
-            unpack_layer(layer, &blobs_dir, &overlay_dir, force_update)?;
+            .await
+            .map_err(|e| with_context(e, format!("Failed to fetch layer for {image_label}")))?;
+            unpack_layer(layer, &blobs_dir, &overlay_dir, force_update, cancel)?;
         }
 
+        emit_registry_event(
+            "pull.ok",
+            &[("image", Cow::Borrowed(image_label.as_str()))],
+        );
         Ok(manifest)
     }
+}
+
+fn load_cached_manifest(
+    reference: &ImageReference,
+    image_dir: &Path,
+) -> Result<Option<OciManifest>, Box<dyn Error + Send + Sync>> {
+    let manifest_path = match manifest_path_for(reference, image_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(
+                "Ignoring cached manifest for {}: {}",
+                reference.display_name(),
+                err
+            );
+            return Ok(None);
+        }
+    };
+
+    let ttl = match cache_ttl_seconds() {
+        Ok(ttl) => ttl,
+        Err(err) => {
+            warn!("Ignoring manifest cache TTL: {err}");
+            None
+        }
+    };
+
+    if let Some(ttl) = ttl {
+        match std::fs::metadata(&manifest_path) {
+            Ok(meta) => match meta.modified() {
+                Ok(modified) => match modified.elapsed() {
+                    Ok(elapsed) if elapsed.as_secs() > ttl => {
+                        warn!(
+                            "Cached manifest for {} expired after {}s",
+                            reference.display_name(),
+                            ttl
+                        );
+                        return Ok(None);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            "Unable to inspect cache age for {}: {}",
+                            manifest_path.display(),
+                            err
+                        );
+                        return Ok(None);
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        "Unable to inspect cache age for {}: {}",
+                        manifest_path.display(),
+                        err
+                    );
+                    return Ok(None);
+                }
+            },
+            Err(err) => {
+                warn!(
+                    "Unable to inspect cache age for {}: {}",
+                    manifest_path.display(),
+                    err
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    match load_manifest_from_store(reference) {
+        Ok(manifest) => match verify_cached_blobs(&manifest, image_dir) {
+            Ok(()) => Ok(Some(manifest)),
+            Err(err) => {
+                warn!(
+                    "Ignoring cached manifest for {}: {}",
+                    reference.display_name(),
+                    err
+                );
+                Ok(None)
+            }
+        },
+        Err(err) => {
+            warn!(
+                "Failed to load cached manifest for {}: {}",
+                reference.display_name(),
+                err
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn verify_cached_blobs(
+    manifest: &OciManifest,
+    image_dir: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let blobs_dir = image_dir.join("blobs/sha256");
+    let config_path = blobs_dir.join(digest_hex(&manifest.config.digest)?);
+    verify_blob(&config_path, &manifest.config)?;
+    for layer in &manifest.layers {
+        let layer_path = blobs_dir.join(digest_hex(&layer.digest)?);
+        verify_blob(&layer_path, layer)?;
+    }
+    Ok(())
 }
 
 fn pull_from_fake_registry(
     reference: &ImageReference,
     fake_root: &Path,
     force_update: bool,
+    cancel: Option<&CancellationToken>,
 ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
+    check_cancel(cancel)?;
     let manifest_path = fake_root
         .join("manifests")
         .join(&reference.registry)
@@ -435,6 +634,7 @@ fn pull_from_fake_registry(
         &manifest_bytes,
         fake_root,
         force_update,
+        cancel,
     )?;
     Ok(manifest)
 }
@@ -445,9 +645,11 @@ fn persist_fake_artifacts(
     manifest_bytes: &[u8],
     fake_root: &Path,
     force_update: bool,
+    cancel: Option<&CancellationToken>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    check_cancel(cancel)?;
     let manifest_digest = compute_manifest_digest(manifest_bytes)?;
-    let image_dir = image_store_root();
+    let image_dir = image_store_root()?;
     let blobs_dir = image_dir.join("blobs/sha256");
     let refs_dir = image_dir
         .join("refs")
@@ -500,10 +702,12 @@ fn persist_fake_artifacts(
         )
     })?;
 
+    check_cancel(cancel)?;
     copy_fake_blob(fake_root, &manifest.config, &blobs_dir, force_update)?;
     for layer in &manifest.layers {
+        check_cancel(cancel)?;
         copy_fake_blob(fake_root, layer, &blobs_dir, force_update)?;
-        unpack_layer(layer, &blobs_dir, &overlay_dir, force_update)?;
+        unpack_layer(layer, &blobs_dir, &overlay_dir, force_update, cancel)?;
     }
 
     Ok(())
@@ -567,7 +771,9 @@ async fn get_manifest(
     registry: &str,
     repository: &str,
     reference: &str,
+    cancel: Option<&CancellationToken>,
 ) -> Result<ImageDescriptor, Box<dyn Error + Send + Sync>> {
+    check_cancel(cancel)?;
     let url = format!(
         "https://{}/v2/{}/manifests/{}",
         registry, repository, reference
@@ -593,14 +799,14 @@ async fn get_manifest(
                 format!("Registry returned error status fetching {reference} from {registry}"),
             )
         })?
-        .text()
-        .await
-        .map_err(|e| {
-            with_context(
-                e,
-                format!("Failed to read manifest body for {reference} from {registry}"),
-            )
-        })?;
+        .text();
+    check_cancel(cancel)?;
+    let response = response.await.map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to read manifest body for {reference} from {registry}"),
+        )
+    })?;
     serde_json::from_str(&response).map_err(|e| {
         with_context(
             e,
@@ -616,7 +822,9 @@ async fn download_blob<D: Descriptor>(
     descriptor: &D,
     blobs_dir: &Path,
     force_update: bool,
+    cancel: Option<&CancellationToken>,
 ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    check_cancel(cancel)?;
     let digest = descriptor.digest();
     let digest_hex = digest_hex(digest)?;
     let file_path = blobs_dir.join(digest_hex);
@@ -666,29 +874,32 @@ async fn download_blob<D: Descriptor>(
         )
     })?;
     let url = format!("https://{}/v2/{}/blobs/{}", registry, repository, digest);
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            with_context(
-                e,
-                format!("Failed to download blob {digest} from {registry}/{repository}"),
-            )
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            with_context(
-                e,
-                format!("Registry returned error status downloading blob {digest}"),
-            )
-        })?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to download blob {digest} from {registry}/{repository}"),
+        )
+    })?;
+    if let Err(err) = check_cancel(cancel) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    let response = response.error_for_status().map_err(|e| {
+        with_context(
+            e,
+            format!("Registry returned error status downloading blob {digest}"),
+        )
+    })?;
 
     let mut hasher = Hasher::new(MessageDigest::sha256())
         .map_err(|e| with_context(e, format!("Failed to create hasher for blob {digest}")))?;
     let mut written: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        if let Err(err) = check_cancel(cancel) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
         let data = chunk
             .map_err(|e| with_context(e, format!("Failed to read blob chunk for {digest}")))?;
         hasher
@@ -764,7 +975,9 @@ fn unpack_layer(
     blobs_dir: &Path,
     overlay_dir: &Path,
     force_update: bool,
+    cancel: Option<&CancellationToken>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    check_cancel(cancel)?;
     let digest_hex = digest_hex(&layer.digest)?;
     let file_path = blobs_dir.join(digest_hex);
     let out_path = overlay_dir.join(digest_hex);
@@ -979,6 +1192,7 @@ fn get_digest(index: &ImageIndex) -> Result<String, Box<dyn Error + Send + Sync>
 mod tests {
     use super::*;
     use std::io::Write;
+    use tempfile::tempdir;
     use tempfile::NamedTempFile;
 
     fn expected_arch() -> &'static str {
@@ -1197,5 +1411,145 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Unsupported manifest digest format"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_pull_uses_cache_when_fake_registry_missing() {
+        let store_dir = tempdir().expect("store dir");
+        std::env::set_var(
+            "NANOCLOUD_IMAGE_ROOT",
+            store_dir.path().to_string_lossy().as_ref(),
+        );
+        let fake_root = tempdir().expect("fake registry");
+        std::env::set_var(
+            "NANOCLOUD_FAKE_REGISTRY",
+            fake_root.path().to_string_lossy().as_ref(),
+        );
+
+        let registry = "registry.test";
+        let repository = "demo/app";
+        let tag = "latest";
+        let (manifest_bytes, config_digest) = build_fake_manifest_bytes(registry, repository, tag);
+        write_fake_registry(
+            fake_root.path(),
+            registry,
+            repository,
+            tag,
+            &manifest_bytes,
+            &config_digest,
+        );
+
+        let reference = format!("{registry}/{repository}:{tag}");
+        let manifest = Registry::pull(&reference, false, None).await.expect("first pull");
+        assert_eq!(manifest.config.digest, config_digest);
+
+        let blobs_dir = store_dir.path().join("blobs/sha256");
+        let config_path = blobs_dir.join(&config_digest["sha256:".len()..]);
+        let first_modified = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .modified()
+            .expect("modified time");
+
+        let cached = Registry::pull(&reference, false, None).await.expect("cached pull");
+        assert_eq!(cached.config.digest, manifest.config.digest);
+
+        let second_modified = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .modified()
+            .expect("modified time");
+        assert_eq!(first_modified, second_modified);
+        std::env::remove_var("NANOCLOUD_IMAGE_ROOT");
+        std::env::remove_var("NANOCLOUD_FAKE_REGISTRY");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_pull_reports_manifest_errors() {
+        let store_dir = tempdir().expect("store dir");
+        std::env::set_var(
+            "NANOCLOUD_IMAGE_ROOT",
+            store_dir.path().to_string_lossy().as_ref(),
+        );
+        let fake_root = tempdir().expect("fake registry");
+        std::env::set_var(
+            "NANOCLOUD_FAKE_REGISTRY",
+            fake_root.path().to_string_lossy().as_ref(),
+        );
+
+        let registry = "registry.test";
+        let repository = "demo/bad";
+        let tag = "latest";
+        let manifest_path = fake_root
+            .path()
+            .join("manifests")
+            .join(registry)
+            .join(repository)
+            .join(format!("{tag}.json"));
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).expect("manifest dir");
+        std::fs::write(&manifest_path, b"not-json").expect("manifest contents");
+
+        let reference = format!("{registry}/{repository}:{tag}");
+        let error = Registry::pull(&reference, false, None)
+            .await
+            .expect_err("invalid manifest");
+        assert!(
+            error.to_string().contains("Failed to parse fake manifest"),
+            "error should carry context: {}",
+            error
+        );
+        std::env::remove_var("NANOCLOUD_FAKE_REGISTRY");
+        std::env::remove_var("NANOCLOUD_IMAGE_ROOT");
+    }
+
+    fn build_fake_manifest_bytes(
+        registry: &str,
+        repository: &str,
+        tag: &str,
+    ) -> (Vec<u8>, String) {
+        use sha2::{Digest, Sha256};
+        let config_bytes = br#"{"architecture":"amd64","rootfs":{"diff_ids":[],"type":"layers"}}"#;
+        let config_digest = format!("sha256:{:x}", Sha256::digest(config_bytes));
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_bytes.len(),
+            },
+            "layers": [],
+            "annotations": {
+                "org.opencontainers.image.ref.name": format!("{registry}/{repository}:{tag}")
+            }
+        });
+        (
+            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+            config_digest,
+        )
+    }
+
+    fn write_fake_registry(
+        root: &Path,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+        manifest_bytes: &[u8],
+        config_digest: &str,
+    ) {
+        let manifest_path = root
+            .join("manifests")
+            .join(registry)
+            .join(repository)
+            .join(format!("{tag}.json"));
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).expect("manifest dir");
+        std::fs::write(&manifest_path, manifest_bytes).expect("manifest write");
+
+        let blobs_dir = root.join("blobs/sha256");
+        std::fs::create_dir_all(&blobs_dir).expect("blob dir");
+
+        let config_bytes = br#"{"architecture":"amd64","rootfs":{"diff_ids":[],"type":"layers"}}"#;
+        let config_hex = &config_digest["sha256:".len()..];
+        std::fs::write(blobs_dir.join(config_hex), config_bytes).expect("config blob");
     }
 }

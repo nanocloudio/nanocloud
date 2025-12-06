@@ -105,15 +105,26 @@ pub struct Mount {
     pub options: Option<Vec<String>>,
 }
 
+/// Describes a single encrypted volume mapping supplied to the runtime.
+///
+/// Providers should treat these mounts as stable inputs: the orchestrator will
+/// ensure keys and device paths are prepared, and the runtime should expose the
+/// decrypted path inside the container according to the bundle specification.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EncryptedVolumeMount {
+    /// Logical volume name referenced by the workload.
     pub volume: String,
+    /// Device path for the encrypted block device.
     pub device: String,
+    /// Key identifier used to fetch decryption material.
     #[serde(rename = "keyName")]
     pub key_name: String,
+    /// Optional filesystem type to format or mount.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filesystem: Option<String>,
+    /// Mapper name used for the dm-crypt device.
     pub mapper: String,
+    /// Host path where the decrypted volume is mounted.
     #[serde(rename = "hostMount")]
     pub host_mount: String,
 }

@@ -571,6 +571,7 @@ pub async fn install(
     security: Option<BundleSecurityProfile>,
     runtime_overrides: Option<BundleRuntimeSpec>,
     owner: Option<crate::nanocloud::k8s::pod::OwnerReference>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     metrics::observe_container_operation(
         namespace,
@@ -585,6 +586,7 @@ pub async fn install(
             security,
             runtime_overrides,
             owner,
+            cancel,
         ),
     )
     .await
@@ -600,6 +602,7 @@ async fn install_impl(
     mut security: Option<BundleSecurityProfile>,
     runtime_overrides: Option<BundleRuntimeSpec>,
     owner: Option<crate::nanocloud::k8s::pod::OwnerReference>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<InstallResult, Box<dyn Error + Send + Sync>> {
     // Generate container name
     let container_name = namespace
@@ -674,11 +677,11 @@ async fn install_impl(
     }
 
     // // Pull image
-    // let manifest = Registry::pull(&format!("registry.nanocloud.io/{}", app)).await?;
+    // let manifest = Registry::pull(&format!("registry.nanocloud.io/{}", app), false, None).await?;
     // let oci_image = OciImage::load(&manifest.config.digest)?;
 
     // Fetch image metadata and load profile
-    let image = Image::load(namespace, app, combined_options, force_update)
+    let image = Image::load(namespace, app, combined_options, force_update, cancel)
         .await
         .map_err(|e| with_context(e, format!("Failed to load image metadata for {app}")))?;
 

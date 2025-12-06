@@ -64,6 +64,7 @@ dns-bench = []
 events-bench = []
 k8s-store-bench = []
 network-bench = ["criterion"]
+oci-bench = ["criterion"]
 telemetry-otlp = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 [[bin]]
@@ -88,3 +89,8 @@ strip = "symbols"
 name = "network"
 harness = false
 required-features = ["network-bench"]
+
+[[bench]]
+name = "oci"
+harness = false
+required-features = ["oci-bench"]

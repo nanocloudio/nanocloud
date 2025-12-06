@@ -45,6 +45,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const COMPONENT: &str = "bundle-controller";
 const BUNDLE_PREFIX: &str = "/bundles";
@@ -73,10 +74,14 @@ fn start_bundle_executor(
     event_bus: Arc<InMemoryEventBus>,
     recorder: EventRecorder,
 ) {
+    let runtime_for_executor = Arc::clone(runtime);
     if let Err(err) = runtime.spawn_executor(move |item| {
         let registry = Arc::clone(&registry);
         let event_bus = Arc::clone(&event_bus);
         let recorder = recorder.clone();
+        let shutdown = runtime_for_executor
+            .shutdown_token()
+            .unwrap_or_default();
         async move {
             if let ControllerTarget::Bundle { namespace, name } = &item.target {
                 if let Err(err) = reconcile_bundle(
@@ -85,6 +90,7 @@ fn start_bundle_executor(
                     recorder.clone(),
                     namespace.clone(),
                     name.clone(),
+                    &shutdown,
                 )
                 .await
                 {
@@ -258,6 +264,7 @@ async fn reconcile_bundle(
     recorder: EventRecorder,
     namespace: Option<String>,
     name: String,
+    shutdown: &CancellationToken,
 ) -> Result<(), String> {
     let namespace_label = normalize_namespace(namespace.as_deref());
     let Some(bundle) = registry.get(&namespace_label, &name).await else {
@@ -281,7 +288,7 @@ async fn reconcile_bundle(
     let result = tracing::with_span(
         "controller.bundle",
         format!("{}/{}", namespace_label, span_name),
-        reconcile_bundle_inner(registry_for_span, bundle),
+        reconcile_bundle_inner(registry_for_span, bundle, shutdown.to_owned()),
     )
     .await;
     publish_bundle_event(
@@ -304,6 +311,7 @@ async fn reconcile_bundle(
 async fn reconcile_bundle_inner(
     registry: Arc<BundleRegistry>,
     bundle: Bundle,
+    shutdown: CancellationToken,
 ) -> Result<(), String> {
     let Some(resource_version) = bundle.metadata.resource_version.as_deref() else {
         return Err("bundle missing resourceVersion".to_string());
@@ -448,6 +456,7 @@ async fn reconcile_bundle_inner(
         bundle.spec.security.clone(),
         bundle.spec.runtime.clone(),
         bundle_owner_reference(&bundle),
+        Some(&shutdown),
     )
     .await
     {

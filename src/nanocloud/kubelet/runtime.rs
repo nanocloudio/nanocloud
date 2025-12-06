@@ -1819,7 +1819,7 @@ fn create_rootfs(
     let overlay_dir = base.join("overlay");
     let upper = overlay_dir.join("upper");
     let work = overlay_dir.join("work");
-    let overlay_root = image_store_root().join("overlay");
+    let overlay_root = image_store_root()?.join("overlay");
     let lower_dirs = oci_manifest
         .layers
         .iter()
@@ -2003,7 +2003,7 @@ fn load_manifest_for_container(
 fn find_manifest_by_config_digest(
     digest: &str,
 ) -> Result<OciManifest, Box<dyn Error + Send + Sync>> {
-    let refs_root = image_store_root().join("refs");
+    let refs_root = image_store_root()?.join("refs");
     let mut stack: Vec<PathBuf> = vec![refs_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -2068,7 +2068,7 @@ fn overlay_lowerdirs(manifest: &OciManifest) -> Result<Vec<String>, Box<dyn Erro
                 layer.digest
             )));
         }
-        let path = image_store_root()
+        let path = image_store_root()?
             .join("overlay")
             .join(&layer.digest[7..])
             .to_string_lossy()
@@ -2501,7 +2501,7 @@ mod tests {
     use crate::nanocloud::cni::provider::CniPlugin;
     use crate::nanocloud::controller::runtime::ControllerRuntime;
     use crate::nanocloud::dns::{DnsConfig, DnsService};
-    use crate::nanocloud::oci::runtime_provider::ContainerRuntime;
+    use crate::nanocloud::oci::runtime_provider::{ContainerRuntime, RuntimeCapabilities};
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitStatus;
     use nix::unistd::Pid;
@@ -2605,6 +2605,10 @@ mod tests {
     }
 
     impl ContainerRuntime for RecordingRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+
         fn configure_from_spec(
             &self,
             _container_id: &str,

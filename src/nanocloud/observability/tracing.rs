@@ -157,9 +157,7 @@ pub fn init_with_config(config: TracingConfig) -> Result<TracingHandle, Telemetr
     Ok(handle)
 }
 
-fn build_subscriber(
-    config: &TracingConfig,
-) -> Result<BuiltSubscriber, TelemetryError> {
+fn build_subscriber(config: &TracingConfig) -> Result<BuiltSubscriber, TelemetryError> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
         .parse(config.filter_directives.clone())
@@ -220,13 +218,7 @@ pub fn current_context() -> Option<TraceContext> {
 #[cfg(feature = "telemetry-otlp")]
 fn build_otlp_layer(
     config: &TracingConfig,
-) -> Result<
-    (
-        OtlpLayer,
-        opentelemetry_sdk::trace::SdkTracerProvider,
-    ),
-    TelemetryError,
-> {
+) -> Result<(OtlpLayer, opentelemetry_sdk::trace::SdkTracerProvider), TelemetryError> {
     use opentelemetry_otlp::WithExportConfig;
 
     let endpoint = config
@@ -252,7 +244,10 @@ fn build_otlp_layer(
     let tracer = tracer_provider.tracer("nanocloud");
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
 
-    Ok((tracing_opentelemetry::layer().with_tracer(tracer), tracer_provider))
+    Ok((
+        tracing_opentelemetry::layer().with_tracer(tracer),
+        tracer_provider,
+    ))
 }
 
 /// Execute `fut` while publishing a tracing span whose identifiers are

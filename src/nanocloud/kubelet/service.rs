@@ -51,6 +51,7 @@ use tokio::sync::{
 };
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 struct PodRegistration {
     namespace: Option<String>,
@@ -128,6 +129,7 @@ struct ReplicaPlanWork {
     namespace: Option<String>,
     statefulset: String,
     plan: ReplicaSetDesiredState,
+    shutdown: CancellationToken,
 }
 
 /// Tunable restart backoff policy applied to failing pods.
@@ -315,6 +317,7 @@ pub struct Kubelet {
     pods: RwLock<HashMap<String, Arc<PodRegistration>>>,
     resource_counter: AtomicU64,
     plan_tx: UnboundedSender<ReplicaPlanWork>,
+    shutdown: CancellationToken,
 }
 
 static INSTANCE: OnceLock<Arc<Kubelet>> = OnceLock::new();
@@ -326,11 +329,13 @@ impl Kubelet {
             .get_or_init(|| {
                 let runtime = ControllerRuntime::shared();
                 let (plan_tx, mut plan_rx) = mpsc::unbounded_channel();
+                let shutdown = runtime.shutdown_token().unwrap_or_default();
                 let kubelet = Arc::new(Kubelet {
                     runtime: Arc::clone(&runtime),
                     pods: RwLock::new(HashMap::new()),
                     resource_counter: AtomicU64::new(1),
                     plan_tx: plan_tx.clone(),
+                    shutdown,
                 });
                 let worker = Arc::clone(&kubelet);
                 tokio::spawn(async move {
@@ -1286,6 +1291,7 @@ impl Kubelet {
             namespace,
             statefulset,
             plan,
+            shutdown,
         } = work;
 
         let namespace_ref = namespace.as_deref();
@@ -1332,7 +1338,13 @@ impl Kubelet {
 
         for pod_plan in plan.pods.iter() {
             if let Err(err) = self
-                .ensure_statefulset_pod(namespace_ref, statefulset.as_str(), &workload, pod_plan)
+                .ensure_statefulset_pod(
+                    namespace_ref,
+                    statefulset.as_str(),
+                    &workload,
+                    pod_plan,
+                    &shutdown,
+                )
                 .await
             {
                 let error_text = err.to_string();
@@ -1359,6 +1371,7 @@ impl Kubelet {
         statefulset_name: &str,
         workload: &StatefulSet,
         pod_plan: &ReplicaSetPodDesiredState,
+        shutdown: &CancellationToken,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if matches!(pod_plan.action, ReplicaSetPodAction::Update) {
             self.remove_statefulset_pod(namespace, pod_plan.identity.name.as_str())
@@ -1418,7 +1431,7 @@ impl Kubelet {
             new_error("StatefulSet container specification requires an image reference")
         })?;
 
-        let manifest = Registry::pull(&image_reference, false)
+        let manifest = Registry::pull(&image_reference, false, Some(shutdown))
             .await
             .map_err(|err| {
                 with_context(err, format!("Failed to pull image {}", image_reference))
@@ -1601,6 +1614,7 @@ impl KubeletExecutor for Kubelet {
             namespace: namespace.clone(),
             statefulset: statefulset_name,
             plan: plan.clone(),
+            shutdown: self.shutdown.clone(),
         };
         self.plan_tx
             .send(work)

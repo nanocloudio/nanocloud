@@ -119,6 +119,8 @@ static EVENTS_STREAM_ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTROLLER_RECONCILES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BINDING_EXECUTIONS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static IMAGE_PULLS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static OCI_RUNTIME_EVENTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static OCI_REGISTRY_EVENTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static RESTARTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BUNDLE_STATE_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
 static POD_COUNTS_GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
@@ -221,6 +223,30 @@ fn image_pulls_total() -> &'static IntCounterVec {
         );
         let counter =
             IntCounterVec::new(opts, &["cache_hit"]).expect("failed to build image pulls counter");
+        register_collector(counter)
+    })
+}
+
+fn oci_runtime_events_total() -> &'static IntCounterVec {
+    OCI_RUNTIME_EVENTS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "oci_runtime_events_total",
+            "OCI runtime events grouped by event name",
+        );
+        let counter =
+            IntCounterVec::new(opts, &["event"]).expect("failed to build OCI runtime counter");
+        register_collector(counter)
+    })
+}
+
+fn oci_registry_events_total() -> &'static IntCounterVec {
+    OCI_REGISTRY_EVENTS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "oci_registry_events_total",
+            "OCI registry events grouped by event name",
+        );
+        let counter =
+            IntCounterVec::new(opts, &["event"]).expect("failed to build OCI registry counter");
         register_collector(counter)
     })
 }
@@ -1380,6 +1406,18 @@ pub fn record_binding_execution(service: &str, result: BindingExecutionResult) {
 pub fn record_image_pull(cache_hit: bool) {
     let label = if cache_hit { "true" } else { "false" };
     image_pulls_total().with_label_values(&[label]).inc();
+}
+
+pub fn record_oci_runtime_event(event: &str) {
+    oci_runtime_events_total()
+        .with_label_values(&[event])
+        .inc();
+}
+
+pub fn record_oci_registry_event(event: &str) {
+    oci_registry_events_total()
+        .with_label_values(&[event])
+        .inc();
 }
 
 pub fn record_restart(namespace: Option<&str>, service: &str, reason: &str) {

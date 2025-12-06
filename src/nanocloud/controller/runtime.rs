@@ -121,6 +121,10 @@ impl DispatcherHandle {
             let _ = handle.await;
         }
     }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -374,6 +378,19 @@ impl ControllerRuntime {
         let handle = DispatcherHandle::new(queue, join, shutdown);
         *guard = Some(handle.clone());
         Ok(handle)
+    }
+
+    /// Returns a shutdown token that is cancelled when the dispatcher stops.
+    /// If the dispatcher is not yet running, this attempts to start it.
+    pub fn shutdown_token(&self) -> Option<CancellationToken> {
+        match self.ensure_dispatcher() {
+            Ok(handle) => Some(handle.shutdown_token()),
+            Err(_) => self
+                .dispatcher
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|handle| handle.shutdown_token())),
+        }
     }
 }
 
