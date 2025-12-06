@@ -66,13 +66,7 @@ async fn macro_defaults_expand_expected_values() {
     SecureAssets::generate(secure_dir.path(), false).expect("generate secure assets");
     let _secure_guard = EnvGuard::set("NANOCLOUD_SECURE_ASSETS", secure_dir.path());
 
-    let image = Image::load(
-        None,
-        "conformance/fake-loop",
-        HashMap::new(),
-        false,
-        None,
-    )
+    let image = Image::load(None, "conformance/fake-loop", HashMap::new(), false, None)
         .await
         .expect("image load succeeds");
 

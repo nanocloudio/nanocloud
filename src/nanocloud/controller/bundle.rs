@@ -79,9 +79,7 @@ fn start_bundle_executor(
         let registry = Arc::clone(&registry);
         let event_bus = Arc::clone(&event_bus);
         let recorder = recorder.clone();
-        let shutdown = runtime_for_executor
-            .shutdown_token()
-            .unwrap_or_default();
+        let shutdown = runtime_for_executor.shutdown_token().unwrap_or_default();
         async move {
             if let ControllerTarget::Bundle { namespace, name } = &item.target {
                 if let Err(err) = reconcile_bundle(

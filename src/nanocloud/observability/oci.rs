@@ -1,5 +1,5 @@
-use crate::nanocloud::oci::{set_oci_hooks, OciHooks};
 use crate::nanocloud::observability::metrics;
+use crate::nanocloud::oci::{set_oci_hooks, OciHooks};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;

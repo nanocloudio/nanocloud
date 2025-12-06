@@ -18,13 +18,13 @@ use crate::nanocloud::logger::log_info;
 use crate::nanocloud::oci::hooks::emit_registry_event;
 use crate::nanocloud::oci::{fake_registry_root, image_store_root};
 use crate::nanocloud::util::error::{new_error, with_context};
-use std::borrow::Cow;
 use flate2::read::GzDecoder;
 use futures_util::stream::StreamExt;
 use log::warn;
 use openssl::hash::{Hasher, MessageDigest};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{create_dir_all, File};
@@ -487,10 +487,7 @@ impl Registry {
             unpack_layer(layer, &blobs_dir, &overlay_dir, force_update, cancel)?;
         }
 
-        emit_registry_event(
-            "pull.ok",
-            &[("image", Cow::Borrowed(image_label.as_str()))],
-        );
+        emit_registry_event("pull.ok", &[("image", Cow::Borrowed(image_label.as_str()))]);
         Ok(manifest)
     }
 }
@@ -1441,7 +1438,9 @@ mod tests {
         );
 
         let reference = format!("{registry}/{repository}:{tag}");
-        let manifest = Registry::pull(&reference, false, None).await.expect("first pull");
+        let manifest = Registry::pull(&reference, false, None)
+            .await
+            .expect("first pull");
         assert_eq!(manifest.config.digest, config_digest);
 
         let blobs_dir = store_dir.path().join("blobs/sha256");
@@ -1451,7 +1450,9 @@ mod tests {
             .modified()
             .expect("modified time");
 
-        let cached = Registry::pull(&reference, false, None).await.expect("cached pull");
+        let cached = Registry::pull(&reference, false, None)
+            .await
+            .expect("cached pull");
         assert_eq!(cached.config.digest, manifest.config.digest);
 
         let second_modified = std::fs::metadata(&config_path)
@@ -1502,11 +1503,7 @@ mod tests {
         std::env::remove_var("NANOCLOUD_IMAGE_ROOT");
     }
 
-    fn build_fake_manifest_bytes(
-        registry: &str,
-        repository: &str,
-        tag: &str,
-    ) -> (Vec<u8>, String) {
+    fn build_fake_manifest_bytes(registry: &str, repository: &str, tag: &str) -> (Vec<u8>, String) {
         use sha2::{Digest, Sha256};
         let config_bytes = br#"{"architecture":"amd64","rootfs":{"diff_ids":[],"type":"layers"}}"#;
         let config_digest = format!("sha256:{:x}", Sha256::digest(config_bytes));

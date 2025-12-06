@@ -292,10 +292,7 @@ impl ContainerRuntime for LocalContainerRuntime {
                 ],
             );
         } else {
-            emit_runtime_event(
-                "exec.ok",
-                &[("container_id", Cow::Borrowed(container_id))],
-            );
+            emit_runtime_event("exec.ok", &[("container_id", Cow::Borrowed(container_id))]);
         }
         result
     }
@@ -634,7 +631,9 @@ mod tests {
         reset_runtime_provider_for_test();
         let _ = container_runtime();
         shutdown_container_runtime().expect("shutdown");
-        let err = try_container_runtime().err().expect("provider should be cleared");
+        let err = try_container_runtime()
+            .err()
+            .expect("provider should be cleared");
         assert!(matches!(err, RuntimeError::ProviderMissing));
     }
 

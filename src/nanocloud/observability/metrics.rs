@@ -1409,9 +1409,7 @@ pub fn record_image_pull(cache_hit: bool) {
 }
 
 pub fn record_oci_runtime_event(event: &str) {
-    oci_runtime_events_total()
-        .with_label_values(&[event])
-        .inc();
+    oci_runtime_events_total().with_label_values(&[event]).inc();
 }
 
 pub fn record_oci_registry_event(event: &str) {
