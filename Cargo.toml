@@ -66,6 +66,7 @@ k8s-store-bench = []
 network-bench = ["criterion"]
 oci-bench = ["criterion"]
 scheduler-bench = ["criterion"]
+secrets-bench = ["criterion"]
 telemetry-otlp = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 [[bin]]
@@ -100,3 +101,8 @@ required-features = ["oci-bench"]
 name = "scheduler"
 harness = false
 required-features = ["scheduler-bench"]
+
+[[bench]]
+name = "secrets"
+harness = false
+required-features = ["secrets-bench"]
