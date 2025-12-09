@@ -7,7 +7,7 @@ SERVICE_NAME := nanocloud
 VALIDATION_LOG_DIR ?= target/validation
 SCHEMA_OUTPUT_DIR ?= target/schema
 
-.PHONY: all debug release openapi package install clean help validate-controllers schema dockyard-docs test-conformance test-network
+.PHONY: all debug release openapi package install clean help validate-controllers schema dockyard-docs test-conformance test-network test-security
 
 all: debug
 
@@ -53,6 +53,12 @@ test-network:
 	@set -euo pipefail; \
 	$(CARGO) test --locked -p nanocloud --lib network::; \
 	$(CARGO) test --locked -p nanocloud --doc network::
+
+# Run security module tests (unit, integration, and validation)
+test-security:
+	@set -euo pipefail; \
+	$(CARGO) test --locked -p nanocloud --lib security::; \
+	$(CARGO) test --locked -p nanocloud --test security_validation
 
 lint:
 	$(CARGO) clippy --all-targets --all-features
@@ -100,4 +106,5 @@ help:
 	 echo "  install  Install the latest Debian package and restart the service if active"; \
 	 echo "  clean    Remove build artifacts"; \
 	 echo "  validate-controllers  Run controller validation pipeline"; \
-	 echo "  test-network  Run network module unit/doc tests (including doc tests)"
+	 echo "  test-network  Run network module unit/doc tests (including doc tests)"; \
+	 echo "  test-security Run security module unit and integration tests"

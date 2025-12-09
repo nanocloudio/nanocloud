@@ -68,6 +68,8 @@ oci-bench = ["criterion"]
 scheduler-bench = ["criterion"]
 secrets-bench = ["criterion"]
 telemetry-otlp = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# Enable runtime capability list override for testing (reads from NANOCLOUD_EXTRA_CAPABILITIES env var)
+security-test-caps = []
 
 [[bin]]
 name = "openapi_gen"
