@@ -140,6 +140,15 @@ pub async fn issue_ephemeral_certificate(
             Err(BootstrapTokenError::Malformed(_)) => {
                 return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid token"));
             }
+            Err(BootstrapTokenError::InvalidFormat(_)) => {
+                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid token format"));
+            }
+            Err(BootstrapTokenError::Expired) => {
+                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "token has expired"));
+            }
+            Err(BootstrapTokenError::DecryptionFailed(_)) => {
+                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "token decryption failed"));
+            }
             Err(BootstrapTokenError::Storage(err)) => {
                 return Err(ApiError::internal_error(err.into()));
             }

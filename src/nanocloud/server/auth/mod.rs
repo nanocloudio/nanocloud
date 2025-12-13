@@ -1,5 +1,3 @@
-pub(crate) mod bootstrap;
-
 /*
  * Copyright (C) 2024 The Nanocloud Authors
  *
@@ -15,6 +13,97 @@ pub(crate) mod bootstrap;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+//! Authentication and authorization middleware for the Nanocloud API.
+//!
+//! This module provides the authentication layer for the HTTP server, supporting
+//! multiple authentication mechanisms.
+//!
+//! # Authentication Methods
+//!
+//! ## Client Certificates (mTLS)
+//!
+//! The primary authentication method. Client certificates are validated during
+//! the TLS handshake and the subject's Distinguished Name (DN) is extracted.
+//!
+//! ```text
+//! Subject: CN=service-name,O=nanocloud
+//! ```
+//!
+//! Special handling for device certificates:
+//! - Certificates with `CN=device:<device-id>` are treated as device identities
+//! - These receive `AuthScope::Device` scope
+//!
+//! ## JWT Bearer Tokens
+//!
+//! Service account tokens for API authentication:
+//!
+//! ```text
+//! Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+//! ```
+//!
+//! Required claims:
+//! - `sub`: Subject (service account name)
+//! - `iss`: Issuer (must match cluster identifier)
+//! - `aud`: Audience (must include "nanocloud")
+//! - `scope`: Array of granted scopes
+//! - `exp`: Expiration timestamp
+//!
+//! ## Bootstrap Tokens
+//!
+//! One-time tokens for initial registration:
+//!
+//! ```text
+//! Authorization: Bearer <token-id>.<token-secret>
+//! ```
+//!
+//! Properties:
+//! - Consumed on first successful use
+//! - Associated with a specific subject and scopes
+//! - Optional cluster binding
+//! - Encrypted storage with authenticated encryption
+//!
+//! # Authorization
+//!
+//! Authorization is based on the authenticated identity and requested operation.
+//! The `AuthContext` attached to each request contains:
+//!
+//! - `subject`: The authenticated identity
+//! - `scope`: The granted permissions
+//!
+//! ## Auth Scopes
+//!
+//! - `Unauthenticated`: No valid credentials provided
+//! - `Certificate`: Authenticated via client certificate
+//! - `Device`: Device identity (special certificate)
+//! - `Bootstrap`: Bootstrap token (limited scope)
+//! - `Jwt(scopes)`: JWT with specific scopes
+//!
+//! # Usage
+//!
+//! The `AuthLayer` is applied to the router to automatically extract
+//! authentication context from requests:
+//!
+//! ```ignore
+//! use nanocloud::server::auth::AuthLayer;
+//!
+//! let app = Router::new()
+//!     .route("/api/v1/pods", get(list_pods))
+//!     .layer(AuthLayer::new());
+//! ```
+//!
+//! Handlers can extract the auth context:
+//!
+//! ```ignore
+//! use nanocloud::server::auth::{AuthContext, RequestAuthExt};
+//!
+//! async fn list_pods(request: Request<Body>) -> Result<Response, ApiError> {
+//!     let context = request.auth_context()?;
+//!     // Check authorization...
+//! }
+//! ```
+
+pub(crate) mod bootstrap;
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, MatchedPath};
@@ -499,6 +588,33 @@ where
                             &metadata,
                         );
                     }
+                    Err(BootstrapTokenError::InvalidFormat(message)) => {
+                        metrics::record_bootstrap_token_attempt(BootstrapAuthOutcome::Invalid);
+                        let owned = [("token", redact_token(&token)), ("error", message)];
+                        let metadata: Vec<(&str, &str)> = owned
+                            .iter()
+                            .map(|(key, value)| (*key, value.as_str()))
+                            .collect();
+                        log_warn(AUTH_LOG_COMPONENT, "Bootstrap token format invalid", &metadata);
+                    }
+                    Err(BootstrapTokenError::Expired) => {
+                        metrics::record_bootstrap_token_attempt(BootstrapAuthOutcome::Invalid);
+                        let owned = [("token", redact_token(&token)), ("error", "token expired".to_string())];
+                        let metadata: Vec<(&str, &str)> = owned
+                            .iter()
+                            .map(|(key, value)| (*key, value.as_str()))
+                            .collect();
+                        log_warn(AUTH_LOG_COMPONENT, "Bootstrap token expired", &metadata);
+                    }
+                    Err(BootstrapTokenError::DecryptionFailed(message)) => {
+                        metrics::record_bootstrap_token_attempt(BootstrapAuthOutcome::Invalid);
+                        let owned = [("token", redact_token(&token)), ("error", message)];
+                        let metadata: Vec<(&str, &str)> = owned
+                            .iter()
+                            .map(|(key, value)| (*key, value.as_str()))
+                            .collect();
+                        log_warn(AUTH_LOG_COMPONENT, "Bootstrap token decryption failed", &metadata);
+                    }
                 }
             } else {
                 metrics::record_bootstrap_token_attempt(BootstrapAuthOutcome::Invalid);
@@ -563,6 +679,60 @@ impl<B> RequestAuthExt for Request<B> {
     fn auth_context(&self) -> Option<&AuthContext> {
         self.extensions().get::<AuthContext>()
     }
+}
+
+// ============================================================================
+// Auth Helper Functions for Handlers
+// ============================================================================
+
+/// Extract the authenticated subject's identifier from the context.
+/// Returns the subject string (DN, device ID, JWT subject, or bootstrap token subject).
+#[allow(dead_code)]
+pub fn extract_subject_identifier(context: &AuthContext) -> Option<String> {
+    match context.subject() {
+        AuthSubject::Anonymous => None,
+        AuthSubject::DistinguishedName(dn) => Some(dn.clone()),
+        AuthSubject::Device { device_id, .. } => Some(device_id.clone()),
+        AuthSubject::BootstrapToken(subject) => Some(subject.clone()),
+        AuthSubject::Jwt { subject, .. } => Some(subject.clone()),
+    }
+}
+
+/// Check if the authenticated subject has a specific JWT scope.
+#[allow(dead_code)]
+pub fn has_jwt_scope(context: &AuthContext, required_scope: &str) -> bool {
+    match context.scope() {
+        AuthScope::Certificate => true, // Certificates always have full access
+        AuthScope::Jwt(scopes) => {
+            scopes.iter().any(|s| s == required_scope || s == "*")
+        }
+        _ => false,
+    }
+}
+
+/// Check if the request has any valid authentication (not anonymous).
+#[allow(dead_code)]
+pub fn is_authenticated(context: &AuthContext) -> bool {
+    !matches!(context.subject(), AuthSubject::Anonymous)
+        && !matches!(context.scope(), AuthScope::Unauthenticated)
+}
+
+/// Check if authentication is via certificate (highest privilege).
+#[allow(dead_code)]
+pub fn is_certificate_auth(context: &AuthContext) -> bool {
+    matches!(context.scope(), AuthScope::Certificate)
+}
+
+/// Check if authentication is via device certificate.
+#[allow(dead_code)]
+pub fn is_device_auth(context: &AuthContext) -> bool {
+    matches!(context.scope(), AuthScope::Device)
+}
+
+/// Check if authentication is via bootstrap token.
+#[allow(dead_code)]
+pub fn is_bootstrap_auth(context: &AuthContext) -> bool {
+    matches!(context.scope(), AuthScope::Bootstrap)
 }
 
 /// Middleware that rejects requests without an authenticated subject or required scope.
@@ -1343,4 +1513,123 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    // ========================================================================
+    // Tests for auth helper functions
+    // ========================================================================
+
+    #[test]
+    fn extract_subject_identifier_from_dn() {
+        let context = AuthContext {
+            subject: AuthSubject::DistinguishedName("CN=test-user".to_string()),
+            scope: AuthScope::Certificate,
+        };
+        assert_eq!(
+            extract_subject_identifier(&context),
+            Some("CN=test-user".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_subject_identifier_from_device() {
+        let context = AuthContext {
+            subject: AuthSubject::Device {
+                device_id: "device-123".to_string(),
+                distinguished_name: "CN=device:device-123".to_string(),
+            },
+            scope: AuthScope::Device,
+        };
+        assert_eq!(
+            extract_subject_identifier(&context),
+            Some("device-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_subject_identifier_from_jwt() {
+        let context = AuthContext {
+            subject: AuthSubject::Jwt {
+                subject: "user@example.com".to_string(),
+                issuer: Some("nanocloud".to_string()),
+            },
+            scope: AuthScope::Jwt(vec!["read".to_string()]),
+        };
+        assert_eq!(
+            extract_subject_identifier(&context),
+            Some("user@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_subject_identifier_returns_none_for_anonymous() {
+        let context = AuthContext::default();
+        assert_eq!(extract_subject_identifier(&context), None);
+    }
+
+    #[test]
+    fn has_jwt_scope_matches_exact_scope() {
+        let context = AuthContext {
+            subject: AuthSubject::Jwt {
+                subject: "user".to_string(),
+                issuer: None,
+            },
+            scope: AuthScope::Jwt(vec!["pods.read".to_string(), "pods.write".to_string()]),
+        };
+        assert!(has_jwt_scope(&context, "pods.read"));
+        assert!(has_jwt_scope(&context, "pods.write"));
+        assert!(!has_jwt_scope(&context, "secrets.read"));
+    }
+
+    #[test]
+    fn has_jwt_scope_wildcard_matches_all() {
+        let context = AuthContext {
+            subject: AuthSubject::Jwt {
+                subject: "admin".to_string(),
+                issuer: None,
+            },
+            scope: AuthScope::Jwt(vec!["*".to_string()]),
+        };
+        assert!(has_jwt_scope(&context, "anything"));
+        assert!(has_jwt_scope(&context, "pods.read"));
+    }
+
+    #[test]
+    fn has_jwt_scope_certificate_always_authorized() {
+        let context = AuthContext {
+            subject: AuthSubject::DistinguishedName("CN=admin".to_string()),
+            scope: AuthScope::Certificate,
+        };
+        assert!(has_jwt_scope(&context, "anything"));
+    }
+
+    #[test]
+    fn is_authenticated_detects_valid_auth() {
+        let authenticated = AuthContext {
+            subject: AuthSubject::BootstrapToken("user".to_string()),
+            scope: AuthScope::Bootstrap,
+        };
+        assert!(is_authenticated(&authenticated));
+
+        let anonymous = AuthContext::default();
+        assert!(!is_authenticated(&anonymous));
+    }
+
+    #[test]
+    fn is_certificate_auth_detects_cert_scope() {
+        let cert_auth = AuthContext {
+            subject: AuthSubject::DistinguishedName("CN=test".to_string()),
+            scope: AuthScope::Certificate,
+        };
+        assert!(is_certificate_auth(&cert_auth));
+
+        let jwt_auth = AuthContext {
+            subject: AuthSubject::Jwt {
+                subject: "user".to_string(),
+                issuer: None,
+            },
+            scope: AuthScope::Jwt(vec![]),
+        };
+        assert!(!is_certificate_auth(&jwt_auth));
+    }
+
 }

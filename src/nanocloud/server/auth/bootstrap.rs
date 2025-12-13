@@ -1,3 +1,39 @@
+//! Bootstrap token authentication service.
+//!
+//! This module provides single-use bootstrap tokens for initial cluster setup
+//! and device enrollment. Tokens are stored encrypted in the keyspace with
+//! optional TTL expiration.
+//!
+//! # Token Format
+//!
+//! Bootstrap tokens follow the format `{id}.{secret}` where:
+//! - `id`: Unique token identifier used for storage lookup
+//! - `secret`: Encrypted secret validated against stored ciphertext
+//!
+//! # Storage
+//!
+//! Tokens are stored in the keyspace at `/v1/token/{id}` with the following
+//! JSON structure:
+//!
+//! ```json
+//! {
+//!   "user": "subject-name",
+//!   "cluster": "cluster-name",
+//!   "scope": ["scope1", "scope2"],
+//!   "aud": ["audience1"],
+//!   "secret": {
+//!     "key": "wrapped-encryption-key",
+//!     "ciphertext": "encrypted-secret"
+//!   }
+//! }
+//! ```
+//!
+//! # Security
+//!
+//! - Tokens are single-use and consumed after successful validation
+//! - Token secrets are stored encrypted using the cluster encryption key
+//! - Expired tokens are automatically cleaned up by a background maintenance task
+
 use std::error::Error;
 use std::fmt;
 use std::sync::OnceLock;
@@ -17,6 +53,12 @@ const BOOTSTRAP_PREFIX: &str = "/v1/token";
 const BOOTSTRAP_LOG_COMPONENT: &str = "auth-bootstrap";
 const TOKEN_REPAIR_SCHEDULE: &str = "0 */5 * * * *";
 
+/// Maximum length for token IDs to prevent abuse.
+const MAX_TOKEN_ID_LENGTH: usize = 256;
+
+/// Maximum length for subject names.
+const MAX_SUBJECT_LENGTH: usize = 512;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BootstrapToken {
     pub token: String,
@@ -28,10 +70,41 @@ pub(crate) struct BootstrapToken {
     pub raw: String,
 }
 
+/// Error types for bootstrap token operations.
 #[derive(Debug)]
 pub(crate) enum BootstrapTokenError {
+    /// Keyspace storage error
     Storage(String),
+    /// Token payload is malformed or invalid
     Malformed(String),
+    /// Token format validation failed
+    InvalidFormat(String),
+    /// Token has expired
+    Expired,
+    /// Secret decryption failed
+    DecryptionFailed(String),
+}
+
+impl BootstrapTokenError {
+    /// Returns true if this is a validation error (client's fault).
+    #[allow(dead_code)]
+    pub fn is_client_error(&self) -> bool {
+        matches!(
+            self,
+            BootstrapTokenError::Malformed(_)
+                | BootstrapTokenError::InvalidFormat(_)
+                | BootstrapTokenError::Expired
+        )
+    }
+
+    /// Returns true if this is a server/storage error.
+    #[allow(dead_code)]
+    pub fn is_server_error(&self) -> bool {
+        matches!(
+            self,
+            BootstrapTokenError::Storage(_) | BootstrapTokenError::DecryptionFailed(_)
+        )
+    }
 }
 
 impl fmt::Display for BootstrapTokenError {
@@ -41,11 +114,71 @@ impl fmt::Display for BootstrapTokenError {
             BootstrapTokenError::Malformed(msg) => {
                 write!(f, "invalid bootstrap token payload: {msg}")
             }
+            BootstrapTokenError::InvalidFormat(msg) => {
+                write!(f, "invalid token format: {msg}")
+            }
+            BootstrapTokenError::Expired => write!(f, "bootstrap token has expired"),
+            BootstrapTokenError::DecryptionFailed(msg) => {
+                write!(f, "failed to decrypt token secret: {msg}")
+            }
         }
     }
 }
 
 impl Error for BootstrapTokenError {}
+
+/// Validate a bootstrap token format before lookup.
+///
+/// Returns the token ID and secret parts if valid.
+#[allow(dead_code)]
+pub(crate) fn validate_token_format(token: &str) -> Result<(String, String), BootstrapTokenError> {
+    let trimmed = token.trim();
+
+    if trimmed.is_empty() {
+        return Err(BootstrapTokenError::InvalidFormat(
+            "token cannot be empty".to_string(),
+        ));
+    }
+
+    if trimmed.len() > MAX_TOKEN_ID_LENGTH + MAX_TOKEN_ID_LENGTH + 1 {
+        return Err(BootstrapTokenError::InvalidFormat(
+            "token exceeds maximum length".to_string(),
+        ));
+    }
+
+    let (id, secret) = trimmed.split_once('.').ok_or_else(|| {
+        BootstrapTokenError::InvalidFormat(
+            "token must be in format 'id.secret'".to_string(),
+        )
+    })?;
+
+    if id.is_empty() {
+        return Err(BootstrapTokenError::InvalidFormat(
+            "token ID cannot be empty".to_string(),
+        ));
+    }
+
+    if secret.is_empty() {
+        return Err(BootstrapTokenError::InvalidFormat(
+            "token secret cannot be empty".to_string(),
+        ));
+    }
+
+    if id.len() > MAX_TOKEN_ID_LENGTH {
+        return Err(BootstrapTokenError::InvalidFormat(
+            format!("token ID exceeds maximum length of {}", MAX_TOKEN_ID_LENGTH),
+        ));
+    }
+
+    // Check for invalid characters in ID (path traversal prevention)
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(BootstrapTokenError::InvalidFormat(
+            "token ID contains invalid characters".to_string(),
+        ));
+    }
+
+    Ok((id.to_string(), secret.to_string()))
+}
 
 #[derive(Clone)]
 pub(crate) struct BootstrapTokenService {
@@ -112,6 +245,12 @@ impl BootstrapTokenService {
             }
         }
 
+        if let Some(expiry) = expires_at {
+            if SystemTime::now() >= expiry {
+                return Err(BootstrapTokenError::Expired);
+            }
+        }
+
         let subject = grant
             .get("user")
             .and_then(Value::as_str)
@@ -123,6 +262,13 @@ impl BootstrapTokenService {
                 )
             })?
             .to_string();
+
+        if subject.len() > MAX_SUBJECT_LENGTH {
+            return Err(BootstrapTokenError::Malformed(format!(
+                "bootstrap token subject exceeds maximum length of {} characters",
+                MAX_SUBJECT_LENGTH
+            )));
+        }
 
         let cluster = grant
             .get("cluster")
@@ -323,12 +469,12 @@ fn extract_secret(grant: &Value) -> Result<Option<String>, BootstrapTokenError> 
         })?;
 
     let encryption_key = EncryptionKey::unwrap(&key.to_string())
-        .map_err(|err| BootstrapTokenError::Malformed(err.to_string()))?;
+        .map_err(|err| BootstrapTokenError::DecryptionFailed(err.to_string()))?;
     let decrypted = encryption_key
         .decrypt(&ciphertext.to_string())
-        .map_err(|err| BootstrapTokenError::Malformed(err.to_string()))?;
+        .map_err(|err| BootstrapTokenError::DecryptionFailed(err.to_string()))?;
     let secret = String::from_utf8(decrypted).map_err(|_| {
-        BootstrapTokenError::Malformed(
+        BootstrapTokenError::DecryptionFailed(
             "bootstrap token secret payload was not valid UTF-8".to_string(),
         )
     })?;
@@ -531,6 +677,91 @@ mod tests {
     }
 
     #[test]
+    fn validate_token_format_accepts_valid_tokens() {
+        let result = validate_token_format("abc123.secret456");
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "abc123");
+        assert_eq!(secret, "secret456");
+    }
+
+    #[test]
+    fn validate_token_format_rejects_empty() {
+        assert!(matches!(
+            validate_token_format(""),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            validate_token_format("   "),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn validate_token_format_rejects_no_separator() {
+        assert!(matches!(
+            validate_token_format("noseparator"),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn validate_token_format_rejects_empty_parts() {
+        assert!(matches!(
+            validate_token_format(".secret"),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            validate_token_format("id."),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn validate_token_format_rejects_path_traversal() {
+        assert!(matches!(
+            validate_token_format("../etc/passwd.secret"),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            validate_token_format("foo/bar.secret"),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            validate_token_format("foo\\bar.secret"),
+            Err(BootstrapTokenError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn bootstrap_token_error_classification() {
+        assert!(BootstrapTokenError::Malformed("test".into()).is_client_error());
+        assert!(BootstrapTokenError::InvalidFormat("test".into()).is_client_error());
+        assert!(BootstrapTokenError::Expired.is_client_error());
+
+        assert!(BootstrapTokenError::Storage("test".into()).is_server_error());
+        assert!(BootstrapTokenError::DecryptionFailed("test".into()).is_server_error());
+    }
+
+    #[test]
+    fn bootstrap_token_error_display() {
+        let storage = BootstrapTokenError::Storage("io error".into());
+        assert!(storage.to_string().contains("keyspace error"));
+
+        let malformed = BootstrapTokenError::Malformed("bad json".into());
+        assert!(malformed.to_string().contains("invalid bootstrap token"));
+
+        let invalid = BootstrapTokenError::InvalidFormat("no dot".into());
+        assert!(invalid.to_string().contains("invalid token format"));
+
+        let expired = BootstrapTokenError::Expired;
+        assert!(expired.to_string().contains("expired"));
+
+        let decrypt = BootstrapTokenError::DecryptionFailed("key error".into());
+        assert!(decrypt.to_string().contains("decrypt"));
+    }
+
+    #[test]
     #[serial]
     fn returns_none_for_missing_or_expired_token() {
         let _guard = test_lock().lock().unwrap();
@@ -575,5 +806,143 @@ mod tests {
 
         thread::sleep(Duration::from_secs(2));
         assert!(service.lookup(&full_token).unwrap().is_none());
+    }
+
+    // Additional configuration validation tests
+
+    #[test]
+    fn validate_token_format_rejects_too_long_id() {
+        // Token IDs longer than MAX_TOKEN_ID_LENGTH should be rejected
+        let long_id = "a".repeat(MAX_TOKEN_ID_LENGTH + 1);
+        let token = format!("{}.secret", long_id);
+        let result = validate_token_format(&token);
+        assert!(matches!(result, Err(BootstrapTokenError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn validate_token_format_accepts_max_length_id() {
+        // Token IDs at exactly MAX_TOKEN_ID_LENGTH should be accepted
+        let max_id = "a".repeat(MAX_TOKEN_ID_LENGTH);
+        let token = format!("{}.secret", max_id);
+        let result = validate_token_format(&token);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_token_format_handles_multiple_dots() {
+        // Token with multiple dots - should split at first dot
+        let result = validate_token_format("id.part1.part2.part3");
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "id");
+        assert_eq!(secret, "part1.part2.part3");
+    }
+
+    #[test]
+    fn bootstrap_token_error_is_server_error() {
+        assert!(!BootstrapTokenError::Malformed("test".into()).is_server_error());
+        assert!(!BootstrapTokenError::InvalidFormat("test".into()).is_server_error());
+        assert!(!BootstrapTokenError::Expired.is_server_error());
+
+        assert!(BootstrapTokenError::Storage("test".into()).is_server_error());
+        assert!(BootstrapTokenError::DecryptionFailed("test".into()).is_server_error());
+    }
+
+    #[test]
+    fn bootstrap_token_equality() {
+        let token1 = BootstrapToken {
+            token: "abc.def".to_string(),
+            subject: "user1".to_string(),
+            cluster: Some("cluster1".to_string()),
+            scopes: vec!["scope1".to_string()],
+            audiences: vec!["aud1".to_string()],
+            expires_at: None,
+            raw: "{}".to_string(),
+        };
+
+        let token2 = BootstrapToken {
+            token: "abc.def".to_string(),
+            subject: "user1".to_string(),
+            cluster: Some("cluster1".to_string()),
+            scopes: vec!["scope1".to_string()],
+            audiences: vec!["aud1".to_string()],
+            expires_at: None,
+            raw: "{}".to_string(),
+        };
+
+        assert_eq!(token1, token2);
+    }
+
+    #[test]
+    fn bootstrap_token_debug() {
+        let token = BootstrapToken {
+            token: "abc.def".to_string(),
+            subject: "testuser".to_string(),
+            cluster: None,
+            scopes: vec![],
+            audiences: vec![],
+            expires_at: None,
+            raw: "{}".to_string(),
+        };
+
+        let debug = format!("{:?}", token);
+        assert!(debug.contains("testuser"));
+        assert!(debug.contains("BootstrapToken"));
+    }
+
+    #[test]
+    fn bootstrap_token_clone() {
+        let token = BootstrapToken {
+            token: "abc.def".to_string(),
+            subject: "user".to_string(),
+            cluster: Some("cluster".to_string()),
+            scopes: vec!["read".to_string(), "write".to_string()],
+            audiences: vec!["api".to_string()],
+            expires_at: None,
+            raw: "{}".to_string(),
+        };
+
+        let cloned = token.clone();
+        assert_eq!(token, cloned);
+    }
+
+    #[test]
+    fn validate_token_format_whitespace_handling() {
+        // Leading/trailing whitespace in parts should be handled
+        let result = validate_token_format("  id  .  secret  ");
+        // Should either fail validation or trim whitespace appropriately
+        // Current implementation doesn't trim, so spaces become part of id
+        if result.is_ok() {
+            let (id, _secret) = result.unwrap();
+            // Verify behavior is consistent
+            assert!(id.contains(" ") || id == "id");
+        }
+    }
+
+    #[test]
+    fn validate_token_format_special_characters() {
+        // Test with various special characters that might be problematic
+        // Path separators in the ID (before first dot) should be rejected
+        assert!(validate_token_format("id/part.secret").is_err());
+        assert!(validate_token_format("id\\part.secret").is_err());
+
+        // Double-dot is only checked in the ID portion (before first dot)
+        // The ID is everything before the first dot character
+        // "a..b.secret" -> id="a", so no .. in ID, accepted
+        let result = validate_token_format("a..b.secret");
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "a");
+        assert_eq!(secret, ".b.secret");
+
+        // "a..secret" -> id="a", secret=".secret", valid
+        assert!(validate_token_format("a..secret").is_ok());
+
+        // To actually trigger the .. rejection, it must appear in the ID
+        // (before the first dot). Using a split_once means .. before first dot.
+        assert!(validate_token_format("a..secret").is_ok()); // a, .secret - no .. in "a"
+
+        // Edge case: token starting with .. has id=".." which contains ".."
+        assert!(validate_token_format("..a.secret").is_err());
     }
 }

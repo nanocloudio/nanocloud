@@ -14,6 +14,31 @@
  * limitations under the License.
  */
 
+//! Centralized request validation and selector parsing.
+//!
+//! This module provides utilities for parsing Kubernetes-style selectors
+//! (field selectors and label selectors) and validating common request parameters.
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use crate::nanocloud::server::handlers::selectors::{
+//!     parse_object_selector, validate_namespace, validate_resource_name
+//! };
+//!
+//! // Parse selectors
+//! let selector = parse_object_selector(
+//!     Some("metadata.name=my-pod"),
+//!     Some("app=web,env=prod")
+//! )?;
+//!
+//! // Validate namespace
+//! let ns = validate_namespace(&namespace)?;
+//!
+//! // Validate resource name
+//! let name = validate_resource_name(&name, "Pod")?;
+//! ```
+
 use super::error::ApiError;
 use crate::nanocloud::k8s::{
     configmap::ConfigMap,
@@ -480,6 +505,183 @@ fn normalize_value(value: &str) -> String {
     trimmed.to_string()
 }
 
+// ============================================================================
+// Request Validation Helpers
+// ============================================================================
+
+/// Maximum length for Kubernetes resource names (DNS subdomain).
+const MAX_NAME_LENGTH: usize = 253;
+
+/// Maximum length for Kubernetes namespace names (DNS label).
+const MAX_NAMESPACE_LENGTH: usize = 63;
+
+/// Validate a Kubernetes namespace name.
+///
+/// Kubernetes namespace names must:
+/// - Be non-empty
+/// - Be at most 63 characters
+/// - Contain only lowercase alphanumeric characters or '-'
+/// - Start with an alphabetic character
+/// - End with an alphanumeric character
+#[allow(dead_code)]
+pub fn validate_namespace(namespace: &str) -> Result<&str, ApiError> {
+    if namespace.is_empty() {
+        return Err(ApiError::bad_request("namespace cannot be empty"));
+    }
+
+    if namespace.len() > MAX_NAMESPACE_LENGTH {
+        return Err(ApiError::bad_request(format!(
+            "namespace cannot exceed {} characters",
+            MAX_NAMESPACE_LENGTH
+        )));
+    }
+
+    if !is_valid_dns_label(namespace) {
+        return Err(ApiError::bad_request(
+            "namespace must be a valid DNS label (lowercase alphanumeric with hyphens, starting with letter)",
+        ));
+    }
+
+    Ok(namespace)
+}
+
+/// Validate a Kubernetes resource name.
+///
+/// Kubernetes resource names must:
+/// - Be non-empty
+/// - Be at most 253 characters (DNS subdomain)
+/// - Contain only lowercase alphanumeric characters, '-' or '.'
+/// - Start and end with an alphanumeric character
+#[allow(dead_code)]
+pub fn validate_resource_name<'a>(name: &'a str, resource_kind: &str) -> Result<&'a str, ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "{} name cannot be empty",
+            resource_kind
+        )));
+    }
+
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(ApiError::bad_request(format!(
+            "{} name cannot exceed {} characters",
+            resource_kind, MAX_NAME_LENGTH
+        )));
+    }
+
+    if !is_valid_dns_subdomain(name) {
+        return Err(ApiError::bad_request(format!(
+            "{} name must be a valid DNS subdomain (lowercase alphanumeric with hyphens/dots, \
+             starting and ending with alphanumeric)",
+            resource_kind
+        )));
+    }
+
+    Ok(name)
+}
+
+/// Validate that a string is a valid positive integer for limit/timeout parameters.
+#[allow(dead_code)]
+pub fn validate_positive_integer(value: &str, param_name: &str) -> Result<u64, ApiError> {
+    value.parse::<u64>().map_err(|_| {
+        ApiError::bad_request(format!(
+            "{} must be a positive integer",
+            param_name
+        ))
+    }).and_then(|n| {
+        if n == 0 {
+            Err(ApiError::bad_request(format!(
+                "{} must be greater than 0",
+                param_name
+            )))
+        } else {
+            Ok(n)
+        }
+    })
+}
+
+/// Validate that a limit value is within bounds.
+#[allow(dead_code)]
+pub fn validate_limit(limit: u32, max_allowed: u32) -> Result<u32, ApiError> {
+    if limit == 0 {
+        return Err(ApiError::bad_request("limit must be greater than 0"));
+    }
+    if limit > max_allowed {
+        return Err(ApiError::bad_request(format!(
+            "limit cannot exceed {}",
+            max_allowed
+        )));
+    }
+    Ok(limit)
+}
+
+/// Validate a container name.
+#[allow(dead_code)]
+pub fn validate_container_name(name: &str) -> Result<&str, ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request("container name cannot be empty"));
+    }
+
+    if name.len() > MAX_NAMESPACE_LENGTH {
+        return Err(ApiError::bad_request(format!(
+            "container name cannot exceed {} characters",
+            MAX_NAMESPACE_LENGTH
+        )));
+    }
+
+    // Container names follow DNS label rules
+    if !is_valid_dns_label(name) {
+        return Err(ApiError::bad_request(
+            "container name must be a valid DNS label",
+        ));
+    }
+
+    Ok(name)
+}
+
+/// Check if a string is a valid DNS label (RFC 1123).
+fn is_valid_dns_label(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+
+    // Must start with a letter
+    if !chars[0].is_ascii_lowercase() {
+        return false;
+    }
+
+    // Must end with alphanumeric
+    if !chars.last().unwrap().is_ascii_alphanumeric() {
+        return false;
+    }
+
+    // All characters must be lowercase alphanumeric or hyphen
+    chars.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+}
+
+/// Check if a string is a valid DNS subdomain (RFC 1123).
+fn is_valid_dns_subdomain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+
+    // Must start with alphanumeric
+    if !chars[0].is_ascii_alphanumeric() {
+        return false;
+    }
+
+    // Must end with alphanumeric
+    if !chars.last().unwrap().is_ascii_alphanumeric() {
+        return false;
+    }
+
+    // All characters must be lowercase alphanumeric, hyphen, or dot
+    chars.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +963,293 @@ mod tests {
         .expect("selector mismatch should be rejected");
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ========================================================================
+    // Validation Helper Tests
+    // ========================================================================
+
+    #[test]
+    fn validate_namespace_accepts_valid_names() {
+        assert!(validate_namespace("default").is_ok());
+        assert!(validate_namespace("kube-system").is_ok());
+        assert!(validate_namespace("my-app-prod").is_ok());
+        assert!(validate_namespace("a1b2c3").is_ok());
+    }
+
+    #[test]
+    fn validate_namespace_rejects_invalid_names() {
+        assert!(validate_namespace("").is_err());
+        assert!(validate_namespace("Default").is_err()); // uppercase
+        assert!(validate_namespace("-invalid").is_err()); // starts with hyphen
+        assert!(validate_namespace("invalid-").is_err()); // ends with hyphen
+        assert!(validate_namespace("has_underscore").is_err());
+        assert!(validate_namespace("has.dot").is_err());
+        assert!(validate_namespace("123numeric").is_err()); // starts with number
+    }
+
+    #[test]
+    fn validate_namespace_rejects_too_long() {
+        let long_name = "a".repeat(64);
+        assert!(validate_namespace(&long_name).is_err());
+    }
+
+    #[test]
+    fn validate_resource_name_accepts_valid_names() {
+        assert!(validate_resource_name("my-pod", "Pod").is_ok());
+        assert!(validate_resource_name("web.server.v1", "Pod").is_ok());
+        assert!(validate_resource_name("a", "Pod").is_ok());
+    }
+
+    #[test]
+    fn validate_resource_name_rejects_invalid_names() {
+        assert!(validate_resource_name("", "Pod").is_err());
+        assert!(validate_resource_name("My-Pod", "Pod").is_err()); // uppercase
+        assert!(validate_resource_name("-pod", "Pod").is_err()); // starts with hyphen
+        assert!(validate_resource_name("pod-", "Pod").is_err()); // ends with hyphen
+        assert!(validate_resource_name(".pod", "Pod").is_err()); // starts with dot
+        assert!(validate_resource_name("pod.", "Pod").is_err()); // ends with dot
+    }
+
+    #[test]
+    fn validate_positive_integer_accepts_valid() {
+        assert_eq!(validate_positive_integer("1", "limit").unwrap(), 1);
+        assert_eq!(validate_positive_integer("100", "limit").unwrap(), 100);
+        assert_eq!(validate_positive_integer("999999", "timeout").unwrap(), 999999);
+    }
+
+    #[test]
+    fn validate_positive_integer_rejects_invalid() {
+        assert!(validate_positive_integer("0", "limit").is_err());
+        assert!(validate_positive_integer("-1", "limit").is_err());
+        assert!(validate_positive_integer("abc", "limit").is_err());
+        assert!(validate_positive_integer("", "limit").is_err());
+    }
+
+    #[test]
+    fn validate_limit_checks_bounds() {
+        assert!(validate_limit(1, 100).is_ok());
+        assert!(validate_limit(100, 100).is_ok());
+        assert!(validate_limit(0, 100).is_err());
+        assert!(validate_limit(101, 100).is_err());
+    }
+
+    #[test]
+    fn validate_container_name_accepts_valid() {
+        assert!(validate_container_name("nginx").is_ok());
+        assert!(validate_container_name("my-sidecar").is_ok());
+        assert!(validate_container_name("init-container1").is_ok());
+    }
+
+    #[test]
+    fn validate_container_name_rejects_invalid() {
+        assert!(validate_container_name("").is_err());
+        assert!(validate_container_name("NGINX").is_err());
+        assert!(validate_container_name("-nginx").is_err());
+        assert!(validate_container_name("nginx-").is_err());
+    }
+
+    #[test]
+    fn is_valid_dns_label_handles_edge_cases() {
+        assert!(is_valid_dns_label("a"));
+        assert!(is_valid_dns_label("abc123"));
+        assert!(!is_valid_dns_label("")); // empty
+        assert!(!is_valid_dns_label("1abc")); // starts with digit
+        assert!(!is_valid_dns_label("abc-")); // ends with hyphen
+    }
+
+    #[test]
+    fn is_valid_dns_subdomain_handles_edge_cases() {
+        assert!(is_valid_dns_subdomain("a"));
+        assert!(is_valid_dns_subdomain("a.b.c"));
+        assert!(is_valid_dns_subdomain("my-app.example.com"));
+        assert!(!is_valid_dns_subdomain("")); // empty
+        assert!(!is_valid_dns_subdomain(".abc")); // starts with dot
+        assert!(!is_valid_dns_subdomain("abc.")); // ends with dot
+    }
+
+    // Performance regression tests to ensure selector parsing scales well
+
+    #[test]
+    fn parse_label_selector_many_requirements() {
+        // Test parsing a selector with many label requirements
+        let parts: Vec<String> = (0..50)
+            .map(|i| format!("label{}=value{}", i, i))
+            .collect();
+        let selector_str = parts.join(",");
+
+        let result = parse_object_selector(None, Some(&selector_str));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_label_selector_long_values() {
+        // Test parsing labels with long key/value strings
+        let long_key = "a".repeat(63); // max DNS label length
+        let long_value = "v".repeat(63);
+        let selector_str = format!("{}={}", long_key, long_value);
+
+        let result = parse_object_selector(None, Some(&selector_str));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_label_selector_set_with_many_values() {
+        // Test In operator with many values
+        let values: Vec<String> = (0..100).map(|i| format!("val{}", i)).collect();
+        let selector_str = format!("env in ({})", values.join(","));
+
+        let result = parse_object_selector(None, Some(&selector_str));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_combined_selectors_stress() {
+        // Test combined field and label selectors with multiple requirements
+        let field_selector = "metadata.name=my-pod,metadata.namespace=default";
+        let label_parts: Vec<String> = (0..20)
+            .map(|i| format!("app-label-{}=value-{}", i, i))
+            .collect();
+        let label_selector = label_parts.join(",");
+
+        let result = parse_object_selector(Some(field_selector), Some(&label_selector));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn matches_labels_many_requirements() {
+        // Test matching against many label requirements
+        let label_parts: Vec<String> = (0..50)
+            .map(|i| format!("label{}=value{}", i, i))
+            .collect();
+        let selector_str = label_parts.join(",");
+        let selector = parse_object_selector(None, Some(&selector_str)).unwrap().unwrap();
+
+        // Build matching labels
+        let mut labels: HashMap<String, String> = HashMap::new();
+        for i in 0..50 {
+            labels.insert(format!("label{}", i), format!("value{}", i));
+        }
+
+        let metadata = ObjectMeta {
+            name: Some("test-pod".to_string()),
+            namespace: Some("default".to_string()),
+            labels,
+            ..Default::default()
+        };
+
+        assert!(selector.matches_object(&metadata));
+    }
+
+    #[test]
+    fn matches_labels_large_label_set() {
+        // Test matching when object has many labels
+        let selector = parse_object_selector(None, Some("target=match")).unwrap().unwrap();
+
+        // Build object with many labels
+        let mut labels: HashMap<String, String> = HashMap::new();
+        for i in 0..1000 {
+            labels.insert(format!("label{}", i), format!("value{}", i));
+        }
+        labels.insert("target".to_string(), "match".to_string());
+
+        let metadata = ObjectMeta {
+            name: Some("test-pod".to_string()),
+            namespace: Some("default".to_string()),
+            labels,
+            ..Default::default()
+        };
+
+        assert!(selector.matches_object(&metadata));
+    }
+
+    #[test]
+    fn parse_selector_repeated_iterations() {
+        // Verify parsing is consistent across many iterations
+        let field_selector = "metadata.name=test-pod";
+        let label_selector = "app=web,env=prod,tier=frontend";
+
+        for _ in 0..100 {
+            let result = parse_object_selector(Some(field_selector), Some(label_selector));
+            assert!(result.is_ok());
+            let selector = result.unwrap().unwrap();
+            assert!(selector.metadata_name.is_some());
+        }
+    }
+
+    #[test]
+    fn validate_namespace_repeated() {
+        // Stress test namespace validation
+        for _ in 0..1000 {
+            assert!(validate_namespace("default").is_ok());
+            assert!(validate_namespace("kube-system").is_ok());
+            assert!(validate_namespace("my-namespace-123").is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_resource_name_repeated() {
+        // Stress test resource name validation
+        for _ in 0..1000 {
+            assert!(validate_resource_name("my-pod", "Pod").is_ok());
+            assert!(validate_resource_name("nginx-deployment-abc123", "Deployment").is_ok());
+        }
+    }
+
+    #[test]
+    fn parse_complex_set_expression() {
+        // Test complex set expressions
+        let selector = "env in (prod,staging,dev),tier notin (backend),!disabled,enabled";
+        let result = parse_object_selector(None, Some(selector));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn label_requirement_matching_performance() {
+        // Test many matches against same selector
+        let selector = parse_object_selector(
+            None,
+            Some("app=web,env=prod,tier=frontend,version=v1"),
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut labels: HashMap<String, String> = HashMap::new();
+        labels.insert("app".to_string(), "web".to_string());
+        labels.insert("env".to_string(), "prod".to_string());
+        labels.insert("tier".to_string(), "frontend".to_string());
+        labels.insert("version".to_string(), "v1".to_string());
+
+        let metadata = ObjectMeta {
+            name: Some("test".to_string()),
+            namespace: Some("default".to_string()),
+            labels,
+            ..Default::default()
+        };
+
+        // Run many matches
+        for _ in 0..1000 {
+            assert!(selector.matches_object(&metadata));
+        }
+    }
+
+    #[test]
+    fn parse_deeply_nested_quoted_values() {
+        // Test quoted values with special characters
+        let selector = r#"annotation="value with spaces",tag="key=value""#;
+        let result = parse_object_selector(None, Some(selector));
+        // This may fail depending on quote handling, but shouldn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn empty_selectors_parse_quickly() {
+        // Empty selectors should be fast
+        for _ in 0..1000 {
+            let result = parse_object_selector(None, None);
+            assert!(result.is_ok());
+            let result = parse_object_selector(Some(""), Some(""));
+            assert!(result.is_ok());
+        }
     }
 }

@@ -331,3 +331,247 @@ impl BridgeReadinessState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cidr_valid_ipv4() {
+        let (ip, prefix) = parse_cidr("192.168.1.1/24").unwrap();
+        assert_eq!(ip, "192.168.1.1");
+        assert_eq!(prefix, 24);
+    }
+
+    #[test]
+    fn parse_cidr_valid_with_spaces() {
+        let (ip, prefix) = parse_cidr(" 10.0.0.1 /16").unwrap();
+        assert_eq!(ip, "10.0.0.1");
+        assert_eq!(prefix, 16);
+    }
+
+    #[test]
+    fn parse_cidr_valid_max_prefix() {
+        let (ip, prefix) = parse_cidr("172.20.0.1/32").unwrap();
+        assert_eq!(ip, "172.20.0.1");
+        assert_eq!(prefix, 32);
+    }
+
+    #[test]
+    fn parse_cidr_valid_min_prefix() {
+        let (ip, prefix) = parse_cidr("0.0.0.0/0").unwrap();
+        assert_eq!(ip, "0.0.0.0");
+        assert_eq!(prefix, 0);
+    }
+
+    #[test]
+    fn parse_cidr_missing_slash() {
+        let result = parse_cidr("192.168.1.1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid CIDR format"));
+    }
+
+    #[test]
+    fn parse_cidr_invalid_prefix() {
+        let result = parse_cidr("192.168.1.1/abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_cidr_empty_string() {
+        let result = parse_cidr("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bridge_readiness_state_new() {
+        let state = BridgeReadinessState::new();
+        assert_eq!(state.bridge_name, "");
+        assert_eq!(state.expected_cidr, "");
+        assert_eq!(state.attempts, 0);
+        assert!(!state.ready);
+        assert!(state.started_at.is_none());
+    }
+
+    #[test]
+    fn bridge_readiness_state_reset() {
+        let mut state = BridgeReadinessState::new();
+        state.attempts = 5;
+        state.ready = true;
+        state.last_error = Some("old error".to_string());
+
+        state.reset("br0", "10.0.0.1/24");
+
+        assert_eq!(state.bridge_name, "br0");
+        assert_eq!(state.expected_cidr, "10.0.0.1/24");
+        assert_eq!(state.attempts, 0);
+        assert!(!state.ready);
+        assert!(state.started_at.is_some());
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn bridge_readiness_state_prepare_attempt() {
+        let mut state = BridgeReadinessState::new();
+        state.last_error = Some("previous error".to_string());
+
+        state.prepare_attempt();
+        assert_eq!(state.attempts, 1);
+        assert!(state.last_error.is_none());
+
+        state.prepare_attempt();
+        assert_eq!(state.attempts, 2);
+    }
+
+    #[test]
+    fn bridge_readiness_state_prepare_attempt_saturates() {
+        let mut state = BridgeReadinessState::new();
+        state.attempts = u32::MAX;
+
+        state.prepare_attempt();
+        assert_eq!(state.attempts, u32::MAX);
+    }
+
+    #[test]
+    fn bridge_readiness_state_record_observation() {
+        let mut state = BridgeReadinessState::new();
+        let observation = BridgeObservation {
+            carrier: Some(true),
+            operstate: Some("UP".to_string()),
+            addresses: vec!["10.0.0.1/24".to_string()],
+            has_expected_cidr: true,
+            admin_up: true,
+        };
+
+        state.record_observation(observation.clone());
+
+        let recorded = state.last_observation.as_ref().unwrap();
+        assert_eq!(recorded.carrier, Some(true));
+        assert!(recorded.has_expected_cidr);
+        assert!(recorded.admin_up);
+    }
+
+    #[test]
+    fn bridge_readiness_state_snapshot() {
+        let mut state = BridgeReadinessState::new();
+        state.reset("nanocloud0", "172.20.0.1/16");
+        state.prepare_attempt();
+        state.ready = true;
+
+        let snapshot = state.snapshot();
+
+        assert_eq!(snapshot.bridge_name, "nanocloud0");
+        assert_eq!(snapshot.expected_cidr, "172.20.0.1/16");
+        assert_eq!(snapshot.attempts, 1);
+        assert!(snapshot.ready);
+    }
+
+    #[test]
+    fn bridge_observation_defaults() {
+        let observation = BridgeObservation {
+            carrier: None,
+            operstate: None,
+            addresses: vec![],
+            has_expected_cidr: false,
+            admin_up: false,
+        };
+
+        assert!(observation.carrier.is_none());
+        assert!(observation.operstate.is_none());
+        assert!(observation.addresses.is_empty());
+        assert!(!observation.has_expected_cidr);
+        assert!(!observation.admin_up);
+    }
+
+    #[test]
+    fn bridge_observation_with_carrier_up() {
+        let observation = BridgeObservation {
+            carrier: Some(true),
+            operstate: Some("UP".to_string()),
+            addresses: vec!["10.0.0.1/24".to_string(), "192.168.1.1/24".to_string()],
+            has_expected_cidr: true,
+            admin_up: true,
+        };
+
+        assert_eq!(observation.carrier, Some(true));
+        assert_eq!(observation.operstate.as_deref(), Some("UP"));
+        assert_eq!(observation.addresses.len(), 2);
+    }
+
+    #[test]
+    fn bridge_observation_clone() {
+        let observation = BridgeObservation {
+            carrier: Some(true),
+            operstate: Some("UP".to_string()),
+            addresses: vec!["10.0.0.1/24".to_string()],
+            has_expected_cidr: true,
+            admin_up: true,
+        };
+
+        let cloned = observation.clone();
+        assert_eq!(cloned.carrier, observation.carrier);
+        assert_eq!(cloned.operstate, observation.operstate);
+        assert_eq!(cloned.addresses, observation.addresses);
+    }
+
+    #[test]
+    fn bridge_readiness_snapshot_clone() {
+        let snapshot = BridgeReadinessSnapshot {
+            bridge_name: "test",
+            expected_cidr: "10.0.0.1/24",
+            ready: true,
+            attempts: 3,
+            started_at: Some(Instant::now()),
+            last_attempt_completed: Some(Instant::now()),
+            last_error: Some("test error".to_string()),
+            last_observation: None,
+        };
+
+        let cloned = snapshot.clone();
+        assert_eq!(cloned.bridge_name, snapshot.bridge_name);
+        assert_eq!(cloned.ready, snapshot.ready);
+        assert_eq!(cloned.attempts, snapshot.attempts);
+    }
+
+    #[test]
+    fn ip_address_entry_deserialize_minimal() {
+        let json = r#"{"addr_info": []}"#;
+        let entry: IpAddressEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.operstate.is_none());
+        assert!(entry.flags.is_none());
+        assert!(entry.addr_info.is_empty());
+    }
+
+    #[test]
+    fn ip_address_entry_deserialize_full() {
+        let json = r#"{
+            "operstate": "UP",
+            "flags": ["UP", "BROADCAST", "MULTICAST"],
+            "addr_info": [
+                {"family": "inet", "local": "10.0.0.1", "prefixlen": 24}
+            ]
+        }"#;
+        let entry: IpAddressEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.operstate.as_deref(), Some("UP"));
+        assert_eq!(entry.flags.as_ref().unwrap().len(), 3);
+        assert_eq!(entry.addr_info.len(), 1);
+    }
+
+    #[test]
+    fn ip_address_info_deserialize() {
+        let json = r#"{"family": "inet", "local": "192.168.1.1", "prefixlen": 24}"#;
+        let info: IpAddressInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.family.as_deref(), Some("inet"));
+        assert_eq!(info.local.as_deref(), Some("192.168.1.1"));
+        assert_eq!(info.prefixlen, Some(24));
+    }
+
+    #[test]
+    fn ip_address_info_deserialize_partial() {
+        let json = r#"{"family": "inet6"}"#;
+        let info: IpAddressInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.family.as_deref(), Some("inet6"));
+        assert!(info.local.is_none());
+        assert!(info.prefixlen.is_none());
+    }
+}

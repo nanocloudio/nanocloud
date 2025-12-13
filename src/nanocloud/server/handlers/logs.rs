@@ -14,15 +14,13 @@
  * limitations under the License.
  */
 
-use std::io;
+//! Log streaming handler with backpressure and disconnect detection.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::nanocloud::api::types::LogQuery;
@@ -33,6 +31,7 @@ use crate::nanocloud::engine::log::{
 use crate::nanocloud::logger::{log_error, log_info, log_warn};
 
 use super::error::ApiError;
+use super::streaming::{create_stream_channel, StreamConfig};
 
 pub(super) async fn stream_service_logs(
     namespace: Option<String>,
@@ -103,7 +102,12 @@ pub(super) async fn stream_service_logs(
     };
 
     let (handle, mut stream) = spawn_log_stream(log_path, options);
-    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
+
+    // Create streaming channel with backpressure handling
+    let config = StreamConfig::new("server_logs")
+        .with_buffer_size(64)
+        .with_send_timeout(Duration::from_secs(30));
+    let (mut controller, body) = create_stream_channel(config);
 
     let follow_label = if follow { "true" } else { "false" };
     let previous_label = if previous { "true" } else { "false" };
@@ -129,13 +133,29 @@ pub(super) async fn stream_service_logs(
     tokio::spawn(async move {
         let tail_handle = handle;
         while let Some(item) = stream.next().await {
+            // Check for client disconnect before processing
+            if !controller.is_connected() {
+                log_info(
+                    "server_logs",
+                    "Client disconnected, stopping log stream",
+                    &[
+                        ("service", service_label.as_str()),
+                        ("namespace", namespace_clone.as_str()),
+                        ("container_id", container_id_clone.as_str()),
+                        ("bytes_sent", &controller.bytes_sent().to_string()),
+                    ],
+                );
+                break;
+            }
+
             match item {
                 Ok(entry) => {
                     let mut line = entry.message;
                     if !line.ends_with('\n') {
                         line.push('\n');
                     }
-                    if tx.send(Ok(Bytes::from(line))).await.is_err() {
+                    // Use controller.send which handles backpressure and timeouts
+                    if controller.send(Bytes::from(line)).await.is_err() {
                         break;
                     }
                 }
@@ -156,6 +176,18 @@ pub(super) async fn stream_service_logs(
             }
         }
 
+        // Log final stats
+        log_info(
+            "server_logs",
+            "Log stream completed",
+            &[
+                ("service", service_label.as_str()),
+                ("namespace", namespace_clone.as_str()),
+                ("container_id", container_id_clone.as_str()),
+                ("bytes_sent", &controller.bytes_sent().to_string()),
+            ],
+        );
+
         if let Err(err) = tail_handle.shutdown().await {
             let error_text = err.to_string();
             log_warn(
@@ -171,7 +203,6 @@ pub(super) async fn stream_service_logs(
         }
     });
 
-    let body = Body::from_stream(ReceiverStream::new(rx));
     let response = Response::builder()
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)

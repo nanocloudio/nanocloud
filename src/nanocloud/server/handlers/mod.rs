@@ -42,6 +42,7 @@ pub(super) mod service_resources;
 pub mod serviceaccounts;
 pub(super) mod services;
 pub(super) mod statefulsets;
+pub(crate) mod streaming;
 pub(super) mod volumesnapshots;
 mod watch;
 

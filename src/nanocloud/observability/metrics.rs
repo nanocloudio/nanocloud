@@ -150,6 +150,9 @@ static CONTROLLER_DISPATCHER_QUEUE_DEPTH: OnceLock<IntGauge> = OnceLock::new();
 static CONTROLLER_DISPATCHER_HANDLER_ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static CONTROLLER_WATCH_BACKOFF_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
 static CONTROLLER_WATCH_LAGGED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static HTTP_REQUESTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static HTTP_REQUEST_DURATION: OnceLock<HistogramVec> = OnceLock::new();
+static HTTP_REQUESTS_IN_FLIGHT: OnceLock<IntGaugeVec> = OnceLock::new();
 
 fn registry() -> &'static Registry {
     &metrics_state().registry
@@ -758,6 +761,110 @@ fn backup_restore_duration() -> &'static HistogramVec {
         register_collector(histogram)
     })
 }
+
+// ============================================================================
+// HTTP Request Metrics
+// ============================================================================
+
+fn http_requests_total() -> &'static IntCounterVec {
+    HTTP_REQUESTS_TOTAL.get_or_init(|| {
+        let opts = Opts::new(
+            "http_requests_total",
+            "Total HTTP requests handled by the API server",
+        )
+        .subsystem("server");
+        let counter = IntCounterVec::new(opts, &["method", "path", "status"])
+            .expect("failed to build http requests counter");
+        register_collector(counter)
+    })
+}
+
+fn http_request_duration() -> &'static HistogramVec {
+    HTTP_REQUEST_DURATION.get_or_init(|| {
+        let opts = HistogramOpts::new(
+            "http_request_duration_seconds",
+            "HTTP request duration in seconds",
+        )
+        .subsystem("server")
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ]);
+        let histogram = HistogramVec::new(opts, &["method", "path"])
+            .expect("failed to build http request duration histogram");
+        register_collector(histogram)
+    })
+}
+
+fn http_requests_in_flight() -> &'static IntGaugeVec {
+    HTTP_REQUESTS_IN_FLIGHT.get_or_init(|| {
+        let opts = Opts::new(
+            "http_requests_in_flight",
+            "Current number of HTTP requests being processed",
+        )
+        .subsystem("server");
+        let gauge = IntGaugeVec::new(opts, &["method"])
+            .expect("failed to build http requests in flight gauge");
+        register_collector(gauge)
+    })
+}
+
+/// Record an HTTP request with its status code and duration.
+///
+/// This should be called after each request completes.
+pub fn record_http_request(method: &str, path: &str, status: u16, duration: Duration) {
+    let status_str = status.to_string();
+    // Normalize path to prevent cardinality explosion
+    let normalized_path = normalize_http_path(path);
+    http_requests_total()
+        .with_label_values(&[method, &normalized_path, &status_str])
+        .inc();
+    http_request_duration()
+        .with_label_values(&[method, &normalized_path])
+        .observe(duration.as_secs_f64());
+}
+
+/// Increment the in-flight request gauge for a method.
+pub fn inc_http_requests_in_flight(method: &str) {
+    http_requests_in_flight()
+        .with_label_values(&[method])
+        .inc();
+}
+
+/// Decrement the in-flight request gauge for a method.
+pub fn dec_http_requests_in_flight(method: &str) {
+    http_requests_in_flight()
+        .with_label_values(&[method])
+        .dec();
+}
+
+/// Normalize an HTTP path to prevent cardinality explosion from dynamic segments.
+///
+/// Replaces UUIDs, numbers, and other dynamic segments with placeholders.
+fn normalize_http_path(path: &str) -> String {
+    // Split path and normalize each segment
+    let segments: Vec<&str> = path.split('/').collect();
+    let normalized: Vec<String> = segments
+        .iter()
+        .map(|segment| {
+            // Replace UUIDs (8-4-4-4-12 format)
+            if segment.len() == 36 && segment.chars().filter(|c| *c == '-').count() == 4 {
+                return "{id}".to_string();
+            }
+            // Replace numeric segments
+            if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
+                return "{id}".to_string();
+            }
+            // Replace segments that look like resource names (lowercase with dashes)
+            // but only in positions that are likely to be resource names
+            segment.to_string()
+        })
+        .collect();
+    normalized.join("/")
+}
+
+// ============================================================================
+// DNS Metrics
+// ============================================================================
 
 fn dns_queries_total() -> &'static IntCounterVec {
     DNS_QUERIES_TOTAL.get_or_init(|| {
@@ -1644,6 +1751,68 @@ mod tests {
     #[test]
     fn metrics_handle_shutdown_is_noop() {
         MetricsHandle.shutdown();
+    }
+
+    #[test]
+    fn record_http_request_updates_metrics() {
+        let counter = http_requests_total().with_label_values(&["GET", "/api/v1/pods", "200"]);
+        let before_count = counter.get();
+        let histogram = http_request_duration().with_label_values(&["GET", "/api/v1/pods"]);
+        let before_histogram_count = histogram.get_sample_count();
+
+        record_http_request("GET", "/api/v1/pods", 200, Duration::from_millis(50));
+
+        let after_count = counter.get();
+        let after_histogram_count = histogram.get_sample_count();
+        assert_eq!(after_count, before_count + 1);
+        assert_eq!(after_histogram_count, before_histogram_count + 1);
+    }
+
+    #[test]
+    fn http_requests_in_flight_increments_and_decrements() {
+        let gauge = http_requests_in_flight().with_label_values(&["POST"]);
+        let before = gauge.get();
+
+        inc_http_requests_in_flight("POST");
+        assert_eq!(gauge.get(), before + 1);
+
+        dec_http_requests_in_flight("POST");
+        assert_eq!(gauge.get(), before);
+    }
+
+    #[test]
+    fn normalize_http_path_replaces_uuids() {
+        let path = "/api/v1/namespaces/default/pods/550e8400-e29b-41d4-a716-446655440000";
+        let normalized = normalize_http_path(path);
+        assert_eq!(normalized, "/api/v1/namespaces/default/pods/{id}");
+    }
+
+    #[test]
+    fn normalize_http_path_replaces_numeric_segments() {
+        let path = "/api/v1/tasks/12345/status";
+        let normalized = normalize_http_path(path);
+        assert_eq!(normalized, "/api/v1/tasks/{id}/status");
+    }
+
+    #[test]
+    fn normalize_http_path_preserves_non_dynamic_segments() {
+        let path = "/api/v1/namespaces/default/services";
+        let normalized = normalize_http_path(path);
+        assert_eq!(normalized, "/api/v1/namespaces/default/services");
+    }
+
+    #[test]
+    fn http_metrics_appear_in_output() {
+        // Record some metrics
+        record_http_request("DELETE", "/api/v1/test", 204, Duration::from_millis(10));
+        inc_http_requests_in_flight("DELETE");
+        dec_http_requests_in_flight("DELETE");
+
+        let body = gather().expect("metrics encoded");
+        let text = String::from_utf8(body).expect("utf8");
+        assert!(text.contains("nanocloud_server_http_requests_total"));
+        assert!(text.contains("nanocloud_server_http_request_duration_seconds"));
+        assert!(text.contains("nanocloud_server_http_requests_in_flight"));
     }
 }
 #[derive(Copy, Clone, Debug)]

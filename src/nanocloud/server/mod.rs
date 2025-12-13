@@ -14,6 +14,172 @@
  * limitations under the License.
  */
 
+//! Nanocloud HTTP API Server
+//!
+//! This module implements the HTTP server for the Nanocloud API, providing
+//! Kubernetes-compatible endpoints for managing containers, pods, and services.
+//!
+//! # Architecture
+//!
+//! The server is built on [Axum](https://docs.rs/axum) and provides:
+//! - RESTful API endpoints following Kubernetes API conventions
+//! - TLS with mutual authentication (mTLS) support
+//! - Multiple authentication mechanisms (certificates, JWT, bootstrap tokens)
+//! - Streaming endpoints for logs, exec, and watch operations
+//!
+//! # Routes Overview
+//!
+//! ## Core API Routes (`/api/v1`)
+//!
+//! | Method | Path | Description | Auth Required |
+//! |--------|------|-------------|---------------|
+//! | GET | `/api/v1/pods` | List all pods | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/pods` | List pods in namespace | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/pods/{name}` | Get pod by name | Yes |
+//! | POST | `/api/v1/namespaces/{ns}/pods` | Create pod | Yes |
+//! | DELETE | `/api/v1/namespaces/{ns}/pods/{name}` | Delete pod | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/pods/{name}/log` | Stream pod logs | Yes |
+//! | POST | `/api/v1/namespaces/{ns}/pods/{name}/exec` | Execute command | Yes |
+//!
+//! ## Services
+//!
+//! | Method | Path | Description | Auth Required |
+//! |--------|------|-------------|---------------|
+//! | GET | `/api/v1/services` | List all services | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/services` | List services in namespace | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/services/{name}` | Get service | Yes |
+//! | POST | `/api/v1/namespaces/{ns}/services` | Create service | Yes |
+//! | DELETE | `/api/v1/namespaces/{ns}/services/{name}` | Delete service | Yes |
+//!
+//! ## ConfigMaps and Secrets
+//!
+//! | Method | Path | Description | Auth Required |
+//! |--------|------|-------------|---------------|
+//! | GET | `/api/v1/namespaces/{ns}/configmaps` | List configmaps | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/configmaps/{name}` | Get configmap | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/secrets` | List secrets | Yes |
+//! | GET | `/api/v1/namespaces/{ns}/secrets/{name}` | Get secret | Yes |
+//!
+//! ## Watch Endpoints
+//!
+//! Watch endpoints support long-polling for resource changes:
+//! - Add `?watch=true` to list endpoints to receive streaming updates
+//! - Supports `resourceVersion` for resumable watches
+//! - Emits bookmark events for checkpoint synchronization
+//!
+//! ## Health and Metrics
+//!
+//! | Method | Path | Description | Auth Required |
+//! |--------|------|-------------|---------------|
+//! | GET | `/healthz` | Liveness probe | No |
+//! | GET | `/readyz` | Readiness probe | No |
+//! | GET | `/metrics` | Prometheus metrics | Optional |
+//!
+//! # Authentication
+//!
+//! The server supports multiple authentication mechanisms:
+//!
+//! ## Client Certificates (mTLS)
+//!
+//! The primary authentication method uses client certificates issued by
+//! the cluster CA. The certificate's Common Name (CN) is used as the
+//! principal identity.
+//!
+//! - Certificates with `CN=device:*` prefix are treated as device identities
+//! - Other certificates are treated as user/service identities
+//!
+//! ## JWT Bearer Tokens
+//!
+//! Service account tokens can be used for API authentication:
+//!
+//! ```text
+//! Authorization: Bearer <jwt-token>
+//! ```
+//!
+//! Tokens must be signed by the cluster's service account key and include:
+//! - `sub`: Subject (service account name)
+//! - `iss`: Issuer (cluster identifier)
+//! - `scope`: List of granted scopes
+//!
+//! ## Bootstrap Tokens
+//!
+//! One-time tokens for initial node/device registration:
+//!
+//! ```text
+//! Authorization: Bearer <token-id>.<token-secret>
+//! ```
+//!
+//! Bootstrap tokens are consumed on first use and cannot be reused.
+//!
+//! # TLS Configuration
+//!
+//! The server requires TLS and loads certificates from the secure assets directory:
+//!
+//! ## Environment Variables
+//!
+//! - `NANOCLOUD_SECURE_ASSETS`: Path to directory containing TLS assets
+//!
+//! ## Required Files
+//!
+//! - `ca.pem`: Cluster CA certificate
+//! - `server.pem`: Server certificate
+//! - `server-key.pem`: Server private key
+//!
+//! ## Certificate Requirements
+//!
+//! - Server certificate must include SANs for all listen addresses
+//! - Client certificates must be signed by the cluster CA
+//! - ALPN negotiation supports `http/1.1`
+//!
+//! # Error Responses
+//!
+//! All errors follow Kubernetes API conventions:
+//!
+//! ```json
+//! {
+//!   "kind": "Status",
+//!   "apiVersion": "v1",
+//!   "status": "Failure",
+//!   "message": "error description",
+//!   "reason": "BadRequest",
+//!   "code": 400
+//! }
+//! ```
+//!
+//! ## Common Status Codes
+//!
+//! | Code | Reason | Description |
+//! |------|--------|-------------|
+//! | 400 | BadRequest | Invalid request parameters |
+//! | 401 | Unauthorized | Missing or invalid credentials |
+//! | 403 | Forbidden | Authenticated but not authorized |
+//! | 404 | NotFound | Resource does not exist |
+//! | 409 | Conflict | Resource version conflict |
+//! | 422 | UnprocessableEntity | Valid syntax but semantic error |
+//! | 429 | TooManyRequests | Rate limit exceeded |
+//! | 500 | InternalError | Server-side error |
+//! | 503 | ServiceUnavailable | Server temporarily unavailable |
+//!
+//! # Rate Limiting
+//!
+//! The server implements per-endpoint rate limiting:
+//!
+//! - General endpoints: 1000 concurrent requests
+//! - Streaming endpoints: 100 concurrent connections
+//! - Exec endpoints: 50 concurrent sessions
+//! - Watch endpoints: 200 concurrent watchers
+//!
+//! Requests exceeding limits receive HTTP 429 responses.
+//!
+//! # Streaming Endpoints
+//!
+//! Streaming endpoints (`/log`, `/exec`, watch) support:
+//!
+//! - Configurable timeouts (startup, inactivity, max duration)
+//! - Backpressure via bounded channels
+//! - Automatic cleanup on client disconnect
+//! - Graceful shutdown coordination
+
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -890,9 +1056,22 @@ fn build_router() -> Router {
 
 async fn trace_http_request(req: Request<Body>, next: Next) -> Result<Response, Infallible> {
     let method = req.method().clone();
+    let method_str = method.as_str().to_string();
     let path = req.uri().path().to_string();
     let span_name = format!("{} {}", method, path);
+
+    // Track in-flight requests
+    metrics::inc_http_requests_in_flight(&method_str);
+    let start = std::time::Instant::now();
+
     let response = tracing::with_span("api", span_name, next.run(req)).await;
+
+    // Record metrics after request completes
+    let duration = start.elapsed();
+    let status = response.status().as_u16();
+    metrics::dec_http_requests_in_flight(&method_str);
+    metrics::record_http_request(&method_str, &path, status, duration);
+
     Ok(response)
 }
 

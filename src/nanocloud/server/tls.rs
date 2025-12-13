@@ -14,6 +14,29 @@
  * limitations under the License.
  */
 
+//! TLS configuration and handshake utilities for the HTTP server.
+//!
+//! This module provides TLS acceptor configuration with proper certificate
+//! validation and error reporting.
+//!
+//! # Configuration
+//!
+//! The TLS setup uses the cluster's secure assets (certificates and keys)
+//! which are expected to be available via [`TlsInfo`].
+//!
+//! ## Environment Variables
+//!
+//! - `NANOCLOUD_SECURE_ASSETS`: Path to the directory containing TLS assets
+//!
+//! # Error Handling
+//!
+//! All TLS configuration errors are wrapped with context to aid debugging.
+//! Common errors include:
+//! - Missing or invalid certificate/key files
+//! - Certificate/key mismatch
+//! - Invalid certificate chain
+//! - ALPN configuration failures
+
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -126,3 +149,4 @@ pub(super) async fn accept_with_tls(
         .map_err(|e| with_context(e, "TLS handshake failed"))?;
     Ok(tls_stream)
 }
+
