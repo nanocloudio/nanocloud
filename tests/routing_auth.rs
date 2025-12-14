@@ -322,7 +322,7 @@ fn auth_context_in_collections() {
     let mut ctx2 = AuthContext::default();
     ctx2.set_subject(AuthSubject::DistinguishedName("CN=b".to_string()));
 
-    let contexts = vec![ctx1.clone(), ctx2.clone()];
+    let contexts = [ctx1.clone(), ctx2.clone()];
     assert_eq!(contexts.len(), 2);
     assert_eq!(contexts[0], ctx1);
     assert_eq!(contexts[1], ctx2);

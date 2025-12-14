@@ -121,6 +121,10 @@ pub struct CaArgs {
     #[arg(short, long)]
     pub additional: Option<String>,
 
+    /// Output jq-based shell commands to create certificate files with the given prefix
+    #[arg(short = 'f', long = "files")]
+    pub files: Option<String>,
+
     /// Print the equivalent curl command without performing the request
     #[arg(long)]
     pub curl: bool,

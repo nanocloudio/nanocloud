@@ -912,8 +912,7 @@ mod tests {
         let result = validate_token_format("  id  .  secret  ");
         // Should either fail validation or trim whitespace appropriately
         // Current implementation doesn't trim, so spaces become part of id
-        if result.is_ok() {
-            let (id, _secret) = result.unwrap();
+        if let Ok((id, _secret)) = result {
             // Verify behavior is consistent
             assert!(id.contains(" ") || id == "id");
         }

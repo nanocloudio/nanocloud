@@ -119,9 +119,12 @@ fn gen_san_extension(
 ) -> Result<X509Extension, ErrorStack> {
     let mut dns_list: Vec<String> = Vec::new();
     let mut ip_list: Vec<String> = Vec::new();
+    let mut uri_list: Vec<String> = Vec::new();
 
     for name in san_list {
-        if is_ipv4_literal(name) {
+        if is_uri(name) {
+            uri_list.push(name.to_string());
+        } else if is_ipv4_literal(name) {
             ip_list.push(name.to_string());
         } else {
             dns_list.push(name.to_string());
@@ -135,8 +138,16 @@ fn gen_san_extension(
     for ip in &ip_list {
         let _ = san_builder.ip(ip);
     }
+    for uri in &uri_list {
+        let _ = san_builder.uri(uri);
+    }
 
     san_builder.build(context)
+}
+
+fn is_uri(candidate: &str) -> bool {
+    // Check for common URI schemes (spiffe://, https://, http://, etc.)
+    candidate.contains("://")
 }
 
 fn is_ipv4_literal(candidate: &str) -> bool {

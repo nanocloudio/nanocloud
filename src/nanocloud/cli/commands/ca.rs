@@ -48,6 +48,18 @@ pub(super) async fn handle_ca(
     let tls_info = client
         .issue_certificate(&args.common_name, additional)
         .await?;
-    Terminal::stdout(format_args!("{}", serde_json::to_string_pretty(&tls_info)?));
+
+    if let Some(ref prefix) = args.files {
+        // Output jq-based shell commands to create certificate files
+        let json = serde_json::to_string(&tls_info)?;
+        Terminal::stdout(format_args!(
+            "echo '{}' | jq -r '.ca' | base64 -d > ca.pem && \\\n\
+             echo '{}' | jq -r '.key' | base64 -d > {}-key.pem && \\\n\
+             echo '{}' | jq -r '.cert' | base64 -d > {}-cert.pem",
+            json, json, prefix, json, prefix
+        ));
+    } else {
+        Terminal::stdout(format_args!("{}", serde_json::to_string_pretty(&tls_info)?));
+    }
     Ok(())
 }

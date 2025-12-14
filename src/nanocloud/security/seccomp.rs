@@ -300,9 +300,9 @@ pub fn validate_default_action(action: &str) -> Result<(), Box<dyn std::error::E
             "seccomp default action validation failed: empty input",
             &[("input", action)],
         );
-        return Err(new_error(format!(
-            "Invalid seccomp defaultAction: empty or whitespace-only value"
-        )));
+        return Err(new_error(
+            "Invalid seccomp defaultAction: empty or whitespace-only value".to_string(),
+        ));
     }
     if SECCOMP_ACTIONS.contains(&normalized.as_str()) {
         Ok(())
