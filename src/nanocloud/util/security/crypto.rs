@@ -27,6 +27,7 @@ use super::assets::load_secret_key;
 use super::kms::{self, EncryptedDataKey, ENCRYPTED_BLOB_PREFIX};
 use crate::nanocloud::util::error::with_context;
 
+/// Symmetric data key wrapper that encrypts payloads and authoritatively encodes envelopes.
 pub struct EncryptionKey {
     key: Vec<u8>,
     envelope: OnceLock<EncryptedDataKey>,

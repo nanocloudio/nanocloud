@@ -908,8 +908,14 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("rename"));
 
-        assert!(CNI_KEYSPACE.get(&ip_pool_path("172.20.0.2")).is_err());
-        assert!(CNI_KEYSPACE.get(&allocation_path(container_id)).is_err());
+        assert!(CNI_KEYSPACE
+            .get_optional(&ip_pool_path("172.20.0.2"))
+            .unwrap()
+            .is_none());
+        assert!(CNI_KEYSPACE
+            .get_optional(&allocation_path(container_id))
+            .unwrap()
+            .is_none());
 
         let calls = runner.calls();
         assert!(calls
@@ -963,9 +969,18 @@ mod tests {
 
         delete_with_runner(&runner, &env).expect("delete ok");
 
-        assert!(CNI_KEYSPACE.get(&allocation_path(container_id)).is_err());
-        assert!(CNI_KEYSPACE.get(&ip_pool_path("10.0.0.2")).is_err());
-        assert!(CNI_KEYSPACE.get(&port_forward_path(container_id)).is_err());
+        assert!(CNI_KEYSPACE
+            .get_optional(&allocation_path(container_id))
+            .unwrap()
+            .is_none());
+        assert!(CNI_KEYSPACE
+            .get_optional(&ip_pool_path("10.0.0.2"))
+            .unwrap()
+            .is_none());
+        assert!(CNI_KEYSPACE
+            .get_optional(&port_forward_path(container_id))
+            .unwrap()
+            .is_none());
 
         let calls = runner.calls();
         assert!(calls
@@ -1054,7 +1069,15 @@ mod tests {
 
         let err = configure_port_forwards(&runner, container_id, "br0", vec![rule]).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
-        assert!(CNI_KEYSPACE.get(&port_forward_path(container_id)).is_err());
+        let record_path = Config::Keyspace
+            .get_path()
+            .join("cni")
+            .join(PORT_FORWARDS_PREFIX.trim_start_matches('/'))
+            .join(container_id);
+        assert!(
+            !record_path.exists(),
+            "port forward entry unexpectedly persisted for invalid input"
+        );
         reset_cni_keyspace();
     }
 

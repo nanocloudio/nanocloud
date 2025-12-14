@@ -825,16 +825,12 @@ pub fn record_http_request(method: &str, path: &str, status: u16, duration: Dura
 
 /// Increment the in-flight request gauge for a method.
 pub fn inc_http_requests_in_flight(method: &str) {
-    http_requests_in_flight()
-        .with_label_values(&[method])
-        .inc();
+    http_requests_in_flight().with_label_values(&[method]).inc();
 }
 
 /// Decrement the in-flight request gauge for a method.
 pub fn dec_http_requests_in_flight(method: &str) {
-    http_requests_in_flight()
-        .with_label_values(&[method])
-        .dec();
+    http_requests_in_flight().with_label_values(&[method]).dec();
 }
 
 /// Normalize an HTTP path to prevent cardinality explosion from dynamic segments.

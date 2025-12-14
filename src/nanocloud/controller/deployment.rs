@@ -128,19 +128,13 @@ impl DeploymentController {
 
     pub fn desired_state(&self) -> Result<Option<DeploymentDesiredState>, DeploymentError> {
         let key = self.state_key();
-        match CONTROLLER_KEYSPACE.get(&key) {
-            Ok(raw) => {
-                let desired = serde_json::from_str(&raw).map_err(DeploymentError::Serialization)?;
-                Ok(Some(desired))
-            }
-            Err(err) => {
-                if is_missing_value_error(err.as_ref()) {
-                    Ok(None)
-                } else {
-                    Err(DeploymentError::Persistence(err))
-                }
-            }
-        }
+        let raw = match CONTROLLER_KEYSPACE.get_optional(&key) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(DeploymentError::Persistence(err)),
+        };
+        let desired = serde_json::from_str(&raw).map_err(DeploymentError::Serialization)?;
+        Ok(Some(desired))
     }
 
     pub fn reconcile(

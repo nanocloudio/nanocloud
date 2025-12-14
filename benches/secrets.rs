@@ -185,7 +185,9 @@ fn bench_cached_vs_direct(c: &mut Criterion) {
         let secret = sample_secret("default", "bench-cached", 256);
         cached_store.put(secret).expect("put should succeed");
         // Warm the cache
-        cached_store.get("default", "bench-cached").expect("get should succeed");
+        cached_store
+            .get("default", "bench-cached")
+            .expect("get should succeed");
 
         b.iter(|| {
             cached_store

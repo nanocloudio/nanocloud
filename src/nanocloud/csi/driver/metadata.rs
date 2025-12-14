@@ -57,20 +57,15 @@ pub fn read_service_index(
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     // Service indices live under /services/<namespace>/<service> and store volume IDs.
     let key = service_key(namespace, service);
-    match CSI_KEYSPACE.get(&key) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map_err(|e| with_context(e, format!("Failed to parse service index {}", key))),
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(Vec::new())
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load service index {}", key),
-                ))
-            }
-        }
-    }
+    let raw = match CSI_KEYSPACE
+        .get_optional(&key)
+        .map_err(|e| with_context(e, format!("Failed to load service index {}", key)))?
+    {
+        Some(raw) => raw,
+        None => return Ok(Vec::new()),
+    };
+    serde_json::from_str(&raw)
+        .map_err(|e| with_context(e, format!("Failed to parse service index {}", key)))
 }
 
 pub fn write_service_index(
@@ -145,21 +140,16 @@ pub fn delete_volume_record(volume_id: &str) -> Result<(), Box<dyn Error + Send 
 
 pub fn load_volume(volume_id: &str) -> Result<Option<StoredVolume>, Box<dyn Error + Send + Sync>> {
     let key = volume_key(volume_id);
-    match CSI_KEYSPACE.get(&key) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|e| with_context(e, "Failed to deserialize stored volume")),
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load volume {}", volume_id),
-                ))
-            }
-        }
-    }
+    let raw = match CSI_KEYSPACE
+        .get_optional(&key)
+        .map_err(|e| with_context(e, format!("Failed to load volume {}", volume_id)))?
+    {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| with_context(e, "Failed to deserialize stored volume"))
 }
 
 pub fn list_service_volumes(
@@ -188,21 +178,16 @@ pub fn load_snapshot(
     snapshot_id: &str,
 ) -> Result<Option<StoredSnapshot>, Box<dyn Error + Send + Sync>> {
     let key = snapshot_key(snapshot_id);
-    match CSI_KEYSPACE.get(&key) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|e| with_context(e, "Failed to deserialize stored snapshot")),
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load snapshot {}", snapshot_id),
-                ))
-            }
-        }
-    }
+    let raw = match CSI_KEYSPACE
+        .get_optional(&key)
+        .map_err(|e| with_context(e, format!("Failed to load snapshot {}", snapshot_id)))?
+    {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| with_context(e, "Failed to deserialize stored snapshot"))
 }
 
 pub fn delete_snapshot_record(snapshot_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {

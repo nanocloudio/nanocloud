@@ -122,12 +122,7 @@ pub fn validate_type_name(type_name: &str) -> Result<(), SecretError> {
 /// Parses and validates an RFC3339 timestamp.
 pub fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, SecretError> {
     DateTime::parse_from_rfc3339(timestamp)
-        .map_err(|e| {
-            SecretError::Validation(format!(
-                "Invalid timestamp '{}': {}",
-                timestamp, e
-            ))
-        })
+        .map_err(|e| SecretError::Validation(format!("Invalid timestamp '{}': {}", timestamp, e)))
         .map(|dt| dt.with_timezone(&Utc))
 }
 

@@ -579,7 +579,11 @@ mod tests {
         assert_eq!(cache.len(), 3);
 
         // Add 4th entry - should evict oldest
-        cache.put("default", "secret3", sample_stored_secret("default", "secret3"));
+        cache.put(
+            "default",
+            "secret3",
+            sample_stored_secret("default", "secret3"),
+        );
 
         // Should still have 3 entries
         assert!(cache.len() <= 3);
@@ -612,8 +616,16 @@ mod tests {
             enabled: true,
         });
 
-        cache.put("default", "secret1", sample_stored_secret("default", "secret1"));
-        cache.put("default", "secret2", sample_stored_secret("default", "secret2"));
+        cache.put(
+            "default",
+            "secret1",
+            sample_stored_secret("default", "secret1"),
+        );
+        cache.put(
+            "default",
+            "secret2",
+            sample_stored_secret("default", "secret2"),
+        );
 
         let stats = cache.stats();
         assert!(stats.enabled);
@@ -638,8 +650,16 @@ mod tests {
             enabled: true,
         });
 
-        cache.put("default", "secret1", sample_stored_secret("default", "secret1"));
-        cache.put("default", "secret2", sample_stored_secret("default", "secret2"));
+        cache.put(
+            "default",
+            "secret1",
+            sample_stored_secret("default", "secret1"),
+        );
+        cache.put(
+            "default",
+            "secret2",
+            sample_stored_secret("default", "secret2"),
+        );
 
         assert_eq!(cache.len(), 2);
 

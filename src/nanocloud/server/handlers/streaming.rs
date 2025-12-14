@@ -170,7 +170,10 @@ impl StreamController {
                     "Stream send timeout (backpressure)",
                     &[
                         ("bytes_sent", &self.bytes_sent.to_string()),
-                        ("timeout_secs", &self.config.send_timeout.as_secs().to_string()),
+                        (
+                            "timeout_secs",
+                            &self.config.send_timeout.as_secs().to_string(),
+                        ),
                     ],
                 );
                 Err(SendError::Timeout)
@@ -218,7 +221,6 @@ pub fn create_stream_channel(config: StreamConfig) -> (StreamController, Body) {
     let body = Body::from_stream(ReceiverStream::new(rx));
     (controller, body)
 }
-
 
 #[cfg(test)]
 mod tests {

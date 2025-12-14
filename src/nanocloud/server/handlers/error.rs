@@ -232,9 +232,18 @@ mod tests {
         assert_eq!(default_reason(StatusCode::NOT_FOUND), "NotFound");
         assert_eq!(default_reason(StatusCode::CONFLICT), "Conflict");
         assert_eq!(default_reason(StatusCode::GONE), "Gone");
-        assert_eq!(default_reason(StatusCode::TOO_MANY_REQUESTS), "TooManyRequests");
-        assert_eq!(default_reason(StatusCode::SERVICE_UNAVAILABLE), "ServiceUnavailable");
-        assert_eq!(default_reason(StatusCode::INTERNAL_SERVER_ERROR), "InternalError");
+        assert_eq!(
+            default_reason(StatusCode::TOO_MANY_REQUESTS),
+            "TooManyRequests"
+        );
+        assert_eq!(
+            default_reason(StatusCode::SERVICE_UNAVAILABLE),
+            "ServiceUnavailable"
+        );
+        assert_eq!(
+            default_reason(StatusCode::INTERNAL_SERVER_ERROR),
+            "InternalError"
+        );
     }
 
     #[test]
@@ -334,12 +343,10 @@ mod tests {
 
     #[test]
     fn conflict_error_with_conflicts_field() {
-        let conflicts = vec![
-            ApplyConflict {
-                path: "spec.replicas".to_string(),
-                existing_manager: "kubectl".to_string(),
-            },
-        ];
+        let conflicts = vec![ApplyConflict {
+            path: "spec.replicas".to_string(),
+            existing_manager: "kubectl".to_string(),
+        }];
         let err = ApiError::conflict_with_details("apply conflict", conflicts);
         assert_eq!(err.status(), StatusCode::CONFLICT);
         // conflicts are preserved in the error

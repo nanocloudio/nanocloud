@@ -39,6 +39,12 @@ pub fn keyspace_lock() -> &'static KeyspaceTestLock {
     LOCK.get_or_init(KeyspaceTestLock::new)
 }
 
+/// Clears the watch state for a given keyspace partition. Useful for integration
+/// tests that rely on clean watch histories.
+pub fn reset_keyspace_partition_watch(partition: &'static str) {
+    crate::nanocloud::util::reset_partition_watch(partition);
+}
+
 fn target_dir() -> PathBuf {
     if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
         PathBuf::from(dir)

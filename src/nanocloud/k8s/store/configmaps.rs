@@ -59,26 +59,21 @@ pub fn load_config_map(
     name: &str,
 ) -> Result<Option<ConfigMap>, Box<dyn Error + Send + Sync>> {
     let key = namespaced_key(CONFIGMAP_PREFIX, namespace, name);
-    match K8S_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let parsed = deserialize_from_store(
-                "ConfigMap",
-                &raw,
-                &format!("Failed to parse ConfigMap from key '{}'", key),
-            )?;
-            Ok(Some(parsed))
-        }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load ConfigMap '{}' from keyspace", key),
-                ))
-            }
-        }
-    }
+    let raw = match K8S_KEYSPACE.get_optional(&key).map_err(|err| {
+        with_context(
+            err,
+            format!("Failed to load ConfigMap '{}' from keyspace", key),
+        )
+    })? {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let parsed = deserialize_from_store(
+        "ConfigMap",
+        &raw,
+        &format!("Failed to parse ConfigMap from key '{}'", key),
+    )?;
+    Ok(Some(parsed))
 }
 
 pub fn delete_config_map(

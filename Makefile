@@ -58,6 +58,8 @@ test-network:
 test-security:
 	@set -euo pipefail; \
 	$(CARGO) test --locked -p nanocloud --lib security::; \
+	$(CARGO) test --locked -p nanocloud --doc util::keyspace::; \
+	$(CARGO) test --locked -p nanocloud --doc util::security::; \
 	$(CARGO) test --locked -p nanocloud --test security_validation
 
 lint:

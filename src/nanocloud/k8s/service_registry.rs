@@ -131,7 +131,7 @@ impl ClusterIpAllocator {
     ) -> Result<String, Box<dyn Error + Send + Sync>> {
         let _guard = self.mutex.lock().expect("allocator mutex poisoned");
         let service_key = Self::service_key(namespace, name);
-        if CLUSTER_IP_KEYSPACE.get(&service_key).is_ok() {
+        if CLUSTER_IP_KEYSPACE.get_optional(&service_key)?.is_some() {
             return Err(new_error(format!(
                 "Service '{namespace}/{name}' already has a ClusterIP"
             )));
@@ -159,19 +159,10 @@ impl ClusterIpAllocator {
             )));
         }
         let ip_key = Self::ip_key(requested);
-        match CLUSTER_IP_KEYSPACE.get(&ip_key) {
-            Ok(_) => {
-                return Err(new_error(format!(
-                    "Requested ClusterIP '{requested}' is already allocated"
-                )))
-            }
-            Err(err) => {
-                if !err.to_string().contains("No such file or directory")
-                    && !err.to_string().contains("not found")
-                {
-                    return Err(err);
-                }
-            }
+        if CLUSTER_IP_KEYSPACE.get_optional(&ip_key)?.is_some() {
+            return Err(new_error(format!(
+                "Requested ClusterIP '{requested}' is already allocated"
+            )));
         }
         let service_key = Self::service_key(namespace, name);
         CLUSTER_IP_KEYSPACE.put(&service_key, requested)?;
@@ -184,10 +175,10 @@ impl ClusterIpAllocator {
         namespace: &str,
         name: &str,
     ) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let mut current = match CLUSTER_IP_KEYSPACE.get(NEXT_IP_KEY) {
-            Ok(value) => value.parse::<u32>().unwrap_or(self.range.start),
-            Err(_) => self.range.start,
-        };
+        let mut current = CLUSTER_IP_KEYSPACE
+            .get_optional(NEXT_IP_KEY)?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(self.range.start);
 
         let mut attempts = 0usize;
         let max_attempts = (self.range.end - self.range.start + 1) as usize;
@@ -202,13 +193,7 @@ impl ClusterIpAllocator {
             }
             let candidate = u32_to_ipv4(current).to_string();
             let ip_key = Self::ip_key(&candidate);
-            let available = match CLUSTER_IP_KEYSPACE.get(&ip_key) {
-                Ok(_) => false,
-                Err(err) => {
-                    err.to_string().contains("No such file or directory")
-                        || err.to_string().contains("not found")
-                }
-            };
+            let available = CLUSTER_IP_KEYSPACE.get_optional(&ip_key)?.is_none();
             if available {
                 let service_key = Self::service_key(namespace, name);
                 CLUSTER_IP_KEYSPACE.put(&service_key, &candidate)?;
@@ -225,9 +210,9 @@ impl ClusterIpAllocator {
     fn release(&self, namespace: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _guard = self.mutex.lock().expect("allocator mutex poisoned");
         let service_key = Self::service_key(namespace, name);
-        let ip = match CLUSTER_IP_KEYSPACE.get(&service_key) {
-            Ok(value) => value,
-            Err(_) => return Ok(()),
+        let ip = match CLUSTER_IP_KEYSPACE.get_optional(&service_key)? {
+            Some(value) => value,
+            None => return Ok(()),
         };
         CLUSTER_IP_KEYSPACE.delete(&service_key)?;
         let ip_key = Self::ip_key(ip.trim());

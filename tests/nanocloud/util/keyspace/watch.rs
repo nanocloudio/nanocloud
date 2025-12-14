@@ -65,7 +65,6 @@ async fn watch_emits_events_in_order() {
     assert_eq!(deleted.key, "/alpha");
     assert!(deleted.value.is_none());
     assert!(deleted.resource_version > modified.resource_version);
-
 }
 
 #[tokio::test]

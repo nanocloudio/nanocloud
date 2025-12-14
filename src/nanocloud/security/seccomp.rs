@@ -116,9 +116,9 @@
 //! filter.apply()?;
 //! ```
 
+use super::error::SecurityError;
 use crate::nanocloud::logger::log_debug;
 use crate::nanocloud::util::error::{new_error, with_context};
-use super::error::SecurityError;
 use libc::{sock_filter, sock_fprog};
 use serde::Deserialize;
 use std::error::Error;
@@ -292,7 +292,9 @@ pub fn validate_action(action: &str) -> Result<String, SecurityError> {
 /// assert!(validate_default_action("allow").is_ok());
 /// assert!(validate_default_action("invalid").is_err());
 /// ```
-pub fn validate_default_action(action: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn validate_default_action(
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let normalized = normalize_action(action);
     if normalized.is_empty() {
         log_debug(

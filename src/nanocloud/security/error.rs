@@ -66,7 +66,11 @@ impl fmt::Display for SecurityError {
                 write!(f, "unknown capability: '{}'", capability)
             }
             SecurityError::UnknownSyscall { syscall } => {
-                write!(f, "unknown syscall '{}' referenced by seccomp profile", syscall)
+                write!(
+                    f,
+                    "unknown syscall '{}' referenced by seccomp profile",
+                    syscall
+                )
             }
             SecurityError::InvalidSeccompProfile { reason } => {
                 write!(f, "invalid seccomp profile: {}", reason)

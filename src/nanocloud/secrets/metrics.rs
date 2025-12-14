@@ -119,9 +119,11 @@ impl ErrorCategory {
             ErrorCategory::NotFound
         } else if lower.contains("validation") {
             ErrorCategory::Validation
-        } else if lower.contains("integrity") || lower.contains("hmac") || lower.contains("tamper") {
+        } else if lower.contains("integrity") || lower.contains("hmac") || lower.contains("tamper")
+        {
             ErrorCategory::Integrity
-        } else if lower.contains("crypto") || lower.contains("encrypt") || lower.contains("decrypt") {
+        } else if lower.contains("crypto") || lower.contains("encrypt") || lower.contains("decrypt")
+        {
             ErrorCategory::Crypto
         } else if lower.contains("io") || lower.contains("file") || lower.contains("keyspace") {
             ErrorCategory::Io
@@ -395,7 +397,10 @@ impl SecretMetrics for LoggingMetrics {
             &[
                 ("namespace", namespace),
                 ("name", name_str),
-                ("duration_ms", &format!("{:.2}", duration.as_secs_f64() * 1000.0)),
+                (
+                    "duration_ms",
+                    &format!("{:.2}", duration.as_secs_f64() * 1000.0),
+                ),
             ],
         );
     }
@@ -418,7 +423,10 @@ impl SecretMetrics for LoggingMetrics {
                 ("namespace", namespace),
                 ("name", name_str),
                 ("error_category", category.as_str()),
-                ("duration_ms", &format!("{:.2}", duration.as_secs_f64() * 1000.0)),
+                (
+                    "duration_ms",
+                    &format!("{:.2}", duration.as_secs_f64() * 1000.0),
+                ),
             ],
         );
     }
@@ -429,10 +437,7 @@ impl SecretMetrics for LoggingMetrics {
         log_error(
             self.component,
             "SECURITY: Secret integrity check failed - possible tampering detected",
-            &[
-                ("namespace", namespace),
-                ("name", name),
-            ],
+            &[("namespace", namespace), ("name", name)],
         );
     }
 
@@ -442,10 +447,7 @@ impl SecretMetrics for LoggingMetrics {
         log_debug(
             self.component,
             "Secret cache hit",
-            &[
-                ("namespace", namespace),
-                ("name", name),
-            ],
+            &[("namespace", namespace), ("name", name)],
         );
     }
 
@@ -455,10 +457,7 @@ impl SecretMetrics for LoggingMetrics {
         log_debug(
             self.component,
             "Secret cache miss",
-            &[
-                ("namespace", namespace),
-                ("name", name),
-            ],
+            &[("namespace", namespace), ("name", name)],
         );
     }
 }
@@ -504,7 +503,8 @@ impl SecretMetrics for CountingMetrics {
         _name: Option<&str>,
         _duration: Duration,
     ) {
-        self.success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.success_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn record_failure(
@@ -515,19 +515,23 @@ impl SecretMetrics for CountingMetrics {
         _category: ErrorCategory,
         _duration: Duration,
     ) {
-        self.failure_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.failure_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn record_integrity_failure(&self, _namespace: &str, _name: &str) {
-        self.integrity_failure_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.integrity_failure_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn record_cache_hit(&self, _namespace: &str, _name: &str) {
-        self.cache_hit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cache_hit_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn record_cache_miss(&self, _namespace: &str, _name: &str) {
-        self.cache_miss_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cache_miss_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -615,23 +619,33 @@ mod tests {
         metrics.record_cache_miss("default", "not-cached");
 
         assert_eq!(
-            metrics.success_count.load(std::sync::atomic::Ordering::SeqCst),
+            metrics
+                .success_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
         assert_eq!(
-            metrics.failure_count.load(std::sync::atomic::Ordering::SeqCst),
+            metrics
+                .failure_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
         assert_eq!(
-            metrics.integrity_failure_count.load(std::sync::atomic::Ordering::SeqCst),
+            metrics
+                .integrity_failure_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
         assert_eq!(
-            metrics.cache_hit_count.load(std::sync::atomic::Ordering::SeqCst),
+            metrics
+                .cache_hit_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
         assert_eq!(
-            metrics.cache_miss_count.load(std::sync::atomic::Ordering::SeqCst),
+            metrics
+                .cache_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
     }

@@ -86,7 +86,10 @@ fn auth_context_cloning() {
         subject: "user@example.com".to_string(),
         issuer: Some("issuer".to_string()),
     });
-    original.set_scope(AuthScope::Jwt(vec!["read".to_string(), "write".to_string()]));
+    original.set_scope(AuthScope::Jwt(vec![
+        "read".to_string(),
+        "write".to_string(),
+    ]));
 
     let cloned = original.clone();
     assert_eq!(original, cloned);

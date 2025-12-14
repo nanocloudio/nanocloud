@@ -50,10 +50,7 @@ use crate::nanocloud::Config;
 #[derive(Debug)]
 pub enum ConfigError {
     /// Secure assets directory does not exist.
-    MissingDirectory {
-        path: PathBuf,
-        hint: String,
-    },
+    MissingDirectory { path: PathBuf, hint: String },
 
     /// Secure assets directory has incorrect permissions.
     InsecurePermissions {
@@ -64,10 +61,7 @@ pub enum ConfigError {
     },
 
     /// Master key file does not exist.
-    MissingKeyFile {
-        path: PathBuf,
-        hint: String,
-    },
+    MissingKeyFile { path: PathBuf, hint: String },
 
     /// Master key file is not readable.
     UnreadableKeyFile {
@@ -85,10 +79,7 @@ pub enum ConfigError {
     },
 
     /// Master key file is empty.
-    EmptyKeyFile {
-        path: PathBuf,
-        hint: String,
-    },
+    EmptyKeyFile { path: PathBuf, hint: String },
 
     /// Master key file is not valid PEM format.
     InvalidKeyFormat {
@@ -98,10 +89,7 @@ pub enum ConfigError {
     },
 
     /// Master key is not an RSA private key.
-    WrongKeyType {
-        path: PathBuf,
-        hint: String,
-    },
+    WrongKeyType { path: PathBuf, hint: String },
 
     /// Master key has insufficient key size.
     InsufficientKeySize {
@@ -123,7 +111,12 @@ impl fmt::Display for ConfigError {
                     hint
                 )
             }
-            ConfigError::InsecurePermissions { path, actual, expected, hint } => {
+            ConfigError::InsecurePermissions {
+                path,
+                actual,
+                expected,
+                hint,
+            } => {
                 write!(
                     f,
                     "Secure assets directory has insecure permissions: '{}' (mode {:04o}, expected {:04o})\n  Hint: {}",
@@ -150,7 +143,12 @@ impl fmt::Display for ConfigError {
                     hint
                 )
             }
-            ConfigError::InsecureKeyPermissions { path, actual, expected, hint } => {
+            ConfigError::InsecureKeyPermissions {
+                path,
+                actual,
+                expected,
+                hint,
+            } => {
                 write!(
                     f,
                     "Master encryption key has insecure permissions: '{}' (mode {:04o}, expected {:04o} or stricter)\n  Hint: {}",
@@ -185,7 +183,12 @@ impl fmt::Display for ConfigError {
                     hint
                 )
             }
-            ConfigError::InsufficientKeySize { path, actual_bits, minimum_bits, hint } => {
+            ConfigError::InsufficientKeySize {
+                path,
+                actual_bits,
+                minimum_bits,
+                hint,
+            } => {
                 write!(
                     f,
                     "Master encryption key has insufficient size: '{}' ({} bits, minimum {} bits)\n  Hint: {}",
@@ -251,7 +254,8 @@ pub fn validate_key_material() -> Result<ValidationResult, ConfigError> {
         return Err(ConfigError::MissingDirectory {
             path: secure_assets_path,
             hint: "Run 'nanoctl install' or 'nanoctl setup' to generate secure assets, \
-                   or set NANOCLOUD_SECURE_ASSETS to an existing directory.".to_string(),
+                   or set NANOCLOUD_SECURE_ASSETS to an existing directory."
+                .to_string(),
         });
     }
 
@@ -262,8 +266,10 @@ pub fn validate_key_material() -> Result<ValidationResult, ConfigError> {
     if !master_key_path.exists() {
         return Err(ConfigError::MissingKeyFile {
             path: master_key_path,
-            hint: "Run 'nanoctl install' or 'nanoctl setup' to generate the master encryption key. \
-                   The file should be named 'secret.key' in the secure assets directory.".to_string(),
+            hint:
+                "Run 'nanoctl install' or 'nanoctl setup' to generate the master encryption key. \
+                   The file should be named 'secret.key' in the secure assets directory."
+                    .to_string(),
         });
     }
 
@@ -367,7 +373,8 @@ fn validate_key_content(path: &Path) -> Result<u32, ConfigError> {
         return Err(ConfigError::EmptyKeyFile {
             path: path.to_path_buf(),
             hint: "Regenerate the key using 'nanoctl install --force' or \
-                   delete the file and run 'nanoctl setup'.".to_string(),
+                   delete the file and run 'nanoctl setup'."
+                .to_string(),
         });
     }
 
@@ -379,7 +386,8 @@ fn validate_key_content(path: &Path) -> Result<u32, ConfigError> {
                 path: path.to_path_buf(),
                 error: e.to_string(),
                 hint: "The key file must be a PEM-encoded private key. \
-                       Regenerate using 'nanoctl install --force'.".to_string(),
+                       Regenerate using 'nanoctl install --force'."
+                    .to_string(),
             });
         }
     };
@@ -391,7 +399,8 @@ fn validate_key_content(path: &Path) -> Result<u32, ConfigError> {
             return Err(ConfigError::WrongKeyType {
                 path: path.to_path_buf(),
                 hint: "The master encryption key must be an RSA private key. \
-                       Regenerate using 'nanoctl install --force'.".to_string(),
+                       Regenerate using 'nanoctl install --force'."
+                    .to_string(),
             });
         }
     };
@@ -466,7 +475,11 @@ pub fn configuration_status() -> String {
                 result.secure_assets_path.display(),
                 result.master_key_path.display(),
                 result.key_size_bits,
-                if result.keyspace_ready { "ready" } else { "not ready" }
+                if result.keyspace_ready {
+                    "ready"
+                } else {
+                    "not ready"
+                }
             )
         }
         Err(e) => {
@@ -516,7 +529,10 @@ mod tests {
 
         let result = validate_key_material();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::MissingDirectory { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigError::MissingDirectory { .. }
+        ));
 
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
     }
@@ -536,7 +552,10 @@ mod tests {
 
         let result = validate_key_material();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::MissingKeyFile { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigError::MissingKeyFile { .. }
+        ));
 
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
     }
@@ -562,7 +581,10 @@ mod tests {
 
         let result = validate_key_material();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::EmptyKeyFile { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigError::EmptyKeyFile { .. }
+        ));
 
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
     }
@@ -588,7 +610,10 @@ mod tests {
 
         let result = validate_key_material();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::InvalidKeyFormat { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigError::InvalidKeyFormat { .. }
+        ));
 
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
     }

@@ -105,20 +105,13 @@ impl StatefulSetController {
     /// Loads the desired state previously persisted for this StatefulSet.
     pub fn desired_state(&self) -> Result<Option<StatefulSetDesiredState>, StatefulSetError> {
         let key = self.state_key();
-        match CONTROLLER_KEYSPACE.get(&key) {
-            Ok(raw) => {
-                let desired =
-                    serde_json::from_str(&raw).map_err(StatefulSetError::Serialization)?;
-                Ok(Some(desired))
-            }
-            Err(err) => {
-                if is_missing_value_error(err.as_ref()) {
-                    Ok(None)
-                } else {
-                    Err(StatefulSetError::Persistence(err))
-                }
-            }
-        }
+        let raw = match CONTROLLER_KEYSPACE.get_optional(&key) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(StatefulSetError::Persistence(err)),
+        };
+        let desired = serde_json::from_str(&raw).map_err(StatefulSetError::Serialization)?;
+        Ok(Some(desired))
     }
 
     /// Computes the bounded ReplicaSet plan for the supplied spec and observed pods.

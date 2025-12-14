@@ -268,27 +268,22 @@ pub fn load(
     app: &str,
 ) -> Result<Option<StatefulSet>, Box<dyn Error + Send + Sync>> {
     let key = make_statefulset_key(namespace, app);
-    match K8S_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let parsed = serde_json::from_str(&raw).map_err(|err| {
-                with_context(
-                    err,
-                    format!("Failed to parse StatefulSet from key '{}'", key),
-                )
-            })?;
-            Ok(Some(parsed))
-        }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load StatefulSet '{}' from keyspace", key),
-                ))
-            }
-        }
-    }
+    let raw = match K8S_KEYSPACE.get_optional(&key).map_err(|err| {
+        with_context(
+            err,
+            format!("Failed to load StatefulSet '{}' from keyspace", key),
+        )
+    })? {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let parsed = serde_json::from_str(&raw).map_err(|err| {
+        with_context(
+            err,
+            format!("Failed to parse StatefulSet from key '{}'", key),
+        )
+    })?;
+    Ok(Some(parsed))
 }
 
 pub fn delete(namespace: Option<&str>, app: &str) -> Result<(), Box<dyn Error + Send + Sync>> {

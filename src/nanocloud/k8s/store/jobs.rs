@@ -175,31 +175,23 @@ pub fn get_job(
     name: &str,
 ) -> Result<Option<Job>, Box<dyn Error + Send + Sync>> {
     let key = make_job_key(namespace, name);
-    match K8S_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let mut job: Job = serde_json::from_str(&raw).map_err(|err| {
-                with_context(err, format!("Failed to parse Job from key '{}'", key))
-            })?;
-            if job.metadata.name.is_none() {
-                job.metadata.name = Some(name.to_string());
-            }
-            job.metadata.namespace = Some(normalize_namespace(namespace));
-            if job.metadata.resource_version.is_none() {
-                job.metadata.resource_version = Some("1".to_string());
-            }
-            Ok(Some(job))
-        }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load Job '{}' from keyspace", key),
-                ))
-            }
-        }
+    let raw = match K8S_KEYSPACE
+        .get_optional(&key)
+        .map_err(|err| with_context(err, format!("Failed to load Job '{}' from keyspace", key)))?
+    {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let mut job: Job = serde_json::from_str(&raw)
+        .map_err(|err| with_context(err, format!("Failed to parse Job from key '{}'", key)))?;
+    if job.metadata.name.is_none() {
+        job.metadata.name = Some(name.to_string());
     }
+    job.metadata.namespace = Some(normalize_namespace(namespace));
+    if job.metadata.resource_version.is_none() {
+        job.metadata.resource_version = Some("1".to_string());
+    }
+    Ok(Some(job))
 }
 
 pub fn delete_job(namespace: Option<&str>, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {

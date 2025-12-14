@@ -1655,19 +1655,13 @@ fn load_backoff_state(
     name: &str,
 ) -> Result<Option<RestartBackoff>, Box<dyn Error + Send + Sync>> {
     let key = backoff_key(namespace, name);
-    match KUBELET_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let state: RestartBackoffState = serde_json::from_str(&raw)?;
-            Ok(Some(RestartBackoff::from_state(state)))
-        }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        }
-    }
+    let raw = match KUBELET_KEYSPACE.get_optional(&key) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let state: RestartBackoffState = serde_json::from_str(&raw)?;
+    Ok(Some(RestartBackoff::from_state(state)))
 }
 
 fn persist_backoff_state(
@@ -1713,20 +1707,14 @@ fn load_desired_state(
     name: &str,
 ) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
     let key = desired_state_key(namespace, name);
-    match KUBELET_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let record: DesiredStateRecord = serde_json::from_str(&raw)
-                .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
-            Ok(Some(record.running))
-        }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        }
-    }
+    let raw = match KUBELET_KEYSPACE.get_optional(&key) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let record: DesiredStateRecord =
+        serde_json::from_str(&raw).map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
+    Ok(Some(record.running))
 }
 
 fn clear_desired_state(

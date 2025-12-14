@@ -157,6 +157,14 @@ Controller discovery endpoints (`/apis/nanocloud.io/v1`, `/api/v1`) list the ava
 - **Secure assets** – `nanocloud setup` prepares `/var/lib/nanocloud.io/secure_assets`, generates encryption keys, and keeps them off the container filesystem.
 - **Bindings safety nets** – option validation ensures binding prerequisites are satisfied before commands execute, preventing privilege mismatches between workloads.
 
+## Testing & Doc Tests
+
+- `make test` – runs the full workspace suites with deterministic keyspace/secure-asset roots.
+- `make test-security` – exercises the security unit/integration tests **and** the util/security doc tests (`cargo test --doc util::keyspace::` and `cargo test --doc util::security::`).
+- `cargo test --doc <module>::` – runs targeted doc snippets; e.g., `cargo test --doc util::keyspace::` verifies the async/offloading example in `keyspace.rs`.
+
+Keeping doc tests wired into CI ensures the usage examples in `util::error`, `util::keyspace`, and `util::security` remain accurate even as the APIs evolve.
+
 ## Device Management
 
 - `nanocloud device` exposes subcommands to list, get, create, and delete device records within namespaces plus issue device certificates by POSTing CSRs. Each command reuses the API client’s authentication plumbing so it inherits TLS, bootstrap, and token support.
@@ -171,3 +179,5 @@ Controller discovery endpoints (`/apis/nanocloud.io/v1`, `/api/v1`) list the ava
 ## Contributing
 
 Issues and pull requests are welcome. When authoring Dockyard images, follow the `io.nanocloud.options` schema so new services inherit the same binding and macro capabilities. Runtime or controller changes should include unit tests (`src/nanocloud/**`) and, where relevant, integration coverage (`tests/`).
+
+- Prefer the shared error helpers in `nanocloud::util::error` (see the examples in `src/nanocloud/util/error.rs`) so new code consistently uses `new_error` for user-facing strings and `with_context` when propagating IO or crypto failures.

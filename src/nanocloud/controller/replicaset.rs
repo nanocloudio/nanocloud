@@ -257,19 +257,13 @@ impl ReplicaSetController {
     /// Loads the desired state previously persisted for this ReplicaSet.
     pub fn desired_state(&self) -> Result<Option<ReplicaSetDesiredState>, ReplicaSetError> {
         let key = self.state_key();
-        match CONTROLLER_KEYSPACE.get(&key) {
-            Ok(raw) => {
-                let desired = serde_json::from_str(&raw).map_err(ReplicaSetError::Serialization)?;
-                Ok(Some(desired))
-            }
-            Err(err) => {
-                if is_missing_value_error(err.as_ref()) {
-                    Ok(None)
-                } else {
-                    Err(ReplicaSetError::Persistence(err))
-                }
-            }
-        }
+        let raw = match CONTROLLER_KEYSPACE.get_optional(&key) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(ReplicaSetError::Persistence(err)),
+        };
+        let desired = serde_json::from_str(&raw).map_err(ReplicaSetError::Serialization)?;
+        Ok(Some(desired))
     }
 
     /// Reconciles the ReplicaSet against observed pods and persists the desired state.

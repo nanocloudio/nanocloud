@@ -26,31 +26,65 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock, RwLock,
+};
 
 use super::assets::load_secret_key;
 use crate::nanocloud::util::error::{new_error, with_context};
 use crate::nanocloud::Config;
 
-const ENVELOPE_VERSION: u32 = 1;
+pub(crate) const ENVELOPE_VERSION: u32 = 1;
 pub(crate) const ENCRYPTED_BLOB_PREFIX: &str = "v1:";
 const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
 
-static GLOBAL_KMS: OnceLock<Arc<dyn KeyManagementService>> = OnceLock::new();
+static GLOBAL_KMS: OnceLock<RwLock<Arc<dyn KeyManagementService>>> = OnceLock::new();
+static GLOBAL_KMS_REGISTERED: AtomicBool = AtomicBool::new(false);
 type KeyMaterial = (String, Arc<PKey<Private>>);
 
 #[allow(dead_code)]
 pub fn register_global_kms(
     provider: Arc<dyn KeyManagementService>,
 ) -> Result<(), Arc<dyn KeyManagementService>> {
-    GLOBAL_KMS.set(provider)
+    if GLOBAL_KMS_REGISTERED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(provider);
+    }
+    let slot = global_kms_slot();
+    let mut guard = slot
+        .write()
+        .expect("global KMS registry lock poisoned");
+    *guard = provider;
+    Ok(())
 }
 
 pub fn global_kms() -> Arc<dyn KeyManagementService> {
-    GLOBAL_KMS
-        .get_or_init(|| Arc::new(LocalKms::new()) as Arc<dyn KeyManagementService>)
+    global_kms_slot()
+        .read()
+        .expect("global KMS registry lock poisoned")
         .clone()
+}
+
+fn global_kms_slot() -> &'static RwLock<Arc<dyn KeyManagementService>> {
+    GLOBAL_KMS.get_or_init(|| {
+        let provider: Arc<dyn KeyManagementService> = Arc::new(LocalKms::new());
+        RwLock::new(provider)
+    })
+}
+
+#[cfg(any(test, feature = "security-test-noop"))]
+#[allow(dead_code)]
+pub(crate) fn override_global_kms_for_tests(provider: Arc<dyn KeyManagementService>) {
+    GLOBAL_KMS_REGISTERED.store(true, Ordering::SeqCst);
+    let slot = global_kms_slot();
+    let mut guard = slot
+        .write()
+        .expect("global KMS registry lock poisoned");
+    *guard = provider;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

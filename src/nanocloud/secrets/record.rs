@@ -109,9 +109,7 @@ pub fn build_associated_data(
         immutable: metadata.immutable,
         resource_version: metadata.resource_version.as_deref(),
     };
-    serde_json::to_vec(&aad).map_err(|e| {
-        Box::new(e) as Box<dyn Error + Send + Sync>
-    })
+    serde_json::to_vec(&aad).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
 }
 
 /// Builds a complete secret store record.
@@ -155,7 +153,9 @@ pub fn decode_record(json: &str) -> Result<SecretStoreRecord, Box<dyn Error + Se
 }
 
 /// Encodes a cipher payload to JSON bytes.
-pub fn encode_payload(payload: &SecretCipherPayload) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+pub fn encode_payload(
+    payload: &SecretCipherPayload,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     serde_json::to_vec(payload).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
 }
 

@@ -108,11 +108,8 @@ impl RotationResult {
     fn record_failure(&mut self, namespace: &str, name: &str, error: &str) {
         self.failure_count += 1;
         if self.failures.len() < Self::MAX_FAILURE_DETAILS {
-            self.failures.push((
-                namespace.to_string(),
-                name.to_string(),
-                error.to_string(),
-            ));
+            self.failures
+                .push((namespace.to_string(), name.to_string(), error.to_string()));
         }
     }
 
@@ -155,7 +152,8 @@ pub fn rotate_secret(
     name: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Read and decrypt the secret
-    let stored = store.get(namespace, name)?
+    let stored = store
+        .get(namespace, name)?
         .ok_or_else(|| SecretError::NotFound {
             namespace: namespace.to_string(),
             name: name.to_string(),
@@ -418,7 +416,10 @@ mod tests {
             .expect("get should succeed")
             .expect("secret should exist");
 
-        assert_eq!(rotated.secret.data.get("key"), Some(&"value-rotation-test".to_string()));
+        assert_eq!(
+            rotated.secret.data.get("key"),
+            Some(&"value-rotation-test".to_string())
+        );
         // Digest should be different due to new data key
         assert_ne!(rotated.digest, original_digest);
 
@@ -454,8 +455,8 @@ mod tests {
         }
 
         // Rotate all
-        let result = rotate_all_secrets(&store, RotationConfig::default())
-            .expect("rotation should succeed");
+        let result =
+            rotate_all_secrets(&store, RotationConfig::default()).expect("rotation should succeed");
 
         assert_eq!(result.success_count, 3);
         assert_eq!(result.failure_count, 0);
@@ -562,9 +563,15 @@ mod tests {
         let store = KeyspaceSecretStore::new();
 
         // Create secrets in different namespaces
-        store.put(sample_secret("ns1", "secret-a")).expect("put should succeed");
-        store.put(sample_secret("ns1", "secret-b")).expect("put should succeed");
-        store.put(sample_secret("ns2", "secret-c")).expect("put should succeed");
+        store
+            .put(sample_secret("ns1", "secret-a"))
+            .expect("put should succeed");
+        store
+            .put(sample_secret("ns1", "secret-b"))
+            .expect("put should succeed");
+        store
+            .put(sample_secret("ns2", "secret-c"))
+            .expect("put should succeed");
 
         // Rotate only ns1
         let result = rotate_namespace_secrets(&store, "ns1", RotationConfig::default())
@@ -593,6 +600,9 @@ mod tests {
         assert_eq!(result.total_processed(), 4);
         assert!(!result.is_complete());
         assert_eq!(result.failures.len(), 1);
-        assert_eq!(result.failures[0], ("ns".to_string(), "name1".to_string(), "error1".to_string()));
+        assert_eq!(
+            result.failures[0],
+            ("ns".to_string(), "name1".to_string(), "error1".to_string())
+        );
     }
 }

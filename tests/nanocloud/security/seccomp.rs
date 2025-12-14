@@ -18,21 +18,30 @@ mod parsing_tests {
     fn parses_valid_profile_with_single_syscall() {
         let profile = r#"{"deny": ["ptrace"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Expected valid profile to parse successfully");
+        assert!(
+            result.is_ok(),
+            "Expected valid profile to parse successfully"
+        );
     }
 
     #[test]
     fn parses_valid_profile_with_multiple_syscalls() {
         let profile = r#"{"deny": ["ptrace", "mount", "reboot"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Expected valid profile with multiple syscalls to parse");
+        assert!(
+            result.is_ok(),
+            "Expected valid profile with multiple syscalls to parse"
+        );
     }
 
     #[test]
     fn parses_profile_with_empty_deny_list() {
         let profile = r#"{"deny": []}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Expected profile with empty deny list to parse");
+        assert!(
+            result.is_ok(),
+            "Expected profile with empty deny list to parse"
+        );
     }
 
     #[test]
@@ -40,14 +49,20 @@ mod parsing_tests {
         // The implementation lowercases syscall names before lookup
         let profile = r#"{"deny": ["PTRACE", "Mount", "REBOOT"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Expected mixed-case syscall names to be normalized");
+        assert!(
+            result.is_ok(),
+            "Expected mixed-case syscall names to be normalized"
+        );
     }
 
     #[test]
     fn trims_whitespace_from_syscall_names() {
         let profile = r#"{"deny": ["  ptrace  ", "mount"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Expected whitespace-padded syscall names to be trimmed");
+        assert!(
+            result.is_ok(),
+            "Expected whitespace-padded syscall names to be trimmed"
+        );
     }
 }
 
@@ -71,7 +86,10 @@ mod validation_error_tests {
     fn rejects_missing_deny_field() {
         let profile = r#"{}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Expected missing deny field to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected missing deny field to be rejected"
+        );
     }
 
     #[test]
@@ -97,7 +115,10 @@ mod validation_error_tests {
         // If any syscall is invalid, the whole profile should be rejected
         let profile = r#"{"deny": ["ptrace", "invalid_syscall", "mount"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Expected profile with invalid syscall to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected profile with invalid syscall to be rejected"
+        );
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("invalid_syscall"),
@@ -124,7 +145,10 @@ mod validation_error_tests {
     fn rejects_non_string_syscall_entries() {
         let profile = r#"{"deny": [123, "ptrace"]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Expected numeric syscall entry to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected numeric syscall entry to be rejected"
+        );
     }
 }
 
@@ -143,7 +167,8 @@ mod file_loading_tests {
 
     #[test]
     fn returns_error_for_nonexistent_file() {
-        let result = SeccompFilter::from_path(std::path::Path::new("/nonexistent/path/profile.json"));
+        let result =
+            SeccompFilter::from_path(std::path::Path::new("/nonexistent/path/profile.json"));
         assert!(result.is_err(), "Expected error for nonexistent file");
         let err = result.unwrap_err();
         assert!(
@@ -211,10 +236,16 @@ mod known_syscalls_tests {
 
     #[test]
     fn accepts_all_known_syscalls_in_single_profile() {
-        let syscalls: Vec<String> = KNOWN_SYSCALLS.iter().map(|s| format!(r#""{}""#, s)).collect();
+        let syscalls: Vec<String> = KNOWN_SYSCALLS
+            .iter()
+            .map(|s| format!(r#""{}""#, s))
+            .collect();
         let profile = format!(r#"{{"deny": [{}]}}"#, syscalls.join(", "));
         let result = SeccompFilter::from_str(&profile);
-        assert!(result.is_ok(), "Expected all known syscalls to be accepted together");
+        assert!(
+            result.is_ok(),
+            "Expected all known syscalls to be accepted together"
+        );
     }
 
     #[test]
@@ -245,14 +276,20 @@ mod edge_cases {
         // Empty string after trim should fail
         let profile = r#"{"deny": [""]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Expected empty syscall name to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected empty syscall name to be rejected"
+        );
     }
 
     #[test]
     fn handles_whitespace_only_syscall() {
         let profile = r#"{"deny": ["   "]}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Expected whitespace-only syscall to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected whitespace-only syscall to be rejected"
+        );
     }
 
     #[test]
@@ -268,7 +305,10 @@ mod edge_cases {
         let profile = r#"{"deny": ["ptrace\u0000"]}"#;
         let result = SeccompFilter::from_str(profile);
         // Unicode/null characters should result in unknown syscall
-        assert!(result.is_err(), "Expected unicode in syscall name to be rejected");
+        assert!(
+            result.is_err(),
+            "Expected unicode in syscall name to be rejected"
+        );
     }
 }
 
@@ -532,10 +572,7 @@ mod architecture_validation_tests {
 
     #[test]
     fn validates_known_architectures() {
-        assert_eq!(
-            validate_architecture("x86_64").unwrap(),
-            "SCMP_ARCH_X86_64"
-        );
+        assert_eq!(validate_architecture("x86_64").unwrap(), "SCMP_ARCH_X86_64");
         assert_eq!(
             validate_architecture("SCMP_ARCH_AARCH64").unwrap(),
             "SCMP_ARCH_AARCH64"
@@ -698,8 +735,8 @@ mod bundle_integration_tests {
             ("SCMP_ACT_ALLOW", true),
             ("SCMP_ACT_ERRNO", true),
             ("SCMP_ACT_KILL", true),
-            ("allow", true),  // alias
-            ("errno", true),  // alias
+            ("allow", true), // alias
+            ("errno", true), // alias
             ("INVALID_ACTION", false),
         ];
 
@@ -870,42 +907,60 @@ mod profile_with_default_action_tests {
     fn parses_profile_with_valid_default_action() {
         let profile = r#"{"deny": [], "defaultAction": "SCMP_ACT_ALLOW"}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Should parse profile with valid defaultAction");
+        assert!(
+            result.is_ok(),
+            "Should parse profile with valid defaultAction"
+        );
     }
 
     #[test]
     fn parses_profile_with_lowercase_default_action() {
         let profile = r#"{"deny": [], "defaultAction": "scmp_act_allow"}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Should parse profile with lowercase defaultAction");
+        assert!(
+            result.is_ok(),
+            "Should parse profile with lowercase defaultAction"
+        );
     }
 
     #[test]
     fn parses_profile_with_alias_default_action() {
         let profile = r#"{"deny": [], "defaultAction": "allow"}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Should parse profile with alias defaultAction");
+        assert!(
+            result.is_ok(),
+            "Should parse profile with alias defaultAction"
+        );
     }
 
     #[test]
     fn parses_profile_without_default_action() {
         let profile = r#"{"deny": []}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Should parse profile without defaultAction (uses default)");
+        assert!(
+            result.is_ok(),
+            "Should parse profile without defaultAction (uses default)"
+        );
     }
 
     #[test]
     fn rejects_profile_with_invalid_default_action() {
         let profile = r#"{"deny": [], "defaultAction": "INVALID_ACTION"}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Should reject profile with invalid defaultAction");
+        assert!(
+            result.is_err(),
+            "Should reject profile with invalid defaultAction"
+        );
     }
 
     #[test]
     fn rejects_profile_with_empty_default_action() {
         let profile = r#"{"deny": [], "defaultAction": ""}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_err(), "Should reject profile with empty defaultAction");
+        assert!(
+            result.is_err(),
+            "Should reject profile with empty defaultAction"
+        );
     }
 
     #[test]
@@ -925,7 +980,10 @@ mod profile_with_default_action_tests {
     fn parses_profile_with_default_action_and_deny_list() {
         let profile = r#"{"deny": ["ptrace", "mount"], "defaultAction": "SCMP_ACT_LOG"}"#;
         let result = SeccompFilter::from_str(profile);
-        assert!(result.is_ok(), "Should parse profile with both deny list and defaultAction");
+        assert!(
+            result.is_ok(),
+            "Should parse profile with both deny list and defaultAction"
+        );
     }
 
     #[test]

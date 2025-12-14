@@ -75,3 +75,13 @@ Common remediation steps:
 
 Events also appear in the reconciliation summary (`reason` field) so CI pipelines
 and alerting systems can react without scraping controller logs.
+
+## Test-Friendly Security Helpers
+
+Security helpers are intentionally heavy because they touch on-disk assets and
+invoke OpenSSL. When writing unit tests that only need deterministic envelopes,
+enable the `security-test-noop` Cargo feature and call
+`nanocloud::util::security::install_noop_security_helpers()`. The helper swaps in
+an in-memory Key Management Service so `EncryptionKey::new(None)` and the secret
+store wrappers can run without generating certificates or loading private keys.
+The feature is opt-in and should never be enabled for production builds.

@@ -57,19 +57,28 @@ mod normalize_capability_name_tests {
     #[test]
     fn replaces_dashes_with_underscores() {
         assert_eq!(normalize_capability_name("cap-net-raw"), "CAP_NET_RAW");
-        assert_eq!(normalize_capability_name("net-bind-service"), "CAP_NET_BIND_SERVICE");
+        assert_eq!(
+            normalize_capability_name("net-bind-service"),
+            "CAP_NET_BIND_SERVICE"
+        );
     }
 
     #[test]
     fn replaces_spaces_with_underscores() {
         assert_eq!(normalize_capability_name("cap net raw"), "CAP_NET_RAW");
-        assert_eq!(normalize_capability_name("net bind service"), "CAP_NET_BIND_SERVICE");
+        assert_eq!(
+            normalize_capability_name("net bind service"),
+            "CAP_NET_BIND_SERVICE"
+        );
     }
 
     #[test]
     fn handles_mixed_separators() {
         assert_eq!(normalize_capability_name("cap-net raw"), "CAP_NET_RAW");
-        assert_eq!(normalize_capability_name("net-bind service"), "CAP_NET_BIND_SERVICE");
+        assert_eq!(
+            normalize_capability_name("net-bind service"),
+            "CAP_NET_BIND_SERVICE"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -150,7 +159,10 @@ mod dedupe_capabilities_tests {
     fn preserves_insertion_order() {
         let caps = vec!["CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_NET_BIND_SERVICE"];
         let result = dedupe_capabilities(caps);
-        assert_eq!(result, vec!["CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_NET_BIND_SERVICE"]);
+        assert_eq!(
+            result,
+            vec!["CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_NET_BIND_SERVICE"]
+        );
     }
 
     #[test]
@@ -222,11 +234,7 @@ mod non_privileged_capabilities_tests {
     fn non_privileged_capabilities_list_is_unique() {
         let mut seen = std::collections::HashSet::new();
         for cap in NON_PRIVILEGED_CAPABILITIES {
-            assert!(
-                seen.insert(*cap),
-                "Duplicate capability found: {}",
-                cap
-            );
+            assert!(seen.insert(*cap), "Duplicate capability found: {}", cap);
         }
     }
 
@@ -425,7 +433,10 @@ mod validate_capability_tests {
     fn returns_normalized_form_for_valid() {
         assert_eq!(validate_capability("net_raw").unwrap(), "CAP_NET_RAW");
         assert_eq!(validate_capability("CAP_CHOWN").unwrap(), "CAP_CHOWN");
-        assert_eq!(validate_capability("cap-sys-admin").unwrap(), "CAP_SYS_ADMIN");
+        assert_eq!(
+            validate_capability("cap-sys-admin").unwrap(),
+            "CAP_SYS_ADMIN"
+        );
     }
 
     #[test]
@@ -574,7 +585,7 @@ mod bundle_integration_tests {
         // Simulate a bundle spec extraCapabilities field
         let bundle_caps = vec![
             "CAP_NET_RAW",
-            "cap_net_admin", // lowercase - should normalize
+            "cap_net_admin",    // lowercase - should normalize
             "NET_BIND_SERVICE", // without prefix - should normalize
         ];
 
@@ -651,10 +662,10 @@ mod bundle_integration_tests {
         // Bundle specs might have duplicates due to user error or templating
         let bundle_caps = vec![
             "CAP_NET_RAW",
-            "cap_net_raw",   // duplicate after normalization
+            "cap_net_raw", // duplicate after normalization
             "CAP_NET_ADMIN",
-            "net_admin",     // duplicate after normalization
-            "",              // empty entry
+            "net_admin", // duplicate after normalization
+            "",          // empty entry
             "CAP_CHOWN",
         ];
 
@@ -748,7 +759,10 @@ mod capabilities_are_subset_of_all_tests {
 
     #[test]
     fn rejects_invalid_capabilities() {
-        assert!(!capabilities_are_subset_of_all(["CAP_NET_RAW", "CAP_INVALID"]));
+        assert!(!capabilities_are_subset_of_all([
+            "CAP_NET_RAW",
+            "CAP_INVALID"
+        ]));
     }
 
     #[test]
@@ -758,7 +772,9 @@ mod capabilities_are_subset_of_all_tests {
 
     #[test]
     fn accepts_all_capabilities() {
-        assert!(capabilities_are_subset_of_all(ALL_CAPABILITIES.iter().copied()));
+        assert!(capabilities_are_subset_of_all(
+            ALL_CAPABILITIES.iter().copied()
+        ));
     }
 }
 
@@ -767,7 +783,10 @@ mod capabilities_are_non_privileged_tests {
 
     #[test]
     fn accepts_non_privileged_capabilities() {
-        assert!(capabilities_are_non_privileged(["CAP_NET_RAW", "CAP_NET_ADMIN"]));
+        assert!(capabilities_are_non_privileged([
+            "CAP_NET_RAW",
+            "CAP_NET_ADMIN"
+        ]));
     }
 
     #[test]
@@ -875,15 +894,15 @@ mod capability_set_is_subset_tests {
 
     #[test]
     fn equal_sets_are_subsets() {
-        assert!(capability_set_is_subset(
-            ["CAP_NET_RAW"],
-            ["CAP_NET_RAW"]
-        ));
+        assert!(capability_set_is_subset(["CAP_NET_RAW"], ["CAP_NET_RAW"]));
     }
 
     #[test]
     fn empty_is_subset_of_anything() {
-        assert!(capability_set_is_subset(Vec::<&str>::new(), ["CAP_NET_RAW"]));
+        assert!(capability_set_is_subset(
+            Vec::<&str>::new(),
+            ["CAP_NET_RAW"]
+        ));
         let empty: Vec<&str> = vec![];
         assert!(capability_set_is_subset(empty.clone(), empty));
     }
@@ -924,19 +943,14 @@ mod capability_set_difference_tests {
 
     #[test]
     fn empty_when_subset() {
-        let diff = capability_set_difference(
-            ["CAP_NET_RAW"],
-            ["CAP_NET_RAW", "CAP_CHOWN"],
-        );
+        let diff = capability_set_difference(["CAP_NET_RAW"], ["CAP_NET_RAW", "CAP_CHOWN"]);
         assert!(diff.is_empty());
     }
 
     #[test]
     fn empty_when_equal() {
-        let diff = capability_set_difference(
-            ["CAP_NET_RAW", "CAP_CHOWN"],
-            ["CAP_NET_RAW", "CAP_CHOWN"],
-        );
+        let diff =
+            capability_set_difference(["CAP_NET_RAW", "CAP_CHOWN"], ["CAP_NET_RAW", "CAP_CHOWN"]);
         assert!(diff.is_empty());
     }
 
@@ -963,10 +977,7 @@ mod capability_set_difference_tests {
 
     #[test]
     fn normalizes_before_comparison() {
-        let diff = capability_set_difference(
-            ["cap_net_raw", "CAP_CHOWN"],
-            ["CAP_NET_RAW"],
-        );
+        let diff = capability_set_difference(["cap_net_raw", "CAP_CHOWN"], ["CAP_NET_RAW"]);
         assert_eq!(diff, vec!["CAP_CHOWN"]);
     }
 }
@@ -1002,21 +1013,14 @@ mod capabilities_requiring_privileged_tests {
 
     #[test]
     fn deduplicates_results() {
-        let privileged = capabilities_requiring_privileged([
-            "CAP_CHOWN",
-            "cap_chown",
-            "chown",
-        ]);
+        let privileged = capabilities_requiring_privileged(["CAP_CHOWN", "cap_chown", "chown"]);
         assert_eq!(privileged, vec!["CAP_CHOWN"]);
     }
 
     #[test]
     fn result_is_sorted() {
-        let privileged = capabilities_requiring_privileged([
-            "CAP_SYS_ADMIN",
-            "CAP_CHOWN",
-            "CAP_KILL",
-        ]);
+        let privileged =
+            capabilities_requiring_privileged(["CAP_SYS_ADMIN", "CAP_CHOWN", "CAP_KILL"]);
         assert_eq!(privileged, vec!["CAP_CHOWN", "CAP_KILL", "CAP_SYS_ADMIN"]);
     }
 
@@ -1468,7 +1472,9 @@ mod runtime_integration_tests {
 
         assert!(config.validate().is_ok());
         assert!(config.add_capabilities.contains(&"CAP_NET_RAW".to_string()));
-        assert!(config.add_capabilities.contains(&"CAP_SYS_ADMIN".to_string()));
+        assert!(config
+            .add_capabilities
+            .contains(&"CAP_SYS_ADMIN".to_string()));
     }
 
     #[test]
@@ -1491,8 +1497,14 @@ mod runtime_integration_tests {
 
         assert!(config.validate().is_ok());
         // All should be normalized to canonical form
-        assert!(config.add_capabilities.iter().all(|c| c.starts_with("CAP_")));
-        assert!(config.add_capabilities.iter().all(|c| c == &c.to_uppercase()));
+        assert!(config
+            .add_capabilities
+            .iter()
+            .all(|c| c.starts_with("CAP_")));
+        assert!(config
+            .add_capabilities
+            .iter()
+            .all(|c| c == &c.to_uppercase()));
     }
 
     // -------------------------------------------------------------------------
@@ -1532,7 +1544,10 @@ mod runtime_integration_tests {
         config.add_caps(["NET_RAW", "NET_ADMIN", "NET_BIND_SERVICE"]);
 
         assert!(config.validate().is_ok());
-        assert!(!config.requires_privileged(), "Only networking caps should not require privileged");
+        assert!(
+            !config.requires_privileged(),
+            "Only networking caps should not require privileged"
+        );
         assert!(config.privileged_caps().is_empty());
     }
 
@@ -1542,7 +1557,10 @@ mod runtime_integration_tests {
         config.add_caps(["NET_RAW", "SYS_ADMIN", "CHOWN"]);
 
         assert!(config.validate().is_ok());
-        assert!(config.requires_privileged(), "SYS_ADMIN and CHOWN require privileged");
+        assert!(
+            config.requires_privileged(),
+            "SYS_ADMIN and CHOWN require privileged"
+        );
 
         let privileged = config.privileged_caps();
         assert!(privileged.contains(&"CAP_SYS_ADMIN".to_string()));
@@ -1646,10 +1664,18 @@ mod runtime_integration_tests {
 
         // Validate all are known capabilities
         for cap in &oci.bounding {
-            assert!(is_valid_capability(cap), "OCI bounding cap {} should be valid", cap);
+            assert!(
+                is_valid_capability(cap),
+                "OCI bounding cap {} should be valid",
+                cap
+            );
         }
         for cap in &oci.inheritable {
-            assert!(is_valid_capability(cap), "OCI inheritable cap {} should be valid", cap);
+            assert!(
+                is_valid_capability(cap),
+                "OCI inheritable cap {} should be valid",
+                cap
+            );
         }
     }
 
@@ -1668,11 +1694,13 @@ mod runtime_integration_tests {
 
         // Step 2: Check if privileged mode is needed
         let normalized = validation_result.unwrap();
-        let privileged_required = !capabilities_are_non_privileged(normalized.iter().map(|s| s.as_str()));
+        let privileged_required =
+            !capabilities_are_non_privileged(normalized.iter().map(|s| s.as_str()));
         assert!(privileged_required, "CHOWN requires privileged");
 
         // Step 3: Get list of privileged capabilities for warning/error
-        let privileged_caps = capabilities_requiring_privileged(normalized.iter().map(|s| s.as_str()));
+        let privileged_caps =
+            capabilities_requiring_privileged(normalized.iter().map(|s| s.as_str()));
         assert_eq!(privileged_caps, vec!["CAP_CHOWN"]);
     }
 
@@ -1697,17 +1725,13 @@ mod runtime_integration_tests {
         let requested_caps = ["net_raw", "NET_ADMIN", "cap-sys-admin"];
 
         // Check if requested is subset of allowed
-        let is_subset = capability_set_is_subset(
-            requested_caps.iter().copied(),
-            allowed_caps.iter().copied(),
-        );
+        let is_subset =
+            capability_set_is_subset(requested_caps.iter().copied(), allowed_caps.iter().copied());
         assert!(!is_subset, "SYS_ADMIN is not in allowed set");
 
         // Find what's not allowed
-        let not_allowed = capability_set_difference(
-            requested_caps.iter().copied(),
-            allowed_caps.iter().copied(),
-        );
+        let not_allowed =
+            capability_set_difference(requested_caps.iter().copied(), allowed_caps.iter().copied());
         assert_eq!(not_allowed, vec!["CAP_SYS_ADMIN"]);
     }
 

@@ -14,6 +14,25 @@
  * limitations under the License.
  */
 
+//! Shared helpers that power Nanocloud subsystems.
+//!
+//! - `error` and `keyspace` provide general-purpose utilities that can be used
+//!   from most modules.
+//! - The `security` submodule houses TLS/crypto helpers and should only be used
+//!   when code already deals with sensitive material. It documents its own
+//!   guarantees and limitations to prevent accidental misuse.
+//!
+//! Keeping these responsibilities in a single crate simplifies imports while
+//! the documentation above makes the intended boundaries explicit.
+//!
+//! ## Future reorganization
+//!
+//! Security-heavy helpers will eventually graduate to a dedicated module or
+//! crate so that audits can reason about cryptographic boundaries without
+//! scanning general-purpose utilities. Until that split happens, code touching
+//! TLS or encryption primitives should import from `nanocloud::util::security`
+//! directly and avoid re-exporting sensitive wrappers through unrelated modules.
+
 pub mod error;
 mod keyspace;
 pub mod security;
@@ -22,3 +41,4 @@ pub mod security;
 pub use keyspace::{
     is_missing_value_error, Keyspace, KeyspaceEvent, KeyspaceEventType, SingleUseTokenOutcome,
 };
+pub(crate) use keyspace::reset_partition_watch;

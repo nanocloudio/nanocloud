@@ -45,9 +45,7 @@ fn lock_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
 /// Acquires or creates a lock for a specific secret key.
 fn get_secret_lock(key: &str) -> Arc<Mutex<()>> {
     let registry = lock_registry();
-    let mut guard = registry
-        .lock()
-        .expect("secret lock registry poisoned");
+    let mut guard = registry.lock().expect("secret lock registry poisoned");
     guard
         .entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))

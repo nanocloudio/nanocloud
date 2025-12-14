@@ -42,6 +42,7 @@ pub struct VolumeKeyMetadata {
     pub created: bool,
 }
 
+/// Generates and loads CA, service, and volume key material from the secure-assets directory.
 pub struct SecureAssets;
 
 struct CachedSecretKey {
@@ -68,6 +69,74 @@ fn secret_key_cache() -> &'static Mutex<Option<CachedSecretKey>> {
 
 fn ca_cache() -> &'static Mutex<Option<CachedCa>> {
     CA_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn ensure_secure_dir(
+    dir: &Path,
+    label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !dir.exists() {
+        return Err(new_error(format!(
+            "{label} '{}' does not exist",
+            dir.display()
+        )));
+    }
+    let metadata = fs::metadata(dir).map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to inspect {label} '{}'", dir.display()),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(new_error(format!(
+            "{label} '{}' must be a directory",
+            dir.display()
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(new_error(format!(
+            "{label} '{}' must have permissions 0700 (found {:o})",
+            dir.display(),
+            mode
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_asset_file(
+    path: &Path,
+    private: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !path.exists() {
+        return Err(new_error(format!(
+            "Secure asset '{}' is missing",
+            path.display()
+        )));
+    }
+    let metadata = fs::metadata(path).map_err(|e| {
+        with_context(
+            e,
+            format!("Failed to inspect secure asset '{}'", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(new_error(format!(
+            "Secure asset '{}' must be a file",
+            path.display()
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    let expected = if private { 0o400 } else { 0o444 };
+    if mode != expected {
+        return Err(new_error(format!(
+            "Secure asset '{}' must have permissions {:03o} (found {:03o})",
+            path.display(),
+            expected,
+            mode
+        )));
+    }
+    Ok(())
 }
 
 fn modified_time(path: &Path) -> SystemTime {
@@ -110,6 +179,7 @@ impl SecureAssets {
                 ),
             )
         })?;
+        ensure_secure_dir(dir, "Secure assets directory")?;
 
         if repair && ca_cert_path.exists() && !ca_key_path.exists() {
             return Err(new_error(
@@ -171,6 +241,7 @@ impl SecureAssets {
         volumes: &[String],
         overwrite: bool,
     ) -> Result<Vec<VolumeKeyMetadata>, Box<dyn Error + Send + Sync>> {
+        ensure_secure_dir(dir, "Secure assets directory")?;
         let mut dedup = std::collections::BTreeSet::new();
         let mut metadata = Vec::new();
         for volume in volumes {
@@ -199,11 +270,22 @@ impl SecureAssets {
                 ),
             )
         })?;
+        fs::set_permissions(&volumes_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to set permissions on secure assets volume directory '{}'",
+                    volumes_dir.display()
+                ),
+            )
+        })?;
+        ensure_secure_dir(&volumes_dir, "Secure assets volume directory")?;
 
         let file_name = format!("{volume}.key");
         let key_path = volumes_dir.join(&file_name);
 
         if key_path.exists() && !overwrite {
+            ensure_asset_file(&key_path, true)?;
             let encoded = fs::read_to_string(&key_path).map_err(|e| {
                 with_context(
                     e,
@@ -257,6 +339,9 @@ pub(crate) fn load_ca() -> Result<(X509, PKey<Private>), Box<dyn Error + Send + 
     let dir = Config::SecureAssets.get_path();
     let ca_cert_path = dir.join("ca.crt");
     let ca_key_path = dir.join("ca.key");
+    ensure_secure_dir(&dir, "Secure assets directory")?;
+    ensure_asset_file(&ca_cert_path, false)?;
+    ensure_asset_file(&ca_key_path, true)?;
     let cert_modified = modified_time(&ca_cert_path);
     let key_modified = modified_time(&ca_key_path);
 
@@ -314,6 +399,8 @@ pub(crate) fn load_ca() -> Result<(X509, PKey<Private>), Box<dyn Error + Send + 
 pub(crate) fn load_secret_key() -> Result<PKey<Private>, Box<dyn Error + Send + Sync>> {
     let dir = Config::SecureAssets.get_path();
     let secret_key_path = dir.join("secret.key");
+    ensure_secure_dir(&dir, "Secure assets directory")?;
+    ensure_asset_file(&secret_key_path, true)?;
     let modified = modified_time(&secret_key_path);
 
     {
@@ -568,6 +655,47 @@ mod tests {
         assert_ne!(
             first_der, second_der,
             "CA cache did not refresh after key update"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_secret_key_rejects_insecure_permissions() {
+        clear_asset_caches();
+        let dir = tempdir().expect("tempdir");
+        let secure_path = dir.path().join("secure");
+        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", secure_path.display().to_string());
+        SecureAssets::generate(&secure_path, false).expect("generate assets");
+
+        let secret_path = secure_path.join("secret.key");
+        fs::set_permissions(&secure_path, fs::Permissions::from_mode(0o755))
+            .expect("relax dir perms");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o644))
+            .expect("relax key perms");
+
+        let err = load_secret_key().expect_err("loading key must fail");
+        assert!(
+            err.to_string().contains("permissions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_ca_surfaces_missing_files() {
+        clear_asset_caches();
+        let dir = tempdir().expect("tempdir");
+        let secure_path = dir.path().join("secure");
+        let _env = EnvOverride::set("NANOCLOUD_SECURE_ASSETS", secure_path.display().to_string());
+        SecureAssets::generate(&secure_path, false).expect("generate assets");
+
+        let ca_key_path = secure_path.join("ca.key");
+        fs::remove_file(&ca_key_path).expect("remove ca key");
+
+        let err = load_ca().expect_err("load ca should fail without key");
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected error: {err}"
         );
     }
 }

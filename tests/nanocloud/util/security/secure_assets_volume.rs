@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use nanocloud::nanocloud::util::security::SecureAssets;
 use tempfile::TempDir;
@@ -7,6 +8,7 @@ use tempfile::TempDir;
 fn volume_keys_generate_with_fingerprint() {
     let temp = TempDir::new().expect("tempdir");
     let dir = temp.path().to_path_buf();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("secure perms");
 
     let info = SecureAssets::ensure_volume_keys(&dir, &[String::from("data-volume")], false)
         .expect("generate volume key");
@@ -31,6 +33,7 @@ fn volume_keys_generate_with_fingerprint() {
 fn invalid_volume_name_rejected() {
     let temp = TempDir::new().expect("tempdir");
     let dir = temp.path().to_path_buf();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("secure perms");
 
     let err = SecureAssets::ensure_volume_keys(&dir, &[String::from("INVALID")], false)
         .expect_err("uppercase volume should fail");

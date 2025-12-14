@@ -734,7 +734,9 @@ pub fn capability_set_difference<S1: AsRef<str>, S2: AsRef<str>>(
 /// let privileged = capabilities_requiring_privileged(["CAP_NET_RAW", "CAP_NET_ADMIN"]);
 /// assert!(privileged.is_empty());
 /// ```
-pub fn capabilities_requiring_privileged<S: AsRef<str>>(caps: impl IntoIterator<Item = S>) -> Vec<String> {
+pub fn capabilities_requiring_privileged<S: AsRef<str>>(
+    caps: impl IntoIterator<Item = S>,
+) -> Vec<String> {
     let mut result = Vec::new();
     for cap in caps {
         let normalized = normalize_capability_name(cap.as_ref());

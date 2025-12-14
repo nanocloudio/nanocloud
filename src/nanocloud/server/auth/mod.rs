@@ -595,11 +595,18 @@ where
                             .iter()
                             .map(|(key, value)| (*key, value.as_str()))
                             .collect();
-                        log_warn(AUTH_LOG_COMPONENT, "Bootstrap token format invalid", &metadata);
+                        log_warn(
+                            AUTH_LOG_COMPONENT,
+                            "Bootstrap token format invalid",
+                            &metadata,
+                        );
                     }
                     Err(BootstrapTokenError::Expired) => {
                         metrics::record_bootstrap_token_attempt(BootstrapAuthOutcome::Invalid);
-                        let owned = [("token", redact_token(&token)), ("error", "token expired".to_string())];
+                        let owned = [
+                            ("token", redact_token(&token)),
+                            ("error", "token expired".to_string()),
+                        ];
                         let metadata: Vec<(&str, &str)> = owned
                             .iter()
                             .map(|(key, value)| (*key, value.as_str()))
@@ -613,7 +620,11 @@ where
                             .iter()
                             .map(|(key, value)| (*key, value.as_str()))
                             .collect();
-                        log_warn(AUTH_LOG_COMPONENT, "Bootstrap token decryption failed", &metadata);
+                        log_warn(
+                            AUTH_LOG_COMPONENT,
+                            "Bootstrap token decryption failed",
+                            &metadata,
+                        );
                     }
                 }
             } else {
@@ -703,9 +714,7 @@ pub fn extract_subject_identifier(context: &AuthContext) -> Option<String> {
 pub fn has_jwt_scope(context: &AuthContext, required_scope: &str) -> bool {
     match context.scope() {
         AuthScope::Certificate => true, // Certificates always have full access
-        AuthScope::Jwt(scopes) => {
-            scopes.iter().any(|s| s == required_scope || s == "*")
-        }
+        AuthScope::Jwt(scopes) => scopes.iter().any(|s| s == required_scope || s == "*"),
         _ => false,
     }
 }
@@ -1631,5 +1640,4 @@ mod tests {
         };
         assert!(!is_certificate_auth(&jwt_auth));
     }
-
 }

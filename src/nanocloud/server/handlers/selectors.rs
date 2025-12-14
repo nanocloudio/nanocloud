@@ -582,21 +582,19 @@ pub fn validate_resource_name<'a>(name: &'a str, resource_kind: &str) -> Result<
 /// Validate that a string is a valid positive integer for limit/timeout parameters.
 #[allow(dead_code)]
 pub fn validate_positive_integer(value: &str, param_name: &str) -> Result<u64, ApiError> {
-    value.parse::<u64>().map_err(|_| {
-        ApiError::bad_request(format!(
-            "{} must be a positive integer",
-            param_name
-        ))
-    }).and_then(|n| {
-        if n == 0 {
-            Err(ApiError::bad_request(format!(
-                "{} must be greater than 0",
-                param_name
-            )))
-        } else {
-            Ok(n)
-        }
-    })
+    value
+        .parse::<u64>()
+        .map_err(|_| ApiError::bad_request(format!("{} must be a positive integer", param_name)))
+        .and_then(|n| {
+            if n == 0 {
+                Err(ApiError::bad_request(format!(
+                    "{} must be greater than 0",
+                    param_name
+                )))
+            } else {
+                Ok(n)
+            }
+        })
 }
 
 /// Validate that a limit value is within bounds.
@@ -657,7 +655,9 @@ fn is_valid_dns_label(s: &str) -> bool {
     }
 
     // All characters must be lowercase alphanumeric or hyphen
-    chars.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+    chars
+        .iter()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
 }
 
 /// Check if a string is a valid DNS subdomain (RFC 1123).
@@ -679,7 +679,9 @@ fn is_valid_dns_subdomain(s: &str) -> bool {
     }
 
     // All characters must be lowercase alphanumeric, hyphen, or dot
-    chars.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.')
+    chars
+        .iter()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.')
 }
 
 #[cfg(test)]
@@ -1015,7 +1017,10 @@ mod tests {
     fn validate_positive_integer_accepts_valid() {
         assert_eq!(validate_positive_integer("1", "limit").unwrap(), 1);
         assert_eq!(validate_positive_integer("100", "limit").unwrap(), 100);
-        assert_eq!(validate_positive_integer("999999", "timeout").unwrap(), 999999);
+        assert_eq!(
+            validate_positive_integer("999999", "timeout").unwrap(),
+            999999
+        );
     }
 
     #[test]
@@ -1073,9 +1078,7 @@ mod tests {
     #[test]
     fn parse_label_selector_many_requirements() {
         // Test parsing a selector with many label requirements
-        let parts: Vec<String> = (0..50)
-            .map(|i| format!("label{}=value{}", i, i))
-            .collect();
+        let parts: Vec<String> = (0..50).map(|i| format!("label{}=value{}", i, i)).collect();
         let selector_str = parts.join(",");
 
         let result = parse_object_selector(None, Some(&selector_str));
@@ -1119,11 +1122,11 @@ mod tests {
     #[test]
     fn matches_labels_many_requirements() {
         // Test matching against many label requirements
-        let label_parts: Vec<String> = (0..50)
-            .map(|i| format!("label{}=value{}", i, i))
-            .collect();
+        let label_parts: Vec<String> = (0..50).map(|i| format!("label{}=value{}", i, i)).collect();
         let selector_str = label_parts.join(",");
-        let selector = parse_object_selector(None, Some(&selector_str)).unwrap().unwrap();
+        let selector = parse_object_selector(None, Some(&selector_str))
+            .unwrap()
+            .unwrap();
 
         // Build matching labels
         let mut labels: HashMap<String, String> = HashMap::new();
@@ -1144,7 +1147,9 @@ mod tests {
     #[test]
     fn matches_labels_large_label_set() {
         // Test matching when object has many labels
-        let selector = parse_object_selector(None, Some("target=match")).unwrap().unwrap();
+        let selector = parse_object_selector(None, Some("target=match"))
+            .unwrap()
+            .unwrap();
 
         // Build object with many labels
         let mut labels: HashMap<String, String> = HashMap::new();
@@ -1207,12 +1212,10 @@ mod tests {
     #[test]
     fn label_requirement_matching_performance() {
         // Test many matches against same selector
-        let selector = parse_object_selector(
-            None,
-            Some("app=web,env=prod,tier=frontend,version=v1"),
-        )
-        .unwrap()
-        .unwrap();
+        let selector =
+            parse_object_selector(None, Some("app=web,env=prod,tier=frontend,version=v1"))
+                .unwrap()
+                .unwrap();
 
         let mut labels: HashMap<String, String> = HashMap::new();
         labels.insert("app".to_string(), "web".to_string());

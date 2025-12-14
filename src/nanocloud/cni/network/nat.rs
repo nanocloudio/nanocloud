@@ -160,7 +160,7 @@ pub(crate) fn clear_port_forwards(
     container_id: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let key = port_forward_path(container_id);
-    let stored = CNI_KEYSPACE.get(&key).ok();
+    let stored = CNI_KEYSPACE.get_optional(&key).ok().flatten();
     let mut stored_err: Option<Box<dyn Error + Send + Sync>> = None;
 
     if let Some(stored) = stored {

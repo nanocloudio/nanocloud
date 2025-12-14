@@ -368,7 +368,10 @@ mod tests {
     fn parse_cidr_missing_slash() {
         let result = parse_cidr("192.168.1.1");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid CIDR format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid CIDR format"));
     }
 
     #[test]

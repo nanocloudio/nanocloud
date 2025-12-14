@@ -227,35 +227,27 @@ pub fn load_pod_manifest(
             return Ok(Some(pod.clone()));
         }
     }
-    match K8S_KEYSPACE.get(&key) {
-        Ok(raw) => {
-            let mut pod: Pod = serde_json::from_str(&raw).map_err(|err| {
-                with_context(err, format!("Failed to parse Pod from key '{}'", key))
-            })?;
-            pod.status = None;
-            if let Ok(mut cache) = pod_cache().lock() {
-                cache.insert(key.clone(), pod.clone());
-            }
-            Ok(Some(pod))
+    let raw = K8S_KEYSPACE
+        .get_optional(&key)
+        .map_err(|err| with_context(err, format!("Failed to load Pod '{}' from keyspace", key)))?;
+    if let Some(raw) = raw {
+        let mut pod: Pod = serde_json::from_str(&raw)
+            .map_err(|err| with_context(err, format!("Failed to parse Pod from key '{}'", key)))?;
+        pod.status = None;
+        if let Ok(mut cache) = pod_cache().lock() {
+            cache.insert(key.clone(), pod.clone());
         }
-        Err(err) => {
-            if is_missing_value_error(err.as_ref()) {
-                match load(namespace, app)? {
-                    Some(legacy) => {
-                        let converted = pod_from_statefulset(&legacy);
-                        if let Ok(mut cache) = pod_cache().lock() {
-                            cache.insert(key.clone(), converted.clone());
-                        }
-                        Ok(Some(converted))
-                    }
-                    None => Ok(None),
+        Ok(Some(pod))
+    } else {
+        match load(namespace, app)? {
+            Some(legacy) => {
+                let converted = pod_from_statefulset(&legacy);
+                if let Ok(mut cache) = pod_cache().lock() {
+                    cache.insert(key.clone(), converted.clone());
                 }
-            } else {
-                Err(with_context(
-                    err,
-                    format!("Failed to load Pod '{}' from keyspace", key),
-                ))
+                Ok(Some(converted))
             }
+            None => Ok(None),
         }
     }
 }

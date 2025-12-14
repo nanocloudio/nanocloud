@@ -441,13 +441,18 @@ impl KeyspaceSecretStore {
         name: &str,
     ) -> Result<Option<StoredSecret>, Box<dyn Error + Send + Sync>> {
         // Validate input parameters
-        validation::validate_namespace(namespace).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        validation::validate_namespace(namespace)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         validation::validate_name(name).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let key = KeyspaceSecretStore::record_key(namespace, name);
 
         // Read raw record from storage
-        let raw_record = match self.storage.read(&key).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)? {
+        let raw_record = match self
+            .storage
+            .read(&key)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+        {
             Some(value) => value,
             None => return Ok(None),
         };
@@ -467,7 +472,8 @@ impl KeyspaceSecretStore {
             &record.ciphertext,
             &record.wrapped_key,
             &record.digest,
-        ).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        )
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         // Reconstruct secret material from decrypted payload
         let secret = SecretMaterial {
@@ -490,11 +496,17 @@ impl KeyspaceSecretStore {
     ///
     /// The secret is encrypted with a new data key, and an HMAC digest is computed
     /// for integrity verification. The write is performed atomically.
-    pub fn put(&self, secret: SecretMaterial) -> Result<StoredSecret, Box<dyn Error + Send + Sync>> {
+    pub fn put(
+        &self,
+        secret: SecretMaterial,
+    ) -> Result<StoredSecret, Box<dyn Error + Send + Sync>> {
         // Validate input parameters
-        validation::validate_namespace(&secret.namespace).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        validation::validate_name(&secret.name).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        validation::validate_type_name(&secret.type_name).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        validation::validate_namespace(&secret.namespace)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        validation::validate_name(&secret.name)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        validation::validate_type_name(&secret.type_name)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let created_at = Utc::now();
         let record_key = KeyspaceSecretStore::record_key(&secret.namespace, &secret.name);
@@ -522,7 +534,8 @@ impl KeyspaceSecretStore {
         let serialized = record::encode_record(&record)
             .map_err(|e| with_context(e, "Failed to encode secret record"))?;
 
-        self.storage.write_atomic(&record_key, &serialized)
+        self.storage
+            .write_atomic(&record_key, &serialized)
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok(StoredSecret {
@@ -536,20 +549,27 @@ impl KeyspaceSecretStore {
     ///
     /// Returns `Ok(())` even if the secret does not exist.
     pub fn delete(&self, namespace: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        validation::validate_namespace(namespace).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        validation::validate_namespace(namespace)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         validation::validate_name(name).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let key = KeyspaceSecretStore::record_key(namespace, name);
-        self.storage.delete(&key).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        self.storage
+            .delete(&key)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     }
 
     /// Lists all secrets, optionally filtered by namespace.
-    pub fn list(&self, namespace: Option<&str>) -> Result<Vec<StoredSecret>, Box<dyn Error + Send + Sync>> {
+    pub fn list(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredSecret>, Box<dyn Error + Send + Sync>> {
         use crate::nanocloud::Config;
         use std::fs;
 
         if let Some(ns) = namespace {
-            validation::validate_namespace(ns).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            validation::validate_namespace(ns)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         }
 
         let root = Config::Keyspace.get_path().join("secrets").join("secrets");
@@ -820,11 +840,17 @@ mod tests {
 
         // Create initial secret
         let mut secret = sample_secret();
-        store.put(secret.clone()).expect("initial put should succeed");
+        store
+            .put(secret.clone())
+            .expect("initial put should succeed");
 
         // Update with new data
-        secret.data.insert("new-key".to_string(), "new-value".to_string());
-        store.put(secret.clone()).expect("update put should succeed");
+        secret
+            .data
+            .insert("new-key".to_string(), "new-value".to_string());
+        store
+            .put(secret.clone())
+            .expect("update put should succeed");
 
         // Verify the update
         let fetched = store
@@ -832,7 +858,10 @@ mod tests {
             .expect("get should succeed")
             .expect("secret should exist");
         assert_eq!(fetched.secret.data.len(), 3);
-        assert_eq!(fetched.secret.data.get("new-key"), Some(&"new-value".to_string()));
+        assert_eq!(
+            fetched.secret.data.get("new-key"),
+            Some(&"new-value".to_string())
+        );
 
         env::remove_var("NANOCLOUD_KEYSPACE");
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
@@ -916,7 +945,11 @@ mod tests {
         let result = store.get(&secret.namespace, &secret.name);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
-        assert!(err_str.contains("integrity") || err_str.contains("HMAC") || err_str.contains("mismatch"));
+        assert!(
+            err_str.contains("integrity")
+                || err_str.contains("HMAC")
+                || err_str.contains("mismatch")
+        );
 
         env::remove_var("NANOCLOUD_KEYSPACE");
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
@@ -930,7 +963,10 @@ mod tests {
     ) -> Option<std::path::PathBuf> {
         use walkdir::WalkDir;
 
-        for entry in WalkDir::new(keyspace_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(keyspace_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.file_name() == Some(std::ffi::OsStr::new("_value_")) {
                 // Check if this path contains the namespace and name
@@ -1014,20 +1050,38 @@ mod tests {
         secret2.name = "secret-2".to_string();
         secret2.data.insert("extra".to_string(), "data".to_string());
 
-        store.put(secret1.clone()).expect("put secret1 should succeed");
-        store.put(secret2.clone()).expect("put secret2 should succeed");
+        store
+            .put(secret1.clone())
+            .expect("put secret1 should succeed");
+        store
+            .put(secret2.clone())
+            .expect("put secret2 should succeed");
 
         // Both should be retrievable independently
-        let fetched1 = store.get("default", "secret-1").expect("get should succeed").expect("secret should exist");
-        let fetched2 = store.get("default", "secret-2").expect("get should succeed").expect("secret should exist");
+        let fetched1 = store
+            .get("default", "secret-1")
+            .expect("get should succeed")
+            .expect("secret should exist");
+        let fetched2 = store
+            .get("default", "secret-2")
+            .expect("get should succeed")
+            .expect("secret should exist");
 
         assert_eq!(fetched1.secret.data.len(), 2);
         assert_eq!(fetched2.secret.data.len(), 3);
 
         // Deleting one shouldn't affect the other
-        store.delete("default", "secret-1").expect("delete should succeed");
-        assert!(store.get("default", "secret-1").expect("get should succeed").is_none());
-        assert!(store.get("default", "secret-2").expect("get should succeed").is_some());
+        store
+            .delete("default", "secret-1")
+            .expect("delete should succeed");
+        assert!(store
+            .get("default", "secret-1")
+            .expect("get should succeed")
+            .is_none());
+        assert!(store
+            .get("default", "secret-2")
+            .expect("get should succeed")
+            .is_some());
 
         env::remove_var("NANOCLOUD_KEYSPACE");
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
@@ -1261,10 +1315,7 @@ mod tests {
                 .get("default", &format!("parallel-secret-{}", i))
                 .expect("get should succeed")
                 .expect("secret should exist");
-            assert_eq!(
-                fetched.secret.data.get("index"),
-                Some(&format!("{}", i))
-            );
+            assert_eq!(fetched.secret.data.get("index"), Some(&format!("{}", i)));
         }
 
         env::remove_var("NANOCLOUD_KEYSPACE");
@@ -1324,7 +1375,9 @@ mod tests {
         );
 
         // Recovery: delete and recreate
-        store.delete("default", "corruption-test").expect("delete should succeed");
+        store
+            .delete("default", "corruption-test")
+            .expect("delete should succeed");
 
         let recovery_secret = SecretMaterial {
             namespace: "default".to_string(),
@@ -1334,7 +1387,9 @@ mod tests {
             data,
             resource_version: None,
         };
-        store.put(recovery_secret).expect("recovery put should succeed");
+        store
+            .put(recovery_secret)
+            .expect("recovery put should succeed");
 
         // Now get should succeed
         let fetched = store
@@ -1405,13 +1460,17 @@ mod tests {
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
-            err_str.contains("integrity") || err_str.contains("HMAC") || err_str.contains("mismatch"),
+            err_str.contains("integrity")
+                || err_str.contains("HMAC")
+                || err_str.contains("mismatch"),
             "Expected integrity error, got: {}",
             err_str
         );
 
         // Recovery: delete and recreate
-        store.delete("default", "hmac-test").expect("delete should succeed");
+        store
+            .delete("default", "hmac-test")
+            .expect("delete should succeed");
 
         let recovery_secret = SecretMaterial {
             namespace: "default".to_string(),
@@ -1421,14 +1480,19 @@ mod tests {
             data,
             resource_version: None,
         };
-        store.put(recovery_secret).expect("recovery put should succeed");
+        store
+            .put(recovery_secret)
+            .expect("recovery put should succeed");
 
         // Now get should succeed
         let fetched = store
             .get("default", "hmac-test")
             .expect("get should succeed after recovery")
             .expect("secret should exist");
-        assert_eq!(fetched.secret.data.get("sensitive"), Some(&"data".to_string()));
+        assert_eq!(
+            fetched.secret.data.get("sensitive"),
+            Some(&"data".to_string())
+        );
 
         env::remove_var("NANOCLOUD_KEYSPACE");
         env::remove_var("NANOCLOUD_SECURE_ASSETS");
@@ -1481,7 +1545,9 @@ mod tests {
         assert!(result.is_err());
 
         // Recovery: delete and recreate
-        store.delete("default", "partial-corruption").expect("delete should succeed");
+        store
+            .delete("default", "partial-corruption")
+            .expect("delete should succeed");
 
         let recovery_secret = SecretMaterial {
             namespace: "default".to_string(),
@@ -1491,7 +1557,9 @@ mod tests {
             data,
             resource_version: None,
         };
-        store.put(recovery_secret).expect("recovery put should succeed");
+        store
+            .put(recovery_secret)
+            .expect("recovery put should succeed");
 
         // Now get should succeed
         let fetched = store
@@ -1548,7 +1616,9 @@ mod tests {
         assert!(result.is_err());
 
         // Recovery: delete and recreate
-        store.delete("default", "empty-file-test").expect("delete should succeed");
+        store
+            .delete("default", "empty-file-test")
+            .expect("delete should succeed");
 
         let recovery_secret = SecretMaterial {
             namespace: "default".to_string(),
@@ -1558,7 +1628,9 @@ mod tests {
             data,
             resource_version: None,
         };
-        store.put(recovery_secret).expect("recovery put should succeed");
+        store
+            .put(recovery_secret)
+            .expect("recovery put should succeed");
 
         // Now get should succeed
         let fetched = store

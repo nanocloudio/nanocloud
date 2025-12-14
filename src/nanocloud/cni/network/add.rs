@@ -287,7 +287,7 @@ pub(crate) fn delete(
     container_id: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let allocation_key = allocation_path(container_id);
-    let allocation = CNI_KEYSPACE.get(&allocation_key).ok();
+    let allocation = CNI_KEYSPACE.get_optional(&allocation_key).ok().flatten();
     if let Some(allocation) = allocation {
         let mut parts = allocation.split_whitespace();
         let ip_address = parts.next().unwrap_or("").to_string();

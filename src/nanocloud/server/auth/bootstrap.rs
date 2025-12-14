@@ -147,9 +147,7 @@ pub(crate) fn validate_token_format(token: &str) -> Result<(String, String), Boo
     }
 
     let (id, secret) = trimmed.split_once('.').ok_or_else(|| {
-        BootstrapTokenError::InvalidFormat(
-            "token must be in format 'id.secret'".to_string(),
-        )
+        BootstrapTokenError::InvalidFormat("token must be in format 'id.secret'".to_string())
     })?;
 
     if id.is_empty() {
@@ -165,9 +163,10 @@ pub(crate) fn validate_token_format(token: &str) -> Result<(String, String), Boo
     }
 
     if id.len() > MAX_TOKEN_ID_LENGTH {
-        return Err(BootstrapTokenError::InvalidFormat(
-            format!("token ID exceeds maximum length of {}", MAX_TOKEN_ID_LENGTH),
-        ));
+        return Err(BootstrapTokenError::InvalidFormat(format!(
+            "token ID exceeds maximum length of {}",
+            MAX_TOKEN_ID_LENGTH
+        )));
     }
 
     // Check for invalid characters in ID (path traversal prevention)

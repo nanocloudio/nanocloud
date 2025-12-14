@@ -65,13 +65,13 @@ pub fn compute_digest(
         SecretError::Crypto(with_context(e, "Failed to initialise HMAC signer").to_string())
     })?;
 
-    signer.update(&buffer).map_err(|e| {
-        SecretError::Crypto(with_context(e, "Failed to compute HMAC").to_string())
-    })?;
+    signer
+        .update(&buffer)
+        .map_err(|e| SecretError::Crypto(with_context(e, "Failed to compute HMAC").to_string()))?;
 
-    let digest = signer.sign_to_vec().map_err(|e| {
-        SecretError::Crypto(with_context(e, "Failed to finalise HMAC").to_string())
-    })?;
+    let digest = signer
+        .sign_to_vec()
+        .map_err(|e| SecretError::Crypto(with_context(e, "Failed to finalise HMAC").to_string()))?;
 
     Ok(digest.iter().map(|byte| format!("{:02x}", byte)).collect())
 }
@@ -110,9 +110,9 @@ pub fn encrypt_secret(
             SecretError::Crypto(with_context(e, "Failed to encrypt secret payload").to_string())
         })?;
 
-    let wrapped_key = data_key.wrap().map_err(|e| {
-        SecretError::Crypto(with_context(e, "Failed to wrap data key").to_string())
-    })?;
+    let wrapped_key = data_key
+        .wrap()
+        .map_err(|e| SecretError::Crypto(with_context(e, "Failed to wrap data key").to_string()))?;
 
     let digest = compute_digest(&payload.data, data_key.key_bytes())?;
 
@@ -143,7 +143,8 @@ pub fn decrypt_and_verify(
 
     // Attempt decryption with associated data, falling back to legacy decryption
     let ciphertext_string = ciphertext.to_string();
-    let plaintext = match encryption_key.decrypt_with_context(&ciphertext_string, &associated_data) {
+    let plaintext = match encryption_key.decrypt_with_context(&ciphertext_string, &associated_data)
+    {
         Ok(value) => value,
         Err(err) if ciphertext.starts_with(ENCRYPTED_BLOB_PREFIX) => {
             // Fallback for legacy secrets without associated data

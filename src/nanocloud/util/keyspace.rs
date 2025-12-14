@@ -14,6 +14,61 @@
  * limitations under the License.
  */
 
+//! Filesystem-backed persistence used for small configuration blobs, bootstrap
+//! tokens, and other Nanocloud coordination data. The keyspace enforces
+//! canonical key paths, persists each value inside its own directory, and
+//! serializes blocking operations through a background worker pool so that
+//! callers can safely use the same API from async and synchronous contexts.
+//!
+//! # Atomicity and durability
+//!
+//! Values and associated expiry metadata are written through a write-then-rename
+//! helper that fsyncs the temporary file and parent directory. Callers can rely
+//! on atomic replacement semantics for a single key: a reader will either
+//! observe the old value or the fully written replacement. Helper functions such
+//! as [`is_missing_value_error`] expose the expected error semantics for absent
+//! entries.
+//!
+//! # Error semantics
+//!
+//! - Missing values return `Value file not found` errors or can be detected via
+//!   [`is_missing_value_error`].
+//! - IO failures are wrapped with context that describes the file system path
+//!   being touched.
+//! - Expiry metadata is optional; if present but invalid it results in an error
+//!   and the caller is expected to handle it as a fatal condition.
+//!
+//! # Concurrency expectations
+//!
+//! All operations coordinate via a global file lock to avoid concurrent writers
+//! clobbering directories. For deployments that need stricter coordination per
+//! logical key, set the `NANOCLOUD_KEYSPACE_PER_KEY_LOCKS=1` environment
+//! variable. When enabled, mutating operations also acquire an in-process lock
+//! unique to the key path. The lock acquisition respects the
+//! `NANOCLOUD_KEYSPACE_LOCK_TIMEOUT_SECS` timeout (default 10 seconds) and
+//! surfaces clear errors if contention cannot be resolved quickly.
+//!
+//! # Async usage and batching
+//!
+//! Public APIs automatically offload filesystem work onto a blocking executor,
+//! making them safe to call from async contexts. When performing multi-step
+//! updates it is still more efficient to batch them inside a single blocking
+//! task or to rely on [`Keyspace::watch`] to observe changes rather than
+//! repeatedly polling:
+//!
+//! ```no_run
+//! # use nanocloud::nanocloud::util::Keyspace;
+//! # async fn reconcile() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! let keyspace = Keyspace::new("controllers");
+//! tokio::task::spawn_blocking(move || {
+//!     keyspace.put("/leases/a", "holder-a")?;
+//!     keyspace.put("/leases/b", "holder-b")
+//! })
+//! .await??;
+//! # Ok(())
+//! # }
+//! ```
+
 use crate::nanocloud::logger::log_warn;
 use crate::nanocloud::observability::metrics;
 use crate::nanocloud::util::error::{new_error, with_context};
@@ -29,7 +84,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
@@ -43,8 +98,12 @@ const MAX_KEY_LENGTH: usize = 512;
 const WATCH_HISTORY_LIMIT: usize = 512;
 const WATCH_CHANNEL_CAPACITY: usize = 128;
 const KEYSPACE_BLOCKING_WORKERS: usize = 4;
+const KEY_LOCK_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+const KEY_LOCK_TIMEOUT_ENV: &str = "NANOCLOUD_KEYSPACE_LOCK_TIMEOUT_SECS";
+const KEY_LOCK_ENABLED_ENV: &str = "NANOCLOUD_KEYSPACE_PER_KEY_LOCKS";
 
 type KeyParser<K> = Arc<dyn Fn(&str) -> Result<K, Box<dyn Error + Send + Sync>> + Send + Sync>;
+type EnvOverrideCache<T> = Mutex<Option<(Option<String>, T)>>;
 
 struct BlockingExecutor {
     sender: mpsc::Sender<Job>,
@@ -211,6 +270,9 @@ impl KeyspaceEvent {
     }
 }
 
+static WATCH_REGISTRY: OnceLock<Mutex<HashMap<&'static str, Arc<PartitionWatch>>>> =
+    OnceLock::new();
+
 struct PartitionWatch {
     sender: broadcast::Sender<KeyspaceEvent>,
     history: RwLock<VecDeque<KeyspaceEvent>>,
@@ -263,8 +325,15 @@ impl PartitionWatch {
 }
 
 fn watch_registry() -> &'static Mutex<HashMap<&'static str, Arc<PartitionWatch>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, Arc<PartitionWatch>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    WATCH_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn reset_partition_watch(partition: &'static str) {
+    if let Some(registry) = WATCH_REGISTRY.get() {
+        if let Ok(mut guard) = registry.lock() {
+            guard.remove(partition);
+        }
+    }
 }
 
 fn get_partition_watch(partition: &'static str) -> Arc<PartitionWatch> {
@@ -404,6 +473,221 @@ impl Drop for FileLock {
     }
 }
 
+#[derive(Default)]
+struct PerKeyLockRegistry {
+    locks: Mutex<HashMap<String, Arc<KeyLockState>>>,
+}
+
+impl PerKeyLockRegistry {
+    fn acquire(
+        self: &Arc<Self>,
+        key: String,
+        timeout: Duration,
+    ) -> Result<KeyLockGuard, Box<dyn Error + Send + Sync>> {
+        let state = {
+            let mut locks = self
+                .locks
+                .lock()
+                .map_err(|_| new_error("Per-key lock registry mutex poisoned"))?;
+            Arc::clone(
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(KeyLockState::default())),
+            )
+        };
+
+        state
+            .acquire(timeout)
+            .map_err(|e| with_context(e, format!("Failed to lock key '{}'", key)))?;
+
+        Ok(KeyLockGuard {
+            registry: Arc::clone(self),
+            key,
+            state,
+        })
+    }
+
+    fn release(&self, key: &str, state: &Arc<KeyLockState>) {
+        state.release();
+        if !state.is_idle() {
+            return;
+        }
+
+        if let Ok(mut locks) = self.locks.lock() {
+            if let Some(current) = locks.get(key) {
+                if Arc::ptr_eq(current, state) && state.is_idle() {
+                    locks.remove(key);
+                }
+            }
+        }
+    }
+}
+
+struct KeyLockGuard {
+    registry: Arc<PerKeyLockRegistry>,
+    key: String,
+    state: Arc<KeyLockState>,
+}
+
+impl Drop for KeyLockGuard {
+    fn drop(&mut self) {
+        self.registry.release(&self.key, &self.state);
+    }
+}
+
+#[derive(Default)]
+struct KeyLockState {
+    state: Mutex<KeyLockInner>,
+    cvar: Condvar,
+}
+
+#[derive(Default)]
+struct KeyLockInner {
+    locked: bool,
+    waiters: usize,
+}
+
+impl KeyLockState {
+    fn acquire(&self, timeout: Duration) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| new_error("Per-key lock state mutex poisoned"))?;
+        let deadline = if timeout.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + timeout)
+        };
+
+        while guard.locked {
+            let Some(deadline) = deadline else {
+                return Err(new_error("Per-key lock is already held"));
+            };
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(new_error("Timed out waiting for per-key lock"));
+            }
+            let wait_duration = deadline.saturating_duration_since(now);
+            guard.waiters = guard.waiters.saturating_add(1);
+            let (new_guard, wait_result) = self
+                .cvar
+                .wait_timeout_while(guard, wait_duration, |state| state.locked)
+                .map_err(|_| new_error("Per-key lock condvar poisoned"))?;
+            guard = new_guard;
+            guard.waiters = guard.waiters.saturating_sub(1);
+            if wait_result.timed_out() && guard.locked {
+                return Err(new_error("Timed out waiting for per-key lock"));
+            }
+        }
+
+        guard.locked = true;
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        guard.locked = false;
+        self.cvar.notify_one();
+    }
+
+    fn is_idle(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => !state.locked && state.waiters == 0,
+            Err(_) => false,
+        }
+    }
+}
+
+fn per_key_lock_registry() -> &'static Arc<PerKeyLockRegistry> {
+    static REGISTRY: OnceLock<Arc<PerKeyLockRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Arc::new(PerKeyLockRegistry::default()))
+}
+
+fn env_snapshot(key: &str) -> Option<String> {
+    env::var(key).ok().map(|value| value.trim().to_string())
+}
+
+fn parse_per_key_lock_enabled(value: Option<&str>) -> bool {
+    value
+        .map(|candidate| matches_ignore_case(candidate, &["1", "true", "yes"]))
+        .unwrap_or(false)
+}
+
+fn parse_per_key_lock_timeout(value: Option<&str>) -> Duration {
+    match value {
+        Some(trimmed) if !trimmed.is_empty() => match trimmed.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => {
+                log_warn(
+                    KEYSPACE_COMPONENT,
+                    "Invalid per-key lock timeout override",
+                    &[("value", trimmed)],
+                );
+                KEY_LOCK_TIMEOUT_DEFAULT
+            }
+        },
+        _ => KEY_LOCK_TIMEOUT_DEFAULT,
+    }
+}
+
+fn per_key_locking_enabled() -> bool {
+    static ENABLED: OnceLock<EnvOverrideCache<bool>> = OnceLock::new();
+    let snapshot = env_snapshot(KEY_LOCK_ENABLED_ENV);
+    if let Ok(mut guard) = ENABLED.get_or_init(|| Mutex::new(None)).lock() {
+        if let Some((cached, enabled)) = guard.as_ref() {
+            if cached.as_deref() == snapshot.as_deref() {
+                return *enabled;
+            }
+        }
+        let enabled = parse_per_key_lock_enabled(snapshot.as_deref());
+        *guard = Some((snapshot, enabled));
+        enabled
+    } else {
+        parse_per_key_lock_enabled(snapshot.as_deref())
+    }
+}
+
+fn per_key_lock_timeout() -> Duration {
+    static TIMEOUT: OnceLock<EnvOverrideCache<Duration>> = OnceLock::new();
+    let snapshot = env_snapshot(KEY_LOCK_TIMEOUT_ENV);
+    if let Ok(mut guard) = TIMEOUT.get_or_init(|| Mutex::new(None)).lock() {
+        if let Some((cached, timeout)) = guard.as_ref() {
+            if cached.as_deref() == snapshot.as_deref() {
+                return *timeout;
+            }
+        }
+        let parsed = parse_per_key_lock_timeout(snapshot.as_deref());
+        *guard = Some((snapshot, parsed));
+        parsed
+    } else {
+        parse_per_key_lock_timeout(snapshot.as_deref())
+    }
+}
+
+fn matches_ignore_case(value: &str, accepted: &[&str]) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    accepted.iter().any(|candidate| normalized == *candidate)
+}
+
+fn maybe_lock_key(key_path: &Path) -> Result<Option<KeyLockGuard>, Box<dyn Error + Send + Sync>> {
+    if !per_key_locking_enabled() {
+        return Ok(None);
+    }
+
+    let key = key_path
+        .to_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| key_path.display().to_string());
+
+    let registry = Arc::clone(per_key_lock_registry());
+    registry.acquire(key, per_key_lock_timeout()).map(Some)
+}
+
+/// Filesystem-backed partition for storing small configuration blobs.
 #[derive(Clone, Copy)]
 pub struct Keyspace {
     partition: &'static str,
@@ -483,6 +767,7 @@ impl Keyspace {
     fn put_blocking(&self, key: &str, value: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.ensure_repaired()?;
         let key_path = resolve_path(self.partition, key)?;
+        let _key_guard = maybe_lock_key(&key_path)?;
         let _lock = FileLock::new(false)
             .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
         let value_path = key_path.join(VALUE_FILE_NAME);
@@ -534,6 +819,7 @@ impl Keyspace {
 
         self.ensure_repaired()?;
         let key_path = resolve_path(self.partition, key)?;
+        let _key_guard = maybe_lock_key(&key_path)?;
         let _lock = FileLock::new(false)
             .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
 
@@ -579,41 +865,29 @@ impl Keyspace {
     fn get_blocking(&self, key: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         self.ensure_repaired()?;
         let key_path = resolve_path(self.partition, key)?;
-        let value_path = key_path.join(VALUE_FILE_NAME);
-        let missing_msg = || format!("Value file not found: {}", value_path.display());
-
-        let shared_lock = FileLock::new(true)
-            .map_err(|e| with_context(e, "Failed to acquire shared keyspace lock"))?;
-
-        if is_expired(&key_path)? {
-            drop(shared_lock);
-            let exclusive_lock = FileLock::new(false)
-                .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
-            if is_expired(&key_path)? {
-                prune_expired(self.partition, &key_path)?;
-                drop(exclusive_lock);
-                return Err(new_error(missing_msg()));
-            }
-            let value = match read_value_if_exists(&key_path)? {
-                Some(value) => value,
-                None => {
-                    drop(exclusive_lock);
-                    return Err(new_error(missing_msg()));
-                }
-            };
-            drop(exclusive_lock);
-            return Ok(value);
+        match self.load_value_optional(&key_path)? {
+            Some(value) => Ok(value),
+            None => Err(new_error(format!(
+                "Value file not found: {}",
+                key_path.join(VALUE_FILE_NAME).display()
+            ))),
         }
+    }
 
-        let value = match read_value_if_exists(&key_path)? {
-            Some(value) => value,
-            None => {
-                drop(shared_lock);
-                return Err(new_error(missing_msg()));
-            }
-        };
-        drop(shared_lock);
-        Ok(value)
+    /// Retrieves the value associated with the given key if it exists.
+    pub fn get_optional(&self, key: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let keyspace = *self;
+        let key = key.to_string();
+        self.execute_blocking("get_optional", move || keyspace.get_optional_blocking(&key))
+    }
+
+    fn get_optional_blocking(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        self.ensure_repaired()?;
+        let key_path = resolve_path(self.partition, key)?;
+        self.load_value_optional(&key_path)
     }
 
     /// Retrieves the value and expiry associated with the given key.
@@ -636,6 +910,33 @@ impl Keyspace {
         let key_path = resolve_path(self.partition, key)?;
         let expiry = read_expiry(&key_path)?;
         Ok((value, expiry))
+    }
+
+    fn load_value_optional(
+        &self,
+        key_path: &Path,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let shared_lock = FileLock::new(true)
+            .map_err(|e| with_context(e, "Failed to acquire shared keyspace lock"))?;
+
+        if is_expired(key_path)? {
+            drop(shared_lock);
+            let _key_guard = maybe_lock_key(key_path)?;
+            let exclusive_lock = FileLock::new(false)
+                .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
+            if is_expired(key_path)? {
+                prune_expired(self.partition, key_path)?;
+                drop(exclusive_lock);
+                return Ok(None);
+            }
+            let value = read_value_if_exists(key_path)?;
+            drop(exclusive_lock);
+            return Ok(value);
+        }
+
+        let value = read_value_if_exists(key_path)?;
+        drop(shared_lock);
+        Ok(value)
     }
 
     /// Consumes a single-use token while enforcing an upper bound on TTL.
@@ -666,6 +967,7 @@ impl Keyspace {
 
         self.ensure_repaired()?;
         let key_path = resolve_path(self.partition, key)?;
+        let _key_guard = maybe_lock_key(&key_path)?;
         let exclusive_lock = FileLock::new(false)
             .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
 
@@ -752,6 +1054,7 @@ impl Keyspace {
     fn delete_blocking(&self, key: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.ensure_repaired()?;
         let key_path = resolve_path(self.partition, key)?;
+        let _key_guard = maybe_lock_key(&key_path)?;
         let _lock = FileLock::new(false)
             .map_err(|e| with_context(e, "Failed to acquire exclusive keyspace lock"))?;
 
@@ -871,6 +1174,7 @@ impl Keyspace {
                         format!("{}/{}", base.trim_end_matches('/'), candidate_str)
                     };
                     let key_path = resolve_path(self.partition, &key)?;
+                    let _key_guard = maybe_lock_key(&key_path)?;
                     return put_value(&key_path, value, None).map(|_| candidate_str);
                 }
             }
@@ -950,7 +1254,7 @@ fn is_valid_key_path(key: &str) -> bool {
         !segment.is_empty()
             && segment
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
     })
 }
 
@@ -1291,12 +1595,37 @@ fn repair_directory(
 }
 
 /// Returns true when a keyspace error indicates a missing value file.
+///
+/// Prefer [`Keyspace::get_optional`] for new code; this helper remains for
+/// compatibility when working with existing `get`/`delete` call sites that
+/// still surface missing entries as errors.
 pub fn is_missing_value_error(err: &dyn Error) -> bool {
     let msg = err.to_string();
     msg.contains("No such file or directory") || msg.contains("Value file not found")
 }
 
 fn persist_atomically(target: &Path, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    write_atomic_file(target, |tmpfile, tmpfile_path| {
+        tmpfile.write_all(data).map_err(|e| {
+            with_context(
+                e,
+                format!(
+                    "Failed to write to temporary file '{}'",
+                    tmpfile_path.display()
+                ),
+            )
+        })
+    })
+}
+
+/// Writes to a temporary file and atomically replaces the target on success.
+///
+/// The provided closure receives a writable handle to the temporary file and
+/// may add additional metadata to the file before it is flushed and renamed.
+fn write_atomic_file<F>(target: &Path, writer: F) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnOnce(&mut File, &Path) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
     let parent = target.parent().ok_or_else(|| {
         new_error(format!(
             "Target '{}' does not have a parent directory",
@@ -1323,15 +1652,7 @@ fn persist_atomically(target: &Path, data: &[u8]) -> Result<(), Box<dyn Error + 
         )
     })?;
 
-    tmpfile.write_all(data).map_err(|e| {
-        with_context(
-            e,
-            format!(
-                "Failed to write to temporary file '{}'",
-                tmpfile_path.display()
-            ),
-        )
-    })?;
+    writer(&mut tmpfile, &tmpfile_path)?;
     tmpfile.sync_all().map_err(|e| {
         with_context(
             e,

@@ -4,6 +4,11 @@ version = "0.0.1"
 edition = "2021"
 description = "A CLI tool for managing your Nanocloud"
 
+[lib]
+name = "nanocloud"
+path = "src/lib.rs"
+doctest = true
+
 [dependencies]
 base64 = "0.22.1"
 prometheus = "0.14.0"
@@ -67,9 +72,13 @@ network-bench = ["criterion"]
 oci-bench = ["criterion"]
 scheduler-bench = ["criterion"]
 secrets-bench = ["criterion"]
+keyspace-bench = ["criterion"]
+crypto-bench = ["criterion"]
 telemetry-otlp = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # Enable runtime capability list override for testing (reads from NANOCLOUD_EXTRA_CAPABILITIES env var)
 security-test-caps = []
+# Replace heavy security helpers with lightweight shims during tests.
+security-test-noop = []
 
 [[bin]]
 name = "openapi_gen"
@@ -79,7 +88,7 @@ required-features = ["openapi"]
 [dev-dependencies]
 serde_urlencoded = "0.7.1"
 http = "0.2"
-hyper = { version = "0.14", features = ["stream"] }
+hyper014 = { package = "hyper", version = "0.14", features = ["stream"] }
 serial_test = "3.1.1"
 walkdir = "2.5.0"
 logtest = "2.0"
@@ -108,3 +117,13 @@ required-features = ["scheduler-bench"]
 name = "secrets"
 harness = false
 required-features = ["secrets-bench"]
+
+[[bench]]
+name = "keyspace"
+harness = false
+required-features = ["keyspace-bench"]
+
+[[bench]]
+name = "crypto"
+harness = false
+required-features = ["crypto-bench"]

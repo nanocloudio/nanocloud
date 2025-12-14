@@ -51,10 +51,7 @@ pub enum SecretError {
     ///
     /// The requested secret does not exist. This may be an expected condition
     /// in some workflows (e.g., checking if a secret exists before creating).
-    NotFound {
-        namespace: String,
-        name: String,
-    },
+    NotFound { namespace: String, name: String },
 
     /// IO error during keyspace operations.
     ///
@@ -145,7 +142,11 @@ impl fmt::Display for SecretError {
             SecretError::Io(msg) => write!(f, "Secret IO error: {}", msg),
             SecretError::Crypto(msg) => write!(f, "Secret crypto error: {}", msg),
             SecretError::Integrity { key, message } => {
-                write!(f, "Secret integrity check failed for '{}': {}", key, message)
+                write!(
+                    f,
+                    "Secret integrity check failed for '{}': {}",
+                    key, message
+                )
             }
             SecretError::Encode(msg) => write!(f, "Secret encoding error: {}", msg),
             SecretError::Decode(msg) => write!(f, "Secret decoding error: {}", msg),
