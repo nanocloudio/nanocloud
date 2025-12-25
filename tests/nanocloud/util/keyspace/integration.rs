@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use nanocloud::nanocloud::secrets::{KeyspaceSecretStore, SecretMaterial};
 use nanocloud::nanocloud::test_support::{keyspace_lock, reset_keyspace_partition_watch};
-use nanocloud::nanocloud::util::{Keyspace, KeyspaceEventType};
 use nanocloud::nanocloud::util::security::SecureAssets;
+use nanocloud::nanocloud::util::{Keyspace, KeyspaceEventType};
 use tempfile::TempDir;
 
 struct EnvGuard {

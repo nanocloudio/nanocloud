@@ -31,7 +31,10 @@ impl KeyManagementService for NoOpKms {
     fn generate_data_key(&self) -> Result<GeneratedDataKey, Box<dyn Error + Send + Sync>> {
         let plaintext = vec![0_u8; 32];
         let envelope = self.encode_envelope(&plaintext)?;
-        Ok(GeneratedDataKey { plaintext, envelope })
+        Ok(GeneratedDataKey {
+            plaintext,
+            envelope,
+        })
     }
 
     fn encrypt_data_key(

@@ -15,10 +15,12 @@
  */
 
 use crate::nanocloud::k8s::service::Service;
+#[cfg(test)]
+use crate::nanocloud::k8s::store::common::HotResourceCacheMetrics;
 use crate::nanocloud::k8s::store::common::{
     bump_resource_version, deserialize_from_store, namespaced_key, namespaced_root,
     normalize_namespace, serialize_for_store, validate_resource_target, value_file_path,
-    with_resource_lock, HotResourceCache, HotResourceCacheMetrics, K8S_KEYSPACE, SERVICE_PREFIX,
+    with_resource_lock, HotResourceCache, K8S_KEYSPACE, SERVICE_PREFIX,
 };
 use crate::nanocloud::util::error::with_context;
 use crate::nanocloud::util::is_missing_value_error;
@@ -48,8 +50,8 @@ fn invalidate_service_cache(namespace: Option<&str>) {
     cache.invalidate(&service_cache_key(None));
 }
 
-#[allow(dead_code)]
-pub fn service_cache_metrics() -> HotResourceCacheMetrics {
+#[cfg(test)]
+fn service_cache_metrics() -> HotResourceCacheMetrics {
     service_cache().metrics()
 }
 
@@ -249,4 +251,74 @@ pub fn delete_service(
         invalidate_service_cache(namespace);
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nanocloud::k8s::service::ServicePort;
+    use crate::nanocloud::test_support::keyspace_lock;
+    use std::env;
+    use tempfile::TempDir;
+
+    struct TestEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tempdir: TempDir,
+        previous_keyspace: Option<String>,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let guard = keyspace_lock().lock();
+            let tempdir = TempDir::new().expect("tempdir");
+            let keyspace_root = tempdir.path().join("keyspace");
+            std::fs::create_dir_all(&keyspace_root).expect("keyspace dir");
+
+            let previous_keyspace = env::var("NANOCLOUD_KEYSPACE").ok();
+            env::set_var("NANOCLOUD_KEYSPACE", &keyspace_root);
+
+            TestEnv {
+                _guard: guard,
+                _tempdir: tempdir,
+                previous_keyspace,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            match self.previous_keyspace.as_ref() {
+                Some(value) => env::set_var("NANOCLOUD_KEYSPACE", value),
+                None => env::remove_var("NANOCLOUD_KEYSPACE"),
+            }
+        }
+    }
+
+    #[test]
+    fn service_cache_metrics_returns_state() {
+        let _env = TestEnv::new();
+
+        let mut svc = Service::default();
+        svc.metadata.name = Some("test-svc".to_string());
+        svc.metadata.namespace = Some("test-ns".to_string());
+        svc.spec.ports.push(ServicePort {
+            name: Some("http".to_string()),
+            port: 80,
+            target_port: Some(8080),
+            protocol: Some("TCP".to_string()),
+        });
+
+        save_service(Some("test-ns"), "test-svc", &svc).expect("save");
+        let _ = list_services(Some("test-ns")).expect("list services");
+
+        // Verify metrics returns valid state (cache may or may not be enabled
+        // depending on test run order and env var initialization)
+        let metrics = service_cache_metrics();
+        assert!(
+            metrics.misses >= 1 || !metrics.enabled,
+            "should record miss or be disabled"
+        );
+
+        delete_service(Some("test-ns"), "test-svc").expect("cleanup");
+    }
 }

@@ -16,8 +16,8 @@
 
 use crate::nanocloud::k8s::deployment::Deployment;
 use crate::nanocloud::k8s::store::common::{
-    bump_resource_version, namespaced_key, namespaced_root, normalize_namespace,
-    validate_resource_target, value_file_path, with_resource_lock, DEPLOYMENT_PREFIX, K8S_KEYSPACE,
+    namespaced_key, namespaced_root, normalize_namespace, validate_resource_target,
+    value_file_path, with_resource_lock, DEPLOYMENT_PREFIX, K8S_KEYSPACE,
 };
 use crate::nanocloud::logger::log_warn;
 use crate::nanocloud::util::error::with_context;

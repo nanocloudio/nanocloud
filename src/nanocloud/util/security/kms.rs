@@ -55,9 +55,7 @@ pub fn register_global_kms(
         return Err(provider);
     }
     let slot = global_kms_slot();
-    let mut guard = slot
-        .write()
-        .expect("global KMS registry lock poisoned");
+    let mut guard = slot.write().expect("global KMS registry lock poisoned");
     *guard = provider;
     Ok(())
 }
@@ -81,9 +79,7 @@ fn global_kms_slot() -> &'static RwLock<Arc<dyn KeyManagementService>> {
 pub(crate) fn override_global_kms_for_tests(provider: Arc<dyn KeyManagementService>) {
     GLOBAL_KMS_REGISTERED.store(true, Ordering::SeqCst);
     let slot = global_kms_slot();
-    let mut guard = slot
-        .write()
-        .expect("global KMS registry lock poisoned");
+    let mut guard = slot.write().expect("global KMS registry lock poisoned");
     *guard = provider;
 }
 

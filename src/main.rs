@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-mod nanocloud;
-
 use clap::Parser;
 
-use nanocloud::cli::{bootstrap, run, NanoCtl, Terminal};
+use nanocloud::nanocloud::cli::{bootstrap, run, NanoCtl, Terminal};
 
 #[tokio::main]
 async fn main() {

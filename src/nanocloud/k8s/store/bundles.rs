@@ -28,7 +28,6 @@ use crate::nanocloud::util::is_missing_value_error;
 use std::error::Error;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 
 pub fn list_bundles(namespace: Option<&str>) -> Result<Vec<Bundle>, Box<dyn Error + Send + Sync>> {
     let mut results = Vec::new();

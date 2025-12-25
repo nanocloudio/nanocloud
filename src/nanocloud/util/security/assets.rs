@@ -71,22 +71,15 @@ fn ca_cache() -> &'static Mutex<Option<CachedCa>> {
     CA_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn ensure_secure_dir(
-    dir: &Path,
-    label: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn ensure_secure_dir(dir: &Path, label: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !dir.exists() {
         return Err(new_error(format!(
             "{label} '{}' does not exist",
             dir.display()
         )));
     }
-    let metadata = fs::metadata(dir).map_err(|e| {
-        with_context(
-            e,
-            format!("Failed to inspect {label} '{}'", dir.display()),
-        )
-    })?;
+    let metadata = fs::metadata(dir)
+        .map_err(|e| with_context(e, format!("Failed to inspect {label} '{}'", dir.display())))?;
     if !metadata.is_dir() {
         return Err(new_error(format!(
             "{label} '{}' must be a directory",
@@ -104,10 +97,7 @@ fn ensure_secure_dir(
     Ok(())
 }
 
-fn ensure_asset_file(
-    path: &Path,
-    private: bool,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn ensure_asset_file(path: &Path, private: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !path.exists() {
         return Err(new_error(format!(
             "Secure asset '{}' is missing",

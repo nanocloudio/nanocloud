@@ -37,8 +37,8 @@ pub mod error;
 mod keyspace;
 pub mod security;
 
+pub(crate) use keyspace::reset_partition_watch;
 #[allow(unused_imports)]
 pub use keyspace::{
     is_missing_value_error, Keyspace, KeyspaceEvent, KeyspaceEventType, SingleUseTokenOutcome,
 };
-pub(crate) use keyspace::reset_partition_watch;

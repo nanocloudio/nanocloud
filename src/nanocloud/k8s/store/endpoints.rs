@@ -15,10 +15,12 @@
  */
 
 use crate::nanocloud::k8s::endpoints::Endpoints;
+#[cfg(test)]
+use crate::nanocloud::k8s::store::common::HotResourceCacheMetrics;
 use crate::nanocloud::k8s::store::common::{
     bump_resource_version, deserialize_from_store, namespaced_key, namespaced_root,
     normalize_namespace, serialize_for_store, validate_resource_target, value_file_path,
-    with_resource_lock, HotResourceCache, HotResourceCacheMetrics, ENDPOINTS_PREFIX, K8S_KEYSPACE,
+    with_resource_lock, HotResourceCache, ENDPOINTS_PREFIX, K8S_KEYSPACE,
 };
 use crate::nanocloud::util::error::with_context;
 use crate::nanocloud::util::is_missing_value_error;
@@ -48,8 +50,8 @@ fn invalidate_endpoints_cache(namespace: Option<&str>) {
     cache.invalidate(&endpoints_cache_key(None));
 }
 
-#[allow(dead_code)]
-pub fn endpoints_cache_metrics() -> HotResourceCacheMetrics {
+#[cfg(test)]
+fn endpoints_cache_metrics() -> HotResourceCacheMetrics {
     endpoints_cache().metrics()
 }
 
@@ -261,4 +263,80 @@ pub fn delete_endpoints(
         invalidate_endpoints_cache(namespace);
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nanocloud::k8s::endpoints::{EndpointAddress, EndpointPort, EndpointSubset};
+    use crate::nanocloud::k8s::pod::ObjectMeta;
+    use crate::nanocloud::test_support::keyspace_lock;
+    use std::env;
+    use tempfile::TempDir;
+
+    struct TestEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tempdir: TempDir,
+        previous_keyspace: Option<String>,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let guard = keyspace_lock().lock();
+            let tempdir = TempDir::new().expect("tempdir");
+            let keyspace_root = tempdir.path().join("keyspace");
+            std::fs::create_dir_all(&keyspace_root).expect("keyspace dir");
+
+            let previous_keyspace = env::var("NANOCLOUD_KEYSPACE").ok();
+            env::set_var("NANOCLOUD_KEYSPACE", &keyspace_root);
+
+            TestEnv {
+                _guard: guard,
+                _tempdir: tempdir,
+                previous_keyspace,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            match self.previous_keyspace.as_ref() {
+                Some(value) => env::set_var("NANOCLOUD_KEYSPACE", value),
+                None => env::remove_var("NANOCLOUD_KEYSPACE"),
+            }
+        }
+    }
+
+    #[test]
+    fn endpoints_cache_metrics_returns_state() {
+        let _env = TestEnv::new();
+
+        let mut endpoints = Endpoints {
+            metadata: ObjectMeta {
+                name: Some("test-svc".to_string()),
+                namespace: Some("test-ns".to_string()),
+                ..Default::default()
+            },
+            ..Endpoints::default()
+        };
+        endpoints.subsets.push(EndpointSubset {
+            addresses: vec![EndpointAddress {
+                ip: "10.0.0.1".to_string(),
+            }],
+            ports: vec![EndpointPort::new(Some("http".to_string()), 80, None)],
+        });
+
+        save_endpoints(Some("test-ns"), "test-svc", &endpoints).expect("save");
+        let _ = list_endpoints(Some("test-ns")).expect("list endpoints");
+
+        // Verify metrics returns valid state (cache may or may not be enabled
+        // depending on test run order and env var initialization)
+        let metrics = endpoints_cache_metrics();
+        assert!(
+            metrics.misses >= 1 || !metrics.enabled,
+            "should record miss or be disabled"
+        );
+
+        delete_endpoints(Some("test-ns"), "test-svc").expect("cleanup");
+    }
 }

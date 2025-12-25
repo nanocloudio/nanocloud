@@ -31,6 +31,8 @@ pub mod persistentvolumeclaim;
 pub mod pod;
 pub mod rbac;
 pub mod replicaset;
+#[cfg(feature = "edge")]
+pub mod route;
 pub mod secret;
 pub mod secret_manager;
 pub mod service;
@@ -38,3 +40,5 @@ pub mod service_registry;
 pub mod statefulset;
 pub mod store;
 pub mod table;
+#[cfg(feature = "edge")]
+pub mod webhook;

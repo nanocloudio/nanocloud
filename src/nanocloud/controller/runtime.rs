@@ -688,6 +688,16 @@ pub enum ControllerTarget {
         namespace: Option<String>,
         name: String,
     },
+    #[cfg(feature = "edge")]
+    Route {
+        namespace: Option<String>,
+        name: String,
+    },
+    #[cfg(feature = "edge")]
+    Webhook {
+        namespace: Option<String>,
+        name: String,
+    },
 }
 
 impl ControllerTarget {
@@ -701,6 +711,9 @@ impl ControllerTarget {
             | ControllerTarget::Bundle { namespace, .. }
             | ControllerTarget::VolumeSnapshot { namespace, .. }
             | ControllerTarget::NetworkPolicy { namespace, .. } => namespace.as_deref(),
+            #[cfg(feature = "edge")]
+            ControllerTarget::Route { namespace, .. }
+            | ControllerTarget::Webhook { namespace, .. } => namespace.as_deref(),
         }
     }
 
@@ -714,6 +727,8 @@ impl ControllerTarget {
             | ControllerTarget::Bundle { name, .. }
             | ControllerTarget::VolumeSnapshot { name, .. }
             | ControllerTarget::NetworkPolicy { name, .. } => name,
+            #[cfg(feature = "edge")]
+            ControllerTarget::Route { name, .. } | ControllerTarget::Webhook { name, .. } => name,
         }
     }
 }
@@ -773,6 +788,24 @@ impl fmt::Display for ControllerTarget {
                 write!(
                     f,
                     "NetworkPolicy/{}/{}",
+                    normalize_namespace(namespace.as_deref()),
+                    name
+                )
+            }
+            #[cfg(feature = "edge")]
+            ControllerTarget::Route { namespace, name } => {
+                write!(
+                    f,
+                    "Route/{}/{}",
+                    normalize_namespace(namespace.as_deref()),
+                    name
+                )
+            }
+            #[cfg(feature = "edge")]
+            ControllerTarget::Webhook { namespace, name } => {
+                write!(
+                    f,
+                    "Webhook/{}/{}",
                     normalize_namespace(namespace.as_deref()),
                     name
                 )
@@ -847,6 +880,26 @@ impl ControllerWorkItem {
     pub fn network_policy(namespace: Option<&str>, name: &str) -> Self {
         Self {
             target: ControllerTarget::NetworkPolicy {
+                namespace: namespace.map(|ns| ns.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    #[cfg(feature = "edge")]
+    pub fn route(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            target: ControllerTarget::Route {
+                namespace: namespace.map(|ns| ns.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    #[cfg(feature = "edge")]
+    pub fn webhook(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            target: ControllerTarget::Webhook {
                 namespace: namespace.map(|ns| ns.to_string()),
                 name: name.to_string(),
             },

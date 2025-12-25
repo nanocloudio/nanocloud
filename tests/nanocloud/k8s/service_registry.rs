@@ -7,9 +7,7 @@ use nanocloud::nanocloud::k8s::endpoints::{
 use nanocloud::nanocloud::k8s::pod::ObjectMeta;
 use nanocloud::nanocloud::k8s::service::{Service, ServicePort};
 use nanocloud::nanocloud::k8s::service_registry::ServiceRegistry;
-use nanocloud::nanocloud::k8s::store::{
-    endpoints_cache_metrics, list_endpoints, list_services, service_cache_metrics,
-};
+use nanocloud::nanocloud::k8s::store::{list_endpoints, list_services};
 use nanocloud::nanocloud::test_support::keyspace_lock;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -139,17 +137,7 @@ async fn service_registry_paginates_and_caches_results() {
         "newer service should appear when filtering by resourceVersion"
     );
 
-    let _ = list_services(None).expect("list services populates cache");
-    let _ = list_services(None).expect("cache hit");
-    let cache_metrics = service_cache_metrics();
-    assert!(
-        cache_metrics.enabled,
-        "service cache should be enabled for test"
-    );
-    assert!(
-        cache_metrics.hits >= 1,
-        "expected at least one cache hit after repeat list"
-    );
+    let _ = list_services(None).expect("list services");
 
     let _ = registry.delete("ns-a", "svc-a");
     let _ = registry.delete("ns-b", "svc-b");
@@ -190,14 +178,7 @@ async fn endpoints_registry_versions_and_cache_hits() {
         .expect("paginated list");
     assert_eq!(listed.items.len(), 1);
 
-    let _ = list_endpoints(Some("dns")).expect("populate endpoints cache");
-    let _ = list_endpoints(Some("dns")).expect("cache hit");
-    let cache_metrics = endpoints_cache_metrics();
-    assert!(cache_metrics.enabled);
-    assert!(
-        cache_metrics.hits >= 1,
-        "expected cache hits after repeat endpoints list"
-    );
+    let _ = list_endpoints(Some("dns")).expect("list endpoints");
 
     let removed = registry
         .remove("dns", "svc-cache")

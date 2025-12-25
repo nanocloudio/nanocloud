@@ -49,10 +49,10 @@ mod blocking;
 mod cert;
 mod crypto;
 pub mod kms;
-mod tls;
-pub mod volume;
 #[cfg(all(test, feature = "security-test-noop"))]
 pub mod noop;
+mod tls;
+pub mod volume;
 
 #[cfg(test)]
 #[allow(unused_imports)]

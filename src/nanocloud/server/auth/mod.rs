@@ -218,8 +218,8 @@ pub struct ClientCertificate {
 }
 
 impl ClientCertificate {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(subject: String) -> Self {
+    #[cfg(all(test, feature = "openapi"))]
+    fn new(subject: String) -> Self {
         Self { subject }
     }
 

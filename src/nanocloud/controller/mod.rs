@@ -24,9 +24,13 @@ pub mod networkpolicy;
 pub mod reconcile;
 pub mod replicaset;
 pub mod rollout;
+#[cfg(feature = "edge")]
+pub mod route;
 pub mod runtime;
 pub mod scheduling;
 pub mod snapshot;
 pub mod statefulset;
 pub mod status;
 pub mod watch;
+#[cfg(feature = "edge")]
+pub mod webhook;

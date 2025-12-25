@@ -22,8 +22,12 @@ pub mod controller;
 pub mod csi;
 pub mod diagnostics;
 pub mod dns;
+#[cfg(feature = "edge")]
+pub mod edge;
 pub mod engine;
 pub mod events;
+pub mod http;
+pub mod http_middleware;
 pub mod k8s;
 pub mod kubelet;
 pub mod logger;
