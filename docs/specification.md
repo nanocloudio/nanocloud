@@ -220,6 +220,30 @@ the control-plane timeline:
 
 Refer to `docs/guides/bindings.md` for authoring guidance and detailed examples.
 
+## Control Plane Plumbing
+
+Nanocloud embeds every layer of the Kubernetes control plane inside the single binary so operators do not have to deploy etcd, admission webhooks, or custom schedulers.
+
+### Keyspace Partitions
+- The filesystem-backed Keyspace (`src/nanocloud/util/keyspace.rs`) stores workloads, controller state, secrets, and registries under dedicated prefixes (`/controllers`, `/pods`, `/network`, etc.).
+- Writers rely on atomic write-then-rename semantics with fsync of both the value file and parent directory; optional per-key locks (`NANOCLOUD_KEYSPACE_PER_KEY_LOCKS=1`) ensure admission and controllers never clobber concurrent updates.
+- Watchers expose in-memory history buffers so the API server can serve bookmarkable watches even when clients briefly disconnect; the watch registry enforces a bounded backlog to avoid unbounded memory growth.
+
+### Watch & Pagination Semantics
+- List handlers share the same query contract: `watch`, `resourceVersion`, `resourceVersionMatch`, `fieldSelector`, `labelSelector`, `limit`, `continue`, `allowWatchBookmarks`, and `timeoutSeconds`.
+- Single-object requests reject incompatible query options (`limit`, `continue`, `resourceVersionMatch`) just like Kubernetes; list requests normalize namespaces, enforce limit>0, and include `ListMeta` entries with `continue` tokens when additional data remains.
+- Bookmark events are emitted every 30 seconds during long watches so clients can checkpoint their `resourceVersion` even when nothing changes.
+
+### Server-Side Apply & Conflict Reporting
+- `PATCH /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}` accepts `Content-Type: application/apply-patch+{json,yaml}` plus `fieldManager`, `force`, and `dryRun` query parameters.
+- Apply ownership is persisted per JSON pointer, mirroring Kubernetes’ SSA implementation; conflicting managers trigger HTTP 409 responses with `conflicts[].path` and `conflicts[].existingManager` so the CLI can show precise remediation steps.
+- Dry-run requests still exercise schema validation and controller admission but skip persistence, enabling pipeline validation without mutating the local keyspace.
+
+### TLS, Tokens, and RBAC Scopes
+- The HTTPS server enforces TLS by default and can require client certificates via `NANOCLOUD_REQUIRE_CLIENT_CERTIFICATE=1`.
+- `nanocloud token` mints bootstrap tokens that can be exchanged for short-lived service-account JWTs or x509 certificates; every API handler declares the scopes it requires (e.g., `bundles.manage`, `pods.exec`).
+- Device certificates are issued under `/apis/nanocloud.io/v1/namespaces/{namespace}/devices/certificates`, and kubeconfigs emitted by `nanocloud config` embed the signed client cert or bearer token.
+
 ## Exec API
 
 - The API exposes the `/api/v1/namespaces/{namespace}/pods/{name}/exec` and

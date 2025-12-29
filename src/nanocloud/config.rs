@@ -16,9 +16,11 @@
 
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, PathBuf};
+use std::str::FromStr;
 
 /// Enum for supported configuration parameters
 #[derive(Debug)]
@@ -183,5 +185,198 @@ impl Config {
             Config::SecureAssets => Some(0o700),
             Config::EncryptedVolumes => Some(0o700),
         }
+    }
+}
+
+// =============================================================================
+// Subsystem Backend Configuration
+// =============================================================================
+
+/// Identifies which subsystem a backend configuration applies to.
+///
+/// This enum provides a consistent pattern for configuring whether subsystems
+/// use embedded (built-in) or external implementations. Each subsystem has
+/// an associated environment variable following the convention:
+/// `NANOCLOUD_<SUBSYSTEM>_BACKEND`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subsystem {
+    /// State storage (keyspace) - supports `embedded` or `etcd`
+    Keyspace,
+    // Future subsystems:
+    // Cni,      // Container networking - `embedded` or `external`
+    // Oci,      // Container runtime - `embedded` or `external`
+    // Csi,      // Storage interface - `embedded` or `external`
+}
+
+impl Subsystem {
+    /// Returns the environment variable name for this subsystem's backend.
+    pub const fn env_var(&self) -> &'static str {
+        match self {
+            Subsystem::Keyspace => "NANOCLOUD_KEYSPACE_BACKEND",
+        }
+    }
+
+    /// Returns the default backend for this subsystem.
+    pub const fn default_backend(&self) -> &'static str {
+        match self {
+            Subsystem::Keyspace => "embedded",
+        }
+    }
+
+    /// Returns the list of valid backend names for this subsystem.
+    pub const fn valid_backends(&self) -> &'static [&'static str] {
+        match self {
+            Subsystem::Keyspace => &["embedded", "etcd"],
+        }
+    }
+
+    /// Gets the configured backend from the environment or returns the default.
+    pub fn get_backend(&self) -> String {
+        env::var(self.env_var())
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.default_backend().to_string())
+    }
+
+    /// Validates and returns the configured backend.
+    ///
+    /// Returns an error if the configured backend is not in the valid list.
+    pub fn get_validated_backend(&self) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let backend = self.get_backend();
+        if self.valid_backends().contains(&backend.as_str()) {
+            Ok(backend)
+        } else {
+            Err(format!(
+                "Invalid backend '{}' for {}. Valid options: {}",
+                backend,
+                self.env_var(),
+                self.valid_backends().join(", ")
+            )
+            .into())
+        }
+    }
+}
+
+/// Backend type for the keyspace subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyspaceBackend {
+    /// Filesystem-backed storage (default)
+    #[default]
+    Embedded,
+    /// External etcd cluster
+    Etcd,
+}
+
+impl KeyspaceBackend {
+    /// Returns the backend type from the environment configuration.
+    pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let backend = Subsystem::Keyspace.get_validated_backend()?;
+        backend.parse()
+    }
+}
+
+impl FromStr for KeyspaceBackend {
+    type Err = Box<dyn Error + Send + Sync>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "embedded" | "filesystem" | "fs" => Ok(KeyspaceBackend::Embedded),
+            "etcd" => Ok(KeyspaceBackend::Etcd),
+            other => Err(format!(
+                "Unknown keyspace backend '{}'. Valid options: embedded, etcd",
+                other
+            )
+            .into()),
+        }
+    }
+}
+
+impl fmt::Display for KeyspaceBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyspaceBackend::Embedded => write!(f, "embedded"),
+            KeyspaceBackend::Etcd => write!(f, "etcd"),
+        }
+    }
+}
+
+// =============================================================================
+// Etcd Configuration
+// =============================================================================
+
+/// Environment variable for etcd endpoints (comma-separated URLs).
+pub const ETCD_ENDPOINTS_ENV: &str = "NANOCLOUD_ETCD_ENDPOINTS";
+
+/// Environment variable for etcd key prefix.
+pub const ETCD_PREFIX_ENV: &str = "NANOCLOUD_ETCD_PREFIX";
+
+/// Environment variable for etcd username (optional authentication).
+pub const ETCD_USERNAME_ENV: &str = "NANOCLOUD_ETCD_USERNAME";
+
+/// Environment variable for etcd password (optional authentication).
+pub const ETCD_PASSWORD_ENV: &str = "NANOCLOUD_ETCD_PASSWORD";
+
+/// Default etcd endpoint when not configured.
+pub const ETCD_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:2379";
+
+/// Default etcd key prefix.
+pub const ETCD_DEFAULT_PREFIX: &str = "/nanocloud";
+
+/// Configuration for connecting to an etcd cluster.
+#[derive(Debug, Clone)]
+pub struct EtcdConfig {
+    /// Etcd server endpoints (comma-separated in env var)
+    pub endpoints: Vec<String>,
+    /// Key prefix for all keyspace operations
+    pub prefix: String,
+    /// Optional username for authentication
+    pub username: Option<String>,
+    /// Optional password for authentication
+    pub password: Option<String>,
+}
+
+impl EtcdConfig {
+    /// Loads etcd configuration from environment variables.
+    pub fn from_env() -> Self {
+        let endpoints = env::var(ETCD_ENDPOINTS_ENV)
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|_| vec![ETCD_DEFAULT_ENDPOINT.to_string()]);
+
+        let prefix = env::var(ETCD_PREFIX_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| ETCD_DEFAULT_PREFIX.to_string());
+
+        let username = env::var(ETCD_USERNAME_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        let password = env::var(ETCD_PASSWORD_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        Self {
+            endpoints,
+            prefix,
+            username,
+            password,
+        }
+    }
+
+    /// Returns true if authentication credentials are configured.
+    pub fn has_auth(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
+    }
+
+    /// Returns the full key path with prefix for a given partition and key.
+    pub fn full_key(&self, partition: &str, key: &str) -> String {
+        format!("{}/{}{}", self.prefix, partition, key)
     }
 }
