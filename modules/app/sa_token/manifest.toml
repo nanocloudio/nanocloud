@@ -1,0 +1,47 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# sa_token — nanocloud's ServiceAccount token issuer as a PIC
+# module (the k8s serviceaccounts/token surface). Mirrors cert_manager: on start
+# it self-generates a P-256 signing keypair, deposits the private scalar in the
+# kernel KEY_VAULT (contract 0x0010, an infra contract), and publishes the
+# public key at /sa-pubkey. Each /token-req/ mints a signed JWS (ES256 = P-256 +
+# SHA-256, signed BY HANDLE — the key never re-enters the module) for
+# system:serviceaccount:<ns>:<name> and returns it at /token-resp/. No new
+# capability surface — existing fluxor crypto only.
+
+# Cadence-independent: it does no tick-based timekeeping, just polls its watch.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above.
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# KEY_VAULT (contract 0x0010) is an infra contract — implicitly granted, so it
+# needs no requires_contract entry.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the tokens it mints.
+[observability]
+exempt = "Control-plane SA-token minter — provider-driven, emits no telemetry stream"

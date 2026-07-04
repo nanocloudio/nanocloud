@@ -1,0 +1,116 @@
+# Adaptive-tick cadence graph — the scheduler fmod on a single
+# relaxable domain, proving fluxor's upward-only variable cadence for an idle
+# nanocloud control plane.
+#
+# Same module + self-edge as fluxor-scheduler.yaml, but domain `main` enables
+# adaptive tick:
+#
+#   adaptive_flags = 3 = ADAPTIVE_FLAG_IDLE (bit 0, demand-driven idle relax)
+#                      | ADAPTIVE_FLAG_CADENCE (bit 1, AIMD variable cadence)
+#   tick_min_us = 1000   the HARD floor — the responsive base tick. The pacer
+#                        never goes below it (no sub-floor busy-spin); a burst is
+#                        absorbed intra-tick by the existing burst/multi-pass
+#                        machinery, not by shrinking the period.
+#   tick_max_us = 50000  the idle backstop. When the domain has no pending wake
+#                        and no burst, the pacer walks the next deadline UP toward
+#                        this ceiling. Any store change (a SUBSCRIBE push) latches
+#                        an event wake that snaps the loop straight back to the
+#                        floor, so relaxation costs no latency on real work.
+#
+# Net: an idle control plane parks ~20x/s (50ms) instead of ~1000x/s (1ms), with
+# unchanged responsiveness. Only the power/thermal idle cost changes.
+#
+# Admissibility (I1): the scheduler declares timer_class = "agnostic"
+# (cadence-independent — it reads no tick-as-time), so it clears the mechanism-(b)
+# attestation gate in `validate_adaptive_tick`. A tick-counting module here would
+# make `fluxor build` reject this graph outright.
+#
+# Single-domain by design on the linux host: the linux runner is single-threaded
+# and paces the base graph off domain 0, so the relaxable domain IS domain 0
+# here. The two-domain split (a fixed-cadence tenant co-resident beside this
+# relaxable one) becomes operative on the multicore bcm2712 target and once a
+# native/RT workload that must not relax shares the node.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+execution:
+  domains:
+    - name: main
+      cores: [0]
+      adaptive_flags: 3
+      tick_min_us: 1000
+      tick_max_us: 50000
+
+modules:
+  # The scheduler is PARAMS: the FIRST unbound Pod (where spec.nodeName=,
+  # count index 0) JOIN /ready-nodes/ picked by the fewest Pods bound to it —
+  # measured from the Pods themselves at pick time — PATCHes spec.nodeName;
+  # one bind per pass, the spread emergent. Then the Scheduled event. Reads
+  # /ready-nodes/ from the DaemonSet chain's projection. Params from
+  # modules/app/_chronicle/scheduler.uproc.
+  - name: sc_unbound
+    type: store_source
+    prefix: "/pods/"
+    where: "spec.nodeName="
+    count: 1
+    join: "/ready-nodes/"
+    join_pick: "mincount:/pods/:spec.nodeName"
+    watch: "/ready-nodes/"
+  - name: sc_bind
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/scheduler.uproc bd
+      decision: "010a0000001e000100021400000010000000000000000020010002150000001200002130001e0000008a000100020100000040010000001005000000000000004002000000010002030000004003000000120d00737065632e6e6f64654e616d65401300000012010022400400000001000215000000400500000012010022400600000001000203000000401e0000000100021c00000040220000000100021d0000004023000000010002150000004024000000411c000000730001000201000000400100000010000000000000000040020000001200004003000000120000401300000012000040040000001200004005000000120000400600000001000203000000401e0000000100021c00000040220000000100021d000000402300000001000215000000402400000041"
+  - name: sc_patch
+    type: store_effect
+    key_prefix: "/pods/"
+  - name: sc_record
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/scheduler.uproc rc
+      decision: "010500000012000100020200000010c800000000000000200026000000680101000201000000400100000010030000000000000040020000000100021e0000004003000000120c002e5363686564756c65642e3040110000001215007b226d65746164617461223a7b226e616d65223a224004000000010002230000004005000000121b002e5363686564756c65642e30222c226e616d657370616365223a224006000000010002220000004007000000122f00227d2c22696e766f6c7665644f626a656374223a7b226b696e64223a22506f64222c226e616d657370616365223a224008000000010002220000004009000000120a00222c226e616d65223a22400a00000001000223000000400b000000123c00227d2c22726561736f6e223a225363686564756c6564222c226d657373616765223a225375636365737366756c6c792061737369676e656420746f20400c00000001000224000000400d000000121c00222c2274797065223a224e6f726d616c222c22636f756e74223a317d400e000000410a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000401100000041"
+  - name: sc_events
+    type: store_effect
+    key_prefix: "/events/"
+  # the ready-nodes projection (the DaemonSet chain's rdy decision)
+  - name: ds_nodes
+    type: store_source
+    prefix: "/nodes/"
+    paths: "status.ready"
+  - name: ds_ready
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc rdy
+      decision: "01050000001000010002040000001204007472756520000b00000030000100020100000040010000001003000000000000004002000000010002030000004003000000120100314004000000410b0000002f000100020100000040010000001004000000000000004002000000010002030000004003000000120000400400000041"
+  - name: ds_mark
+    type: store_effect
+    key_prefix: "/ready-nodes/"
+    domain: main
+
+# Self-edge: the scheduler's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: sc_unbound.status
+    to: sc_unbound.changes
+  - from: sc_unbound.record_out
+    to: sc_bind.record_in
+  - from: sc_bind.result_out
+    to: sc_patch.request_in
+    buffer_group: 111
+  - from: sc_patch.response_out
+    to: sc_record.record_in
+  - from: sc_record.result_out
+    to: sc_events.request_in
+    buffer_group: 112
+  - from: ds_nodes.status
+    to: ds_nodes.changes
+  - from: ds_nodes.record_out
+    to: ds_ready.record_in
+  - from: ds_ready.result_out
+    to: ds_mark.request_in
+    buffer_group: 41

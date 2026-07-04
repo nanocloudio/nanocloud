@@ -1,0 +1,219 @@
+// DaemonSet as params: one Pod per ready Node. Three chains.
+//
+//   ready   /nodes/ -> /ready-nodes/<node>   the readiness projection; a
+//           fold the scheduler also performs, now a record nothing else
+//           has to recompute
+//   place   /daemonsets.apps/ JOIN /ready-nodes/ -> one record per (ds,
+//           node) -> EXISTS the pod -> create-if-absent, node-pinned
+//   prune   /pods/ owned by a DaemonSet -> GET /ready-nodes/<nodeName> ->
+//           404 -> DELETE
+//
+// The cross product is the SOURCE's (`join`), as the count was for
+// ReplicaSet: the cardinality is another prefix's, and every (ds, node) is an
+// independent create-if-absent.
+module nanocloud.daemonset {
+
+  // ---- ready: the readiness projection ----
+  message ds.Node {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;    // "<node>" — the tail below /nodes/
+    ready: string = 4;  // status.ready, "true" or otherwise
+  }
+  message ds.Mark {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision ready(n: ds.Node) -> ds.Mark {
+    when n.ready == "true" ->
+      ds.Mark { cid: n.seq, op: PUT, key: n.key, v1: "1" };
+    default ->
+      ds.Mark { cid: n.seq, op: DELETE, key: n.key, v1: "" };
+  }
+
+  // ---- place: one Pod per (DaemonSet, ready Node) ----
+  message ds.Pair {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<ds>"
+    members: string = 4;  // spec.template.spec.* — the template's members,
+                          // braces off, so nodeName can be spliced in
+    node: string = 21;    // the joined ready node
+    podkey: string = 24;  // "<ns>/<ds>-<node>"
+    podname: string = 26; // "<ds>-<node>"
+    ns: string = 28;
+    ds: string = 29;
+  }
+  message ds.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_members: string = 31;
+    c_node: string = 32;
+    c_ns: string = 34;
+    c_ds: string = 35;
+    c_pod: string = 39;
+  }
+  message ds.Answer {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_members: string = 31;
+    c_node: string = 32;
+    c_ns: string = 34;
+    c_ds: string = 35;
+    c_pod: string = 39;
+  }
+  message ds.Create {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+    p10: string = 13; p11: string = 14; p12: string = 15;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  decision probe(p: ds.Pair) -> ds.Probe {
+    default ->
+      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey,
+                 c_key: p.podkey, c_members: p.members, c_node: p.node,
+                 c_ns: p.ns, c_ds: p.ds, c_pod: p.podname };
+  }
+
+  // Create-if-absent, node-pinned: the template's members with nodeName
+  // spliced in first. An empty template takes the comma-less form.
+  decision create(a: ds.Answer) -> ds.Create {
+    when a.status == 404 && a.c_members == "" ->
+      ds.Create { cid: a.cid, op: PUT, key: a.c_key,
+                  p1: "{\"metadata\":{\"name\":\"",
+                  p2: a.c_pod,
+                  p3: "\",\"namespace\":\"",
+                  p4: a.c_ns,
+                  p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
+                  p6: a.c_ds,
+                  p7: "\"}]},\"spec\":{\"nodeName\":\"",
+                  p8: a.c_node,
+                  p9: "\"",
+                  p10: "",
+                  p11: "",
+                  p12: "}}" };
+    when a.status == 404 ->
+      ds.Create { cid: a.cid, op: PUT, key: a.c_key,
+                  p1: "{\"metadata\":{\"name\":\"",
+                  p2: a.c_pod,
+                  p3: "\",\"namespace\":\"",
+                  p4: a.c_ns,
+                  p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
+                  p6: a.c_ds,
+                  p7: "\"}]},\"spec\":{\"nodeName\":\"",
+                  p8: a.c_node,
+                  p9: "\",",
+                  p10: a.c_members,
+                  p11: "",
+                  p12: "}}" };
+    default ->
+      ds.Create { cid: a.cid, op: NOOP, key: "" };
+  }
+
+  // ---- prune: a DaemonSet Pod whose Node is no longer ready ----
+  message ds.Pod {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<pod>"
+    kind: string = 4;     // metadata.ownerReferences.0.kind
+    node: string = 5;     // spec.nodeName
+  }
+  message ds.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the node, under /ready-nodes/
+    c_key: string = 30;   // the pod, to delete
+  }
+  message ds.Known {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+  }
+  message ds.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  decision ask(p: ds.Pod) -> ds.Ask {
+    when p.kind == "DaemonSet" && p.node != "" ->
+      ds.Ask { cid: p.seq, op: EXISTS, key: p.node, c_key: p.key };
+    default ->
+      ds.Ask { cid: p.seq, op: NOOP, key: "", c_key: p.key };
+  }
+  decision prune(k: ds.Known) -> ds.Act {
+    when k.status == 404 ->
+      ds.Act { cid: k.cid, op: DELETE, key: k.c_key };
+    default ->
+      ds.Act { cid: k.cid, op: NOOP, key: "" };
+  }
+
+  transformation pass_node(n: ds.Node) -> ds.Node {
+    ds.Node { seq: n.seq, rev: n.rev, key: n.key, ready: n.ready }
+  }
+  transformation pass_pair(p: ds.Pair) -> ds.Pair {
+    ds.Pair { seq: p.seq, rev: p.rev, key: p.key, members: p.members, node: p.node,
+              podkey: p.podkey, podname: p.podname, ns: p.ns, ds: p.ds }
+  }
+  transformation pass_answer(a: ds.Answer) -> ds.Answer {
+    ds.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
+                c_members: a.c_members, c_node: a.c_node, c_ns: a.c_ns,
+                c_ds: a.c_ds, c_pod: a.c_pod }
+  }
+  transformation pass_pod(p: ds.Pod) -> ds.Pod {
+    ds.Pod { seq: p.seq, rev: p.rev, key: p.key, kind: p.kind, node: p.node }
+  }
+  transformation pass_known(k: ds.Known) -> ds.Known {
+    ds.Known { cid: k.cid, status: k.status, value: k.value, c_key: k.c_key }
+  }
+
+  pipeline rdy(n: ds.Node) -> ds.Mark {
+    call x = pass_node(n);
+    call y = ready(x);
+    return y;
+  }
+  pipeline prb(p: ds.Pair) -> ds.Probe {
+    call x = pass_pair(p);
+    call y = probe(x);
+    return y;
+  }
+  pipeline mk(a: ds.Answer) -> ds.Create {
+    call x = pass_answer(a);
+    call y = create(x);
+    return y;
+  }
+  pipeline ask(p: ds.Pod) -> ds.Ask {
+    call x = pass_pod(p);
+    call y = ask(x);
+    return y;
+  }
+  pipeline prn(k: ds.Known) -> ds.Act {
+    call x = pass_known(k);
+    call y = prune(x);
+    return y;
+  }
+
+  entry rdy = rdy;
+  entry prb = prb;
+  entry mk = mk;
+  entry ask = ask;
+  entry prn = prn;
+
+  provenance revision "daemonset-join" toolchain "chronicle-authoring";
+}

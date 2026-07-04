@@ -1,0 +1,44 @@
+# Nanocloud project config consumed by the `fluxor` CLI. See
+# ~/Development/nanocloudio/standards/{ci,fluxor-modules,tests,lints,dependencies}.md
+# for the schema each table belongs to.
+
+# Project identity (standards/dependencies.md §2.1).
+[project]
+name    = "nanocloud"
+version = "0.0.1"
+
+# Cross-project dependencies (standards/dependencies.md §2.2). Resolves
+# fluxor's published source crates and fmod palette via the local registry.
+# PIC modules in `modules/app/*/mod.rs` consume the materialised SDK source
+# at `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
+[dependencies]
+fluxor = "0.0.1"
+wave = "0.0.1"
+chronicle = "0.0.1"
+# kagi owns the identity protocols, and `authn` / `sa_token` speak them rather
+# than reimplementing them: `authn` compiles kagi's own `kagi-common` fragments
+# (`jose`, `verify_keyset`, `auth_wire`, `b64`) to decide whether a credential
+# is genuine, and `sa_token` publishes its verification key in kagi's key-frame
+# wire format. What nanocloud keeps is the question "is this caller allowed to
+# do this" — not the cryptography behind the answer.
+kagi = "0.0.1"
+
+[ci]
+# Module targets to build in CI. Nanocloud nodes are Pi 5; the deb
+# ships `bcm2712` `.fmod` artefacts run as PIC on linux/aarch64.
+targets = ["bcm2712"]
+
+[ci.test]
+# The runtime test gate. nanocloud has no cargo tests — its behaviour is
+# proven by graph E2Es that boot the built `.fmod` artefacts and drive them
+# (real HTTP, the store seam, mTLS). `fluxor ci` runs each after the strict
+# module build, so `make ci` is the full gate (lint + build + behaviour),
+# not lint/build alone. `make test` runs the same scripts standalone.
+scripts = ["scripts/*-e2e.sh"]
+
+[ci.hygiene]
+# nanocloud is fluxor-only — no host `src/` crate. Every PIC fmod under
+# `modules/` is `no_std`, where an inline `#[cfg(test)]` block compiles away
+# silently and a green run would mean nothing, so inline tests are banned there.
+# Behaviour is proven by the graph E2Es (`scripts/*-e2e.sh`, `make test`).
+forbid_inline_tests = ["modules"]

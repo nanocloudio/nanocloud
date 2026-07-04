@@ -1,0 +1,179 @@
+// StatefulSet as params: ordered, stable-identity Pods. The ReplicaSet chain
+// with two differences, both gates:
+//   up:   create ordinal i only when i-1 exists AND is ready (0 is ungated)
+//   down: delete a surplus ordinal only when i+1 is absent — "my successor
+//         is gone" is how a per-record decision knows it is the highest, so
+//         teardown proceeds highest-first without a budget
+// Stage 1 asks about the NEIGHBOUR that gates this ordinal: the predecessor
+// when in range, the successor when not.
+module nanocloud.statefulset {
+
+  message st.Ord {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<name>"
+    tmpl: string = 4;     // spec.template.spec, opaque
+    replicas: string = 5; // spec.replicas as text; empty = not projectable
+    succkey: string = 19; // "<ns>/<name>-<i+1>"
+    ord: int = 20;
+    ordstr: string = 21;
+    want: int = 22;
+    prevstr: string = 23; // empty at 0
+    selfkey: string = 24; // "<ns>/<name>-<i>"
+    prevkey: string = 25; // "<ns>/<name>-<i-1>"
+    pod: string = 26;     // "<name>-<i>"
+    ns: string = 28;
+    name: string = 29;
+  }
+  message st.NbQ {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;    // "1" in range, "" surplus
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_pod: string = 39;
+  }
+  message st.NbA {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_pod: string = 39;
+    ready: string = 40;   // the neighbour's status.ready
+  }
+  message st.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_gate: string = 38;  // "1" when the neighbour permits acting
+    c_pod: string = 39;
+  }
+  message st.Answer {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_gate: string = 38;
+    c_pod: string = 39;
+  }
+  message st.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // Stage 1: which neighbour gates me? In range: the predecessor (none at
+  // 0, so NOOP and let 204 mean "ungated"). Surplus: the successor.
+  decision neighbour(o: st.Ord) -> st.NbQ {
+    when o.replicas == "" ->
+      st.NbQ { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_in: "",
+               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+    when o.ord < o.want && o.prevstr == "" ->
+      st.NbQ { cid: o.seq, op: NOOP, key: "", c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1",
+               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+    when o.ord < o.want ->
+      st.NbQ { cid: o.seq, op: GET, key: o.prevkey, c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1",
+               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+    default ->
+      st.NbQ { cid: o.seq, op: GET, key: o.succkey, c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "",
+               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+  }
+
+  // Stage 2: the gate. In range: ungated at 0 (204) or predecessor ready.
+  // Surplus: successor absent (404). A missing key (the non-projectable
+  // Deployment) probes nothing.
+  decision probe(a: st.NbA) -> st.Probe {
+    when a.c_key == "" ->
+      st.Probe { cid: a.cid, op: NOOP, key: "", c_key: "", c_tmpl: "", c_in: "",
+                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "", c_pod: a.c_pod };
+    when a.c_in == "1" && a.status == 204 ->
+      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "1",
+                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
+    when a.c_in == "1" && a.status == 200 && a.ready == "true" ->
+      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "1",
+                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
+    when a.c_in == "" && a.status == 404 ->
+      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "",
+                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
+    default ->
+      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in,
+                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "", c_pod: a.c_pod };
+  }
+
+  // Stage 3: act, gated.
+  decision converge(a: st.Answer) -> st.Act {
+    when a.c_in == "1" && a.status == 404 && a.c_gate == "1" ->
+      st.Act { cid: a.cid, op: PUT, key: a.c_key,
+               p1: "{\"metadata\":{\"name\":\"",
+               p2: a.c_pod,
+               p3: "\",\"namespace\":\"",
+               p4: a.c_ns,
+               p5: "\",\"ownerReferences\":[{\"kind\":\"StatefulSet\",\"name\":\"",
+               p6: a.c_name,
+               p7: "\"}]},\"spec\":",
+               p8: a.c_tmpl,
+               p9: "}" };
+    when a.c_in == "" && a.status == 200 && a.c_gate == "1" ->
+      st.Act { cid: a.cid, op: DELETE, key: a.c_key };
+    default ->
+      st.Act { cid: a.cid, op: NOOP, key: "" };
+  }
+
+  transformation pass_ord(o: st.Ord) -> st.Ord {
+    st.Ord { seq: o.seq, rev: o.rev, key: o.key, tmpl: o.tmpl, replicas: o.replicas,
+             succkey: o.succkey, ord: o.ord, ordstr: o.ordstr, want: o.want,
+             prevstr: o.prevstr, selfkey: o.selfkey, prevkey: o.prevkey, pod: o.pod,
+             ns: o.ns, name: o.name }
+  }
+  transformation pass_nb(a: st.NbA) -> st.NbA {
+    st.NbA { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
+             c_in: a.c_in, c_ns: a.c_ns, c_name: a.c_name, c_pod: a.c_pod, ready: a.ready }
+  }
+  transformation pass_ans(a: st.Answer) -> st.Answer {
+    st.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
+                c_in: a.c_in, c_ns: a.c_ns, c_name: a.c_name, c_gate: a.c_gate, c_pod: a.c_pod }
+  }
+  pipeline nb(o: st.Ord) -> st.NbQ {
+    call x = pass_ord(o);
+    call y = neighbour(x);
+    return y;
+  }
+  pipeline ask(a: st.NbA) -> st.Probe {
+    call x = pass_nb(a);
+    call y = probe(x);
+    return y;
+  }
+  pipeline act(a: st.Answer) -> st.Act {
+    call x = pass_ans(a);
+    call y = converge(x);
+    return y;
+  }
+  entry nb = nb;
+  entry ask = ask;
+  entry act = act;
+  provenance revision "statefulset-neighbour" toolchain "chronicle-authoring";
+}

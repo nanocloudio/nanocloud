@@ -1,0 +1,20 @@
+# admission workload graph: the admission fmod, which
+# watches /admit-req/ in the store and validates/defaults/quota-checks each
+# mutating request against /admission-policy/ + live object counts, writing
+# /admit-resp/. Pure admission decision over the store.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: api_admission
+
+# Self-edge: the module's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: api_admission.status
+    to: api_admission.changes

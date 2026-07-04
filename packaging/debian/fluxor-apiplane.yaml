@@ -1,0 +1,35 @@
+# api-plane workload graph: the whole request hot-path
+# as cooperating modules on one shared store. nanocloud's HTTP edge
+# (ApiRouter) drives a request through them in order — authn resolves the
+# credential, rbac_gate authorizes, admission validates/defaults mutations,
+# core_api does the CRUD, watch_streamer serves ?watch=true. Each is a pure
+# store transform; they compose only through the store (wiring is empty).
+target: linux
+tick_us: 1000
+
+# The self-edges below (per-module change-sink allocators) are deliberate 1-node
+# cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: authn
+  - name: rbac_gate
+  - name: api_admission
+  - name: core_api
+  - name: watch_streamer
+
+# Self-edges: each watching module's own output feeds its `changes` input,
+# allocating a module-owned channel the store's namespace.change SUBSCRIBE pushes
+# onto. The module never writes the output; it drains pushed events from the input.
+wiring:
+  - from: authn.status
+    to: authn.changes
+  - from: api_admission.status
+    to: api_admission.changes
+  - from: core_api.status
+    to: core_api.changes
+  - from: rbac_gate.status
+    to: rbac_gate.changes
+  - from: watch_streamer.status
+    to: watch_streamer.changes

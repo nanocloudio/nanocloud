@@ -1,0 +1,90 @@
+// The scheduler as params: least-loaded placement, one Pod per pass.
+//   bind    the FIRST unbound Pod (where spec.nodeName=, count index 0)
+//           JOIN /ready-nodes/ picked by the least number of Pods bound to
+//           it (mincount over /pods/ by spec.nodeName) -> PATCH spec.nodeName
+//   record  the Scheduled event, from the write's own reply
+// One Pod per pass, and the load is measured from the Pods themselves at
+// pick time — not from a projection that could lag the bind that just
+// happened — so the spread is exact, and emergent, as k8s's is.
+module nanocloud.scheduler {
+  message sc.Unbound {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<pod>"
+    idx: int = 20;        // position among unbound pods
+    node: string = 21;    // the least-loaded ready node (join_pick)
+    ns: string = 28;
+    pod: string = 29;
+  }
+  message sc.Bind {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    v1: string = 4; v2: string = 5; v3: string = 6;   // a JSON string: quote, node, quote
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_pod: string = 35;
+    c_node: string = 36;
+  }
+  message sc.Bound {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_pod: string = 35;
+    c_node: string = 36;
+  }
+  message sc.Evt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    xk: string = 17;
+    v1: string = 4;   v2: string = 5;   v3: string = 6;
+    v4: string = 7;   v5: string = 8;   v6: string = 9;
+    v7: string = 10;  v8: string = 11;  v9: string = 12;
+    v10: string = 13; v11: string = 14;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum PATCH = 5;
+
+  decision bind(u: sc.Unbound) -> sc.Bind {
+    when u.idx == 0 && u.node != "" ->
+      sc.Bind { cid: u.seq, op: PATCH, key: u.key, path: "spec.nodeName",
+                v1: "\"", v2: u.node, v3: "\"",
+                c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node };
+    default ->
+      sc.Bind { cid: u.seq, op: NOOP, key: "", path: "", v1: "", v2: "", v3: "",
+                c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node };
+  }
+  decision record(b: sc.Bound) -> sc.Evt {
+    when b.status == 200 ->
+      sc.Evt { cid: b.cid, op: PUT, key: b.c_key, xk: ".Scheduled.0",
+               v1: "{\"metadata\":{\"name\":\"",
+               v2: b.c_pod,
+               v3: ".Scheduled.0\",\"namespace\":\"",
+               v4: b.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: b.c_ns,
+               v7: "\",\"name\":\"",
+               v8: b.c_pod,
+               v9: "\"},\"reason\":\"Scheduled\",\"message\":\"Successfully assigned to ",
+               v10: b.c_node,
+               v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    default ->
+      sc.Evt { cid: b.cid, op: NOOP, key: "", xk: "" };
+  }
+  transformation pass_unbound(u: sc.Unbound) -> sc.Unbound {
+    sc.Unbound { seq: u.seq, rev: u.rev, key: u.key, idx: u.idx, node: u.node, ns: u.ns, pod: u.pod }
+  }
+  transformation pass_bound(b: sc.Bound) -> sc.Bound {
+    sc.Bound { cid: b.cid, status: b.status, value: b.value, c_key: b.c_key, c_ns: b.c_ns, c_pod: b.c_pod, c_node: b.c_node }
+  }
+  pipeline bd(u: sc.Unbound) -> sc.Bind { call x = pass_unbound(u); call y = bind(x); return y; }
+  pipeline rc(b: sc.Bound) -> sc.Evt { call x = pass_bound(b); call y = record(x); return y; }
+  entry bd = bd;
+  entry rc = rc;
+  provenance revision "scheduler-mincount" toolchain "chronicle-authoring";
+}

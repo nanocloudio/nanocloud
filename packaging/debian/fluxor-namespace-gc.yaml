@@ -1,0 +1,20 @@
+# namespace-gc graph: the namespace_gc fmod, which
+# watches /namespaces/ and, for a namespace marked phase=Terminating, deletes
+# every object under it across all namespaced resource prefixes and then removes
+# the namespace record. Namespaced teardown as a store transform.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: namespace_gc
+
+# Self-edge: the GC's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: namespace_gc.status
+    to: namespace_gc.changes

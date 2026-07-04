@@ -1,0 +1,30 @@
+# Project-shared clippy configuration. Per standards/lints.md §6, this file
+# holds lints that take *config values* (paths, thresholds), not levels —
+# levels live in the build flags `fluxor ci` passes to clippy-driver, since
+# nanocloud has no cargo crate to carry a [workspace.lints] table.
+#
+# nanocloud's modules are no_std PIC fmods with hand-written state machines,
+# exactly like lattice's — the generous complexity budgets below mirror that.
+
+disallowed-macros = [
+    { path = "std::println",  reason = "no_std fmods have no std; use the SDK dev_log" },
+    { path = "std::eprintln", reason = "no_std fmods have no std; use the SDK dev_log" },
+    # std::dbg is covered by clippy::dbg_macro in the CI clippy flags.
+]
+
+disallowed-methods = [
+    # Add per-module entries here as the fmod surface grows.
+]
+
+# Cognitive / type-complexity budgets are intentionally generous — the fmod
+# reconcilers carry many branches and tuple-y JSON-walk types that are clearer
+# inline than split. Matches lattice's PIC-module budgets.
+cognitive-complexity-threshold = 60
+type-complexity-threshold      = 350
+
+# Inline tests are forbidden in modules/ (fluxor.toml [ci.hygiene]), so the
+# test-only escape hatches are irrelevant here; kept explicit for parity.
+allow-print-in-tests  = false
+allow-dbg-in-tests    = false
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

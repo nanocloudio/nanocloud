@@ -1,0 +1,95 @@
+# device graph: the device_reconciler + cert_manager, cooperating over the
+# shared control-plane store to provision a SPIFFE identity per Device CR.
+# device_reconciler watches /devices.nanocloud.io/, writes a /cert-req/ for each
+# Device; cert_manager mints /cert-resp/ (real in-module X.509 with the SPIFFE
+# URI SAN); device_reconciler projects the identity at
+# /deviceidentities.nanocloud.io/<ns>/<name>. No new capability surface.
+target: linux
+tick_us: 1000
+
+# Each module self-wires status -> changes (a 1-node cycle) to allocate its
+# store-change sink channel.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # The Device identity is PARAMS: PUT the SPIFFE-shaped cert-req, GET the
+  # minted response, GET the CA, PUT the identity — four stages from one
+  # record, every write put-if-changed. Params from modules/app/_chronicle/device.uproc.
+  - name: dv_source
+    type: store_source
+    prefix: "/devices.nanocloud.io/"
+    watch: "/cert-resp/,/ca-cert"
+  - name: dv_req
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/device.uproc rq
+      decision: "002b000000e80001000201000000400100000010030000000000000040020000000100021c00000040030000001201002d40110000000100021d0000004012000000120a00636e3d6465766963653a40040000000100021d00000040050000001205003b646e733d40060000000100021d00000040070000001228003b7370696666653d7370696666653a2f2f6e616e6f636c6f75642e6c6f63616c2f6465766963652f40080000000100021c00000040090000001201002f400a0000000100021d000000400b00000001000203000000401e0000000100021c00000040220000000100021d000000402300000041"
+  - name: dv_reqs
+    type: store_effect
+    key_prefix: "/cert-req/"
+  - name: dv_resp
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/device.uproc rs
+      decision: "0017000000600001000201000000400100000010010000000000000040020000000100022200000040030000001201002d40110000000100022300000040120000000100021e000000401e00000001000222000000402200000001000223000000402300000041"
+  - name: dv_resps
+    type: store_effect
+    key_prefix: "/cert-resp/"
+    flat: 1
+    paths: "crt"
+  - name: dv_ca
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/device.uproc cg
+      decision: "010a0000001e000100020200000010c8000000000000002001000228000000120000213000140000005b0001000201000000400100000010010000000000000040020000001208002f63612d6365727440030000000100021e000000401e00000001000222000000402200000001000223000000402300000001000228000000402400000041130000004f00010002010000004001000000100000000000000000400200000012000040030000000100021e000000401e000000010002220000004022000000010002230000004023000000120000402400000041"
+  - name: dv_cacert
+    type: store_effect
+  - name: dv_id
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/device.uproc idn
+      decision: "01050000000c000100022400000012000021001f000000b00001000201000000400100000010030000000000000040020000000100021e00000040030000001227007370696666653d7370696666653a2f2f6e616e6f636c6f75642e6c6f63616c2f6465766963652f40040000000100022200000040050000001201002f40060000000100022300000040070000001205003b6372743d40080000000100022400000040090000001204003b63613d400a00000001000203000000400b000000120000400c000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: dv_ids
+    type: store_effect
+    key_prefix: "/deviceidentities.nanocloud.io/"
+  # DEVELOPMENT DECLARATION, not a preference. `cert_manager` refuses to
+  # construct without it — see the development gate in its `mod.rs`. It
+  # regenerates its CA at every startup, returns leaf PRIVATE KEYS as
+  # plaintext hex on the control-plane store, and lets the caller choose its own
+  # CN/DNS/SPIFFE. A deployment issues from kagi's `certificate_endpoint`.
+  #
+  # It stands only because nothing else answers the `/cert-req/` seam
+  # `device_reconciler` writes to, and removing an issuer before its
+  # replacement exists is a regression rather than a fix. What the flag buys
+  # is that any graph naming this module fails closed instead of quietly
+  # inheriting an issuing authority.
+  - name: cert_manager
+    params:
+      development: 1
+
+wiring:
+  - from: dv_source.status
+    to: dv_source.changes
+  - from: dv_source.record_out
+    to: dv_req.record_in
+  - from: dv_req.result_out
+    to: dv_reqs.request_in
+    buffer_group: 121
+  - from: dv_reqs.response_out
+    to: dv_resp.record_in
+  - from: dv_resp.result_out
+    to: dv_resps.request_in
+    buffer_group: 122
+  - from: dv_resps.response_out
+    to: dv_ca.record_in
+  - from: dv_ca.result_out
+    to: dv_cacert.request_in
+    buffer_group: 123
+  - from: dv_cacert.response_out
+    to: dv_id.record_in
+  - from: dv_id.result_out
+    to: dv_ids.request_in
+    buffer_group: 124
+  - from: cert_manager.status
+    to: cert_manager.changes

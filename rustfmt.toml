@@ -1,0 +1,7 @@
+# Minimal rustfmt configuration - use Rust defaults with minor adjustments.
+# Shared with the sibling projects (quantum, lattice) per standards/lints.md.
+# nanocloud has no cargo crate, so the formatting check runs over the PIC fmod
+# sources under modules/app/*/mod.rs as a `fluxor ci` phase; this file governs
+# that run so formatting matches the siblings rather than falling back to
+# defaults.
+edition = "2021"

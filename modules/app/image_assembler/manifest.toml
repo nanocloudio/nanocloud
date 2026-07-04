@@ -1,0 +1,37 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Image assembler — the rootfs-assembly decision (container backend). A
+# drained pull plan (all layers digest-verified in the blob cache) projects an
+# ASSEMBLY JOB — `/sandboxes/img-asm-<name>` running the extraction script as
+# a host workload via sandbox_runner (the one module holding the privileged
+# workload surface) — and maps its terminal status to `/image-rootfs/<name>
+# state=ready|failed`, which pod_lifecycle gates image-backed pods on. Pure
+# store transform; no privileged surface here.
+
+# Cadence-independent: it polls its watch, no tick-based timekeeping.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events (for /image-pull-plan/ and the
+# img-asm- /sandbox-status/ keys) onto this input. The graph allocates the
+# channel by self-wiring `status` -> `changes`.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane assembly decision — projects assembly jobs + records; observed via the sandbox status it consumes and the events plane"

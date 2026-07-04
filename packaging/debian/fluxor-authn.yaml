@@ -1,0 +1,20 @@
+# authn workload graph: the authn fmod, which watches
+# /authn-req/ in the store and resolves each credential (an mTLS peer identity
+# via /peer-ids/, or a bearer token via /sa-tokens/) to a Kubernetes identity,
+# writing /authn-resp/. The TLS handshake + peer identity is fluxor tls's job.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: authn
+
+# Self-edge: the module's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: authn.status
+    to: authn.changes

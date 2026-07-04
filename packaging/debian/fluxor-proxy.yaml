@@ -1,0 +1,21 @@
+# proxy-compiler workload graph the proxy_compiler fmod, which
+# watches /services/ and /endpoints/ in the control-plane store, compiles the
+# node's nftables NAT ruleset (ClusterIP -> backend DNAT), and publishes it to
+# /dataplane/proxy. The node's network backend consumes it and programs nft —
+# decision here, effect there.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: proxy_compiler
+
+# Self-edge: the compiler's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: proxy_compiler.status
+    to: proxy_compiler.changes

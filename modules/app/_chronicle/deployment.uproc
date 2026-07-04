@@ -1,0 +1,235 @@
+// Deployment -> ReplicaSet as params. The projection half of the workload
+// chain: a Deployment's spec, owned by the Deployment, labelled with a digest
+// of its pod template, written as the same-named ReplicaSet.
+//
+// Four stages, because a PUT-if-changed with rollout history is three store
+// operations that depend on one read:
+//   read     GET the current ReplicaSet (hash + spec projected)
+//   archive  on a template change, PUT the old spec to controllerrevisions
+//   write    PUT the ReplicaSet, unless nothing changed
+//   record   the ScalingReplicaSet event, from the write's own reply
+module nanocloud.deployment {
+
+  message dp.Dep {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<name>" — the ReplicaSet has the SAME tail
+    spec: string = 4;     // spec, an opaque subtree — becomes the RS spec
+    replicas: string = 5; // spec.replicas; empty = not a projectable Deployment
+    ns: string = 28;      // the key's namespace segment — NOT metadata.namespace,
+    name: string = 29;    // which a CLI-written document does not carry
+    hash: string = 27;    // FNV-1a of spec.template, from the source
+  }
+
+  // Stage 1: read the current ReplicaSet, carrying everything the later
+  // stages need — a reply is a status and projections, nothing else.
+  message dp.Read {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_spec: string = 31;
+    c_hash: string = 32;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dp.Cur {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_spec: string = 31;
+    c_hash: string = 32;
+    c_ns: string = 34;
+    c_name: string = 35;
+    cur_hash: string = 40; // metadata.labels.pod-template-hash on the current RS
+    cur_spec: string = 41; // its spec
+  }
+
+  // Stage 2: archive the previous spec on a template change. The verdict for
+  // the WRITE is decided here too, from the same read, and rides as `c_evt`:
+  //   create  no ReplicaSet yet
+  //   roll    template changed (hash differs) — archive first
+  //   scale   same template, spec differs (a replicas edit)
+  //   ""      nothing changed — the write stage does nothing
+  message dp.Arch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;    // "<ns>/<name>" under /controllerrevisions.apps/
+    xk: string = 17;    // "/previous"
+    v1: string = 4;     // the old spec
+    c_key: string = 30;
+    c_spec: string = 31;
+    c_hash: string = 32;
+    c_evt: string = 33;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dp.Arched {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_spec: string = 31;
+    c_hash: string = 32;
+    c_evt: string = 33;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+
+  // Stage 3: the ReplicaSet document, as value parts the connector joins.
+  message dp.Write {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+    p10: string = 13; p11: string = 14;
+    c_key: string = 30;
+    c_evt: string = 33;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dp.Written {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_evt: string = 33;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+
+  // Stage 4: the event.
+  message dp.Evt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    xk: string = 17;
+    v1: string = 4;   v2: string = 5;   v3: string = 6;
+    v4: string = 7;   v5: string = 8;   v6: string = 9;
+    v7: string = 10;  v8: string = 11;  v9: string = 12;
+    v10: string = 13; v11: string = 14;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+
+  decision read(d: dp.Dep) -> dp.Read {
+    // A Deployment must declare spec.replicas to project a ReplicaSet.
+    when d.replicas == "" ->
+      dp.Read { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_spec: d.spec, c_hash: d.hash, c_ns: d.ns, c_name: d.name };
+    default ->
+      dp.Read { cid: d.seq, op: GET, key: d.key,
+                c_key: d.key, c_spec: d.spec, c_hash: d.hash, c_ns: d.ns, c_name: d.name };
+  }
+
+  decision archive(c: dp.Cur) -> dp.Arch {
+    when c.status == 404 ->
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
+                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "create",
+                c_ns: c.c_ns, c_name: c.c_name };
+    when c.status == 200 && c.cur_hash != c.c_hash ->
+      dp.Arch { cid: c.cid, op: PUT, key: c.c_key, xk: "/previous", v1: c.cur_spec,
+                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "roll",
+                c_ns: c.c_ns, c_name: c.c_name };
+    when c.status == 200 && c.cur_spec != c.c_spec ->
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
+                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "scale",
+                c_ns: c.c_ns, c_name: c.c_name };
+    default ->
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
+                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "",
+                c_ns: c.c_ns, c_name: c.c_name };
+  }
+
+  decision write(a: dp.Arched) -> dp.Write {
+    when a.c_evt == "" ->
+      dp.Write { cid: a.cid, op: NOOP, key: "", c_key: a.c_key, c_evt: "",
+                 c_ns: a.c_ns, c_name: a.c_name };
+    default ->
+      dp.Write { cid: a.cid, op: PUT, key: a.c_key,
+                 p1: "{\"metadata\":{\"name\":\"",
+                 p2: a.c_name,
+                 p3: "\",\"namespace\":\"",
+                 p4: a.c_ns,
+                 p5: "\",\"ownerReferences\":[{\"kind\":\"Deployment\",\"name\":\"",
+                 p6: a.c_name,
+                 p7: "\"}],\"labels\":{\"pod-template-hash\":\"",
+                 p8: a.c_hash,
+                 p9: "\"}},\"spec\":",
+                 p10: a.c_spec,
+                 p11: "}",
+                 c_key: a.c_key, c_evt: a.c_evt, c_ns: a.c_ns, c_name: a.c_name };
+  }
+
+  // One event for every change, as the module records it: k8s says
+  // ScalingReplicaSet for a create and a scale alike.
+  decision record(w: dp.Written) -> dp.Evt {
+    when w.c_evt != "" && w.status == 200 ->
+      dp.Evt { cid: w.cid, op: PUT, key: w.c_key, xk: ".ScalingReplicaSet.0",
+               v1: "{\"metadata\":{\"name\":\"",
+               v2: w.c_name,
+               v3: ".ScalingReplicaSet.0\",\"namespace\":\"",
+               v4: w.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Deployment\",\"namespace\":\"",
+               v6: w.c_ns,
+               v7: "\",\"name\":\"",
+               v8: w.c_name,
+               v9: "\"},\"reason\":\"ScalingReplicaSet\",\"message\":\"Scaled up replica set ",
+               v10: w.c_name,
+               v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    default ->
+      dp.Evt { cid: w.cid, op: NOOP, key: "", xk: "" };
+  }
+
+  transformation pass_dep(d: dp.Dep) -> dp.Dep {
+    dp.Dep { seq: d.seq, rev: d.rev, key: d.key, ns: d.ns, name: d.name,
+             spec: d.spec, replicas: d.replicas, hash: d.hash }
+  }
+  transformation pass_cur(c: dp.Cur) -> dp.Cur {
+    dp.Cur { cid: c.cid, status: c.status, value: c.value, c_key: c.c_key,
+             c_spec: c.c_spec, c_hash: c.c_hash, c_ns: c.c_ns, c_name: c.c_name,
+             cur_hash: c.cur_hash, cur_spec: c.cur_spec }
+  }
+  transformation pass_arched(a: dp.Arched) -> dp.Arched {
+    dp.Arched { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
+                c_spec: a.c_spec, c_hash: a.c_hash, c_evt: a.c_evt,
+                c_ns: a.c_ns, c_name: a.c_name }
+  }
+  transformation pass_written(w: dp.Written) -> dp.Written {
+    dp.Written { cid: w.cid, status: w.status, value: w.value, c_key: w.c_key,
+                 c_evt: w.c_evt, c_ns: w.c_ns, c_name: w.c_name }
+  }
+
+  pipeline rd(d: dp.Dep) -> dp.Read {
+    call x = pass_dep(d);
+    call y = read(x);
+    return y;
+  }
+  pipeline arch(c: dp.Cur) -> dp.Arch {
+    call x = pass_cur(c);
+    call y = archive(x);
+    return y;
+  }
+  pipeline wr(a: dp.Arched) -> dp.Write {
+    call x = pass_arched(a);
+    call y = write(x);
+    return y;
+  }
+  pipeline rec(w: dp.Written) -> dp.Evt {
+    call x = pass_written(w);
+    call y = record(x);
+    return y;
+  }
+
+  entry rd = rd;
+  entry arch = arch;
+  entry wr = wr;
+  entry rec = rec;
+
+  provenance revision "deployment-project" toolchain "chronicle-authoring";
+}

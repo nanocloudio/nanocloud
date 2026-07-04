@@ -1,9 +1,15 @@
-# Overrides for the Nanocloud systemd service
+# Overrides for the Nanocloud systemd service.
+#
+# The control plane is a fluxor graph (see nanocloud.service). There is no host
+# server process and no `--*-mode` flags — the graph IS the control plane.
 
-# Address for the Nanocloud API server to listen on.
-# Use host:port format, e.g. 0.0.0.0:6443 to listen on all interfaces.
-NANOCLOUD_LISTEN=127.0.0.1:6443
+# The control-plane store directory (store.log). The graph is its sole writer.
+FLUXOR_STORE_DIR=/var/lib/nanocloud.io/control-plane/store
 
-# Additional flags to pass to `nanocloud server`.
-# Example: --log-level debug --data-dir /var/lib/nanocloud
-NANOCLOUD_EXTRA_ARGS=
+# The packaged fluxor project root — where `fluxor run` resolves the runtime and
+# the .fmod modules the control-plane graph references.
+FLUXOR_PROJECT_ROOT=/usr/lib/nanocloud/fluxor
+
+# The OCI store dataplane bundles (dns/edge/sandbox/…) are published into for the
+# node to run them as fluxor workloads.
+NANOCLOUD_FLUXOR_STORE=/var/lib/nanocloud.io/fluxor/ocistore

@@ -1,0 +1,58 @@
+# route-validator workload graph.
+#
+# A Route is validated by a Chronicle decision compiled from
+# modules/app/_chronicle/route_validator.uproc; the three modules below only
+# move bytes. The rules — first-error, in spec order — live in the `decision`
+# param rather than in any .fmod, which is the point of the params form.
+#
+# The store contract: watch /routes/, write /route-status/<ns>/<name> =
+# "ready=1;endpoint=<svc>:<port>" | "ready=0;msg=…", guarded, so
+# route_compiler's ready=1 gate reads a settled verdict.
+target: linux
+tick_us: 1000
+
+# Self-edges (change-sink allocators) are deliberate 1-node cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # Watch /routes/ and project the four fields the rules decide on. Depth 2 and
+  # 3 JSON paths — Chronicle's record frame is flat and it has no path reader,
+  # so the projection happens here.
+  - name: store_source
+    prefix: "/routes/"
+    paths: "spec.host,spec.to.name,spec.port,spec.path"
+
+  # The rules, as data.
+  - name: validate
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/route_validator.uproc check
+      #
+      # A baked param has no link to the source it came from, and a stale one
+      # does not error -- it decides something else. That marker is the link:
+      # scripts/chronicle-param-drift-e2e.sh recompiles every graph carrying one
+      # and fails if the bytes differ. The param stays baked because a deb has
+      # no compiler; the marker is what keeps it honest.
+      decision: "05050000000c000100020400000012000020000b0000004b000100020100000040010000001003000000000000004002000000010002030000004003000000121c0072656164793d303b6d73673d686f7374206d75737420626520736574400400000041050000000c000100020500000012000020000b0000005300010002010000004001000000100300000000000000400200000001000203000000400300000012240072656164793d303b6d73673d73657276696365206e616d65206d75737420626520736574400400000041050000000c000100020600000012000020000b0000005800010002010000004001000000100300000000000000400200000001000203000000400300000012290072656164793d303b6d73673d7365727669636520706f7274206d757374206265206e6f6e2d7a65726f400400000041050000000d00010002060000001201003020000b0000005800010002010000004001000000100300000000000000400200000001000203000000400300000012290072656164793d303b6d73673d7365727669636520706f7274206d757374206265206e6f6e2d7a65726f4004000000410d0000001c000100020700000012000021010002070000001201002f5303003230000b0000005a000100020100000040010000001003000000000000004002000000010002030000004003000000122b0072656164793d303b6d73673d7061746820707265666978206d757374207374617274207769746820272f27400400000041130000006100010002010000004001000000100300000000000000400200000001000203000000400300000012110072656164793d313b656e64706f696e743d40040000000100020500000040050000001201003a400600000001000206000000400700000041"
+
+  # Guarded PUT to /route-status/. `response_out` is deliberately unwired: this
+  # is the end of the chain and has nobody to answer.
+  - name: store_effect
+    key_prefix: "/route-status/"
+
+wiring:
+  - from: store_source.status
+    to: store_source.changes
+
+  # NO buffer_group: a Chronicle engine self-frames over a byte stream
+  # (io_core::admit_frame peeks, reads the length, consumes exactly that), so a
+  # mailbox channel breaks its partial read.
+  - from: store_source.record_out
+    to: validate.record_in
+
+  # store_effect reads a whole record per step and declares its input framed, so
+  # the build requires mailbox mode here.
+  - from: validate.result_out
+    to: store_effect.request_in
+    buffer_group: 1

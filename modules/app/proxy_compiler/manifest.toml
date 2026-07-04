@@ -1,0 +1,44 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Service proxy compiler — the kube-proxy equivalent as a compiler reconciler.
+# Watches /services/ and /endpoints/, compiles the node's nftables NAT ruleset
+# (ClusterIP -> backend DNAT load-balancing), and PUBLISHES it to the store at
+# /dataplane/proxy. Decision here, effect there — the node's network backend
+# consumes the published ruleset and programs nft, since programming nft is a
+# Linux dataplane concern rather than a portable fluxor capability. A pure
+# store transform, like every other reconciler.
+
+# Cadence-independent: it does no tick-based timekeeping — polls its watches and
+# re-publishes the full NAT ruleset on change.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above (see fluxor-proxy.yaml).
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The control-plane store — services + endpoints in, compiled ruleset out.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "Control-plane compiler — provider-driven, emits no telemetry stream"

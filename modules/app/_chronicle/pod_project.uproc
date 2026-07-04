@@ -1,0 +1,138 @@
+// The pod's ARTIFACT half: what to run, as opposed to when. Two chains beside
+// the lifecycle state machine.
+//
+//   project  /pod-specs/ -> MERGE the artifact fields into /sandboxes/<uid>
+//            (or /metal-sandboxes/ for a graph-backed pod), and create the
+//            /pod-runtime/ record the lifecycle chain is driven by. The
+//            artifact fields are the spec's; the `phase=` field is the
+//            lifecycle chain's, and MERGE is why the two can own one record
+//            without either restating the other's half.
+//   prune    a /pod-runtime/ whose /pod-specs/ is gone
+module nanocloud.podproject {
+
+  message pp.Spec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // uid
+    cmd: string = 4;
+    rootfs: string = 5;
+    iso: string = 6;
+    net: string = 7;
+    tasks: string = 8;
+    graph: string = 9;
+    res_rootfs: string = 70;  // related /pod-resolved/
+    res_cmd: string = 71;
+  }
+  message pp.Art {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7;
+    p5: string = 8; p6: string = 9; p7: string = 10; p8: string = 11;
+    c_key: string = 30;
+  }
+  message pp.Made {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+  }
+  message pp.Rt {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+  }
+  message pp.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+  }
+  message pp.Known {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+  }
+  message pp.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+
+  enum NOOP = 0;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // A container pod: the explicit spec wins, the resolved image fills in.
+  // Absent parts contribute nothing to the join, so one branch serves a pod
+  // with a rootfs and one without.
+  decision artifact(s: pp.Spec) -> pp.Art {
+    when s.graph != "" ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
+               p5: "", p6: "", p7: "", p8: "", c_key: s.key };
+    when s.cmd != "" ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "cmd=", p2: s.cmd, p3: ";rootfs=", p4: s.rootfs,
+               p5: ";iso=", p6: s.iso, p7: "", p8: "", c_key: s.key };
+    when s.res_cmd != "" ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "cmd=", p2: s.res_cmd, p3: ";rootfs=", p4: s.res_rootfs,
+               p5: ";iso=", p6: s.iso, p7: "", p8: "", c_key: s.key };
+    default ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
+               p5: "", p6: "", p7: "", p8: "", c_key: s.key };
+  }
+  decision metal(s: pp.Spec) -> pp.Art {
+    when s.graph != "" ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "graph=", p2: s.graph, p3: "", p4: "",
+               p5: "", p6: "", p7: "", p8: "", c_key: s.key };
+    default ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
+               p5: "", p6: "", p7: "", p8: "", c_key: s.key };
+  }
+  // The runtime record the lifecycle chain runs on. Create-if-absent: it is
+  // the pod's memory, and recreating it would forget a kill in flight.
+  decision runtime(m: pp.Made) -> pp.Act {
+    default ->
+      pp.Act { cid: m.cid, op: MERGE, key: m.c_key, v1: "seen=1" };
+  }
+
+  decision ask(r: pp.Rt) -> pp.Ask {
+    default -> pp.Ask { cid: r.seq, op: EXISTS, key: r.key, c_key: r.key };
+  }
+  decision prune(k: pp.Known) -> pp.Act {
+    when k.status == 404 ->
+      pp.Act { cid: k.cid, op: DELETE, key: k.c_key, v1: "" };
+    default ->
+      pp.Act { cid: k.cid, op: NOOP, key: "", v1: "" };
+  }
+
+  transformation pass_spec(s: pp.Spec) -> pp.Spec {
+    pp.Spec { seq: s.seq, rev: s.rev, key: s.key, cmd: s.cmd, rootfs: s.rootfs,
+              iso: s.iso, net: s.net, tasks: s.tasks, graph: s.graph,
+              res_rootfs: s.res_rootfs, res_cmd: s.res_cmd }
+  }
+  transformation pass_made(m: pp.Made) -> pp.Made {
+    pp.Made { cid: m.cid, status: m.status, value: m.value, c_key: m.c_key }
+  }
+  transformation pass_rt(r: pp.Rt) -> pp.Rt { pp.Rt { seq: r.seq, rev: r.rev, key: r.key } }
+  transformation pass_known(k: pp.Known) -> pp.Known {
+    pp.Known { cid: k.cid, status: k.status, value: k.value, c_key: k.c_key }
+  }
+  pipeline art(s: pp.Spec) -> pp.Art { call x = pass_spec(s); call y = artifact(x); return y; }
+  pipeline mtl(s: pp.Spec) -> pp.Art { call x = pass_spec(s); call y = metal(x); return y; }
+  pipeline rt(m: pp.Made) -> pp.Act { call x = pass_made(m); call y = runtime(x); return y; }
+  pipeline ak(r: pp.Rt) -> pp.Ask { call x = pass_rt(r); call y = ask(x); return y; }
+  pipeline pr(k: pp.Known) -> pp.Act { call x = pass_known(k); call y = prune(x); return y; }
+  entry art = art;
+  entry mtl = mtl;
+  entry rt = rt;
+  entry ak = ak;
+  entry pr = pr;
+  provenance revision "podproject-artifact" toolchain "chronicle-authoring";
+}

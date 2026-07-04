@@ -1,0 +1,121 @@
+// The ownerRef cascade as params.
+//
+// The sweep: an object carrying an ownerRef whose owner no longer resolves is
+// collected; an object with no ownerRef is never collected. Read-then-decide, so it rides the carry-through seam.
+module nanocloud.gc {
+
+  message gc.Owned {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;     // "<ns>/<name>" — the tail below /pods/
+    owner: string = 4;   // metadata.ownerReferences.0.name
+    ns: string = 28;     // the key's namespace segment; the document may carry none
+  }
+
+  // The owner probe. key/sep/name are KEY PARTS joined by the connector after
+  // its key_prefix: "<ns>" + "/" + "<owner>". The VM cannot concatenate, and
+  // the separator is a literal only a decision knows to emit.
+  message gc.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;     // the namespace
+    owned: string = 30;   // carry-through: what to collect if the owner is gone
+    sep: string = 17;    // "/"
+    name: string = 18;   // the owner's name
+  }
+
+  message gc.Answer {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    owned: string = 30;
+  }
+
+  message gc.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+
+  // An Event in the listing, with its place in it. The count-cap the module
+  // performs — keep the store from growing without bound when a PIC has no
+  // clock for a real age TTL — is a decision over exactly two numbers the
+  // source stamps in count mode: this record's position and the total.
+  message gc.Ev {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;     // "<ns>/<obj>.<reason>.<seq>" — the tail below /events/
+    idx: int = 20;       // position in key order
+    total: int = 22;     // entries under the prefix
+  }
+
+  enum NOOP = 0;
+  enum EXISTS = 2;
+  enum DELETE = 4;
+  // garbage_collector's MAX_EVENTS. Key order is not age, but it is what the
+  // module deletes in too, so the cap keeps the same objects it always kept:
+  // the HIGHEST (total - KEEP) keys survive, the lowest go.
+  enum KEEP = 200;
+
+  // No ownerRef -> never collected (a user-owned top-level object). Otherwise
+  // probe the owner.
+  decision probe(o: gc.Owned) -> gc.Probe {
+    when o.owner == "" ->
+      gc.Probe { cid: o.seq, op: NOOP, key: "", owned: o.key, sep: "", name: "" };
+    default ->
+      gc.Probe { cid: o.seq, op: EXISTS, key: o.ns,
+                 owned: o.key, sep: "/", name: o.owner };
+  }
+
+  // The owner answered: 200 it lives, 404 it is gone and the object is an
+  // orphan. 204 is the NOOP above coming back — nothing to do.
+  decision sweep(a: gc.Answer) -> gc.Act {
+    when a.status == 200 ->
+      gc.Act { cid: a.cid, op: NOOP, key: "" };
+    when a.status == 204 ->
+      gc.Act { cid: a.cid, op: NOOP, key: "" };
+    default ->
+      gc.Act { cid: a.cid, op: DELETE, key: a.owned };
+  }
+
+  // Cap: delete everything below the survivors' floor. `idx + KEEP < total`
+  // is "more than KEEP entries follow this one".
+  decision cap(e: gc.Ev) -> gc.Act {
+    when e.idx + KEEP < e.total ->
+      gc.Act { cid: e.seq, op: DELETE, key: e.key };
+    default ->
+      gc.Act { cid: e.seq, op: NOOP, key: "" };
+  }
+
+  transformation pass_owned(o: gc.Owned) -> gc.Owned {
+    gc.Owned { seq: o.seq, rev: o.rev, key: o.key, owner: o.owner, ns: o.ns }
+  }
+  transformation pass_answer(a: gc.Answer) -> gc.Answer {
+    gc.Answer { cid: a.cid, status: a.status, value: a.value, owned: a.owned }
+  }
+
+  pipeline ask(o: gc.Owned) -> gc.Probe {
+    call x = pass_owned(o);
+    call y = probe(x);
+    return y;
+  }
+  transformation pass_ev(e: gc.Ev) -> gc.Ev {
+    gc.Ev { seq: e.seq, rev: e.rev, key: e.key, idx: e.idx, total: e.total }
+  }
+  pipeline evcap(e: gc.Ev) -> gc.Act {
+    call x = pass_ev(e);
+    call y = cap(x);
+    return y;
+  }
+  pipeline act(a: gc.Answer) -> gc.Act {
+    call x = pass_answer(a);
+    call y = sweep(x);
+    return y;
+  }
+
+  entry ask = ask;
+  entry act = act;
+  entry evcap = evcap;
+
+  provenance revision "ownerref-gc" toolchain "chronicle-authoring";
+}

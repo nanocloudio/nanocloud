@@ -1,0 +1,90 @@
+// The mTLS-peer half of authn, as params.
+//
+// This is the EFFECT-JOIN case: the verdict needs the store's answer AND the
+// request that provoked it (the reqid to write to, and the peer to fall back
+// on). Chronicle has no effect call/join that retains the pre-effect record,
+// so the request's context rides through `store_effect` as opaque
+// CARRY-THROUGH (fields 9..12) and comes back untouched.
+//
+// SCOPE: the peer path only. authn also verifies bearer tokens as compact JWS
+// -- signature, kid, suite and validity window, using kagi's fragments -- which
+// is cryptography and stays in the module. This is the peer half only.
+module nanocloud.authnpeer {
+
+  message an.Req {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // the reqid, as the tail below /authn-req/
+    peer: string = 4;
+  }
+
+  // key is the bare peer; `store_effect`'s key_prefix makes it /peer-ids/<peer>.
+  message an.Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rid: string = 30;      // carry-through: which request this is for
+    peer: string = 31;    // carry-through: the fallback identity
+  }
+
+  message an.Reply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    rid: string = 30;
+    peer: string = 31;
+  }
+
+  // head + ident are VALUE PARTS, joined by the writer in field order.
+  message an.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    head: string = 4;
+    ident: string = 5;
+  }
+
+  enum GET = 1;
+  enum PUT = 3;
+
+  decision lookup(r: an.Req) -> an.Get {
+    default ->
+      an.Get { cid: r.seq, op: GET, key: r.peer, rid: r.key, peer: r.peer };
+  }
+
+  // A verified peer ALWAYS authenticates: remapped when /peer-ids/ has a
+  // binding, otherwise the peer subject is itself the identity. No peer at all
+  // is anonymous.
+  decision decide(p: an.Reply) -> an.Put {
+    when p.peer == "" ->
+      an.Put { cid: p.cid, op: PUT, key: p.rid, head: "401;anonymous" };
+    when p.status == 200 ->
+      an.Put { cid: p.cid, op: PUT, key: p.rid, head: "200;",
+               ident: p.value.substring(3) };   // strip the stored "id="
+    default ->
+      an.Put { cid: p.cid, op: PUT, key: p.rid, head: "200;", ident: p.peer };
+  }
+
+  transformation pass_req(r: an.Req) -> an.Req {
+    an.Req { seq: r.seq, rev: r.rev, key: r.key, peer: r.peer }
+  }
+  transformation pass_reply(p: an.Reply) -> an.Reply {
+    an.Reply { cid: p.cid, status: p.status, value: p.value, rid: p.rid, peer: p.peer }
+  }
+
+  pipeline ask(r: an.Req) -> an.Get {
+    call a = pass_req(r);
+    call b = lookup(a);
+    return b;
+  }
+  pipeline verdict(p: an.Reply) -> an.Put {
+    call a = pass_reply(p);
+    call b = decide(a);
+    return b;
+  }
+
+  entry ask = ask;
+  entry verdict = verdict;
+
+  provenance revision "authn-peer" toolchain "chronicle-authoring";
+}

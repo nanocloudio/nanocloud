@@ -1,0 +1,32 @@
+// A deadline as params: delete the record when its time has come. The
+// source stamps `now` (58) and arms the kernel timer for the earliest
+// `deadline=` it saw; the kernel steps it when that fires; the record
+// arrives with now >= deadline and this decision acts. Nothing polls.
+module nanocloud.ttl {
+  message tt.Rec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    deadline: int = 50;   // ints = deadline (ms, monotonic)
+    now: int = 58;
+  }
+  message tt.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+  decision expire(r: tt.Rec) -> tt.Act {
+    when r.deadline > 0 && r.now >= r.deadline ->
+      tt.Act { cid: r.seq, op: DELETE, key: r.key };
+    default ->
+      tt.Act { cid: r.seq, op: NOOP, key: "" };
+  }
+  transformation pass(r: tt.Rec) -> tt.Rec {
+    tt.Rec { seq: r.seq, rev: r.rev, key: r.key, deadline: r.deadline, now: r.now }
+  }
+  pipeline ex(r: tt.Rec) -> tt.Act { call x = pass(r); call y = expire(x); return y; }
+  entry ex = ex;
+  provenance revision "ttl-deadline" toolchain "chronicle-authoring";
+}

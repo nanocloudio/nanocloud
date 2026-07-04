@@ -1,0 +1,90 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Store effect — the request/response half of the store connector.
+#
+# `store_source` is the subscription half: the store pushes and the graph runs.
+# This is the other shape — a pipeline asks for a key and gets an answer, the
+# client-side mirror of wave's `s3` driven mode, and what the apiserver read
+# path needs. Deliberately TWO ops: the doc's Tier 1 is "the smallest connector
+# that can serve a read", so the thesis is tested on two ops rather than ten
+# built ahead of the test.
+#
+# Wire (Chronicle v1 record frames, both ports):
+#   request_in   1 = cid (i64)    correlation, echoed verbatim
+#                2 = op  (i64)    0 = NOOP, 1 = GET, 2 = EXISTS, 3 = PUT,
+#                                 4 = DELETE. NOOP answers 204 and touches
+#                                 nothing: a decision always yields an outcome
+#                                 and Chronicle has no conditional fork, so
+#                                 "no store operation needed" must be one.
+#                3, 17, 18 = KEY PARTS (bytes), joined after `key_prefix`. An
+#                     owner key `<ns>/<owner>` is two projected fields and a
+#                     literal separator, and the VM cannot concatenate.
+#                4..16 = value PARTS (bytes), joined in field order — PUT only.
+#                     The VM cannot concatenate, so joining bytes is done here;
+#                     it is the writev of this seam and carries no domain
+#                     meaning. Absent parts contribute nothing.
+#                30..39 = CARRY-THROUGH (bytes), echoed verbatim into the reply.
+#                     What lets a linear graph do read-then-decide: without
+#                     Chronicle's effect call/join (another repo's item, not
+#                     built) the reply is all a downstream decision sees, so the
+#                     request's own context would be lost across the effect.
+#                     Narrow on purpose — bounded, opaque, one effect only.
+#   response_out 1 = cid    (i64)
+#                2 = status (i64)  200 found | 404 absent | 400 malformed
+#                3 = value  (bytes) the object, empty for EXISTS or 404
+#
+# The status is the STORE's, not this module's opinion of it — the registry
+# example's "a 404 for a missing blob is loam's 404" applied here: the graph
+# never learns whether an object exists, so it cannot disagree with the store.
+# FIELD MAP (disjoint on purpose, so widening one range can never start
+# silently consuming another's fields):
+#     1,2,3   cid / op / key
+#     4..16   value parts
+#     17,18   extra key parts
+#     20..22  reserved for store_source's expansion trailer
+#     30..39  carry-through (echoed with their TYPE)
+#     40..49  `paths` projected from a GET, as bytes
+#     50..54  `ints` projected from a GET, as i64 (absent -> 0)
+# Ops: 0 NOOP, 1 GET, 2 EXISTS, 3 PUT (204 when unchanged), 4 DELETE,
+# 5 PATCH (set the scalar at dotted path field 19 to field 4 — an i64 is
+# rendered as digits — inside the object at the key; 404 when absent),
+# 6 MERGE (upsert the joined `k=v;…` value parts into the flat record at the
+# key, leaving every other key alone; an empty value removes a key).
+# `flat = 1` reads `k=v;k=v` records for `paths`/`ints`.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# This module reads a whole record per step, so it needs the boundary kept.
+framed = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+# Optional: a TERMINAL writer has nobody to answer, and requiring a sink would
+# put a `debug` node in a production graph purely to swallow replies. Wire it
+# when a later stage needs the status; leave it unwired at the end of a chain.
+required = false
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (this repo's modules, `debug`) does need mailbox,
+# and declares it on its own INPUT port.
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "a read-only store effect at the graph edge — observed through the store it reads and the engine it answers"

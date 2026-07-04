@@ -1,0 +1,43 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Service ClusterIP allocator — IPAM for Services as a
+# PIC module. It SUBSCRIBEs /services/, and for each Service without a clusterIP=
+# assigns the lowest free address from the service CIDR (10.96.0.0/16, base
+# 10.96.0.1), avoiding IPs already allocated to other Services, and writes
+# clusterIP=<ip> back onto it. That ClusterIP is what proxy_compiler DNATs and
+# what DNS can front. A pure allocation transform over the store.
+
+# Cadence-independent: it does no tick-based timekeeping, just polls its watch.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above (see fluxor-service-ipam.yaml).
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the ClusterIPs it assigns.
+[observability]
+exempt = "Control-plane IPAM — provider-driven, emits no telemetry stream"

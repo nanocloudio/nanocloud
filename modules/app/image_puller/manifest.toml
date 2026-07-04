@@ -1,0 +1,43 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Image puller — the pull-SCHEDULING decision as a PIC module. Pulling an
+# image is two things: the decision (which layers actually need fetching — the
+# manifest's layers minus what the content store already has) and the effect
+# (the HTTP fetch + tar/gzip unpack). Only the decision is a pure store
+# transform, so only it lives here; `image_fetcher` performs the effect the
+# plan names. This module watches /image-manifests/
+# and /blobs/ and writes the pull plan (the missing digests) to
+# /image-pull-plan/.
+
+# Cadence-independent: it does no tick-based timekeeping, just polls its watches.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above (see fluxor-imagepull.yaml).
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "Control-plane pull scheduler — provider-driven, emits no telemetry stream"

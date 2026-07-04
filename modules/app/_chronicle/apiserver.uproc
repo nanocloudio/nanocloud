@@ -1,0 +1,75 @@
+// The apiserver read path's dispatch, compiled to params. Under 2 KB:
+// `chronicle author` decodes a document into a 2048-byte buffer.
+module nanocloud.apiserver {
+
+  // What `kube_decode` projects out of a wave HttpRequest envelope. `key` is
+  // assembled there because the VM has no string concatenation.
+  message ns.Request {
+    cid: int = 1;
+    method: int = 2;
+    resource: string = 3;
+    namespace: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+  }
+
+  // What `store_effect` takes. cid rides through so the answer finds its
+  // connection, the same trick conn_id plays across the OCI registry.
+  message ns.StoreCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+
+  enum GET = 1;      // wave wire/method.rs
+  enum OP_GET = 1;   // store_effect
+  enum OP_EXISTS = 2;
+
+  // Method -> store op. A read path only: GET reads the object, anything else
+  // probes for existence rather than inventing a write this graph cannot do.
+  decision to_store(req: ns.Request) -> ns.StoreCall {
+    when req.method == GET ->
+      ns.StoreCall { cid: req.cid, op: OP_GET, key: req.key };
+    default ->
+      ns.StoreCall { cid: req.cid, op: OP_EXISTS, key: req.key };
+  }
+
+  // Identity stage: a codec-only node has no program and fails CLOSED with a
+  // VERSION_UNAVAILABLE record, which downstream looks like an ordinary record
+  // and surfaces two hops away as a decision that will not fire.
+  transformation pass_req(r: ns.Request) -> ns.Request {
+    ns.Request {
+      cid: r.cid, method: r.method, resource: r.resource,
+      namespace: r.namespace, name: r.name, body: r.body, key: r.key
+    }
+  }
+
+  // What `store_effect` answers with; the reply leg re-serializes it into a
+  // wave HttpResponse envelope via the `encode` program.
+  message ns.StoreReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+  }
+
+  transformation pass_reply(r: ns.StoreReply) -> ns.StoreReply {
+    ns.StoreReply { cid: r.cid, status: r.status, value: r.value }
+  }
+
+  pipeline respond(rep: ns.StoreReply) -> ns.StoreReply {
+    call out = pass_reply(rep);
+    return out;
+  }
+
+  pipeline serve(req: ns.Request) -> ns.StoreCall {
+    call decoded = pass_req(req);
+    call called = to_store(decoded);
+    return called;
+  }
+
+  entry serve = serve;
+  entry respond = respond;
+
+  provenance revision "apiserver-read-path" toolchain "chronicle-authoring";
+}

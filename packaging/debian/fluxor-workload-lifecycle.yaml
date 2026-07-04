@@ -1,0 +1,28 @@
+# workload-lifecycle graph: deployment_reconciler,
+# replicaset_reconciler and garbage_collector on one shared store — the full
+# create-AND-delete workload lifecycle. Creating a Deployment cascades to Pods
+# (the two reconcilers); deleting it cascades the other way (the GC collects the
+# orphaned ReplicaSet, then the orphaned Pods). No orchestration beyond the store.
+target: linux
+tick_us: 1000
+
+# The per-module self-edges below (change-sink allocators) are deliberate
+# 1-node cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: deployment_reconciler
+  - name: replicaset_reconciler
+  - name: garbage_collector
+
+# Self-edges: each module's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: deployment_reconciler.status
+    to: deployment_reconciler.changes
+  - from: replicaset_reconciler.status
+    to: replicaset_reconciler.changes
+  - from: garbage_collector.status
+    to: garbage_collector.changes

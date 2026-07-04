@@ -1,0 +1,144 @@
+// The lifecycle chain's writes, downstream of `pod_lifecycle.uproc`'s one
+// decision: the kill key, the sandbox phase, the pod phase, the event. Each
+// reads only the carry the decision stamped — which is the point of stamping
+// it: a stage after an effect sees a status and its carry, nothing else.
+module nanocloud.podeffect {
+
+  message pe.Step {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_sb: string = 31;
+    c_pod: string = 32;
+    c_kill: string = 33;
+    c_rst: int = 34;
+    c_metal: string = 35;
+  }
+  message pe.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: int = 7;
+    c_key: string = 30;
+    c_sb: string = 31;
+    c_pod: string = 32;
+    c_kill: string = 33;
+    c_rst: int = 34;
+    c_metal: string = 35;
+  }
+  message pe.Evt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    uid: string = 17;   // key parts: "default/" + uid + ".<Reason>.0"
+    xk: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8;
+  }
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // two-phase kill: ask, then escalate, then consume the key.
+  decision kill(s: pe.Step) -> pe.Act {
+    when s.c_kill == "term" ->
+      pe.Act { cid: s.cid, op: PUT, key: s.c_key, v1: "sig=term",
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    when s.c_kill == "kill" ->
+      pe.Act { cid: s.cid, op: PUT, key: s.c_key, v1: "sig=kill",
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    when s.c_kill == "clear" ->
+      pe.Act { cid: s.cid, op: DELETE, key: s.c_key,
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "",
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+  }
+  // The phase, merged into whichever sandbox plane this pod belongs to. The
+  // artifact fields are the project chain's; this stage owns `phase=` alone.
+  decision sandbox(s: pe.Step) -> pe.Act {
+    when s.c_sb != "" && s.c_metal == "" ->
+      pe.Act { cid: s.cid, op: MERGE, key: s.c_key, v1: "phase=", v2: s.c_sb,
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "",
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+  }
+  decision metal(s: pe.Step) -> pe.Act {
+    when s.c_sb != "" && s.c_metal != "" ->
+      pe.Act { cid: s.cid, op: MERGE, key: s.c_key, v1: "phase=", v2: s.c_sb,
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "",
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+  }
+  // The public phase. `;restarts=<n>` is appended only when non-zero, so a
+  // settled pod keeps the exact value every consumer already parses.
+  decision status(s: pe.Step) -> pe.Act {
+    when s.c_rst > 0 ->
+      pe.Act { cid: s.cid, op: PUT, key: s.c_key,
+               v1: "phase=", v2: s.c_pod, v3: ";restarts=", v4: s.c_rst,
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+    default ->
+      pe.Act { cid: s.cid, op: PUT, key: s.c_key,
+               v1: "phase=", v2: s.c_pod,
+               c_key: s.c_key, c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill,
+               c_rst: s.c_rst, c_metal: s.c_metal };
+  }
+  // The event, from the write's own reply: 200 means the phase CHANGED.
+  decision record(s: pe.Step) -> pe.Evt {
+    when s.status == 200 && s.c_pod == "Running" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.c_key, xk: ".Started.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.c_key,
+               v3: ".Started.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.c_key,
+               v5: "\"},\"reason\":\"Started\",\"message\":\"Started pod sandbox\",\"type\":\"Normal\",\"count\":1}" };
+    when s.status == 200 && s.c_pod == "Failed" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.c_key, xk: ".Failed.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.c_key,
+               v3: ".Failed.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.c_key,
+               v5: "\"},\"reason\":\"Failed\",\"message\":\"Pod sandbox terminated with an error\",\"type\":\"Warning\",\"count\":1}" };
+    when s.status == 200 && s.c_pod == "Succeeded" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.c_key, xk: ".Completed.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.c_key,
+               v3: ".Completed.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.c_key,
+               v5: "\"},\"reason\":\"Completed\",\"message\":\"Pod sandbox completed\",\"type\":\"Normal\",\"count\":1}" };
+    default ->
+      pe.Evt { cid: s.cid, op: NOOP, key: "", uid: "", xk: "",
+               v1: "", v2: "", v3: "", v4: "", v5: "" };
+  }
+
+  transformation pass(s: pe.Step) -> pe.Step {
+    pe.Step { cid: s.cid, status: s.status, value: s.value, c_key: s.c_key,
+              c_sb: s.c_sb, c_pod: s.c_pod, c_kill: s.c_kill, c_rst: s.c_rst,
+              c_metal: s.c_metal }
+  }
+  pipeline kl(s: pe.Step) -> pe.Act { call x = pass(s); call y = kill(x); return y; }
+  pipeline sb(s: pe.Step) -> pe.Act { call x = pass(s); call y = sandbox(x); return y; }
+  pipeline mt(s: pe.Step) -> pe.Act { call x = pass(s); call y = metal(x); return y; }
+  pipeline st(s: pe.Step) -> pe.Act { call x = pass(s); call y = status(x); return y; }
+  pipeline ev(s: pe.Step) -> pe.Evt { call x = pass(s); call y = record(x); return y; }
+  entry kl = kl;
+  entry sb = sb;
+  entry mt = mt;
+  entry st = st;
+  entry ev = ev;
+  provenance revision "podeffect-writes" toolchain "chronicle-authoring";
+}

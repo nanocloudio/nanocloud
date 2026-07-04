@@ -2,6 +2,78 @@
 
 set -e
 
+setup_fluxor() {
+    # Graph prerequisites: grant the runtime exactly the low-port capability,
+    # and publish the system-service bundles into the node's OCI store so
+    # `dns:1.0.0` / `edge:1.0.0` resolve offline. Best-effort: a failure is
+    # loud and leaves the rest of the install intact.
+    FXROOT=/usr/lib/nanocloud/fluxor
+    RUNTIME="$FXROOT/target/aarch64-unknown-linux-gnu/release/fluxor-linux"
+    STORE=/var/lib/nanocloud.io/fluxor/ocistore
+    [ -x /usr/bin/fluxor ] && [ -x "$RUNTIME" ] || return 0
+
+    if command -v setcap >/dev/null 2>&1; then
+        setcap cap_net_bind_service=+ep "$RUNTIME"             || echo "nanocloud: setcap failed; graph-mode DNS cannot bind :53" >&2
+    fi
+
+    mkdir -p "$STORE"
+    # (dir:bundle) pairs — the bundle name is the app.fluxor.toml [workload]
+    # name and drives both the store ref and the emitted target/fluxor/<name>
+    # dir; it differs from the staging dir for the endpoints reconciler.
+    # Per-bundle skip-if-present (upgrade path); re-publish manually to refresh.
+    NEED=""
+    for pair in "dns:dns" "edge:edge" "endpoints:endpoints-reconciler" "sandbox:sandbox-runner" "webhook:webhook-validator" "route:route-validator" "netpolicy:netpolicy-compiler" "proxy:proxy-compiler"; do
+        SVC="${pair%%:*}"; BUNDLE="${pair##*:}"
+        if [ -f "/usr/share/nanocloud/fluxor/${SVC}/app.fluxor.toml" ]             && ! /usr/bin/fluxor store ls --store "$STORE" 2>/dev/null | grep -q "^${BUNDLE}:1.0.0 "; then
+            NEED="$NEED $pair"
+        fi
+    done
+    [ -n "$NEED" ] || return 0
+    export FLUXOR_PROJECT_ROOT="$FXROOT"
+    # Module blobs are shared by every bundle; tolerate a re-publish error on
+    # upgrades (blobs already present).
+    /usr/bin/fluxor modules publish --store "$STORE" --target bcm2712         --project-root "$FXROOT" >/dev/null 2>&1         || echo "nanocloud: fluxor modules publish reported an error (may already be published)" >&2
+    for pair in $NEED; do
+        SVC="${pair%%:*}"; BUNDLE="${pair##*:}"
+        ( /usr/bin/fluxor build "/usr/share/nanocloud/fluxor/${SVC}/app.fluxor.toml" >/dev/null             && /usr/bin/fluxor bundle publish "$FXROOT/target/fluxor/${BUNDLE}/linux"                 --store "$STORE" >/dev/null )             || echo "nanocloud: ${BUNDLE} bundle publish failed; the ${SVC} graph will report ErrImageNeverPull until published manually" >&2
+    done
+}
+
+gen_node_cert() {
+    # The control-plane graph terminates TLS; provision a self-signed P-256 node
+    # cert (DER, as the tls module wants) if the operator hasn't supplied one.
+    # Best-effort + loud; a missing cert leaves the apiserver unable to bind TLS.
+    CERTDIR=/etc/nanocloud.io/certs
+    [ -f "$CERTDIR/server.der" ] && [ -f "$CERTDIR/server.key.der" ] && return 0
+    command -v openssl >/dev/null 2>&1 || {
+        echo "nanocloud: openssl not found; cannot generate a node TLS cert" >&2; return 0; }
+    mkdir -p "$CERTDIR"; chmod 0700 "$CERTDIR"
+    HOST="$(hostname -f 2>/dev/null || hostname)"
+    if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+         -keyout "$CERTDIR/server.key.pem" -out "$CERTDIR/server.pem" -days 3650 \
+         -subj "/CN=${HOST}" >/dev/null 2>&1 \
+       && openssl x509 -in "$CERTDIR/server.pem" -outform DER -out "$CERTDIR/server.der" 2>/dev/null \
+       && openssl ec   -in "$CERTDIR/server.key.pem" -outform DER -out "$CERTDIR/server.key.der" 2>/dev/null; then
+        chmod 0600 "$CERTDIR"/server.key.* 2>/dev/null || true
+    else
+        echo "nanocloud: node TLS cert generation failed; the apiserver will not bind TLS" >&2
+    fi
+}
+
+install_cli_applet() {
+    # Register the `nanocloud` CLI applet into the
+    # system applet catalogue, so the busybox symlink /usr/bin/nanocloud → fluxor
+    # resolves `nanocloud <cmd>` for any interactive shell (which sources
+    # /etc/profile.d/nanocloud.sh → FLUXOR_APPLETS). Best-effort + loud.
+    [ -x /usr/bin/fluxor ] || return 0
+    [ -f /usr/share/nanocloud/fluxor/cli/app.fluxor.toml ] || return 0
+    mkdir -p /var/lib/nanocloud.io/fluxor
+    FLUXOR_APPLETS=/var/lib/nanocloud.io/fluxor/applets.toml \
+    FLUXOR_PROJECT_ROOT=/usr/lib/nanocloud/fluxor \
+        /usr/bin/fluxor install /usr/share/nanocloud/fluxor/cli/app.fluxor.toml >/dev/null 2>&1 \
+        || echo "nanocloud: CLI applet install failed; 'nanocloud <cmd>' unavailable until 'fluxor install' is re-run" >&2
+}
+
 case "$1" in
     configure)
         LOG_FILE="/var/log/nanocloud.log"
@@ -10,6 +82,10 @@ case "$1" in
         fi
         chown root:adm "${LOG_FILE}" || true
         chmod 0640 "${LOG_FILE}" || true
+
+        gen_node_cert || true
+        setup_fluxor || true
+        install_cli_applet || true
 
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true

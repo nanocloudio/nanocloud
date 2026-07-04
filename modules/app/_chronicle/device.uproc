@@ -1,0 +1,126 @@
+// The Device identity as params: four stages from one record.
+//   req   PUT /cert-req/<ns>-<name> = "cn=device:<name>;dns=<name>;spiffe=…"
+//         (put-if-changed: a quiet cluster spends no revision)
+//   resp  GET /cert-resp/<ns>-<name>, crt projected (flat)
+//   ca    GET /ca-cert, when a crt exists
+//   id    PUT /deviceidentities.nanocloud.io/<ns>/<name> =
+//         "spiffe=…;crt=<hex>;ca=<hex>"
+// The SPIFFE id is the family scheme: spiffe://<trust-domain>/device/<ns>/<name>.
+module nanocloud.device {
+  message dv.Dev {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    ns: string = 28;
+    name: string = 29;
+  }
+  message dv.Req {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;    // ns
+    sep: string = 17;   // "-"
+    name: string = 18;
+    p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7; p5: string = 8;
+    p6: string = 9; p7: string = 10; p8: string = 11;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dv.Reply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dv.Resp {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    sep: string = 17;
+    name: string = 18;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+  }
+  message dv.Minted {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+    crt: string = 40;
+  }
+  message dv.Ca {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_crt: string = 36;
+  }
+  message dv.CaGot {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;   // the CA cert hex
+    c_key: string = 30;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_crt: string = 36;
+  }
+  message dv.Id {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7; p5: string = 8;
+    p6: string = 9; p7: string = 10; p8: string = 11; p9: string = 12;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+
+  decision req(d: dv.Dev) -> dv.Req {
+    default ->
+      dv.Req { cid: d.seq, op: PUT, key: d.ns, sep: "-", name: d.name,
+               p1: "cn=device:", p2: d.name, p3: ";dns=", p4: d.name,
+               p5: ";spiffe=spiffe://nanocloud.local/device/", p6: d.ns, p7: "/", p8: d.name,
+               c_key: d.key, c_ns: d.ns, c_name: d.name };
+  }
+  decision resp(r: dv.Reply) -> dv.Resp {
+    default ->
+      dv.Resp { cid: r.cid, op: GET, key: r.c_ns, sep: "-", name: r.c_name,
+                c_key: r.c_key, c_ns: r.c_ns, c_name: r.c_name };
+  }
+  decision ca(m: dv.Minted) -> dv.Ca {
+    when m.status == 200 && m.crt != "" ->
+      dv.Ca { cid: m.cid, op: GET, key: "/ca-cert",
+              c_key: m.c_key, c_ns: m.c_ns, c_name: m.c_name, c_crt: m.crt };
+    default ->
+      dv.Ca { cid: m.cid, op: NOOP, key: "",
+              c_key: m.c_key, c_ns: m.c_ns, c_name: m.c_name, c_crt: "" };
+  }
+  decision id(g: dv.CaGot) -> dv.Id {
+    when g.c_crt != "" ->
+      dv.Id { cid: g.cid, op: PUT, key: g.c_key,
+              p1: "spiffe=spiffe://nanocloud.local/device/", p2: g.c_ns, p3: "/", p4: g.c_name,
+              p5: ";crt=", p6: g.c_crt, p7: ";ca=", p8: g.value, p9: "" };
+    default ->
+      dv.Id { cid: g.cid, op: NOOP, key: "" };
+  }
+  transformation pass_dev(d: dv.Dev) -> dv.Dev { dv.Dev { seq: d.seq, rev: d.rev, key: d.key, ns: d.ns, name: d.name } }
+  transformation pass_reply(r: dv.Reply) -> dv.Reply { dv.Reply { cid: r.cid, status: r.status, value: r.value, c_key: r.c_key, c_ns: r.c_ns, c_name: r.c_name } }
+  transformation pass_minted(m: dv.Minted) -> dv.Minted { dv.Minted { cid: m.cid, status: m.status, value: m.value, c_key: m.c_key, c_ns: m.c_ns, c_name: m.c_name, crt: m.crt } }
+  transformation pass_cagot(g: dv.CaGot) -> dv.CaGot { dv.CaGot { cid: g.cid, status: g.status, value: g.value, c_key: g.c_key, c_ns: g.c_ns, c_name: g.c_name, c_crt: g.c_crt } }
+  pipeline rq(d: dv.Dev) -> dv.Req { call x = pass_dev(d); call y = req(x); return y; }
+  pipeline rs(r: dv.Reply) -> dv.Resp { call x = pass_reply(r); call y = resp(x); return y; }
+  pipeline cg(m: dv.Minted) -> dv.Ca { call x = pass_minted(m); call y = ca(x); return y; }
+  pipeline idn(g: dv.CaGot) -> dv.Id { call x = pass_cagot(g); call y = id(x); return y; }
+  entry rq = rq;
+  entry rs = rs;
+  entry cg = cg;
+  entry idn = idn;
+  provenance revision "device-identity" toolchain "chronicle-authoring";
+}

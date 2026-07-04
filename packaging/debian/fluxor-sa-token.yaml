@@ -1,0 +1,20 @@
+# sa-token graph the sa_token fmod, nanocloud's ServiceAccount
+# token issuer. On start it self-generates a P-256 signing key (private scalar in
+# the kernel KEY_VAULT) and publishes /sa-pubkey; each /token-req/ mints a signed
+# JWS (ES256, signed by handle) for system:serviceaccount:<ns>:<name> and returns
+# it at /token-resp/. Real signed tokens on existing fluxor crypto.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: sa_token
+
+# Self-edge: the minter's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto.
+wiring:
+  - from: sa_token.status
+    to: sa_token.changes

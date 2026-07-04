@@ -1,0 +1,51 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# api_ingress — the k8s apiserver front door, as a PIC module. It terminates
+# HTTP/1.1 directly off the net stream (from `tls`/`linux_net`), routes each
+# request, runs the authn→authz→admission→core pipeline over the control-plane
+# store seam, marshals the result to k8s JSON, and writes the HTTP response.
+# It is also the store's single writer on the request path.
+#
+# This module is why nanocloud carries no host code at all: the whole HTTP+JSON
+# edge is no_std PIC. The apiserver graph is
+# `linux_net → tls → api_ingress → [api fmods]`.
+
+# Cadence-independent: it polls its net channel and its in-flight response keys.
+timer_class = "agnostic"
+
+# Stream Surface v1 (net_proto) — cleartext HTTP from `tls` (or `linux_net` in
+# the plaintext graph): MSG_BOUND / MSG_ACCEPTED / MSG_DATA / MSG_CLOSED.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+# mTLS peer identity from `tls.peer_identity` (input index 1): the envelope
+# `[0x5A][len:2][conn_id][replica][verified][svid_len][svid…]`, svid = a 32-byte
+# hash of the verified peer cert pubkey. api_ingress maps conn_id→svid and sends
+# `peer=<svid>` as the credential; absent a verified peer it falls back to the
+# Authorization bearer token. Unwired in the plaintext graph (no `tls`).
+[[ports]]
+name = "peer_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# Stream Surface v1 (net_proto) to `tls`/`linux_net`: CMD_BIND / CMD_SEND /
+# CMD_CLOSE.
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+
+# No `changes` self-edge: api_ingress runs every tick to service its socket and
+# polls the specific response keys it wrote itself, so a store subscription would
+# cost a channel to deliver strictly less than the poll already does.
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "Control-plane API ingress — request counts are observed at the HTTP front and the responder fmods it dispatches to"

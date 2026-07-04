@@ -1,0 +1,68 @@
+// Route validation as params. The rules are FIRST-ERROR in spec order, which
+// is exactly a first-hit decision.
+module nanocloud.routevalidator {
+
+  // What `store_source` projects out of /routes/<ns>/<name>. Every projected
+  // field arrives as bytes: `j_path` yields the scalar token, so `port` is the
+  // digits "8080", not an int — which is what the writer wants anyway.
+  message rv.Spec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    host: string = 4;
+    svc: string = 5;
+    port: string = 6;
+    path: string = 7;
+  }
+
+  // What `store_effect` takes. Fields 4..8 are VALUE PARTS joined in order:
+  // the VM cannot concatenate, so "ready=1;endpoint=" + svc + ":" + port is
+  // expressed as four parts rather than one string.
+  message rv.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    head: string = 4;
+    svc: string = 5;
+    sep: string = 6;
+    port: string = 7;
+  }
+
+  enum PUT = 3;
+
+  decision validate(s: rv.Spec) -> rv.Put {
+    when s.host == "" ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=host must be set" };
+    when s.svc == "" ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=service name must be set" };
+    when s.port == "" ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=service port must be non-zero" };
+    when s.port == "0" ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=service port must be non-zero" };
+    when s.path != "" && !s.path.startsWith("/") ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=path prefix must start with '/'" };
+    default ->
+      rv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=1;endpoint=", svc: s.svc, sep: ":", port: s.port };
+  }
+
+  transformation pass(s: rv.Spec) -> rv.Spec {
+    rv.Spec { seq: s.seq, rev: s.rev, key: s.key, host: s.host,
+              svc: s.svc, port: s.port, path: s.path }
+  }
+
+  pipeline check(s: rv.Spec) -> rv.Put {
+    call p = pass(s);
+    call out = validate(p);
+    return out;
+  }
+
+  entry check = check;
+
+  provenance revision "route-validator" toolchain "chronicle-authoring";
+}

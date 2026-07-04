@@ -1,0 +1,346 @@
+// ReplicaSet convergence as params.
+//
+// The reconcile is N INDEPENDENT decisions, not one set operation: deterministic
+// naming makes `web-0` unrelated to `web-1`, so N guarded single-key writes
+// converge over passes. The cardinality therefore lives in the SOURCE
+// (store_source's `expand`), and every ordinal is an ordinary 1:1 decision.
+//
+// No set-shaped connector op, and none needed: an `ensure_range` would decide
+// the whole set inside the connector and leave this decision deciding nothing,
+// which moves the loop from one Rust module to another rather than into params.
+module nanocloud.replicaset {
+
+  message rs.Ord {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;     // "<ns>/<name>" — the tail below /replicasets.apps/
+    tmpl: string = 4;    // spec.template.spec, carried as an opaque subtree
+    ns: string = 28;     // the key's namespace segment — the document may carry
+    name: string = 29;   // neither metadata.namespace nor metadata.name
+    ord: int = 20;       // this index
+    ordstr: string = 21; // the same index as digits — the VM cannot render one
+    want: int = 22;      // spec.replicas
+    prevstr: string = 23;// the predecessor index as digits; empty at 0
+    selfkey: string = 24;// "<ns>/<name>-<i>", built by the source
+    prevkey: string = 25;// "<ns>/<name>-<i-1>"; empty at 0
+    pod: string = 26;    // "<name>-<i>" — the same join without the namespace,
+                         // because a document that NAMES the object wants the
+                         // bare name where a store key wants "<ns>/".
+    hash: string = 5;    // metadata.labels.pod-template-hash on the ReplicaSet
+  }
+
+  // Stage 1 asks about the PREDECESSOR, so the verdict can roll strictly in
+  // ordinal order — one pod at a time, which is what maxUnavailable = 1 means.
+  // The module it mirrors gets the same effect with a per-pass budget of one,
+  // spending it on the first stale ordinal it meets; a per-record decision has
+  // no budget to spend, but "my predecessor is already fresh" identifies the
+  // same pod.
+  message rs.PrevQ {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_name: string = 33;
+    c_ns: string = 34;
+    c_ord: string = 35;
+    c_hash: string = 36;
+    c_prev: string = 37;
+    c_pod: string = 39;
+  }
+
+  message rs.PrevA {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_name: string = 33;
+    c_ns: string = 34;
+    c_ord: string = 35;
+    c_hash: string = 36;
+    c_prev: string = 37;
+    c_pod: string = 39;
+    phash: string = 40;  // the predecessor's pod-template-hash, projected
+  }
+
+  // EXISTS probe for this ordinal's pod. Key parts: "<ns>/" + name + "-" + ord,
+  // after the connector's key_prefix.
+  message rs.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    // Carry-through, echoed untouched: the verdict needs the REQUEST as well as
+    // the answer, and without Chronicle's effect call/join the reply is all it
+    // would otherwise see.
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_name: string = 33;
+    c_ns: string = 34;
+    c_ord: string = 35;
+    c_hash: string = 36;   // the ReplicaSet's template hash
+    c_gate: string = 38;   // "1" when the predecessor is fresh (or absent)
+    c_pod: string = 39;
+  }
+
+  message rs.Answer {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_in: string = 32;
+    c_name: string = 33;
+    c_ns: string = 34;
+    c_ord: string = 35;
+    c_hash: string = 36;
+    c_gate: string = 38;
+    c_pod: string = 39;
+    myhash: string = 40;   // this pod's pod-template-hash, projected
+  }
+
+  // The pod document, as VALUE PARTS joined in field order by the connector.
+  // Thirteen parts because literals and projected fields alternate and the VM
+  // cannot concatenate; joining bytes is the connector's job.
+  message rs.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+    p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    // Carry for the EVENT stage. The connector echoes 30..39 untouched, so the
+    // record that reports what happened rides along with the write that did it
+    // — the only way a decision downstream of the effect can know which branch
+    // fired, since the reply carries a status and nothing else.
+    c_key: string = 30;   // "<ns>/<pod>" — the event's key, minus its suffix
+    c_evt: string = 33;   // "create" | "roll" | "delete" | "" (nothing happened)
+    c_ns: string = 34;    // the namespace, for the event's own metadata
+    c_pod: string = 39;   // "<name>-<i>", for the event's involvedObject
+  }
+
+  // What the event stage writes. `key` is the acted-on object's "<ns>/<pod>"
+  // and `xk` the ".<Reason>.0" suffix, joined after key_prefix "/events/" —
+  // core/v1's `/events/<ns>/<obj>.<reason>.<seq>`. A PIC module has no clock,
+  // so there is no timestamp and `seq` is 0: a recurring reason overwrites its
+  // own event, which is the same coarse behaviour `_shared/event.rs` documents.
+  message rs.Evt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    xk: string = 17;
+    v1: string = 4;   v2: string = 5;   v3: string = 6;
+    v4: string = 7;   v5: string = 8;   v6: string = 9;
+    v7: string = 10;  v8: string = 11;  v9: string = 12;
+    v10: string = 13; v11: string = 14;
+  }
+
+  // The reply the event stage reads: `apply`'s answer, carrying the tag.
+  message rs.Applied {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_evt: string = 33;
+    c_ns: string = 34;
+    c_pod: string = 39;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // Probe every ordinal the source emitted. `c_in` records whether this ordinal
+  // is inside the desired count, as "1" or "" — the verdict needs it and the
+  // answer alone cannot say.
+  // Stage 1: ask about the predecessor. Index 0 has none, so ask about nothing
+  // and let the answer's 204 stand for "ungated".
+  decision ask_prev(o: rs.Ord) -> rs.PrevQ {
+    when o.prevstr == "" && o.ord < o.want ->
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "",
+                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1", c_name: o.name,
+                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
+                 c_pod: o.pod };
+    when o.prevstr == "" ->
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "",
+                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "", c_name: o.name,
+                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
+                 c_pod: o.pod };
+    when o.ord < o.want ->
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey,
+                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1", c_name: o.name,
+                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
+                 c_pod: o.pod };
+    default ->
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey,
+                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "", c_name: o.name,
+                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
+                 c_pod: o.pod };
+  }
+
+  // Stage 2: ask about THIS ordinal, carrying the predecessor verdict. The gate
+  // is "1" when the predecessor is fresh (its hash matches) or when there is no
+  // predecessor at all (status 204 from the NOOP above).
+  decision probe(a: rs.PrevA) -> rs.Probe {
+    when a.status == 204 ->
+      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
+                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
+                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "1",
+                 c_pod: a.c_pod };
+    when a.phash == a.c_hash ->
+      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
+                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
+                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "1",
+                 c_pod: a.c_pod };
+    default ->
+      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
+                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
+                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "",
+                 c_pod: a.c_pod };
+  }
+
+  // Four cases, and only two act:
+  //   in range + absent  -> create (create-if-absent preserves kubelet fields)
+  //   out of range + present -> delete
+  //   otherwise -> nothing
+  decision converge(a: rs.Answer) -> rs.Act {
+    // Roll a stale pod: in range, present, its hash differs from the
+    // ReplicaSet's, and the predecessor is already fresh. Deleted, not
+    // overwritten -- it is recreated from the new template next pass, and
+    // create-if-absent is what preserves the fields a kubelet adds.
+    when a.c_in == "1" && a.status == 200 && a.c_gate == "1" && a.myhash != a.c_hash ->
+      rs.Act { cid: a.cid, op: DELETE, key: a.c_key,
+               c_key: a.c_key, c_evt: "roll", c_ns: a.c_ns, c_pod: a.c_pod };
+    when a.c_in == "1" && a.status == 404 ->
+      rs.Act { cid: a.cid, op: PUT, key: a.c_key,
+               p1: "{\"metadata\":{\"name\":\"",
+               p2: a.c_name,
+               p3: "-",
+               p4: a.c_ord,
+               p5: "\",\"namespace\":\"",
+               p6: a.c_ns,
+               p7: "\",\"ownerReferences\":[{\"kind\":\"ReplicaSet\",\"name\":\"",
+               p8: a.c_name,
+               p9: "\"}],\"labels\":{\"pod-template-hash\":\"",
+               p10: a.c_hash,
+               p11: "\"}},\"spec\":",
+               p12: a.c_tmpl,
+               p13: "}",
+               c_key: a.c_key, c_evt: "create", c_ns: a.c_ns, c_pod: a.c_pod };
+    when a.c_in == "" && a.status == 200 ->
+      rs.Act { cid: a.cid, op: DELETE, key: a.c_key,
+               c_key: a.c_key, c_evt: "delete", c_ns: a.c_ns, c_pod: a.c_pod };
+    default ->
+      rs.Act { cid: a.cid, op: NOOP, key: "", c_key: "", c_evt: "",
+               c_ns: "", c_pod: "" };
+  }
+
+  // Stage 4: RECORD what stage 3 did. Gated on status 200 as well as the tag —
+  // the tag says which branch fired, the status says the store accepted it, and
+  // an event for a write that failed would be a lie. A NOOP answers 204 and its
+  // empty tag falls to the default, so nothing is written for a quiet pass.
+  decision record(a: rs.Applied) -> rs.Evt {
+    when a.c_evt == "create" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulCreate.0",
+               v1: "{\"metadata\":{\"name\":\"",
+               v2: a.c_pod,
+               v3: ".SuccessfulCreate.0\",\"namespace\":\"",
+               v4: a.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: a.c_ns,
+               v7: "\",\"name\":\"",
+               v8: a.c_pod,
+               v9: "\"},\"reason\":\"SuccessfulCreate\",\"message\":\"Created pod ",
+               v10: a.c_pod,
+               v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    when a.c_evt == "roll" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulDelete.0",
+               v1: "{\"metadata\":{\"name\":\"",
+               v2: a.c_pod,
+               v3: ".SuccessfulDelete.0\",\"namespace\":\"",
+               v4: a.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: a.c_ns,
+               v7: "\",\"name\":\"",
+               v8: a.c_pod,
+               v9: "\"},\"reason\":\"SuccessfulDelete\",\"message\":\"Rolled pod ",
+               v10: a.c_pod,
+               v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    when a.c_evt == "delete" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulDelete.0",
+               v1: "{\"metadata\":{\"name\":\"",
+               v2: a.c_pod,
+               v3: ".SuccessfulDelete.0\",\"namespace\":\"",
+               v4: a.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: a.c_ns,
+               v7: "\",\"name\":\"",
+               v8: a.c_pod,
+               v9: "\"},\"reason\":\"SuccessfulDelete\",\"message\":\"Deleted pod ",
+               v10: a.c_pod,
+               v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    default ->
+      rs.Evt { cid: a.cid, op: NOOP, key: "", xk: "" };
+  }
+
+  transformation pass_ord(o: rs.Ord) -> rs.Ord {
+    rs.Ord { seq: o.seq, rev: o.rev, key: o.key, ns: o.ns, name: o.name,
+             tmpl: o.tmpl, ord: o.ord, ordstr: o.ordstr, want: o.want,
+             prevstr: o.prevstr, hash: o.hash,
+             selfkey: o.selfkey, prevkey: o.prevkey }
+  }
+  transformation pass_prev(a: rs.PrevA) -> rs.PrevA {
+    rs.PrevA { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
+               c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name, c_ns: a.c_ns,
+               c_ord: a.c_ord, c_hash: a.c_hash, c_prev: a.c_prev,
+               c_pod: a.c_pod, phash: a.phash }
+  }
+  transformation pass_ans(a: rs.Answer) -> rs.Answer {
+    rs.Answer { cid: a.cid, status: a.status, value: a.value,
+                c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in,
+                c_name: a.c_name, c_ns: a.c_ns, c_ord: a.c_ord,
+                c_hash: a.c_hash, c_gate: a.c_gate, c_pod: a.c_pod,
+                myhash: a.myhash }
+  }
+
+  transformation pass_applied(a: rs.Applied) -> rs.Applied {
+    rs.Applied { cid: a.cid, status: a.status, value: a.value,
+                 c_key: a.c_key, c_evt: a.c_evt, c_ns: a.c_ns, c_pod: a.c_pod }
+  }
+
+  pipeline prev(o: rs.Ord) -> rs.PrevQ {
+    call x = pass_ord(o);
+    call y = ask_prev(x);
+    return y;
+  }
+  pipeline ask(a: rs.PrevA) -> rs.Probe {
+    call x = pass_prev(a);
+    call y = probe(x);
+    return y;
+  }
+  pipeline act(a: rs.Answer) -> rs.Act {
+    call x = pass_ans(a);
+    call y = converge(x);
+    return y;
+  }
+
+  pipeline rec(a: rs.Applied) -> rs.Evt {
+    call x = pass_applied(a);
+    call y = record(x);
+    return y;
+  }
+
+  entry prev = prev;
+  entry ask = ask;
+  entry act = act;
+  entry rec = rec;
+
+  provenance revision "replicaset-expand" toolchain "chronicle-authoring";
+}

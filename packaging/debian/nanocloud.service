@@ -1,12 +1,20 @@
 [Unit]
-Description=Nanocloud API Server
+Description=Nanocloud control plane (fluxor graph)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/nanocloud
-ExecStart=/bin/sh -c 'exec /usr/bin/nanocloud server --listen "$NANOCLOUD_LISTEN" $NANOCLOUD_EXTRA_ARGS'
+# The control plane is a fluxor graph of PIC fmods — the apiserver (api_ingress),
+# the API pipeline (authn/rbac/admission/core_api/…), and every reconciler. There
+# is no host binary. `fluxor run` resolves the graph's modules from the project
+# root (WorkingDirectory), and the graph is the store's single writer via
+# FLUXOR_STORE_DIR.
+WorkingDirectory=/usr/lib/nanocloud/fluxor
+Environment=FLUXOR_STORE_DIR=/var/lib/nanocloud.io/control-plane/store
+ExecStartPre=/bin/mkdir -p /var/lib/nanocloud.io/control-plane/store
+ExecStart=/usr/bin/fluxor run /etc/nanocloud.io/fluxor/controlplane.yaml
 StandardOutput=append:/var/log/nanocloud.log
 StandardError=append:/var/log/nanocloud.log
 Restart=on-failure

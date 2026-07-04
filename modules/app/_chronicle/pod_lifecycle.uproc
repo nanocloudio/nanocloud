@@ -1,0 +1,242 @@
+// The kubelet's decision half as params: the pod lifecycle state machine.
+//
+// The whole per-pod situation is a record, not private module state: the kill
+// escalation and its deadline, the restart count, the backoff deadline, the
+// run clock and its paused span, the terminal latch are all fields on
+// /pod-runtime/<uid>. The source stamps the monotonic clock (58), arms a
+// kernel timer for whichever deadline comes first (`due`), and looks up the
+// same uid under every other plane (`related`), so one record carries the
+// whole situation and one decision reads it.
+//
+//   /pod-runtime/<uid>  kill_phase kill_deadline backoff_until run_started
+//                       paused_since restarts was_terminal      (mine)
+//   /pod-specs/<uid>    cmd desired restart rootfs graph grace   (the ask)
+//   /sandbox-status/    state code                               (the world)
+//   /probe-status/      live                                     (liveness)
+//   /sandboxes/         cmd                    (does the artifact exist yet)
+module nanocloud.podlifecycle {
+
+  message pl.Rt {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    kill_phase: int = 50;
+    kill_deadline: int = 51;
+    backoff_until: int = 52;
+    run_started: int = 53;
+    paused_since: int = 54;
+    restarts: int = 55;
+    was_terminal: int = 56;
+    now: int = 58;
+    cmd: string = 70;
+    desired: string = 71;
+    restart: string = 72;
+    rootfs: string = 73;
+    graph: string = 74;
+    grace: int = 75;
+    state: string = 80;
+    code: string = 81;
+    live: string = 90;
+    sb_cmd: string = 100;
+  }
+
+  // The transition, as a MERGE of the fields that changed — never a PUT: this
+  // decision owns seven fields of a record and must say nothing about the
+  // others, which a whole-document write would have to restate and could
+  // therefore get wrong. Integers ride as integers; the connector renders them.
+  message pl.Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    c_key: string = 30;
+    c_sb: string = 31;    // sandbox phase to project: start | delete | ""
+    c_pod: string = 32;   // the pod phase to report
+    c_kill: string = 33;  // term | kill | clear | ""
+    c_rst: int = 34;      // restart count for the status doc
+    c_metal: string = 35; // "1" when the pod is graph-backed
+  }
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // ORDERING PIN: `desired == deleted` is evaluated FIRST, before the
+  // restart branch, so a pod being killed can never be relaunched by its
+  // restartPolicy.
+  decision step(d: pl.Rt) -> pl.Step {
+    // The artifact is not resolved yet (an image still pulling): report
+    // Pending and project NO sandbox.
+    when d.desired != "deleted" && d.cmd == "" && d.graph == "" && d.sb_cmd == "" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "", c_pod: "Pending", c_kill: "",
+                c_rst: d.restarts, c_metal: "" };
+
+    // ── desired = deleted ──────────────────────────────────────────────
+    // Immediate (grace=0) or nothing live to signal: the direct delete flow,
+    // consuming the kill key if one was in flight.
+    when d.desired == "deleted" && (d.grace == 0 || d.state == "" || d.state == "exited" || d.state == "failed" || d.state == "killed" || d.state == "destroyed" || (d.state == "running" && d.live == "0")) && d.kill_phase != 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "kill_phase=0;kill_deadline=0", 
+                c_key: d.key, c_sb: "delete", c_pod: "Terminating", c_kill: "clear",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.desired == "deleted" && (d.grace == 0 || d.state == "" || d.state == "exited" || d.state == "failed" || d.state == "killed" || d.state == "destroyed" || (d.state == "running" && d.live == "0")) ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "delete", c_pod: "Terminating", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    // Phase 1: ask nicely, and record the deadline the timer will wake us on.
+    when d.desired == "deleted" && d.kill_phase == 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "kill_phase=1;kill_deadline=", v2: d.now + d.grace * 1000, 
+                c_key: d.key, c_sb: "start", c_pod: "Terminating", c_kill: "term",
+                c_rst: d.restarts, c_metal: d.graph };
+    // Grace expired: escalate, then let the delete flow DESTROY.
+    when d.desired == "deleted" && d.kill_phase == 1 && d.now >= d.kill_deadline ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "kill_phase=2", 
+                c_key: d.key, c_sb: "delete", c_pod: "Terminating", c_kill: "kill",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.desired == "deleted" && d.kill_phase == 1 ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Terminating", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.desired == "deleted" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "delete", c_pod: "Terminating", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+
+    // ── terminated (a real exit, or liveness past its threshold) ────
+    // The backoff bookkeeping happens on the terminal EDGE only: the terminal
+    // status persists until the teardown completes, and `was_terminal` is what
+    // makes the increment happen once.
+    when (d.state == "exited" || d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || (d.restart == "onfailure" && d.state != "exited")) && d.was_terminal == 0 && d.state == "exited" ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;restarts=0;backoff_until=0;run_started=0;paused_since=0", 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "",
+                c_rst: 0, c_metal: d.graph };
+    // A run that survived the reset window breaks the streak first.
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.run_started > 0 && d.now - d.run_started >= 600000 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;restarts=1;run_started=0;paused_since=0;backoff_until=", v2: d.now + 1000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "",
+                c_rst: 1, c_metal: d.graph };
+    // delay = min(1s x 2^(n-1), 300s). No shift in the VM and no loop —
+    // n is bounded by the cap, so the ladder IS the function.
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=1;backoff_until=", v2: d.now + 1000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 1, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 1 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=2;backoff_until=", v2: d.now + 2000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 2, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 2 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=3;backoff_until=", v2: d.now + 4000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 3, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 3 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=4;backoff_until=", v2: d.now + 8000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 4, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 4 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=5;backoff_until=", v2: d.now + 16000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 5, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 5 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=6;backoff_until=", v2: d.now + 32000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 6, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 6 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=7;backoff_until=", v2: d.now + 64000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 7, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 && d.restarts == 7 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=8;backoff_until=", v2: d.now + 128000, 
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: 8, c_metal: d.graph };
+    when (d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || d.restart == "onfailure") && d.was_terminal == 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=1;run_started=0;paused_since=0;restarts=", v2: d.restarts + 1, v3: ";backoff_until=", v4: d.now + 300000,
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "", c_rst: d.restarts + 1, c_metal: d.graph };
+    // Already latched: keep tearing down.
+    when (d.state == "exited" || d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0")) && (d.restart == "always" || (d.restart == "onfailure" && d.state != "exited")) ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    // No restart policy: the sandbox is left as it is and the phase reports.
+    when d.state == "exited" && d.code == "0" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Succeeded", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "exited" || d.state == "failed" || d.state == "killed" || (d.state == "running" && d.live == "0") ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Failed", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+
+    // ── destroyed: the slot is free; relaunch once the backoff has passed ──
+    when d.state == "destroyed" && d.backoff_until != 0 && d.now < d.backoff_until ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "delete", c_pod: "Restarting", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "destroyed" ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=0;backoff_until=0", 
+                c_key: d.key, c_sb: "start", c_pod: "Restarting", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+
+    // ── running / paused: the reset clock, frozen across a pause ──
+    when d.state == "running" && d.run_started == 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=0;paused_since=0;run_started=", v2: d.now, 
+                c_key: d.key, c_sb: "start", c_pod: "Running", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "running" && d.paused_since > 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=0;paused_since=0;run_started=", v2: d.run_started + d.now - d.paused_since, 
+                c_key: d.key, c_sb: "start", c_pod: "Running", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "running" && d.was_terminal != 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "was_terminal=0", 
+                c_key: d.key, c_sb: "start", c_pod: "Running", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "running" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Running", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "paused" && d.run_started != 0 && d.paused_since == 0 ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "paused_since=", v2: d.now, 
+                c_key: d.key, c_sb: "start", c_pod: "Paused", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    when d.state == "paused" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Paused", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+    default ->
+      pl.Step { cid: d.seq, op: NOOP, key: "",
+                c_key: d.key, c_sb: "start", c_pod: "Pending", c_kill: "",
+                c_rst: d.restarts, c_metal: d.graph };
+  }
+
+  transformation pass_rt(d: pl.Rt) -> pl.Rt {
+    pl.Rt { seq: d.seq, rev: d.rev, key: d.key, kill_phase: d.kill_phase,
+            kill_deadline: d.kill_deadline, backoff_until: d.backoff_until,
+            run_started: d.run_started, paused_since: d.paused_since,
+            restarts: d.restarts, was_terminal: d.was_terminal, now: d.now,
+            cmd: d.cmd, desired: d.desired, restart: d.restart, rootfs: d.rootfs,
+            graph: d.graph, grace: d.grace, state: d.state, code: d.code,
+            live: d.live, sb_cmd: d.sb_cmd }
+  }
+  pipeline st(d: pl.Rt) -> pl.Step {
+    call x = pass_rt(d);
+    call y = step(x);
+    return y;
+  }
+  entry st = st;
+  provenance revision "podlifecycle-store-state" toolchain "chronicle-authoring";
+}

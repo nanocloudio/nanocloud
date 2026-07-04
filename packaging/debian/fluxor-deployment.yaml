@@ -1,0 +1,23 @@
+# deployment-reconciler workload graph: the
+# deployment_reconciler fmod, which watches /deployments.apps/ in the store
+# and projects the owned ReplicaSet at /replicasets.apps/<ns>/<name>. The
+# essence: a controller is a pure function of store state re-applied on change —
+# SUBSCRIBE inputs, recompute, CAS-write outputs.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: deployment_reconciler
+
+# Self-edge: the reconciler's own output feeds its `changes` input. This is
+# purely a channel allocator — a module cannot open a channel itself, and the
+# store's namespace.change SUBSCRIBE needs a module-owned sink to push onto. The
+# module never writes this output; it passes the resulting input-channel handle
+# to SUBSCRIBE and drains pushed events from it.
+wiring:
+  - from: deployment_reconciler.status
+    to: deployment_reconciler.changes

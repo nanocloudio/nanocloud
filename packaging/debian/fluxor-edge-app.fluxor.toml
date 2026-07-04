@@ -1,0 +1,22 @@
+# Workload source manifest for the cluster-edge bundle. postinst emits it and
+# publishes it into the node's OCI store, so `edge:1.0.0` resolves offline.
+# The graph it references (linux.yaml, staged beside this file) serves the
+# edge's fixed surface.
+[workload]
+name = "edge"
+version = "1.0.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[[export]]
+name = "http"
+protocol = "tcp"
+port = 8080
+binding = "http.net_out"
+
+[resources]
+state_bytes = 262144
+buffer_bytes = 65536

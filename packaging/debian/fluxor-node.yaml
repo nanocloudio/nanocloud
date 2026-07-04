@@ -1,0 +1,29 @@
+# Default fluxor node graph (conffile: operator edits survive upgrades).
+#
+# The substrate every graph-hosted system service co-resides in. Ships with
+# the cluster-dns workload module wired: the dns pod leases udp/53 and
+# forwards non-table names to the delegation address. The plan (FLUXOR_PLAN) assigns pod ownership over
+# these modules; linux_net is the platform prefix (system-owned) — keep
+# NANOCLOUD_FLUXOR_SYSTEM_MODULES in /etc/default/nanocloud equal to the
+# number of platform modules here (1).
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true      # linux_net ⇄ dns feedback pair
+
+platform:
+  net: {}
+
+modules:
+  - name: dns
+    port: 53
+    upstream: "127.0.0.1"
+    upstream_port: 5300    # the delegation address for non-table names
+    ttl: 30
+
+wiring:
+  - from: linux_net.net_out
+    to: dns.net_in
+  - from: dns.net_out
+    to: linux_net.net_in

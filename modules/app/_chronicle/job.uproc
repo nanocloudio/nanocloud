@@ -1,0 +1,171 @@
+// Job as params: run-to-completion. Three chains.
+//   launch  /jobs.batch/ expanded by spec.completions -> EXISTS the pod ->
+//           create-if-absent; NEVER recreated (a Succeeded pod stays)
+//   done    /pods/ owned by a Job with status.phase Succeeded ->
+//           /job-done/<ns>/<pod> = "1" (else deleted): the per-pod fact
+//   status  /jobs.batch/ plain, with count_children over /job-done/ and
+//           desired = spec.completions -> /job-status/<ns>/<job> =
+//           "succeeded=<n>;complete=<0|1>" — the fold is the source's
+module nanocloud.job {
+
+  message jb.Ord {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    tmpl: string = 4;        // spec.template.spec
+    completions: string = 5; // spec.completions as text; empty = not a Job
+    ord: int = 20;
+    want: int = 22;
+    selfkey: string = 24;
+    pod: string = 26;
+    ns: string = 28;
+    name: string = 29;
+  }
+  message jb.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_pod: string = 39;
+  }
+  message jb.Answer {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_tmpl: string = 31;
+    c_ns: string = 34;
+    c_name: string = 35;
+    c_pod: string = 39;
+  }
+  message jb.Create {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+  }
+
+  message jb.Pod {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    kind: string = 4;   // metadata.ownerReferences.0.kind
+    phase: string = 5;  // status.phase
+  }
+  message jb.Mark {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+
+  message jb.Job {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    completions: string = 4;
+    want: int = 20;         // desired = spec.completions
+    donestr: string = 21;   // children under /job-done/, as digits
+    done: int = 22;         // and as a number
+  }
+  message jb.Status {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6;
+  }
+
+  enum NOOP = 0;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  decision probe(o: jb.Ord) -> jb.Probe {
+    when o.completions == "" ->
+      jb.Probe { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+    when o.ord < o.want ->
+      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, c_key: o.selfkey, c_tmpl: o.tmpl,
+                 c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+    default ->
+      jb.Probe { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+  }
+  decision launch(a: jb.Answer) -> jb.Create {
+    when a.status == 404 && a.c_key != "" ->
+      jb.Create { cid: a.cid, op: PUT, key: a.c_key,
+                  p1: "{\"metadata\":{\"name\":\"",
+                  p2: a.c_pod,
+                  p3: "\",\"namespace\":\"",
+                  p4: a.c_ns,
+                  p5: "\",\"ownerReferences\":[{\"kind\":\"Job\",\"name\":\"",
+                  p6: a.c_name,
+                  p7: "\"}]},\"spec\":",
+                  p8: a.c_tmpl,
+                  p9: "}" };
+    default ->
+      jb.Create { cid: a.cid, op: NOOP, key: "" };
+  }
+
+  decision done(p: jb.Pod) -> jb.Mark {
+    when p.kind == "Job" && p.phase == "Succeeded" ->
+      jb.Mark { cid: p.seq, op: PUT, key: p.key, v1: "1" };
+    when p.kind == "Job" ->
+      jb.Mark { cid: p.seq, op: DELETE, key: p.key, v1: "" };
+    default ->
+      jb.Mark { cid: p.seq, op: NOOP, key: "", v1: "" };
+  }
+
+  decision status(j: jb.Job) -> jb.Status {
+    when j.completions == "" ->
+      jb.Status { cid: j.seq, op: NOOP, key: "", v1: "", v2: "", v3: "" };
+    when j.want > 0 && j.done >= j.want ->
+      jb.Status { cid: j.seq, op: PUT, key: j.key, v1: "succeeded=", v2: j.donestr, v3: ";complete=1" };
+    default ->
+      jb.Status { cid: j.seq, op: PUT, key: j.key, v1: "succeeded=", v2: j.donestr, v3: ";complete=0" };
+  }
+
+  transformation pass_ord(o: jb.Ord) -> jb.Ord {
+    jb.Ord { seq: o.seq, rev: o.rev, key: o.key, tmpl: o.tmpl, completions: o.completions,
+             ord: o.ord, want: o.want, selfkey: o.selfkey, pod: o.pod, ns: o.ns, name: o.name }
+  }
+  transformation pass_ans(a: jb.Answer) -> jb.Answer {
+    jb.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
+                c_ns: a.c_ns, c_name: a.c_name, c_pod: a.c_pod }
+  }
+  transformation pass_pod(p: jb.Pod) -> jb.Pod {
+    jb.Pod { seq: p.seq, rev: p.rev, key: p.key, kind: p.kind, phase: p.phase }
+  }
+  transformation pass_job(j: jb.Job) -> jb.Job {
+    jb.Job { seq: j.seq, rev: j.rev, key: j.key, completions: j.completions,
+             want: j.want, donestr: j.donestr, done: j.done }
+  }
+  pipeline prb(o: jb.Ord) -> jb.Probe {
+    call x = pass_ord(o);
+    call y = probe(x);
+    return y;
+  }
+  pipeline mk(a: jb.Answer) -> jb.Create {
+    call x = pass_ans(a);
+    call y = launch(x);
+    return y;
+  }
+  pipeline dn(p: jb.Pod) -> jb.Mark {
+    call x = pass_pod(p);
+    call y = done(x);
+    return y;
+  }
+  pipeline st(j: jb.Job) -> jb.Status {
+    call x = pass_job(j);
+    call y = status(x);
+    return y;
+  }
+  entry prb = prb;
+  entry mk = mk;
+  entry dn = dn;
+  entry st = st;
+  provenance revision "job-fold" toolchain "chronicle-authoring";
+}

@@ -1,0 +1,19 @@
+# Workload source manifest for the route-validator bundle. postinst emits it and
+# publishes it into the node's OCI store, so `route-validator:1.0.0` resolves offline.
+# Portless — the validation drives the store provider via provider_call, not a
+# socket. The graph (linux.yaml, staged beside this file) runs a Chronicle
+# decision over the store.
+[workload]
+name = "route-validator"
+version = "1.0.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+# Three modules, and the Chronicle engines carry their programs in state, so
+# the arena is larger than a single validator module would need.
+state_bytes = 262144
+buffer_bytes = 16384

@@ -1,0 +1,79 @@
+# scheduler workload graph: the scheduler fmod, which
+# watches /pods/ and /nodes/ and binds each unbound Pod (no node= field) to the
+# least-loaded ready Node by writing node=<name> onto it. The kube-scheduler
+# loop as a pure store transform.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # The scheduler is PARAMS: the FIRST unbound Pod (where spec.nodeName=,
+  # count index 0) JOIN /ready-nodes/ picked by the fewest Pods bound to it —
+  # measured from the Pods themselves at pick time — PATCHes spec.nodeName;
+  # one bind per pass, the spread emergent. Then the Scheduled event. Reads
+  # /ready-nodes/ from the DaemonSet chain's projection. Params from
+  # modules/app/_chronicle/scheduler.uproc.
+  - name: sc_unbound
+    type: store_source
+    prefix: "/pods/"
+    where: "spec.nodeName="
+    count: 1
+    join: "/ready-nodes/"
+    join_pick: "mincount:/pods/:spec.nodeName"
+    watch: "/ready-nodes/"
+  - name: sc_bind
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/scheduler.uproc bd
+      decision: "010a0000001e000100021400000010000000000000000020010002150000001200002130001e0000008a000100020100000040010000001005000000000000004002000000010002030000004003000000120d00737065632e6e6f64654e616d65401300000012010022400400000001000215000000400500000012010022400600000001000203000000401e0000000100021c00000040220000000100021d0000004023000000010002150000004024000000411c000000730001000201000000400100000010000000000000000040020000001200004003000000120000401300000012000040040000001200004005000000120000400600000001000203000000401e0000000100021c00000040220000000100021d000000402300000001000215000000402400000041"
+  - name: sc_patch
+    type: store_effect
+    key_prefix: "/pods/"
+  - name: sc_record
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/scheduler.uproc rc
+      decision: "010500000012000100020200000010c800000000000000200026000000680101000201000000400100000010030000000000000040020000000100021e0000004003000000120c002e5363686564756c65642e3040110000001215007b226d65746164617461223a7b226e616d65223a224004000000010002230000004005000000121b002e5363686564756c65642e30222c226e616d657370616365223a224006000000010002220000004007000000122f00227d2c22696e766f6c7665644f626a656374223a7b226b696e64223a22506f64222c226e616d657370616365223a224008000000010002220000004009000000120a00222c226e616d65223a22400a00000001000223000000400b000000123c00227d2c22726561736f6e223a225363686564756c6564222c226d657373616765223a225375636365737366756c6c792061737369676e656420746f20400c00000001000224000000400d000000121c00222c2274797065223a224e6f726d616c222c22636f756e74223a317d400e000000410a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000401100000041"
+  - name: sc_events
+    type: store_effect
+    key_prefix: "/events/"
+  # the ready-nodes projection (the DaemonSet chain's rdy decision)
+  - name: ds_nodes
+    type: store_source
+    prefix: "/nodes/"
+    paths: "status.ready"
+  - name: ds_ready
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc rdy
+      decision: "01050000001000010002040000001204007472756520000b00000030000100020100000040010000001003000000000000004002000000010002030000004003000000120100314004000000410b0000002f000100020100000040010000001004000000000000004002000000010002030000004003000000120000400400000041"
+  - name: ds_mark
+    type: store_effect
+    key_prefix: "/ready-nodes/"
+
+# Self-edge: the scheduler's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: sc_unbound.status
+    to: sc_unbound.changes
+  - from: sc_unbound.record_out
+    to: sc_bind.record_in
+  - from: sc_bind.result_out
+    to: sc_patch.request_in
+    buffer_group: 111
+  - from: sc_patch.response_out
+    to: sc_record.record_in
+  - from: sc_record.result_out
+    to: sc_events.request_in
+    buffer_group: 112
+  - from: ds_nodes.status
+    to: ds_nodes.changes
+  - from: ds_nodes.record_out
+    to: ds_ready.record_in
+  - from: ds_ready.result_out
+    to: ds_mark.request_in
+    buffer_group: 41

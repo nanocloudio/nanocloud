@@ -1,0 +1,185 @@
+// Endpoints as params. Three chains.
+//   slice   /services/ JOIN /pods/ scoped to the namespace, with the label
+//           selector as the join predicate (65) and the pod's readiness, IP
+//           and uid projected (60..62); the probe runner's verdict, when it
+//           has one, overrides readiness -> /endpointslices/<ns>/<svc>/<pod>
+//           = ip, or deleted
+//   prune   a slice whose pod is gone
+//   doc     /services/ with list_children over /endpointslices/ ->
+//           /endpoints/<ns>/<svc> = "<pod>=<ip>,…" — the consumers' document,
+//           unchanged; a materialised view of the slices
+module nanocloud.endpoints {
+
+  message ep.Pair {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    pod: string = 21;     // the pod's name
+    podkey: string = 24;  // its full key
+    ready: string = 60;   // status.ready
+    ip: string = 61;      // status.podIP
+    uid: string = 62;     // metadata.uid
+    hit: string = 65;     // "1" when labels ⊇ selector
+  }
+  message ep.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the uid, under /probe-status/
+    c_key: string = 30;   // "<ns>/<svc>"
+    c_pod: string = 31;
+    c_ready: string = 32;
+    c_ip: string = 33;
+    c_hit: string = 34;
+  }
+  message ep.Probe {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_pod: string = 31;
+    c_ready: string = 32;
+    c_ip: string = 33;
+    c_hit: string = 34;
+    pready: string = 40;  // ready= from the probe record
+  }
+  message ep.Slice {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    sep: string = 17;     // "/"
+    pod: string = 18;
+    v1: string = 4;       // the ip
+  }
+
+  message ep.Sl {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<svc>/<pod>"
+    ns: string = 28;
+    pod: string = 29;
+  }
+  message ep.Exists {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // ns
+    sep: string = 17;
+    pod: string = 18;
+    c_key: string = 30;
+  }
+  message ep.Known {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+  }
+  message ep.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+
+  message ep.Svc {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    selector: string = 4;   // spec.selector; a Service without one has no endpoints
+    list: string = 56;      // "<pod>=<ip>,…"
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // Ask the probe runner when the pod has a uid; otherwise the static
+  // readiness stands (a NOOP answers 204 and carries everything).
+  decision ask(p: ep.Pair) -> ep.Ask {
+    when p.uid != "" ->
+      ep.Ask { cid: p.seq, op: GET, key: p.uid,
+               c_key: p.key, c_pod: p.pod, c_ready: p.ready, c_ip: p.ip, c_hit: p.hit };
+    default ->
+      ep.Ask { cid: p.seq, op: NOOP, key: "",
+               c_key: p.key, c_pod: p.pod, c_ready: p.ready, c_ip: p.ip, c_hit: p.hit };
+  }
+  // Included when matched, addressed, and ready — the probe's verdict when
+  // it has one, the static field otherwise. Excluded is a delete-if-present.
+  decision slice(a: ep.Probe) -> ep.Slice {
+    when a.c_hit == "1" && a.c_ip != "" && a.status == 200 && a.pready == "1" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.c_key, sep: "/", pod: a.c_pod, v1: a.c_ip };
+    when a.c_hit == "1" && a.c_ip != "" && a.status != 200 && a.c_ready == "true" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.c_key, sep: "/", pod: a.c_pod, v1: a.c_ip };
+    default ->
+      ep.Slice { cid: a.cid, op: DELETE, key: a.c_key, sep: "/", pod: a.c_pod, v1: "" };
+  }
+
+  decision exists(s: ep.Sl) -> ep.Exists {
+    default ->
+      ep.Exists { cid: s.seq, op: EXISTS, key: s.ns, sep: "/", pod: s.pod, c_key: s.key };
+  }
+  decision prune(k: ep.Known) -> ep.Act {
+    when k.status == 404 ->
+      ep.Act { cid: k.cid, op: DELETE, key: k.c_key, v1: "" };
+    default ->
+      ep.Act { cid: k.cid, op: NOOP, key: "", v1: "" };
+  }
+
+  decision doc(v: ep.Svc) -> ep.Act {
+    when v.selector == "" ->
+      ep.Act { cid: v.seq, op: NOOP, key: "", v1: "" };
+    when v.list == "" ->
+      ep.Act { cid: v.seq, op: DELETE, key: v.key, v1: "" };
+    default ->
+      ep.Act { cid: v.seq, op: PUT, key: v.key, v1: v.list };
+  }
+
+  transformation pass_pair(p: ep.Pair) -> ep.Pair {
+    ep.Pair { seq: p.seq, rev: p.rev, key: p.key, pod: p.pod, podkey: p.podkey,
+              ready: p.ready, ip: p.ip, uid: p.uid, hit: p.hit }
+  }
+  transformation pass_probe(a: ep.Probe) -> ep.Probe {
+    ep.Probe { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_pod: a.c_pod,
+               c_ready: a.c_ready, c_ip: a.c_ip, c_hit: a.c_hit, pready: a.pready }
+  }
+  transformation pass_sl(s: ep.Sl) -> ep.Sl {
+    ep.Sl { seq: s.seq, rev: s.rev, key: s.key, ns: s.ns, pod: s.pod }
+  }
+  transformation pass_known(k: ep.Known) -> ep.Known {
+    ep.Known { cid: k.cid, status: k.status, value: k.value, c_key: k.c_key }
+  }
+  transformation pass_svc(v: ep.Svc) -> ep.Svc {
+    ep.Svc { seq: v.seq, rev: v.rev, key: v.key, selector: v.selector, list: v.list }
+  }
+  pipeline ak(p: ep.Pair) -> ep.Ask {
+    call x = pass_pair(p);
+    call y = ask(x);
+    return y;
+  }
+  pipeline sl(a: ep.Probe) -> ep.Slice {
+    call x = pass_probe(a);
+    call y = slice(x);
+    return y;
+  }
+  pipeline ex(s: ep.Sl) -> ep.Exists {
+    call x = pass_sl(s);
+    call y = exists(x);
+    return y;
+  }
+  pipeline pr(k: ep.Known) -> ep.Act {
+    call x = pass_known(k);
+    call y = prune(x);
+    return y;
+  }
+  pipeline dc(v: ep.Svc) -> ep.Act {
+    call x = pass_svc(v);
+    call y = doc(x);
+    return y;
+  }
+  entry ak = ak;
+  entry sl = sl;
+  entry ex = ex;
+  entry pr = pr;
+  entry dc = dc;
+  provenance revision "endpoints-join" toolchain "chronicle-authoring";
+}

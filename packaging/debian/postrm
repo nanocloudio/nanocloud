@@ -9,6 +9,9 @@ fi
 case "$1" in
     purge)
         rm -f /etc/default/nanocloud
+        # Generated at postinst (bundle emit) / runtime (store, state).
+        rm -rf /usr/lib/nanocloud/fluxor/target/fluxor \
+               /var/lib/nanocloud.io/fluxor
     ;;
 esac
 

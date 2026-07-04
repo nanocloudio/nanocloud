@@ -1,0 +1,28 @@
+# autoscale graph: hpa_reconciler + deployment_
+# reconciler + replicaset_reconciler on one shared store — the full feedback
+# loop. The HPA reads metrics and turns the Deployment's replicas knob; the
+# reconcilers cascade the new count to Pods. Metrics up → scale up → more Pods;
+# metrics down → scale down → fewer Pods. Closed-loop autoscaling as modules.
+target: linux
+tick_us: 1000
+
+# The self-edges below (each a change-sink allocator) are deliberate 1-node cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: hpa_reconciler
+  - name: deployment_reconciler
+  - name: replicaset_reconciler
+
+# Self-edges: each reconciler's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. A
+# module cannot open a channel itself; it never writes this output, only drains
+# the pushed events from the input.
+wiring:
+  - from: hpa_reconciler.status
+    to: hpa_reconciler.changes
+  - from: deployment_reconciler.status
+    to: deployment_reconciler.changes
+  - from: replicaset_reconciler.status
+    to: replicaset_reconciler.changes

@@ -1,0 +1,59 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Kubelet — nanocloud's METAL pod runtime as a PIC module, the fmod-graph
+# sibling of `sandbox_runner`. It watches the control-plane store for desired
+# metal (fmod-graph) pods projected by `pod_lifecycle` (the shared DECISION
+# half), composes each pod's named workload TEMPLATE into a FLXA subgraph, and
+# drives the METAL backend of the `workload` capability surface (contract
+# 0x1A, source_kind = FMOD_GRAPH — the metal `workload_graph` provider
+# registered on bcm2712): CREATE/START/WAIT/DESTROY/SIGNAL/PAUSE/RESUME,
+# writing pod status back to the store. A metal pod is a composition of flash
+# fmods with its own IP identity, not a container image.
+
+# Composing an owned subgraph + installing a net identity is privileged: every
+# 0x1Axx op additionally requires platform_raw on top of requires_contract =
+# "workload" (the same gate sandbox_runner carries — creating host/metal
+# workloads is powerful; only the kubelet and peers get it).
+permissions = ["platform_raw"]
+
+# Cadence-independent: no tick-based timekeeping — polls its watch and the
+# liveness of live pods each step.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above.
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The workload capability surface (0x1A) — owned-subgraph metal execution.
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
+# The control-plane store — desired metal-sandbox specs in, status out.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the pod status keys it writes and the lifecycle it drives.
+[observability]
+exempt = "Metal pod runtime reconciler — provider-driven, emits no telemetry stream"

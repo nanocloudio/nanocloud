@@ -1,0 +1,129 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Store source — the subscription-driven entry into a Chronicle graph.
+#
+# A reconciler is not request/response: nothing invokes it. The store pushes a
+# change and the graph must run. This module is that entry: it SUBSCRIBEs a
+# prefix, and on any change re-emits one Chronicle v1 record frame per object
+# under it, with configured dotted JSON paths projected into flat fields.
+#
+# Level-triggered by design, exactly like every nanocloud reconciler: a change
+# anywhere under the prefix re-emits the set rather than trying to compute a
+# delta. Downstream stays idempotent (validators write status put-if-changed),
+# so a re-emit costs a pass, never a revision.
+#
+# This is the answer to the two things Chronicle cannot do for itself:
+#   * it has no iteration, so it cannot walk a prefix — the source does;
+#   * its record frame is flat, so it cannot read `spec.to.name` — the source
+#     projects it, with nanocloud's `j_*` helpers, because the JSON schema is
+#     nanocloud's to own.
+#
+# Frame (record_out):
+#   1 = seq   (i64)    monotonic per source instance — the correlation a
+#                      subscription entry has instead of a request id
+#   2 = rev   (i64)    store revision the object was read at
+#   3 = key   (bytes)  the object's key tail, below the prefix
+#   4.. = one field per `paths` entry, in order, as bytes ("" when absent)
+# `flat = 1` reads `k=v;k=v` records instead of nested JSON, each `paths` entry
+# naming a field. Both shapes are in the control plane — k8s objects are JSON,
+# the internal projections are flat.
+#
+# `expand = <path>` emits one record PER INDEX 0..count(+expand_tail) instead of
+# one per object, with a trailer at fixed numbers: 19 `<tail>-<i+1>`, 20 index
+# (i64), 21 index as digits, 22 count (i64), 23 predecessor as digits, 24
+# `<tail>-<i>`, 25 `<tail>-<i-1>`, 26 `<last-segment>-<i>`. `expand_over =
+# <children's prefix>` extends the range past the highest existing child, so a
+# surplus far above the count is still probed.
+#
+# Always: 28 = the key tail's first segment (the namespace under a namespaced
+# prefix), 29 = its last (the name). Documents may lack metadata.namespace —
+# the CLI's do — and the key is the truth; a decision cannot split it.
+#
+# `join = <prefix,…>` emits one record per (object, entry under <prefix>) — the
+# set-shaped sibling of `expand`: 20 index, 21 the joined entry's last segment,
+# 22 count, 24 `<tail>-<seg>`, 26 `<lastseg>-<seg>`. A path ending in `.*`
+# projects an object's MEMBERS (braces stripped) so a decision can splice one
+# more member in with literals. `join_scoped = 1` scopes each join prefix to
+# the object (`<prefix><tail>/…`) and puts the joined entry's FULL key at 24 —
+# a namespace's contents across every namespaced tree, one record each.
+# `join_scoped = 2` scopes to the namespace segment instead. `join_match =
+# "<joined path>:<object path>"` puts "1" at 65 when the joined object's path
+# is a superset of the object's (a label selector); `join_paths` projects the
+# joined object's fields at 60..64. `list_children = <prefix>` materialises the
+# object's children as `<name>=<value>,…` at 56.
+# `child_sep` (default `-`) is the byte between tail and child for
+# `count_children`/`expand_over`; `/` for a namespace's objects.
+#
+# `count_children = <prefix>` puts the number of children `<prefix><tail>-*` at
+# 22 (and as digits at 21) on a plain record; `desired = <path>` puts that
+# path, as an integer, at 20 — a per-object fold and its target, comparable.
+#
+# `related = "<prefix>:<path>,…;<prefix>:<path>"` projects the SAME KEY under
+# another prefix — ten fields per prefix from 70 (70..79, 80..89, …). Every
+# plane here is keyed by the same id, so "the other facts about this object"
+# is a lookup, not a join, and a chain that would need a read stage each
+# needs none. A path with a trailing `#` projects as an INTEGER.
+#
+# `now = 1` stamps the monotonic ms clock at 58 on every record of a scan.
+# `due = <path,…>` names fields holding deadlines in that clock: the earliest
+# one ahead arms a kernel timer, the kernel steps the source when it fires,
+# and the record is emitted with `now` past its deadline. Deadlines live in
+# the store; the timer is the alarm clock; nothing polls.
+#
+# `count = 1` walks the listing twice — count, then emit — stamping every record
+# with its listing position (20, i64) and the total (22, i64). A cap over a
+# prefix ("keep the newest N") is then an ordinary per-record decision; nothing
+# else can tell one record the size of the set it is in. Not combined with
+# `expand`: the two meanings of field 20 are different and never both emitted.
+# `now`/`due` read the monotonic clock. Correct under any cadence — the value
+# is real elapsed time, never a tick count — which is what wall_clock means.
+timer_class = "wall_clock"
+
+# The store pushes namespace.change events onto this input. The graph allocates
+# the channel by self-wiring `status` -> `changes`.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+# record_out is the PRIMARY output: `module_new` hands it over directly, so the
+# hot path never depends on resolving a port by index.
+[[ports]]
+name = "record_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+required = true
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (`debug`, this repo's modules) needs mailbox and
+# says so on its own INPUT port; a graph feeding such a consumer sets
+# `buffer_group` on the edge, as store-source-e2e.sh does.
+
+[[ports]]
+name = "status"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+# `due` arms a kernel timer fd for the earliest deadline in the records; the
+# kernel steps this module when it fires. A timer is an fd.
+[[resources]]
+requires_contract = "timer"
+access = "write"
+
+[observability]
+exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"

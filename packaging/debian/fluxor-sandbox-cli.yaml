@@ -1,0 +1,37 @@
+# Combined node-runtime + CLI graph: sandbox_runner (owns containers, services
+# exec/logs) and nanocloud_cli (arms requests, reads objects) in ONE runtime.
+#
+# Why one runtime, not two: fluxor's store is single-writer (no flock, no
+# multi-process WAL) AND the workload backend's container slots live in the
+# spawning process's memory. So the CLI can only reach a sandbox_runner-owned
+# container — for exec/logs — from the SAME runtime that spawned it. A separate
+# `fluxor exec nanocloud` process can neither share the store nor see the slots.
+#
+# Proven: `-- get pods` lists workloads; `-- exec <id> -- <cmd>` runs a command
+# inside the live container and returns its output; `-- logs <id>` streams it.
+#
+# Caveat (run-to-completion vs persistent): nanocloud_cli is run-to-completion
+# while sandbox_runner is long-lived, so with a running container the runtime
+# does not self-exit (the CLI's output still prints). The clean persistent model
+# -- one long-lived control-plane runtime + CLI-over-apiserver-HTTP -- is the
+# production target; this graph proves the in-runtime CLI<->sandbox seam.
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+modules:
+  - name: sandbox_runner
+  - name: nanocloud_cli
+wiring:
+  - from: sandbox_runner.status
+    to: sandbox_runner.changes
+  - from: cli_in.args_out
+    to: nanocloud_cli.args
+  - from: cli_in.stdin_out
+    to: nanocloud_cli.stdin
+  - from: nanocloud_cli.stdout
+    to: cli_out.bytes_in
+  - from: nanocloud_cli.exit
+    to: cli_out.exit_in

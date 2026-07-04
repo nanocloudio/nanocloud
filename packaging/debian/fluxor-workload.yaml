@@ -1,0 +1,26 @@
+# workload-chain graph: the deployment_reconciler and
+# replicaset_reconciler fmods together on the shared control-plane store, forming
+# the full desired-state chain Deployment → ReplicaSet → Pods. The API plane
+# creates a Deployment; deployment_reconciler projects the ReplicaSet; replicaset_
+# reconciler materialises the Pods; pod_lifecycle (separate graph) then turns
+# Pods into sandboxes. Each is a pure store transform; they compose only through
+# the store (storage.object + storage.namespace).
+target: linux
+tick_us: 1000
+
+# The self-edges below (change-sink allocators) are deliberate 1-node cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: deployment_reconciler
+  - name: replicaset_reconciler
+
+# Self-edges: each reconciler's own output feeds its `changes` input, allocating
+# a module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes the output; it drains pushed events from the input.
+wiring:
+  - from: deployment_reconciler.status
+    to: deployment_reconciler.changes
+  - from: replicaset_reconciler.status
+    to: replicaset_reconciler.changes

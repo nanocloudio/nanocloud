@@ -1,0 +1,52 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# The nanocloud CLI as a fluxor cli-applet fmod: ONE PIC module dispatches
+# nanocloud subcommands (status/get/describe/create/apply/delete/scale,
+# rollout, watch, logs, exec, diagnostics, policy, volume, config, bundle, ca,
+# token), reading argv from cli_in and driving the control-plane store. The
+# `cli` stack injects the host I/O surface (cli_in/cli_out). Installed + run
+# as `fluxor exec nanocloud -- <cmd>` (busybox symlink → `nanocloud <cmd>`).
+# On-node commands read the store directly; remote/API-backed commands are a
+# follow-up (need a net/api-client surface).
+timer_class = "agnostic"
+
+# argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
+[[ports]]
+name = "args"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# stdin bytes (from cli_in.stdin_out) — consumed only by interactive `exec -it`.
+[[ports]]
+name = "stdin"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# stdout → cli_out.bytes_in.
+[[ports]]
+name = "stdout"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# exit code [i32 LE] → cli_out.exit_in.
+[[ports]]
+name = "exit"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "One-shot CLI command dispatcher — reads the store, prints, exits"

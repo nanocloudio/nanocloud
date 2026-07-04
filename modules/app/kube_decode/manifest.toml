@@ -1,0 +1,60 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Kubernetes request decoder — the typed seam between wave's HTTP fan-out and
+# Chronicle's engines.
+#
+# Chronicle's VM has no iteration by construction, so it cannot split a
+# variable-arity URL path into segments; and its record frame is flat, so it
+# cannot read `spec.to.name` out of nested Kubernetes JSON. Both are ordinary
+# domain concerns, and domain logic lives in compiled per-domain modules
+# composed as graph nodes — the relationship wave's `s3` has to the OCI
+# registry example. This is nanocloud's counterpart.
+#
+# It reshapes bytes and decides nothing: no routing, no authorization, no
+# admission meaning. Those stay in params, which is what keeps the thesis
+# ("the logic is data") intact.
+#
+# In:  wave HttpRequest envelope on `req_in`
+#        [conn_id u16][stream_id u16][method u8][flags u8]
+#        [path_len u16][hdr_len u16][body_len u16] then path, headers, body
+# Out: a Chronicle v1 record frame on `record_out`
+#        [count u8] then count x [number u8][type u8][len u16 LE][payload]
+#        1 = wave_request_id  (i64) — the first FOUR envelope bytes, opaque
+#        2 = method           (i64)
+#        3 = resource         (bytes)
+#        4 = namespace        (bytes)
+#        5 = name             (bytes)
+#        6 = body             (bytes, truncated at `max_body`)
+#
+# Field 1 is the four correlation bytes carried whole and never re-split, per
+# webhook.md's "shared invocation context": conn_id alone mis-routes as soon as
+# a client opens parallel HTTP/2 streams.
+
+timer_class = "agnostic"
+
+[[ports]]
+name = "req_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "record_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (this repo's modules, `debug`) does need mailbox,
+# and declares it on its own INPUT port.
+
+[observability]
+exempt = "a pure byte reshaper on the request path — observed through the wave envelope it consumes and the engine it feeds"

@@ -1,239 +1,192 @@
 # Nanocloud
 
-Nanocloud is a single-binary container platform that delivers a Kubernetes-flavoured control plane, runtime, and curated application catalog to a standalone node. The binary you build is the same binary that runs the HTTPS API server, controllers, keyspace store, kubelet, and CLI, so you can provision, patch, and observe services without first assembling a cluster.
+Nanocloud is a Kubernetes control plane built entirely from [fluxor](../fluxor/)
+modules. The apiserver, the request pipeline, every reconciler, the node
+runtime and the CLI are `no_std` position-independent modules (`.fmod`) that
+run as cooperating nodes of a fluxor graph over one shared store. There is no
+host binary and no separate database: install the package, start one systemd
+unit, and the node serves the Kubernetes API.
 
 ## Highlights
-- **Single deployment artifact** – `nanocloud` embeds the API server, watchable Keyspace store, controller manager, kubelet, and OCI runtime.
-- **Kubernetes-aligned APIs** – bundles, pods, configmaps, events, and watch semantics mirror Kubernetes conventions while remaining local.
-- **Self-contained runtime stack** – built-in CNI bridge (`nanocloud0`), CSI driver, streaming backup engine, encrypted secret store, and a Rust OCI runtime replace external dependencies.
-- **Dockyard images** – curated images hosted at `registry.nanocloud.io` advertise options, defaults, and bindings through the `io.nanocloud.options` label.
-- **Bindings-first configuration** – service relationships (database, TLS, identity) are expressed once in image metadata and enforced during reconciliation.
-- **Operational safety** – TLS-only APIs, client-certificate bootstrap flows, exec/session metrics, and declarative backup retention ship out of the box.
-- **In-cluster DNS** – an embedded authoritative DNS server answers `*.svc.<cluster_domain>` and headless endpoint hostnames with automatic `resolv.conf` injection for pods.
-- **Event stream CLI & metrics** – `nanocloud events` mirrors Kubernetes watches, supports `--since`, `--level`, and `--reason` filters plus `--follow`, and the control plane emits Prometheus metrics and structured logs that align with the stream semantics.
 
-## Architecture in Brief
+- **The control plane is a graph.** `fluxor run controlplane.yaml` starts the
+  apiserver, the authn → authz → admission → CRUD pipeline, and every workload
+  controller as modules in a single runtime. Composition is a YAML graph, not a
+  process tree.
+- **Kubernetes-shaped API.** `kubectl` talks to it directly: core/v1,
+  `apps/v1`, `discovery.k8s.io/v1`, `node.k8s.io/v1` and `nanocloud.io/v1`
+  discovery documents, list/get/create/update/delete, and `?watch=true`
+  watches fenced on the store's own revisions.
+- **One store, single writer.** Control-plane state lives in fluxor's
+  `storage.object` / `storage.namespace` contracts — versioned keyed bytes with
+  compare-and-swap, prefix listing and change subscriptions. The graph is its
+  only writer, so a watch is a projection of the store's revision stream rather
+  than a poll.
+- **Host facts stay behind capability surfaces.** A module never calls libc.
+  Sockets arrive through `linux_net`/`tls`, containers through the `workload`
+  contract, files through `fs`, private keys through the kernel key vault — each
+  one a contract admission can gate.
+- **Decision and effect are separate.** Controllers compute; the node's backends
+  act. The network compilers publish an nftables ruleset to the store rather
+  than programming the kernel themselves; the kubelet's decision half projects
+  desired sandboxes, and the runner performs them.
+- **Behaviour is proven on real binaries.** There are no unit tests to mock the
+  seams: `make test` boots the built `.fmod` artefacts in a fluxor runtime and
+  drives them over real HTTP, the real store, and real mTLS.
+
+## Architecture
 
 ```mermaid
 flowchart TD
-    CLI["Nanocloud CLI"] -->|HTTPS| API["API server"]
-    API --> Keyspace[(Keyspace KV store)]
-    API --> Controllers
-    Controllers -->|plans| Kubelet
-    Kubelet --> Runtime["OCI runtime / CNI + CSI"]
-    Runtime --> Services["Managed services (Dockyard catalog + custom)"]
-    Controllers --> Events["Event bus & Metrics"]
+    CLI["nanocloud CLI (cli applet fmod)"] --> Store[("control-plane store<br/>storage.object / storage.namespace")]
+    Client["kubectl / HTTPS client"] --> TLS["linux_net → tls"]
+    TLS --> Ingress["api_ingress<br/>HTTP/1.1 + k8s JSON"]
+    Ingress --> Pipe["authn → rbac_gate → api_admission → core_api"]
+    Pipe --> Store
+    Store --> Ctrl["controllers: deployment, replicaset, daemonset,<br/>statefulset, job, hpa, gc, namespace, scheduler"]
+    Ctrl --> Store
+    Store --> Node["pod_lifecycle → sandbox_runner → workload contract"]
+    Store --> Net["endpoints, service_ipam, service_dns,<br/>proxy/netpolicy/route compilers"]
 ```
 
-- **CLI & HTTP API** – CLI subcommands (`install`, `status`, `exec`, etc.) share the same API server endpoints your automation can call.
-- **Keyspace** – a file-backed, watchable key/value store persists bundle specs, workload state, secrets, and controller metadata with TTL support.
-- **Controllers** – bundle, stateful set, network policy, and snapshot controllers reconcile specs into actionable plans while emitting Kubernetes-style events.
-- **Kubelet & runtime** – a Rust kubelet uses the local OCI runtime to pull Dockyard images, apply CNI/CSI configuration, mount encrypted volumes, and supervise containers.
-- **Exec surface** – the HTTPS API exposes `/api/v1/namespaces/{namespace}/pods/{name}/exec` and `/api/v1/pods/{name}/exec` with WebSocket/HTTP upgrades so `nanocloud exec` can stream stdin/stdout/stderr and request TTY sessions over TLS.
+Every arrow into or out of the store is a contract call, and the API and
+controller modules never address each other directly — the only direct channels
+are the net streams at the edge and each module's own change sink. A request is
+admitted at the edge, written once, and every controller that cares wakes on
+the change and writes its own outputs back. [docs/architecture/modules.md](docs/architecture/modules.md) describes
+each module, the keys it owns, and the capability surfaces it holds.
 
-### Install Flow
+## Install
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant CLI
-    participant API
-    participant Bundles
-    participant Controller
-    participant Kubelet
-    participant Runtime
-
-    User->>CLI: nanocloud install gitea --option database=mariadb
-    CLI->>API: POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles (Bundle)
-    API->>Bundles: Persist Bundle (Keyspace)
-    Bundles-->>Controller: Watch event (ADD/MODIFIED)
-    Controller->>Runtime: Resolve Dockyard image & options<br/>process bindings & required services
-    Controller->>Kubelet: Apply workload plan
-    Kubelet->>Runtime: Pull image, configure CNI/CSI,<br/>mount secrets, execute bindings
-    Runtime-->>Kubelet: Container ready
-    Kubelet-->>API: Pod status + events
-    API-->>CLI: Install complete
-```
-
-## Dockyard Images & Bindings
-
-Dockyard is the official image library bundled with Nanocloud. Each image advertises a structured option surface via the `io.nanocloud.options` label:
-
-- **Options with decorators** – `?optional`, `name=value`, `*requires_option`, and `&binding` modifiers describe defaults, dependencies, and whether an option selects another service.
-- **Macros** – runtime helpers like `!dns`, `!local_ip`, `!rand <len> <charset>`, `!tls <key|cert|ca>`, and `!if key=value` inject environment-aware values without templating.
-- **Bindings** – when an option selects another service (`database=&mariadb`), binding templates describe the commands required to finish bootstrapping (user creation, TLS export, etc.). During reconciliation Nanocloud expands the templates, executes them inside the dependent workload namespace, and records the outcome.
-- **Profiles** – resolved options, secrets, and bindings are written back to the bundle profile so restarts, updates, and snapshots rehydrate the exact configuration.
-
-As a result, a command such as `nanocloud install gitea --option database=mariadb --option database_transport=tls` carries enough metadata for Nanocloud to negotiate MariaDB credentials, request TLS material, seed volumes, and boot the service without additional scripts.
-
-## Install Locally
+The package is built from this checkout against a sibling fluxor tree:
 
 ```bash
-make release && make package && sudo make install
+fluxor update && fluxor sync            # resolve + materialise deps and the SDK
+make build                              # build modules/app/* for bcm2712
+packaging/debian/build.sh               # stage the .deb
+tools/install_deb.sh                    # dpkg -i the newest build, restart the unit
 ```
 
-Requires a standard Rust toolchain installation (e.g., via `rustup`) so the `cargo` build can run; the sequence produces a Debian package and installs it on the host.
+The package installs the fluxor CLI and runtime, every nanocloud `.fmod`, the
+control-plane graph (`/etc/nanocloud.io/fluxor/controlplane.yaml`), the node and
+image-plane graphs, and a systemd unit that runs the control-plane graph with
+`FLUXOR_STORE_DIR` pointed at `/var/lib/nanocloud.io/control-plane/store`.
+`/usr/bin/nanocloud` is a busybox-style symlink to `fluxor`, so `nanocloud <cmd>`
+dispatches the `nanocloud_cli` applet.
 
-## Getting Started
+## Using it
 
 ```bash
-# Prepare secure assets, network bridge, and backup retention
-sudo nanocloud setup
+sudo systemctl start nanocloud          # run the control-plane graph
 
-# Copy the single-use token emitted at the end of setup
-TOKEN="<paste token here>"
-
-# Generate a kubeconfig installer script and apply it
-nanocloud config --token "$TOKEN" | sh
-
-# Run the HTTPS control plane (default 127.0.0.1:6443)
-sudo nanocloud server --listen 0.0.0.0:6443
-
-# Install a Dockyard workload with default
-nanocloud install kafka
-# DNS inside pods resolves services at <name>.<namespace>.svc.cluster.local
-
-# Monitor the service
-nanocloud status
-nanocloud logs kafka --follow
-nanocloud exec kafka -- sh
+nanocloud status                        # cluster object counts
+nanocloud get pods                      # list object names under a resource
+nanocloud get pods default/web-0        # show one object's stored fields
+nanocloud describe pods default/web-0   # a labelled read of one object
+nanocloud apply deployments default/web '{"spec":{"replicas":3, ...}}'
+nanocloud scale deployments default/web 5
+nanocloud delete pods default/web-0
+nanocloud rollout status default/web    # progress against the current template
+nanocloud rollout undo default/web      # restore the archived previous template
+nanocloud watch pods                    # stream a listing as it changes
+nanocloud logs -f <sandbox>             # a sandbox's stdout/stderr
+nanocloud exec -it <sandbox> -- sh      # a command inside a sandbox
+nanocloud diagnostics                   # counts across every resource + health
+nanocloud policy                        # NetworkPolicies + the compiled ruleset
+nanocloud volume                        # PVCs and the volumes bound to them
+nanocloud bundle export > cluster.txt   # every object as `<key>\t<json>` lines
+nanocloud bundle apply < cluster.txt    # recreate them from that dump
+nanocloud token default-sa default      # mint a ServiceAccount JWT
+nanocloud ca                            # print the cluster CA certificate
 ```
 
-### Frequently Used Commands
-- `nanocloud install|start|stop|restart <service>` – manage workloads.
-- `nanocloud uninstall <service> --snapshot backups/service.tar` – tear down while streaming the latest backup tarball.
-- `nanocloud config --user admin --token <value>` – emit kubeconfigs backed by single-use tokens or client certificates.
-- `nanocloud diagnostics` – reconcile local CNI artifacts and nftables rules.
-- `nanocloud volume unlock --device /dev/loop0 --key <name>` – manage encrypted volumes exported by services.
-
-## REST API Surface
-
-Nanocloud exposes Kubernetes-style endpoints for its custom resources alongside convenience endpoints for lifecycle helpers. The core Kubernetes APIs under `/api/v1` and `/apis/apps/v1` are implemented as well, so existing tooling such as `kubectl` can talk to the Nanocloud server without translation:
+The CLI drives the store directly through the storage contracts, so it works
+without the HTTP edge. `kubectl` reaches the same objects over the API, which
+`api_ingress` serves on :7443:
 
 ```bash
-# Stream pods across every namespace using the upstream watch semantics
-kubectl --kubeconfig <(nanocloud config --token "$TOKEN") get pods -A --watch --server https://127.0.0.1:6443
+kubectl --server https://127.0.0.1:7443 get pods -A --watch
 ```
 
-### Kubernetes Core APIs
+## The API surface
 
-| Resource | Endpoint(s) | Highlights |
-| -------- | ----------- | ---------- |
-| Pods | `GET/POST /api/v1/namespaces/{namespace}/pods`, `GET /api/v1/pods` | Supports `fieldSelector`, `labelSelector`, pagination, `resourceVersionMatch`, bookmarkable watches, table output, and `/exec`/`/log` subresources. |
-| Services & Endpoints | `/api/v1/namespaces/{namespace}/services`, `/endpoints` | ClusterIP allocation, watch streams, and selectors follow Kubernetes casing and validation. |
-| ConfigMaps & Secrets | `/api/v1/namespaces/{namespace}/configmaps`, `/secrets` | schema-compatible payloads, encryption enforced for secrets. |
-| Events | `/api/v1/events`, `/api/v1/namespaces/{namespace}/events` | Mirrors Kubernetes `Event` objects so `kubectl get events --watch` works with `--field-selector`. |
-| Deployments, ReplicaSets, StatefulSets, DaemonSets | `/apis/apps/v1/...` | List/watch/get endpoints expose controller-owned metadata, status blocks, and server-side pagination. |
-| Jobs | `/apis/batch/v1/...` | Job status and owner references align with upstream semantics for compatibility with CI/CD tooling. |
+| Group | Resources |
+| ----- | --------- |
+| core/v1 | pods (+ `pods/log`, `pods/exec`), services, endpoints, configmaps, secrets, events, persistentvolumeclaims |
+| apps/v1 | deployments, replicasets, statefulsets, daemonsets |
+| discovery.k8s.io/v1 | endpointslices |
+| node.k8s.io/v1 | runtimeclasses |
+| nanocloud.io/v1 | bundles, roles, rolebindings, volumesnapshots, certificates |
 
-The handlers behind these endpoints honour `watch=true`, `timeoutSeconds`, `allowWatchBookmarks`, and Kubernetes pagination rules so clients can rely on the same contracts they expect from upstream control planes.
+`api_ingress` serves the discovery documents (`/api`, `/apis`, `/api/v1`,
+`/apis/<group>/<version>`), `/version`, `/healthz`, `/openapi.json` and
+`/metrics` directly, and routes everything else through the request pipeline.
+Namespaced paths (`/apis/<group>/<v>/namespaces/<ns>/<resource>[/<name>]`) and
+cluster-scoped paths both resolve to the same generic CRUD module; a grouped
+resource is keyed group-qualified (`deployments.apps`) so it never collides with
+a same-named resource in another group. `?watch=true` on a collection is served
+by `watch_streamer` as a long poll fenced on the store revision the client last
+saw.
 
-### Nanocloud Resources
+## Security
 
-Custom Nanocloud abstractions complement the core APIs:
+- **TLS at the edge.** The `tls` module terminates TLS 1.3 in front of
+  `api_ingress`. With a peer-auth profile it verifies client certificates and
+  emits a per-session SPIFFE-style peer identity, which `api_ingress` carries
+  into the pipeline as the request's credential.
+- **Signed bearer tokens.** `sa_token` mints ES256 ServiceAccount JWTs, signing
+  by handle against a key held in the kernel key vault, and publishes the
+  verification key for `authn` to load. No credential is ever stored: a token is
+  admitted because its signature verifies, not because a record exists.
+- **Deny-by-default authorization.** `rbac_gate` resolves RoleBindings to Roles
+  and admits a request only when a rule matches its verb and resource.
+- **Admission before the store.** Every mutating request crosses
+  `api_admission`, which validates required fields, applies defaults and
+  enforces per-resource quota against live counts.
+- **Certificates in-module.** `cert_manager` mints X.509 leaves with an
+  in-module ASN.1 DER encoder, signing by handle against a CA key in the kernel
+  key vault so the private key never re-enters the module. It is a
+  development-only issuer and refuses to construct without `development: 1` in
+  its graph — it regenerates its CA at every start, returns leaf private keys
+  as plaintext on the store, and lets the caller choose its own SAN. A
+  deployment issues from kagi's certificate endpoint instead.
 
-- **Bundles (custom resource)**  
-  - `GET, POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles`  
-  - `GET, DELETE /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}`
-- **Devices (custom resource)**  
-  - `GET, POST /apis/nanocloud.io/v1/namespaces/{namespace}/devices`  
-  - `GET, DELETE /apis/nanocloud.io/v1/namespaces/{namespace}/devices/{name}`  
-  - `POST /apis/nanocloud.io/v1/namespaces/{namespace}/devices/certificates`
-- **Ephemeral certificates (cluster-scoped custom resource)**  
-  - `POST /apis/nanocloud.io/v1/certificates`
-- **Bundle lifecycle subresources**
-  - `POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/start`
-  - `POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/stop`
-  - `POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/restart`
-  - `POST /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/actions/uninstall`
-  - `GET /apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/backups/latest`
+## Development
 
-Controller discovery endpoints (`/apis/nanocloud.io/v1`, `/api/v1`) list the available resources for clients that mirror Kubernetes discovery.
+```bash
+make build     # fluxor build   — compile modules/app/* to .fmod
+make test      # fluxor test    — run scripts/*-e2e.sh against the built modules
+make lint      # fluxor lint    — the source-tree hygiene suite
+make ci        # fluxor ci      — lint + strict build + the full E2E gate
+make publish   # fluxor publish
+```
 
-## Runtime & Platform Capabilities
+Each lifecycle target delegates to its `fluxor` verb, which reads this
+project's shape from `fluxor.toml`. There is no cargo crate: the modules are
+`no_std` PIC sources that compile against the SDK `fluxor sync` materialises
+under `target/fluxor/fluxor-abi/sdk/`. `make lint` is therefore the source-tree
+hygiene suite, which needs no build; formatting and clippy compile the PIC
+sources per target, so they run as `make ci` phases.
 
-- **OCI runtime** (`src/nanocloud/oci/runtime.rs`) – pulls layers, constructs bundle roots, mounts encrypted volumes, attaches namespaces, and streams structured logs.
-- **CNI** (`src/nanocloud/cni`) – reconciles the `nanocloud0` bridge, applies per-pod routing, and integrates with the network policy controller.
-- **CSI** (`src/nanocloud/csi`) – provisions volumes, handles `NodePublishVolume` flows, maintains volume inventory, and exposes snapshot APIs.
-- **Controllers** (`src/nanocloud/controller`) – bundle/statefulset/network policy/snapshot controllers coordinate desired state and publish events to the in-memory bus.
-- **Keyspace secrets** (`src/nanocloud/secrets`) – secrets are envelope-encrypted, digested via HMAC, and versioned alongside the backing resource.
-- **Scheduler** (`src/nanocloud/scheduler`) – cron/interval executor backs recurring tasks such as token rotation and diagnostics.
+The hygiene scanner enforces two rules that matter here: every `#[allow]`
+carries a `reason`, and inline `#[cfg(test)]` blocks are forbidden under
+`modules/` — in a `no_std` PIC module they compile away silently, so a green
+run would prove nothing. Behaviour is proven by the graph E2Es in `scripts/`,
+each of which boots a real runtime with the real `.fmod` artefacts and asserts
+on the store and the wire.
 
-## Controller Architecture
-
-Nanocloud’s controller manager mirrors the upstream control loop model so Bundle specs flow into Deployments/ReplicaSets/StatefulSets without translation:
-
-- `src/nanocloud/controller/statefulset.rs` persists bounded rollout plans, tracks revision history, prunes ReplicaSets, and annotates pods with template hashes. Reconcilers block on dependency handles exactly like Kubernetes’ work queues, making per-ordinal rollouts deterministic.
-- `src/nanocloud/controller/replicaset` coordinates ReplicaSetDesiredState objects, emits `ADDED/MODIFIED/DELETED` watch events, and hands plans to the kubelet through the shared runtime channel.
-- Bundle, Snapshot, NetworkPolicy, and Device controllers all share the keyed work queue with per-kind metrics (`docs/controllers.md` covers the mappings) so emitting a Bundle mutation immediately schedules dependent controllers.
-- Every controller writes Kubernetes-style `status.conditions` plus Events, and they respect finalizers (`nanocloud.io/bundle-cleanup`) when tearing workloads down.
-
-## Kubelet & Runtime Internals
-
-The embedded kubelet (`src/nanocloud/kubelet/service.rs`) supervises pods generated by controllers:
-
-- Pod registrations track UID, namespace/name, restart counts, and the latest rendered Pod manifest. Failed pods back off exponentially via `RestartBackoffConfig`, mirroring kubelet retry behaviour.
-- The kubelet streams container logs, honors `/exec` WebSocket upgrades, and publishes status updates that propagate straight to the `/api/v1/pods` endpoints.
-- The OCI runtime (`src/nanocloud/oci/runtime.rs`) is capable of standing alone: it joins namespaces, applies seccomp/AppArmor/capability policies, prepares encrypted dm-crypt volumes, and writes CRI-compatible log files without depending on containerd or runc.
-
-## Networking & Service Discovery
-
-Networking primitives are first-class platform components:
-
-- `src/nanocloud/k8s/service_registry.rs` allocates ClusterIPs from a deterministic range, enforces `spec.clusterIP` immutability, tracks headless services, and emits watch events when selectors or ports change.
-- Endpoints and headless services feed into an embedded DNS registry (`src/nanocloud/dns`) that answers `*.svc.<cluster_domain>` and SRV questions with cached snapshots for low-latency lookups.
-- The CNI bridge and network-policy controller enforce pod-level routing and nftables rules so Services, Endpoints, and policies behave exactly as they would in a single-node Kubernetes cluster.
-
-## Control Plane Plumbing
-
-The remaining control-plane pieces that Kubernetes offloads to etcd, admission controllers, and SSA are embedded directly into Nanocloud:
-
-- Keyspace (`src/nanocloud/util/keyspace.rs`) is a watchable, TTL-aware filesystem store with atomic writes, congestion metrics, and optional per-key locks. Controllers, registries, and the API surface all persist state to dedicated partitions.
-- Every listable endpoint supports resourceVersion-based pagination, watch bookmarks, and `continue` tokens—see `src/nanocloud/server/handlers/pods.rs` and peers for the common parsers and validators.
-- Server-side apply for Bundles lives in `src/nanocloud/server/handlers/bundles.rs` and surfaces field-manager conflicts using the same JSON structure Kubernetes returns, including conflict owners.
-- Secrets stay encrypted at rest, token/bootstrap flows require TLS, and controller-to-runtime communication uses the same event bus and tracing context exposed via `/metrics` and the Events API.
-
-## Backups & Snapshots
-
-- **Streaming backups** – workloads register streaming snapshot callbacks so uninstall flows and `/apis/nanocloud.io/v1/namespaces/{namespace}/bundles/{name}/backups/latest` can deliver artifacts without staging to disk.
-- **Retention** – `kube-system/nanocloud.io` ConfigMap (`backup.retentionCount`) governs per-service retention; pruning runs automatically during bundle lifecycle operations.
-- **Volume snapshots** – the snapshot controller persists `VolumeSnapshot` specs in Keyspace and integrates with the CSI driver to manage artifacts and lifecycle events.
-
-## Observability & Diagnostics
-
-- **Metrics** – Prometheus metrics (exec session counts, keyspace queue depth, CNI health, backup throughput, etc.) publish on `/metrics`.
-- **Events** – Kubernetes-style `Event` objects are generated for bundle phases, reconciler failures, and binding status, making troubleshooting familiar.
-- **Diagnostics** – the CLI streams container logs, exposes watch APIs, checks CNI state, and reports controller findings to shorten feedback loops.
-- **Event CLI** – `nanocloud events --follow` upgrades to server-side watches, honors the same selectors as the HTTP stream, and prints structured rows that show namespace/object/reason/message alongside trace/span metadata.
-
-## Security & Access
-
-- **TLS everywhere** – the server runs with TLS enabled; `NANOCLOUD_REQUIRE_CLIENT_CERTIFICATE=true` enforces mutual TLS for API clients.
-- **Tokens** – `nanocloud token` issues short-lived grants (renderable as QR codes) which can be exchanged for service-account JWTs or client certificates.
-- **Secure assets** – `nanocloud setup` prepares `/var/lib/nanocloud.io/secure_assets`, generates encryption keys, and keeps them off the container filesystem.
-- **Bindings safety nets** – option validation ensures binding prerequisites are satisfied before commands execute, preventing privilege mismatches between workloads.
-
-## Testing & Doc Tests
-
-- `make test` – runs the full workspace suites with deterministic keyspace/secure-asset roots.
-- `make test-security` – exercises the security unit/integration tests **and** the util/security doc tests (`cargo test --doc util::keyspace::` and `cargo test --doc util::security::`).
-- `cargo test --doc <module>::` – runs targeted doc snippets; e.g., `cargo test --doc util::keyspace::` verifies the async/offloading example in `keyspace.rs`.
-
-Keeping doc tests wired into CI ensures the usage examples in `util::error`, `util::keyspace`, and `util::security` remain accurate even as the APIs evolve.
-
-## Device Management
-
-- `nanocloud device` exposes subcommands to list, get, create, and delete device records within namespaces plus issue device certificates by POSTing CSRs. Each command reuses the API client’s authentication plumbing so it inherits TLS, bootstrap, and token support.
-- Devices are represented by the `Device` and `DeviceList` APIs under `apis/nanocloud.io/v1/namespaces/{namespace}/devices`; device certificates leverage the `/devices/certificates` endpoint to return signed PEM bundles and status updates for the issuing flow.
-
-## Project Status
-
-- The runtime, API surface, controllers, binding engine, Keyspace-backed persistence, and streaming backup pipeline are production-ready and covered by automated tests.
-- Dockyard images continue to expand; the option/binding schema is stable and used by the built-in catalog.
-- Kubernetes conformance is not a goal, but Nanocloud intentionally mirrors Kubernetes idioms so manifests, tooling, and mental models stay familiar.
+```
+fluxor.toml / fluxor.lock       project shape and registry-pinned dependencies
+modules/app/<name>/             one module: mod.rs + manifest.toml
+modules/app/_shared/            include-only helpers (JSON, store ops, fields)
+modules/app/_chronicle/         controller rules compiled to Chronicle params
+packaging/debian/               the graphs and bundle sources the .deb ships
+scripts/*-e2e.sh                live graph E2Es — the behaviour gate
+```
 
 ## Contributing
 
-Issues and pull requests are welcome. When authoring Dockyard images, follow the `io.nanocloud.options` schema so new services inherit the same binding and macro capabilities. Runtime or controller changes should include unit tests (`src/nanocloud/**`) and, where relevant, integration coverage (`tests/`).
-
-- Prefer the shared error helpers in `nanocloud::util::error` (see the examples in `src/nanocloud/util/error.rs`) so new code consistently uses `new_error` for user-facing strings and `with_context` when propagating IO or crypto failures.
+Issues and pull requests are welcome. A change to a module lands with the graph
+E2E that proves it: add or extend a `scripts/*-e2e.sh` that boots the module for
+real. Keep decisions in modules and effects behind capability surfaces — if a
+change wants a new host fact, it wants a contract, not a syscall.

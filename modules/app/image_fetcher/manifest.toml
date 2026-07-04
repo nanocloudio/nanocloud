@@ -1,0 +1,78 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Image fetcher — the pull EFFECT: index → platform manifest → config +
+# missing digests → fetch → verify → assemble, with the container blob cache
+# as the assemble backend.
+#
+# `arch`/`os` (default arm64/linux) select the platform manifest out of a
+# multi-arch index; the image config blob is fetched and projected as
+# /image-config/<name>, the runtime contract (Entrypoint/Cmd/Env/WorkingDir/
+# User) that pod_lifecycle turns into argv. `image_puller` computes
+# the missing-layer plan; this module speaks HTTP/1.1 + the OCI distribution
+# API on its net pair (through `tls` in client mode for a CA-pinned registry,
+# or straight to `linux_net` for plaintext), digest-verifies each blob, lands
+# the bytes as content-addressed files via the `fs` contract, and writes the
+# /blobs/<digest> marker that shrinks the plan.
+#
+# Wire path (mirrors ota_registry):
+#   image_fetcher.net_out → tls.clear_in ; tls.clear_out → image_fetcher.net_in
+# or plaintext: linux_net.net_out → image_fetcher.net_in (+ reverse).
+
+# Wall-clock timeouts/backoff (connect/response deadlines, exponential
+# backoff) — dev_millis-based, tolerant of variable tick cadence.
+timer_class = "wall_clock"
+
+# Stream Surface v1 (net_proto): MSG_CONNECTED / MSG_DATA / MSG_CLOSED /
+# MSG_ERROR inbound; CMD_CONNECT / CMD_SEND / CMD_CLOSE outbound. Sized to
+# absorb one full TLS-module step burst (cipher ring 16 KiB, decrypt fan-out
+# ~1:1) with headroom — a blob download is a sustained inbound stream.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 65536
+max_record = 8600
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 8600
+required = true
+
+# The store pushes namespace.change events (for /image-requests/ and
+# /image-pull-plan/) onto this input. The graph allocates the channel by
+# self-wiring `status` -> `changes`; the module passes the handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "status"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+# Store: LIST/SUBSCRIBE the request + plan prefixes; write manifests + markers.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Blob cache: content-addressed files under `blob_dir` (OPEN_CREATE / WRITE /
+# FSYNC / UNLINK / MKDIR via the fs contract's write tier).
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "control-plane puller — emits discrete progress log lines (manifest/blob/verified), not a sustained byte data path"

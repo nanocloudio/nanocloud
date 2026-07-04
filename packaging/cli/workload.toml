@@ -1,0 +1,17 @@
+# Workload source manifest for the `nanocloud` CLI applet. `fluxor install`
+# (run from postinst) registers it so `fluxor exec nanocloud -- <cmd>` — and the busybox symlink
+# `/usr/bin/nanocloud` → fluxor — dispatch to the nanocloud_cli PIC fmod. The
+# graph (linux.yaml, staged beside this file) is the cli-applet graph: cli_in →
+# nanocloud_cli → cli_out.
+[workload]
+name = "nanocloud"
+version = "1.0.0"
+role = "cli"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+state_bytes = 65536
+buffer_bytes = 16384

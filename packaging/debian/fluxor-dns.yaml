@@ -1,0 +1,120 @@
+# dns-chain graph: the endpoints chain + service_dns
+# on one shared store — services + ready pods become endpoints, and endpoints
+# become the cluster DNS zone. /dns/<name>.<ns>.svc.cluster.local A-records fall
+# straight out of the store. The cluster-dns bundle then serves the zone.
+target: linux
+tick_us: 1000
+
+# The per-module self-edges below (change-sink allocators) are deliberate
+# 1-node cycles.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # Endpoints is PARAMS: Services JOIN the namespace's Pods with the label
+  # selector as the join predicate and the probe runner's readiness overriding
+  # the static field -> /endpointslices/<ns>/<svc>/<pod>; a slice whose Pod is
+  # gone is pruned; and list_children over the slices materialises
+  # /endpoints/<ns>/<svc> = "<pod>=<ip>,…" — the document the consumers parse,
+  # unchanged. Params from modules/app/_chronicle/endpoints.uproc.
+  - name: ep_pairs
+    type: store_source
+    prefix: "/services/"
+    paths: "spec.selector"
+    join: "/pods/"
+    join_scoped: 2
+    join_match: "metadata.labels:spec.selector"
+    join_paths: "status.ready,status.podIP,metadata.uid"
+    watch: "/pods/,/probe-status/"
+  - name: ep_ask
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/endpoints.uproc ak
+      decision: "01050000000c000100023e000000120000210018000000630001000201000000400100000010010000000000000040020000000100023e000000400300000001000203000000401e00000001000215000000401f0000000100023c00000040200000000100023d000000402100000001000241000000402200000041170000005f000100020100000040010000001000000000000000004002000000120000400300000001000203000000401e00000001000215000000401f0000000100023c00000040200000000100023d000000402100000001000241000000402200000041"
+  - name: ep_probe
+    type: store_effect
+    key_prefix: "/probe-status/"
+    flat: 1
+    paths: "ready"
+  - name: ep_slice
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/endpoints.uproc sl
+      decision: "021400000038000100022200000012010031200100022100000012000021300100020200000010c8000000000000002030010002280000001201003120300011000000480001000201000000400100000010030000000000000040020000000100021e00000040030000001201002f40110000000100021f000000401200000001000221000000400400000041140000003b000100022200000012010031200100022100000012000021300100020200000010c8000000000000002130010002200000001204007472756520300011000000480001000201000000400100000010030000000000000040020000000100021e00000040030000001201002f40110000000100021f00000040120000000100022100000040040000004110000000440001000201000000400100000010040000000000000040020000000100021e00000040030000001201002f40110000000100021f0000004012000000120000400400000041"
+  - name: ep_slices
+    type: store_effect
+    key_prefix: "/endpointslices/"
+  - name: ep_sl_source
+    type: store_source
+    prefix: "/endpointslices/"
+    watch: "/pods/"
+  - name: ep_exists
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/endpoints.uproc ex
+      decision: "0011000000480001000201000000400100000010020000000000000040020000000100021c00000040030000001201002f40110000000100021d000000401200000001000203000000401e00000041"
+  - name: ep_podexists
+    type: store_effect
+    key_prefix: "/pods/"
+  - name: ep_prune
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/endpoints.uproc pr
+      decision: "010500000012000100020200000010940100000000000020000b0000002f0001000201000000400100000010040000000000000040020000000100021e00000040030000001200004004000000410a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000400400000041"
+  - name: ep_collect
+    type: store_effect
+    key_prefix: "/endpointslices/"
+  - name: ep_svcs
+    type: store_source
+    prefix: "/services/"
+    paths: "spec.selector"
+    list_children: "/endpointslices/"
+    child_sep: "/"
+    watch: "/endpointslices/"
+  - name: ep_doc
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/endpoints.uproc dc
+      decision: "02050000000c000100020400000012000020000a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000400400000041050000000c000100023800000012000020000b0000002f0001000201000000400100000010040000000000000040020000000100020300000040030000001200004004000000410c0000003300010002010000004001000000100300000000000000400200000001000203000000400300000001000238000000400400000041"
+  - name: ep_write
+    type: store_effect
+    key_prefix: "/endpoints/"
+  - name: service_dns
+
+# Self-edges: each module's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: ep_pairs.status
+    to: ep_pairs.changes
+  - from: ep_pairs.record_out
+    to: ep_ask.record_in
+  - from: ep_ask.result_out
+    to: ep_probe.request_in
+    buffer_group: 91
+  - from: ep_probe.response_out
+    to: ep_slice.record_in
+  - from: ep_slice.result_out
+    to: ep_slices.request_in
+    buffer_group: 92
+  - from: ep_sl_source.status
+    to: ep_sl_source.changes
+  - from: ep_sl_source.record_out
+    to: ep_exists.record_in
+  - from: ep_exists.result_out
+    to: ep_podexists.request_in
+    buffer_group: 93
+  - from: ep_podexists.response_out
+    to: ep_prune.record_in
+  - from: ep_prune.result_out
+    to: ep_collect.request_in
+    buffer_group: 94
+  - from: ep_svcs.status
+    to: ep_svcs.changes
+  - from: ep_svcs.record_out
+    to: ep_doc.record_in
+  - from: ep_doc.result_out
+    to: ep_write.request_in
+    buffer_group: 95
+  - from: service_dns.status
+    to: service_dns.changes

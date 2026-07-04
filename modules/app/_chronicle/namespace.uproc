@@ -1,0 +1,62 @@
+// Namespace teardown as params. Two chains over /namespaces/:
+//   sweep     scoped JOIN across every namespaced prefix -> one record per
+//             object in the namespace -> DELETE it (full key at 24) when
+//             the namespace is Terminating
+//   finalize  count_children across the same prefixes (child_sep "/") ->
+//             0 and Terminating -> DELETE the namespace record
+module nanocloud.namespace {
+
+  message nsg.Obj {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // the namespace
+    phase: string = 4;    // status.phase
+    fullkey: string = 24; // the object's full key
+  }
+  message nsg.Ns {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    phase: string = 4;
+    remaining: int = 22;
+  }
+  message nsg.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+
+  decision sweep(o: nsg.Obj) -> nsg.Act {
+    when o.phase == "Terminating" ->
+      nsg.Act { cid: o.seq, op: DELETE, key: o.fullkey };
+    default ->
+      nsg.Act { cid: o.seq, op: NOOP, key: "" };
+  }
+  decision finalize(n: nsg.Ns) -> nsg.Act {
+    when n.phase == "Terminating" && n.remaining == 0 ->
+      nsg.Act { cid: n.seq, op: DELETE, key: n.key };
+    default ->
+      nsg.Act { cid: n.seq, op: NOOP, key: "" };
+  }
+  transformation pass_obj(o: nsg.Obj) -> nsg.Obj {
+    nsg.Obj { seq: o.seq, rev: o.rev, key: o.key, phase: o.phase, fullkey: o.fullkey }
+  }
+  transformation pass_ns(n: nsg.Ns) -> nsg.Ns {
+    nsg.Ns { seq: n.seq, rev: n.rev, key: n.key, phase: n.phase, remaining: n.remaining }
+  }
+  pipeline sw(o: nsg.Obj) -> nsg.Act {
+    call x = pass_obj(o);
+    call y = sweep(x);
+    return y;
+  }
+  pipeline fin(n: nsg.Ns) -> nsg.Act {
+    call x = pass_ns(n);
+    call y = finalize(x);
+    return y;
+  }
+  entry sw = sw;
+  entry fin = fin;
+  provenance revision "namespace-teardown" toolchain "chronicle-authoring";
+}

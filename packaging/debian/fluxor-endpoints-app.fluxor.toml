@@ -1,0 +1,17 @@
+# Workload source manifest for the endpoints-reconciler bundle. postinst emits it and
+# publishes it into the node's OCI store, so `endpoints-reconciler:1.0.0` resolves offline.
+# Portless — the reconciler drives the store provider via provider_call, not a
+# socket. The graph (linux.yaml, staged beside this file) runs the endpoints
+# reconcile modules.
+[workload]
+name = "endpoints-reconciler"
+version = "1.0.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+state_bytes = 65536
+buffer_bytes = 16384

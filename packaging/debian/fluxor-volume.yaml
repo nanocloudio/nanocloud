@@ -1,0 +1,20 @@
+# volume-manager workload graph the volume_manager fmod, which
+# watches /volume-requests/ + /volumes/ in the store and computes each pod's
+# resolved mount plan into /volume-plan/. Pure mount-planning decision; the mount
+# syscall is performed by the node's storage backend from that plan.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: volume_manager
+
+# Self-edge: the manager's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: volume_manager.status
+    to: volume_manager.changes

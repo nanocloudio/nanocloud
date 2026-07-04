@@ -1,0 +1,26 @@
+# crypto-signer graph (cert_manager foundation): the crypto_signer fmod, which
+# generates a P-256 keypair, deposits the private key in the kernel KEY_VAULT,
+# and signs /sign-req/ by handle (verifying with p256::ecdsa_verify). Proves an
+# app module can do real crypto on existing fluxor capabilities — no new surface.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # DEVELOPMENT DECLARATION — see `crypto_signer`'s development gate. It is a
+  # KEY_VAULT conformance fixture, and it signs ANY message written to
+  # `/sign-req/<id>`. In a graph anything else can write to, that is a signing
+  # oracle over a vault-held key.
+  - name: crypto_signer
+    params:
+      development: 1
+
+# Self-edge: the signer's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: crypto_signer.status
+    to: crypto_signer.changes

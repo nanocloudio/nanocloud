@@ -1,0 +1,56 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Sandbox runner — the container runtime as a PIC module, and the in-fluxor
+# consumer of the `workload` capability surface (contract 0x1A): it watches the
+# control-plane store for desired sandbox specs projected by `pod_lifecycle`,
+# drives the workload lifecycle (CREATE/START/WAIT/DESTROY), and writes
+# container status back to the store. nanocloud owns image->rootfs
+# materialization; this module owns namespace isolation via the contract. Linux host only in practice — the workload
+# backend is registered there; a bcm2712 .fmod runs in the fluxor-linux
+# runtime and reaches it by class-byte routing.
+
+# Namespace surgery is privileged: every 0x1Axx op additionally requires the
+# platform_raw permission on top of the requires_contract = "workload" grant.
+permissions = ["platform_raw"]
+
+# Cadence-independent: it does no tick-based timekeeping — polls its watch and
+# polls the liveness of live sandboxes each step.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above (see fluxor-sandbox.yaml).
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The workload capability surface (0x1A) — namespace-isolated execution.
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
+# The control-plane store — desired specs in, status out.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the sandbox status keys it writes and the lifecycle it drives.
+[observability]
+exempt = "Container-runtime reconciler — provider-driven, emits no telemetry stream"

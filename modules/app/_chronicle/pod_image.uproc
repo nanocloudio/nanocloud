@@ -1,0 +1,172 @@
+// An image reference resolved to something runnable: the pull trigger, the
+// two gates, and the answer.
+//
+//   /pod-specs/<uid>  image=<repo>[:<tag>]        (the ask)
+//   /image-requests/<flat>  repo=..;tag=..        (the trigger; image_fetcher)
+//   /image-rootfs/<flat>    state=ready;path=..   (the assembler's answer)
+//   /image-config/<flat>    entrypoint=..;cmd=..  (the OCI config)
+//   /pod-resolved/<uid>     rootfs=..;cmd=..      (what the project chain uses)
+//
+// `cmd=` is the LAST field because argv is the one value that can contain the
+// record separator: `CMD ["nginx","-g","daemon off;"]` is ordinary, and the
+// compact `;` grammar cannot carry it. A reader that splits on `;` therefore
+// loses the tail; carrying it whole needs the READER (`sandbox_runner`) to
+// take the remainder of the record after `cmd=` rather than the next segment,
+// which is a change to that module, not to this decision.
+//
+// The repo/tag split and the `/`->`_` store-key spelling are `!` projection
+// modifiers on the source: turning `nanocloud/hello:v2` into the three things
+// a key and a URL need is transcription, not policy. So is `!argv`, which
+// undoes image_fetcher's escaping of the OCI Entrypoint/Cmd lists.
+module nanocloud.podimage {
+
+  message pi.Spec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // uid
+    image: string = 4;
+    repo: string = 5;     // image!repo
+    tag: string = 6;      // image!tag
+    flat: string = 7;     // image!flat
+    rootfs: string = 8;   // an explicit rootfs wins outright
+    cmd: string = 9;      // an explicit cmd wins outright
+  }
+  message pi.Req {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the flat name, under /image-requests/
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    c_key: string = 30;   // the uid
+    c_flat: string = 31;
+    c_cmd: string = 32;
+  }
+  message pi.Sent {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_flat: string = 31;
+    c_cmd: string = 32;
+  }
+  message pi.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_flat: string = 31;
+    c_cmd: string = 32;
+    c_rootfs: string = 33;
+  }
+  message pi.Rootfs {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_flat: string = 31;
+    c_cmd: string = 32;
+    c_rootfs: string = 33;
+    state: string = 40;
+    path: string = 41;
+  }
+  message pi.Cfg {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_flat: string = 31;
+    c_cmd: string = 32;
+    c_rootfs: string = 33;
+    ep: string = 40;      // entrypoint!argv
+    ccmd: string = 41;    // cmd!argv
+  }
+  message pi.Res {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the uid, under /pod-resolved/
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: string = 9;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+
+  // Trigger the pull. An explicit rootfs means the pod is not image-backed.
+  decision request(s: pi.Spec) -> pi.Req {
+    when s.image == "" || s.rootfs != "" ->
+      pi.Req { cid: s.seq, op: NOOP, key: "",
+               c_key: s.key, c_flat: "", c_cmd: s.cmd };
+    default ->
+      pi.Req { cid: s.seq, op: PUT, key: s.flat,
+               v1: "repo=", v2: s.repo, v3: ";tag=", v4: s.tag,
+               c_key: s.key, c_flat: s.flat, c_cmd: s.cmd };
+  }
+  decision ask_rootfs(r: pi.Sent) -> pi.Ask {
+    when r.c_flat == "" ->
+      pi.Ask { cid: r.cid, op: NOOP, key: "",
+               c_key: r.c_key, c_flat: r.c_flat, c_cmd: r.c_cmd, c_rootfs: "" };
+    default ->
+      pi.Ask { cid: r.cid, op: GET, key: r.c_flat,
+               c_key: r.c_key, c_flat: r.c_flat, c_cmd: r.c_cmd, c_rootfs: "" };
+  }
+  // The rootfs gate: nothing is resolved until the assembler says ready.
+  decision ask_cfg(r: pi.Rootfs) -> pi.Ask {
+    when r.state == "ready" && r.c_cmd != "" ->
+      pi.Ask { cid: r.cid, op: NOOP, key: "",
+               c_key: r.c_key, c_flat: r.c_flat, c_cmd: r.c_cmd, c_rootfs: r.path };
+    when r.state == "ready" ->
+      pi.Ask { cid: r.cid, op: GET, key: r.c_flat,
+               c_key: r.c_key, c_flat: r.c_flat, c_cmd: r.c_cmd, c_rootfs: r.path };
+    default ->
+      pi.Ask { cid: r.cid, op: NOOP, key: "",
+               c_key: r.c_key, c_flat: "", c_cmd: r.c_cmd, c_rootfs: "" };
+  }
+  // The answer. An explicit spec `cmd=` wins outright; otherwise argv is the
+  // image's Entrypoint ++ Cmd, exactly as the OCI runtime spec composes them.
+  decision resolve(c: pi.Cfg) -> pi.Res {
+    when c.c_rootfs == "" ->
+      pi.Res { cid: c.cid, op: NOOP, key: "" };
+    when c.c_cmd != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: c.c_key,
+               v1: "rootfs=", v2: c.c_rootfs, v3: ";cmd=", v4: c.c_cmd };
+    when c.ep != "" && c.ccmd != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: c.c_key,
+               v1: "rootfs=", v2: c.c_rootfs, v3: ";cmd=", v4: c.ep, v5: " ", v6: c.ccmd };
+    when c.ep != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: c.c_key,
+               v1: "rootfs=", v2: c.c_rootfs, v3: ";cmd=", v4: c.ep };
+    when c.ccmd != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: c.c_key,
+               v1: "rootfs=", v2: c.c_rootfs, v3: ";cmd=", v4: c.ccmd };
+    default ->
+      pi.Res { cid: c.cid, op: NOOP, key: "" };
+  }
+
+  transformation p1(s: pi.Spec) -> pi.Spec {
+    pi.Spec { seq: s.seq, rev: s.rev, key: s.key, image: s.image, repo: s.repo,
+              tag: s.tag, flat: s.flat, rootfs: s.rootfs, cmd: s.cmd }
+  }
+  transformation p2(r: pi.Sent) -> pi.Sent {
+    pi.Sent { cid: r.cid, status: r.status, value: r.value, c_key: r.c_key,
+              c_flat: r.c_flat, c_cmd: r.c_cmd }
+  }
+  transformation p3(r: pi.Rootfs) -> pi.Rootfs {
+    pi.Rootfs { cid: r.cid, status: r.status, value: r.value, c_key: r.c_key,
+                c_flat: r.c_flat, c_cmd: r.c_cmd, c_rootfs: r.c_rootfs,
+                state: r.state, path: r.path }
+  }
+  transformation p4(c: pi.Cfg) -> pi.Cfg {
+    pi.Cfg { cid: c.cid, status: c.status, value: c.value, c_key: c.c_key,
+             c_flat: c.c_flat, c_cmd: c.c_cmd, c_rootfs: c.c_rootfs,
+             ep: c.ep, ccmd: c.ccmd }
+  }
+  pipeline rq(s: pi.Spec) -> pi.Req { call x = p1(s); call y = request(x); return y; }
+  pipeline ar(r: pi.Sent) -> pi.Ask { call x = p2(r); call y = ask_rootfs(x); return y; }
+  pipeline ac(r: pi.Rootfs) -> pi.Ask { call x = p3(r); call y = ask_cfg(x); return y; }
+  pipeline rs(c: pi.Cfg) -> pi.Res { call x = p4(c); call y = resolve(x); return y; }
+  entry rq = rq;
+  entry ar = ar;
+  entry ac = ac;
+  entry rs = rs;
+  provenance revision "podimage-resolve" toolchain "chronicle-authoring";
+}

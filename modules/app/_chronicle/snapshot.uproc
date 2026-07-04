@@ -1,0 +1,91 @@
+// VolumeSnapshot as params: the control-plane half of a snapshot. Two
+// stages from one record — create the bound VolumeSnapshotContent, then
+// PATCH the VolumeSnapshot's status object to bind it and mark it ready.
+// Idempotent on readyToUse: a ready snapshot is left alone.
+module nanocloud.snapshot {
+  message sn.Vs {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<name>"
+    ready: string = 4;    // status.readyToUse
+    pvc: string = 5;      // spec.source.persistentVolumeClaimName
+    ns: string = 28;
+    name: string = 29;
+  }
+  message sn.Content {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "snapcontent-" literal
+    name: string = 17;    // + the snapshot's name
+    p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7; p5: string = 8;
+    p6: string = 9; p7: string = 10; p8: string = 11; p9: string = 12;
+    p10: string = 13; p11: string = 14;
+    c_key: string = 30;
+    c_name: string = 31;
+  }
+  message sn.Made {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_key: string = 30;
+    c_name: string = 31;
+  }
+  message sn.Bind {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    p1: string = 4; p2: string = 5; p3: string = 6;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum PATCH = 5;
+
+  decision content(v: sn.Vs) -> sn.Content {
+    when v.ready == "true" || v.pvc == "" ->
+      sn.Content { cid: v.seq, op: NOOP, key: "", name: "", p10: "", p11: "", c_key: "", c_name: "" };
+    default ->
+      sn.Content { cid: v.seq, op: PUT, key: "snapcontent-", name: v.name,
+                   p1: "{\"metadata\":{\"name\":\"snapcontent-",
+                   p2: v.name,
+                   p3: "\"},\"spec\":{\"driver\":\"nanocloud.io/local\",\"deletionPolicy\":\"Delete\",\"volumeSnapshotRef\":{\"name\":\"",
+                   p4: v.name,
+                   p5: "\",\"namespace\":\"",
+                   p6: v.ns,
+                   p7: "\"},\"source\":{\"volumeHandle\":\"",
+                   p8: v.pvc,
+                   p9: "\"}},\"status\":{\"readyToUse\":true,\"snapshotHandle\":\"snap-",
+                   p10: v.name,
+                   p11: "\",\"restoreSize\":0}}",
+                   c_key: v.key, c_name: v.name };
+  }
+  // The content exists (written now, or already there: 200 or 204) -> bind.
+  decision bind(m: sn.Made) -> sn.Bind {
+    when m.c_key != "" && (m.status == 200 || m.status == 204) ->
+      sn.Bind { cid: m.cid, op: PATCH, key: m.c_key, path: "status",
+                p1: "{\"readyToUse\":true,\"boundVolumeSnapshotContentName\":\"snapcontent-",
+                p2: m.c_name,
+                p3: "\",\"restoreSize\":\"0\"}" };
+    default ->
+      sn.Bind { cid: m.cid, op: NOOP, key: "", path: "", p1: "", p2: "", p3: "" };
+  }
+  transformation pass_vs(v: sn.Vs) -> sn.Vs {
+    sn.Vs { seq: v.seq, rev: v.rev, key: v.key, ready: v.ready, pvc: v.pvc, ns: v.ns, name: v.name }
+  }
+  transformation pass_made(m: sn.Made) -> sn.Made {
+    sn.Made { cid: m.cid, status: m.status, value: m.value, c_key: m.c_key, c_name: m.c_name }
+  }
+  pipeline ct(v: sn.Vs) -> sn.Content {
+    call x = pass_vs(v);
+    call y = content(x);
+    return y;
+  }
+  pipeline bd(m: sn.Made) -> sn.Bind {
+    call x = pass_made(m);
+    call y = bind(x);
+    return y;
+  }
+  entry ct = ct;
+  entry bd = bd;
+  provenance revision "snapshot-bind" toolchain "chronicle-authoring";
+}

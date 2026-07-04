@@ -1,0 +1,20 @@
+# image-puller workload graph the image_puller fmod, which
+# watches /image-manifests/ + /blobs/ in the store and computes each image's
+# pull plan (the missing layer digests) into /image-pull-plan/. Pure scheduling
+# decision; `image_fetcher` performs the fetch the plan names.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: image_puller
+
+# Self-edge: the puller's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: image_puller.status
+    to: image_puller.changes

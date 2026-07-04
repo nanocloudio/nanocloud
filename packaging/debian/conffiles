@@ -1,2 +1,3 @@
 /etc/default/nanocloud
 /etc/logrotate.d/nanocloud
+/etc/nanocloud.io/fluxor/node.yaml

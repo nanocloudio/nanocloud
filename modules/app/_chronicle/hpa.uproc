@@ -1,0 +1,165 @@
+// HorizontalPodAutoscaler as params: the closed loop. Three reads feed one
+// arithmetic decision, and the write is a PATCH of spec.replicas on the
+// target Deployment — the VM computes the number, the connector places it.
+//
+//   /hpa/<ns>/<name>            target name, min, max, targetCPU (ints)
+//   /deployments.apps/<ns>/<t>  current replicas (int projection)
+//   /hpa-metrics/<ns>/<t>       cpu=<pct>, flat (int projection)
+//   desired = ceil(current * cpu / target), clamped to [min, max]
+module nanocloud.hpa {
+
+  message hp.Hpa {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    target: string = 4;   // spec.scaleTargetRef.name
+    ns: string = 28;
+    mn: int = 50;         // spec.minReplicas (0 = unset -> 1)
+    mx: int = 51;         // spec.maxReplicas (0 = unset -> no ceiling)
+    tgt: int = 52;        // spec.targetCPUUtilizationPercentage (0 -> hold)
+  }
+  // Read 1: the Deployment. Key parts: ns + "/" + target.
+  message hp.DepQ {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    sep: string = 17;
+    name: string = 18;
+    c_ns: string = 30;
+    c_target: string = 31;
+    c_mn: int = 32;
+    c_mx: int = 33;
+    c_tgt: int = 34;
+  }
+  message hp.DepA {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_ns: string = 30;
+    c_target: string = 31;
+    c_mn: int = 32;
+    c_mx: int = 33;
+    c_tgt: int = 34;
+    cur: int = 50;        // spec.replicas
+  }
+  // Read 2: the metric.
+  message hp.MetQ {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    sep: string = 17;
+    name: string = 18;
+    c_ns: string = 30;
+    c_target: string = 31;
+    c_mn: int = 32;
+    c_mx: int = 33;
+    c_tgt: int = 34;
+    c_cur: int = 35;
+  }
+  message hp.MetA {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_ns: string = 30;
+    c_target: string = 31;
+    c_mn: int = 32;
+    c_mx: int = 33;
+    c_tgt: int = 34;
+    c_cur: int = 35;
+    cpu: int = 50;        // cpu=<pct>
+  }
+  // The write: PATCH spec.replicas.
+  message hp.Scale {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;     // ns
+    sep: string = 17;    // "/"
+    name: string = 18;   // the target
+    path: string = 19;   // what to set
+    val: int = 4;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PATCH = 5;
+
+  decision dep(h: hp.Hpa) -> hp.DepQ {
+    when h.target == "" || h.tgt == 0 ->
+      hp.DepQ { cid: h.seq, op: NOOP, key: "", sep: "", name: "",
+                c_ns: h.ns, c_target: h.target, c_mn: h.mn, c_mx: h.mx, c_tgt: h.tgt };
+    default ->
+      hp.DepQ { cid: h.seq, op: GET, key: h.ns, sep: "/", name: h.target,
+                c_ns: h.ns, c_target: h.target, c_mn: h.mn, c_mx: h.mx, c_tgt: h.tgt };
+  }
+  decision met(a: hp.DepA) -> hp.MetQ {
+    when a.status == 200 && a.cur > 0 ->
+      hp.MetQ { cid: a.cid, op: GET, key: a.c_ns, sep: "/", name: a.c_target,
+                c_ns: a.c_ns, c_target: a.c_target, c_mn: a.c_mn, c_mx: a.c_mx,
+                c_tgt: a.c_tgt, c_cur: a.cur };
+    default ->
+      hp.MetQ { cid: a.cid, op: NOOP, key: "", sep: "", name: "",
+                c_ns: a.c_ns, c_target: a.c_target, c_mn: a.c_mn, c_mx: a.c_mx,
+                c_tgt: a.c_tgt, c_cur: 0 };
+  }
+  // desired = ceil(cur * cpu / tgt) = (cur * cpu + tgt - 1) / tgt, clamped.
+  // Each branch restates the expression: the VM binds no locals here, and a
+  // restated expression is still one expression.
+  decision scale(m: hp.MetA) -> hp.Scale {
+    when m.status != 200 || m.c_cur == 0 || m.c_tgt == 0 ->
+      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    // below the floor: the floor (minReplicas, or 1 when unset)
+    when m.c_mn >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < m.c_mn && m.c_cur != m.c_mn ->
+      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
+                 val: m.c_mn };
+    when m.c_mn >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < m.c_mn ->
+      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    when m.c_mn < 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < 1 && m.c_cur != 1 ->
+      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
+                 val: 1 };
+    when m.c_mn < 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < 1 ->
+      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    // above the ceiling
+    when m.c_mx >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt > m.c_mx && m.c_cur != m.c_mx ->
+      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
+                 val: m.c_mx };
+    when m.c_mx >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt > m.c_mx ->
+      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    // within bounds
+    when (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt == m.c_cur ->
+      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    default ->
+      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
+                 val: (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt };
+  }
+
+  transformation pass_hpa(h: hp.Hpa) -> hp.Hpa {
+    hp.Hpa { seq: h.seq, rev: h.rev, key: h.key, target: h.target, ns: h.ns, mn: h.mn, mx: h.mx, tgt: h.tgt }
+  }
+  transformation pass_dep(a: hp.DepA) -> hp.DepA {
+    hp.DepA { cid: a.cid, status: a.status, value: a.value, c_ns: a.c_ns, c_target: a.c_target,
+              c_mn: a.c_mn, c_mx: a.c_mx, c_tgt: a.c_tgt, cur: a.cur }
+  }
+  transformation pass_met(m: hp.MetA) -> hp.MetA {
+    hp.MetA { cid: m.cid, status: m.status, value: m.value, c_ns: m.c_ns, c_target: m.c_target,
+              c_mn: m.c_mn, c_mx: m.c_mx, c_tgt: m.c_tgt, c_cur: m.c_cur, cpu: m.cpu }
+  }
+  pipeline rd(h: hp.Hpa) -> hp.DepQ {
+    call x = pass_hpa(h);
+    call y = dep(x);
+    return y;
+  }
+  pipeline mt(a: hp.DepA) -> hp.MetQ {
+    call x = pass_dep(a);
+    call y = met(x);
+    return y;
+  }
+  pipeline sc(m: hp.MetA) -> hp.Scale {
+    call x = pass_met(m);
+    call y = scale(x);
+    return y;
+  }
+  entry rd = rd;
+  entry mt = mt;
+  entry sc = sc;
+  provenance revision "hpa-closed-loop" toolchain "chronicle-authoring";
+}

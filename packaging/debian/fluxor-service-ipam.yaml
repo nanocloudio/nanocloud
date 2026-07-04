@@ -1,0 +1,20 @@
+# service-ipam graph: the service_ipam fmod, which
+# watches /services/ and assigns each Service without a clusterIP the lowest free
+# address from the service CIDR (10.96.0.0/16). ClusterIP allocation as a
+# store transform — the virtual IP proxy_compiler DNATs and DNS can front.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: service_ipam
+
+# Self-edge: the module's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: service_ipam.status
+    to: service_ipam.changes

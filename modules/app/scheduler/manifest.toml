@@ -1,0 +1,43 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Scheduler — the placement decision as a PIC module. It
+# SUBSCRIBEs /pods/ and /nodes/, and for each unbound Pod (no node= field) picks
+# the least-loaded ready Node and binds it by writing node=<name> onto the Pod.
+# The classic kube-scheduler loop — watch unscheduled pods, score, bind — as a
+# pure store transform. Placement is the DECISION; the kubelet/pod_lifecycle
+# side turns a bound Pod into a sandbox.
+
+# Cadence-independent: it does no tick-based timekeeping, just polls its watch.
+timer_class = "agnostic"
+
+# The store pushes namespace.change events onto this input port. A module cannot
+# open a channel itself, so the graph allocates one by self-wiring `status` ->
+# `changes` (a 1-node cycle); the module passes the resulting channel handle to
+# SUBSCRIBE and drains pushed events from it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The self-edge source. The module never writes it — its sole role is to make
+# the graph allocate the `changes` channel above (see fluxor-scheduler.yaml).
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the bindings it writes.
+[observability]
+exempt = "Control-plane scheduler — provider-driven, emits no telemetry stream"

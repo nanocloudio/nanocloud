@@ -1,0 +1,23 @@
+# route-compiler workload graph:
+# the route_compiler fmod, sibling of proxy_compiler. It watches /routes/,
+# /route-status/, and /endpoints/ in the shared control-plane store, resolves
+# each validated Route's service to its ready backends, and publishes ONE KEY
+# PER ROUTE carrying the full backend set to /dataplane/edge/<ns>/<name>. The
+# `http`-module edge (fluxor-edge.yaml) SUBSCRIBEs that prefix and populates its
+# DynRoute table — decision here, effect there.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: route_compiler
+
+# Self-edge: the compiler's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: route_compiler.status
+    to: route_compiler.changes

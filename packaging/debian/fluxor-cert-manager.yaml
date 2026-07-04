@@ -1,0 +1,34 @@
+# cert-manager graph: the cert_manager fmod, nanocloud's
+# one-shot cert minting service. On start it self-generates a CA (private key in
+# the kernel KEY_VAULT) and publishes /ca-cert; each /cert-req/ mints a leaf
+# keypair, builds a real X.509 cert in-module, signs the TBS with the CA key by
+# handle, and returns /cert-resp/. Real cert issuance on existing fluxor crypto.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  # DEVELOPMENT DECLARATION, not a preference. `cert_manager` refuses to
+  # construct without it — see the development gate in its `mod.rs`. It
+  # regenerates its CA at every startup, returns leaf PRIVATE KEYS as
+  # plaintext hex on the control-plane store, and lets the caller choose its own
+  # CN/DNS/SPIFFE. A deployment issues from kagi's `certificate_endpoint`.
+  #
+  # It stands only because nothing else answers the `/cert-req/` seam
+  # `device_reconciler` writes to, and removing an issuer before its
+  # replacement exists is a regression rather than a fix. What the flag buys
+  # is that any graph naming this module fails closed instead of quietly
+  # inheriting an issuing authority.
+  - name: cert_manager
+    params:
+      development: 1
+
+# Self-edge: the minter's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: cert_manager.status
+    to: cert_manager.changes

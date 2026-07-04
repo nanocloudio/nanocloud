@@ -1,0 +1,20 @@
+# sandbox-runner workload graph: the sandbox_runner
+# fmod, which watches the control-plane store for desired specs projected by
+# pod_lifecycle and drives the `workload` capability surface
+# (contract 0x1A) to create/start/wait/destroy namespace-isolated sandboxes.
+target: linux
+tick_us: 1000
+
+# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+  - name: sandbox_runner
+
+# Self-edge: the runner's own output feeds its `changes` input, allocating a
+# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
+# module never writes this output; it drains pushed events from the input.
+wiring:
+  - from: sandbox_runner.status
+    to: sandbox_runner.changes

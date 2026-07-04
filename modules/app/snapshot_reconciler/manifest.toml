@@ -1,0 +1,33 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# snapshot_reconciler — the VolumeSnapshot controller. Watches
+# /volumesnapshots.snapshot.storage.k8s.io/ and for each snapshot with a source
+# PVC provisions a bound VolumeSnapshotContent + marks the pair ready. The
+# physical data snapshot is a backend effect (a PIC module has no filesystem);
+# this is the control-plane binding. Standard store contracts + a self-edge for
+# the change-sink channel (the same reconciler pattern as the others).
+timer_class = "agnostic"
+
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "Control-plane VolumeSnapshot controller — provider-driven, emits no telemetry stream"
