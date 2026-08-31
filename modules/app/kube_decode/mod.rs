@@ -1,11 +1,15 @@
 //! Kubernetes request decoder — wave HttpRequest → Chronicle record frame.
 //!
-//! See `manifest.toml` for the wire layouts and the rationale. The short version:
-//! Chronicle's VM cannot split a variable-arity path (no iteration, by
-//! construction) and its record frame is flat, so something must project a
-//! Kubernetes request into decided-on fields before a `decision` can route it.
-//! That something is a domain module composed as a graph node — not a new VM
-//! capability.
+//! See `manifest.toml` for the wire layouts and the rationale. The short
+//! version: a Kubernetes request has to become decided-on FIELDS before a
+//! `decision` can route it, and the projections it needs are ones the VM does
+//! not have — reading `metadata.name` out of nested JSON, scanning a header
+//! block for a name, splitting a value on a space, assembling a store key.
+//!
+//! Path splitting alone would not need a module: chronicle's `rd::UNTIL_OPT`
+//! reads a delimited field and is allowed to RUN OUT, so N of them read a path
+//! of up to N segments and pad the rest. The JSON and header work is what does
+//! need one, and is why this module exists.
 //!
 //! This module decides NOTHING. It reshapes bytes. The routing, authorization
 //! and admission meaning stay in Chronicle params.
@@ -33,6 +37,12 @@ include!("../_shared/json.rs");
 /// wave HttpRequest fixed head: conn_id, stream_id, method, flags, then the
 /// three section lengths.
 const REQ_HEAD: usize = 2 + 2 + 1 + 1 + 2 + 2 + 2;
+
+/// wave request flag: a peer-identity TRAILER follows the body —
+/// `[svid_len:u16][svid]`. Set only for a connection whose mTLS handshake
+/// verified the peer (chain validated AND key possession proved); wave will
+/// not set it for a certificate that was merely presented.
+const REQ_FLAG_PEER_IDENTITY: u8 = 0x02;
 
 /// Chronicle record-frame value types (`pipeline_core.rs`).
 const TY_BYTES: u8 = 0;
@@ -206,6 +216,7 @@ fn project(req: &[u8], out: &mut [u8], max_body: u32, passthrough: u32) -> usize
     let hdr_len = u16::from_le_bytes(req[8..10].try_into().unwrap()) as usize;
     let body_len = u16::from_le_bytes(req[10..12].try_into().unwrap()) as usize;
 
+    let flags = req[5];
     let path_at = REQ_HEAD;
     let body_at = path_at + path_len + hdr_len;
     if body_at + body_len > req.len() {
@@ -267,6 +278,10 @@ fn project(req: &[u8], out: &mut [u8], max_body: u32, passthrough: u32) -> usize
             pfield!(put_field(out, p, 9, TY_BYTES, path));
             pfield!(put_field(out, p, 10, TY_BYTES, query));
             pfield!(put_i64(out, p, 11, i64::from(query_flag(query, b"watch"))));
+            // Same field SET on both branches: a consumer indexes by number,
+            // and a field present on one path and absent on the other makes a
+            // downstream decision produce nothing at all.
+            pfield!(put_field(out, p, 12, TY_BYTES, b""));
             out[0] = n;
             return p;
         }
@@ -374,6 +389,42 @@ fn project(req: &[u8], out: &mut [u8], max_body: u32, passthrough: u32) -> usize
     // parameters exist is HTTP; what a watch MEANS stays in params.
     field!(put_field(out, p, 10, TY_BYTES, query));
     field!(put_i64(out, p, 11, i64::from(query_flag(query, b"watch"))));
+
+    // Field 12: the verified mTLS PEER, as hex. Empty on a plaintext
+    // connection, or on one whose peer presented nothing wave would vouch for.
+    //
+    // Read from the trailer rather than from a header, because a header is
+    // whatever the client sent: wave puts this past `body_len`, where a client
+    // cannot reach it, and sets the flag only when the handshake actually
+    // established who the peer is.
+    //
+    // Hex, not raw bytes, because it becomes an identity STRING a decision
+    // compares and an RBAC binding names — and a fingerprint with a `;` or a
+    // `=` in it would break the flat records that carry those.
+    // `peer:` + hex. The PREFIX is the security property, not decoration: two
+    // authentication methods that could produce the same subject string would
+    // let an RBAC binding written for one silently grant the other, and a bare
+    // fingerprint could collide with any other identity scheme added later.
+    // Assembled here because the VM cannot concatenate.
+    const PEER_PREFIX: &[u8] = b"peer:";
+    let mut peer_hex = [0u8; 5 + 2 * 64];
+    let mut peer_len = 0usize;
+    if flags & REQ_FLAG_PEER_IDENTITY != 0 {
+        let t = body_at + body_len;
+        if t + 2 <= req.len() {
+            let n = u16::from_le_bytes(req[t..t + 2].try_into().unwrap()) as usize;
+            if n > 0 && t + 2 + n <= req.len() && PEER_PREFIX.len() + n * 2 <= peer_hex.len() {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                peer_hex[..PEER_PREFIX.len()].copy_from_slice(PEER_PREFIX);
+                for (i, &b) in req[t + 2..t + 2 + n].iter().enumerate() {
+                    peer_hex[PEER_PREFIX.len() + i * 2] = HEX[(b >> 4) as usize];
+                    peer_hex[PEER_PREFIX.len() + i * 2 + 1] = HEX[(b & 0x0f) as usize];
+                }
+                peer_len = PEER_PREFIX.len() + n * 2;
+            }
+        }
+    }
+    field!(put_field(out, p, 12, TY_BYTES, &peer_hex[..peer_len]));
 
     out[0] = n;
     p

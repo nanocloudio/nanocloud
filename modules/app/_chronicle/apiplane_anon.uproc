@@ -1,0 +1,67 @@
+// Anonymous access, as an OPT-IN stage.
+//
+// The chain answers 401 to a request with no credential. Admitting one instead
+// changes who can reach the API, so it is not an arm inside `apiplane.uproc`
+// that quietly does it everywhere — it is a node a graph adds deliberately,
+// visible in the file, and absent from the shipped one.
+//
+// A SEPARATE MODULE for the same reason `apiplane_watch.uproc` is: chronicle
+// caps declarations per module and `apiplane.uproc` sits at the cap. The split
+// is right either way — an optional policy belongs in its own document.
+//
+// `Request` is redeclared field for field. A separate module cannot share the
+// declaration, and the FIELD NUMBERS are the contract between them.
+module nanocloud.apiplane_anon {
+
+  message Request {
+    cid: int = 1;
+    method: int = 2;
+    resource: string = 3;
+    namespace: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+    credential: string = 8;
+    target: string = 9;
+    watch: int = 11;
+    peer: string = 12;
+  }
+
+  // No credential and no mTLS peer becomes `system:anonymous`.
+  //
+  // It sets `peer`, so the rest of the chain needs no new path: `admit`
+  // already treats a peer as authenticated-at-the-edge. The difference between
+  // "authenticated by TLS" and "not authenticated at all" is carried by the
+  // IDENTITY — `peer:<hex>` versus `system:anonymous` — which is where an RBAC
+  // binding can tell them apart. RBAC still decides: `system:anonymous` reaches
+  // nothing without a binding naming it, the same rule every identity gets.
+  decision d_anon(r: Request) -> Request {
+    when r.credential == "" && r.peer == "" ->
+      Request { cid: r.cid, method: r.method, resource: r.resource,
+                namespace: r.namespace, name: r.name, body: r.body,
+                key: r.key, credential: r.credential, target: r.target,
+                watch: r.watch, peer: "system:anonymous" };
+    default ->
+      Request { cid: r.cid, method: r.method, resource: r.resource,
+                namespace: r.namespace, name: r.name, body: r.body,
+                key: r.key, credential: r.credential, target: r.target,
+                watch: r.watch, peer: r.peer };
+  }
+
+  transformation pass_req(r: Request) -> Request {
+    Request { cid: r.cid, method: r.method, resource: r.resource,
+              namespace: r.namespace, name: r.name, body: r.body,
+              key: r.key, credential: r.credential, target: r.target,
+              watch: r.watch, peer: r.peer }
+  }
+
+  pipeline anon(r: Request) -> Request {
+    call x = pass_req(r);
+    call y = d_anon(x);
+    return y;
+  }
+
+  entry anon = anon;
+
+  provenance revision "apiplane-anonymous" toolchain "chronicle-authoring";
+}

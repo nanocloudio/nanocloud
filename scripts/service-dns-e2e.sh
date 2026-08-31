@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for nanocloud's service_dns module (modules/app/service_dns) — the
-# cluster DNS zone as a projection of endpoints. Runs WITH endpoints_reconciler
+# cluster DNS zone as a projection of endpoints. Runs WITH the endpoints chain
 # so the whole chain is visible: services + ready pods become endpoints, and
 # endpoints become /dns/<name>.<ns>.svc.cluster.local A-records.
 #
@@ -14,7 +14,7 @@
 #
 #   /services/<ns>/<name>              = "sel=k=v"
 #   /pods/<ns>/<name>                  = "ip=<addr>;l=k=v;r=0|1"
-#   /endpoints/<ns>/<name>             = "<pod>=<ip>,<pod>=<ip>"   (endpoints_reconciler)
+#   /endpoints/<ns>/<name>             = "<pod>=<ip>,<pod>=<ip>"   (the ep_ chain)
 #   /dns/<name>.<ns>.svc.cluster.local = "a=<ip>;a=<ip>"           (service_dns)
 set -euo pipefail
 
@@ -28,7 +28,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for m in service_dns; do
+for m in store_source decision store_effect; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 [ -e "$FLUXOR_RUNTIME" ] || { echo "FAIL: missing $FLUXOR_RUNTIME"; exit 1; }

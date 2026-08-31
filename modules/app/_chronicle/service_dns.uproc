@@ -1,0 +1,63 @@
+// The cluster DNS zone as params.
+//
+// `/endpoints/<ns>/<svc>` -> `/dns/<svc>.<ns>.svc.cluster.local` = `a=<ip>;…`.
+//
+// Neither half needs compiled code. The KEY is four parts and two literals,
+// which the connector joins because the VM cannot concatenate; the VALUE is the
+// ready addresses decorated as `a=<ip>` and joined with `;`, which
+// `list_item`/`list_join` do while walking the children. The per-element
+// transform is a property of the WALK, not a computation over a list.
+//
+// It reads `/endpointslices/<ns>/<svc>/<pod>` — one key per backend, each
+// holding a bare address — rather than the folded `/endpoints/` document, for
+// the same reason the route compiler does: the elements are already separate.
+module nanocloud.servicedns {
+
+  message dns.Svc {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    ns: string = 28;
+    svc: string = 29;
+    addrs: string = 56;   // list_children + list_values + list_item/list_join
+  }
+
+  // `/dns/<svc>.<ns>.svc.cluster.local`, assembled from four key parts after
+  // the node's `key_prefix`.
+  message dns.Zone {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // <svc>
+    dot: string = 17;     // "."
+    ns: string = 18;      // <ns>
+    suffix: string = 25;  // ".svc.cluster.local"
+    v1: string = 4;       // the decorated address set, or empty
+  }
+
+  enum PUT = 3;
+
+  // An empty endpoint set writes an EMPTY record, not no record: the name must
+  // resolve with no addresses rather than vanish, or a client cannot tell "this
+  // service has no ready backends" from "this service does not exist" — and it
+  // retries the second forever.
+  decision zone(s: dns.Svc) -> dns.Zone {
+    default ->
+      dns.Zone { cid: s.seq, op: PUT, key: s.svc, dot: ".", ns: s.ns,
+                 suffix: ".svc.cluster.local", v1: s.addrs };
+  }
+
+  transformation pass(s: dns.Svc) -> dns.Svc {
+    dns.Svc { seq: s.seq, rev: s.rev, key: s.key, ns: s.ns, svc: s.svc,
+              addrs: s.addrs }
+  }
+
+  pipeline project(s: dns.Svc) -> dns.Zone {
+    call p = pass(s);
+    call out = zone(p);
+    return out;
+  }
+
+  entry project = project;
+
+  provenance revision "service-dns" toolchain "chronicle-authoring";
+}

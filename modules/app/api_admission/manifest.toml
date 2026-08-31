@@ -1,11 +1,18 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
-# Admission — the mutating/validating admission gate as a PIC module (the API
-# write path: … → rbac_gate → admission → core_api). Every mutating request
-# crosses admission before the store: validate required fields, apply defaults
-# (mutating the object), and enforce quota — all a pure function of the
-# request plus policy + counts read from the store. No host facts.
+# Admission — the mutating/validating admission gate as a PIC module. Every
+# mutating request crosses admission before the store: validate required
+# fields, apply defaults (mutating the object), and enforce quota — all a pure
+# function of the request plus policy + counts read from the store. No host
+# facts.
+#
+# Two seams, and a graph wires whichever it needs: a request/response lane in
+# the store (`/admit-req/` → `/admit-resp/`), and the `request_in`/
+# `response_out` connector pair the Chronicle request chain drives, which
+# answers a status plus the object as admitted while what a refusal does to the
+# request stays in params. Counting live objects for a quota is the part a
+# rules VM cannot do, which is why this is a module at all.
 
 # Cadence-independent: it does no tick-based timekeeping, just polls its watch.
 timer_class = "agnostic"

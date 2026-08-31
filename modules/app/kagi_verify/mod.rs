@@ -26,8 +26,8 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/store.rs");
 
 // kagi owns the identity protocols, so it owns the wire. Compiled from its
-// published tree rather than restated here — `authn` already does exactly
-// this, and for the same reason: one definition of what a verify request is.
+// published tree rather than restated here, so there is one definition of what
+// a verify request is.
 #[path = "../../../target/fluxor/kagi-common/auth_wire.rs"]
 mod auth_wire;
 use auth_wire::{VerifiedIdentity, VerifyRequest};

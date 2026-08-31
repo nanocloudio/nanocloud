@@ -84,7 +84,7 @@ nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 echo "== 2. admit a Device CR (default/alice) =="
 store_put "/devices.nanocloud.io/default/alice" '{"spec":{"hash":"a1b2c3","certificateSubject":"device:alice"}}'
 
-echo "== 3. run device_reconciler + cert_manager over the shared store =="
+echo "== 3. run the device chain + cert_manager over the shared store =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
 
@@ -92,7 +92,7 @@ SPIFFE_ID="spiffe://nanocloud.local/device/default/alice"
 
 echo "== 4. the chain wrote a SPIFFE-shaped cert-req =="
 REQ="$(store_last /cert-req/default-alice)"
-[ -n "$REQ" ] || fail "device_reconciler did not write /cert-req/default-alice"
+[ -n "$REQ" ] || fail "the device chain did not write /cert-req/default-alice"
 echo "$REQ" | grep -q "spiffe=$SPIFFE_ID" || fail "cert-req missing the SPIFFE id: $REQ"
 echo "   /cert-req/default-alice = $REQ"
 
@@ -102,7 +102,7 @@ RESP="$(store_last /cert-resp/default-alice)"
 
 echo "== 6. the chain projected the device identity =="
 IDENT="$(store_last /deviceidentities.nanocloud.io/default/alice)"
-[ -n "$IDENT" ] || fail "device_reconciler did not project the identity status"
+[ -n "$IDENT" ] || fail "the device chain did not project the identity status"
 echo "$IDENT" | grep -q "spiffe=$SPIFFE_ID" || fail "identity missing the SPIFFE id"
 CRT_HEX="${IDENT#*;crt=}"; CRT_HEX="${CRT_HEX%%;ca=*}"
 CA_HEX="${IDENT##*;ca=}"

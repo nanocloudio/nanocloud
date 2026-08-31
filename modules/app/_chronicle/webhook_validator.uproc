@@ -1,0 +1,85 @@
+// Webhook validation as params — the sibling of `route_validator.uproc`.
+//
+// The rules are FIRST-ERROR in spec order, which is exactly what a first-hit
+// decision is: five comparisons and one string join, the comparisons a decision
+// and the join the connector's value parts.
+module nanocloud.webhookvalidator {
+
+  // What `store_source` projects out of `/webhooks/<ns>/<name>`, which is a
+  // FLAT record (`k=v;k=v`) rather than JSON — so `flat = 1` on the node and
+  // every field arrives as its bytes.
+  message wv.Spec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    path: string = 4;
+    has_secret: string = 5;
+    secret_name: string = 6;
+    secret_key: string = 7;
+    hmac: string = 8;
+    containers: string = 9;
+  }
+
+  message wv.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    head: string = 4;
+  }
+
+  enum PUT = 3;
+
+  // Order is the contract: a webhook with several faults reports the FIRST in
+  // spec order, so the message a user sees does not change when an unrelated
+  // field is fixed. The message TEXT is the contract too — it is what a user
+  // reads and what the E2E asserts — so these are the module's words, not a
+  // paraphrase.
+  //
+  // The secret rules are guarded on `has_secret == "1"` rather than on the
+  // fields being empty: a webhook that names no secret is complete, and
+  // demanding a secret name from it would refuse a valid spec.
+  decision validate(s: wv.Spec) -> wv.Put {
+    when s.path == "" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=path must be set" };
+    when !s.path.startsWith("/") ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=path must start with '/'" };
+    // "0" and "" are both "no containers": the projection yields empty when the
+    // field is absent, and a template with none cannot run.
+    when s.containers == "" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=job template must have at least one container" };
+    when s.containers == "0" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=job template must have at least one container" };
+    when s.has_secret == "1" && s.secret_name == "" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=secret_name must be set when secretRef is set" };
+    when s.has_secret == "1" && s.secret_key == "" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=secret_key must be set when secretRef is set" };
+    when s.has_secret == "1" && s.hmac != "1" ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key,
+               head: "ready=0;msg=hmac_header must be set when secretRef is set" };
+    default ->
+      wv.Put { cid: s.seq, op: PUT, key: s.key, head: "ready=1" };
+  }
+
+  transformation pass(s: wv.Spec) -> wv.Spec {
+    wv.Spec { seq: s.seq, rev: s.rev, key: s.key, path: s.path,
+              has_secret: s.has_secret, secret_name: s.secret_name,
+              secret_key: s.secret_key, hmac: s.hmac,
+              containers: s.containers }
+  }
+
+  pipeline check(s: wv.Spec) -> wv.Put {
+    call p = pass(s);
+    call out = validate(p);
+    return out;
+  }
+
+  entry check = check;
+
+  provenance revision "webhook-validator" toolchain "chronicle-authoring";
+}

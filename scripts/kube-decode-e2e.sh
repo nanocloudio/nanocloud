@@ -57,7 +57,14 @@ modules:
         app: true
       - path: "/apis/"
         app: true
+      # `/api/` is a PREFIX and does not cover `/version`: a path with no route
+      # never reaches the app at all, and wave answers its own 404.
+      - path: "/version"
+        app: true
   - name: kube_decode
+    # Non-resource paths reach the graph only with this on — the case the
+    # apiplane graph relies on for discovery documents.
+    passthrough: 1
   - name: debug
     mode: 1        # plaintext: log the bytes verbatim, not a hash of them
 wiring:
@@ -114,8 +121,11 @@ drive "$D/auth.log" -H "Authorization: Bearer abc.def.ghi" \
 echo "== 4c. a collection GET with ?watch=true =="
 drive "$D/watch.log" "http://127.0.0.1:$PORT/api/v1/namespaces/default/pods?watch=true&resourceVersion=0"
 
+echo "== 4d. a NON-resource path, under passthrough =="
+drive "$D/pass.log" "http://127.0.0.1:$PORT/version"
+
 echo "== 5. assert the exact Chronicle v1 frames =="
-python3 - "$D/get.log" "$D/post.log" "$D/auth.log" "$D/watch.log" <<'PY'
+python3 - "$D/get.log" "$D/post.log" "$D/auth.log" "$D/watch.log" "$D/pass.log" <<'PY'
 import struct, sys
 logs = [open(a, "rb").read() for a in sys.argv[1:]]
 
@@ -125,7 +135,7 @@ def field(num, ty, payload):
     return bytes([num, ty]) + struct.pack("<H", len(payload)) + payload
 
 def frame(wave_id_known, method, resource, namespace, name, body, key,
-          credential=b"", target=b"", query=b"", watch=0):
+          credential=b"", target=b"", query=b"", watch=0, peer=b""):
     """Every field except the correlation, which the graph assigns."""
     return (field(2, TY_I64, struct.pack("<q", method))
             + field(3, TY_BYTES, resource)
@@ -147,7 +157,11 @@ def frame(wave_id_known, method, resource, namespace, name, body, key,
             # as a NUMBER — the VM has no substring test, so the flag cannot be
             # a comparison downstream.
             + field(10, TY_BYTES, query)
-            + field(11, TY_I64, struct.pack("<q", watch)))
+            + field(11, TY_I64, struct.pack("<q", watch))
+            # The verified mTLS peer, hex. Empty on plaintext — which is every
+            # case here, and the point: the field is always PRESENT, because a
+            # consumer indexes by number and an absent field is not an empty one.
+            + field(12, TY_BYTES, peer))
 
 # wave wire/method.rs: GET = 1, POST = 3 (the registry's uproc pins GET = 1).
 cases = [
@@ -169,6 +183,12 @@ cases = [
      frame(None, 1, b"pods", b"default", b"", b"", b"/pods/default/",
            b"", b"/api/v1/namespaces/default/pods",
            b"watch=true&resourceVersion=0", 1)),
+    # Passthrough: resource, namespace, name and key all EMPTY, the target
+    # carried so a decision can answer by path. The field COUNT must match the
+    # resource case exactly — a frame that is shorter on one branch makes the
+    # decision reading it produce nothing at all.
+    ("GET  /version (passthrough, not a resource path)",
+     frame(None, 1, b"", b"", b"", b"", b"", b"", b"/version")),
 ]
 
 fails = []
@@ -181,14 +201,14 @@ for (label, tail), log in zip(cases, logs):
     # whole frame, not just the part that was easy to predict.
     corr_at = at - 12          # field 1: [1][TY_I64][8,0] + 8 payload bytes
     count_at = corr_at - 1
-    if count_at < 0 or log[count_at] != 11:
-        fails.append(label + " (field count != 11)")
+    if count_at < 0 or log[count_at] != 12:
+        fails.append(label + " (field count != 12)")
         continue
     if log[corr_at] != 1 or log[corr_at + 1] != TY_I64:
         fails.append(label + " (field 1 is not the i64 correlation)")
         continue
     corr = struct.unpack("<q", log[corr_at + 4:corr_at + 12])[0]
-    print("   ok  %-52s corr=0x%08x, 11 fields, byte-exact" % (label, corr))
+    print("   ok  %-52s corr=0x%08x, 12 fields, byte-exact" % (label, corr))
 
 if fails:
     for f in fails:

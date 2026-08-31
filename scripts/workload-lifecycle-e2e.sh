@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for the full workload lifecycle:
-# deployment_reconciler + replicaset_reconciler + the gc_ chain on ONE fluxor
+# the dp_ + rs_ + gc_ chains composed into ONE
 # graph over the fluxor-native control-plane store, consumed through the standard
 # storage contracts (`storage.object` 0x14 + `storage.namespace` 0x13). The
 # store is single-process, owned by the fluxor-linux runtime, and seeded from its durable append-log at

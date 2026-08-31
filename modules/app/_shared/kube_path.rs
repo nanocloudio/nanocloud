@@ -1,10 +1,10 @@
-// Kubernetes REST path parsing — the ONE parser, shared.
+// Kubernetes REST path parsing — the ONE parser.
 //
-// `include!`d by `api_ingress` (which routes requests inside nanocloud) and by
-// `kube_decode` (which projects them into a Chronicle record frame). Two
-// consumers, one grammar: a second copy would drift the moment a group or a
-// sub-resource is added, and the drift would be a silent mis-route rather than
-// a build failure.
+// `include!`d by `kube_decode`, which projects a request into a Chronicle
+// record frame. It lives in `_shared` rather than in that module because the
+// grammar is the API surface's, not one consumer's: a second copy would drift
+// the moment a group or a sub-resource is added, and the drift would be a
+// silent mis-route rather than a build failure.
 
 /// Parse `/api/v1/namespaces/<ns>/<resource>[/<name>]`,
 /// `/api/v1/<resource>` (cluster/all-namespace), and the apps/batch groups into

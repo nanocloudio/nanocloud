@@ -158,13 +158,13 @@ check "GET  /pods/default (list)" 200 \
   "$(drive token.reader "$U")"
 
 echo "== 6. AUTHZ: a subject with no binding is denied, and never reaches the store =="
-check "GET  /pods/default/web-0 as nobody" 403 "forbidden" "$(drive token.nobody "$U/web-0")"
+check "GET  /pods/default/web-0 as nobody" 403 '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,"message":"forbidden"}'  "$(drive token.nobody "$U/web-0")"
 
 echo "== 7. AUTHZ: the viewer's role has no 'delete' rule =="
-check "DELETE /pods/default/web-0 as reader" 403 "forbidden" "$(drive token.reader -X DELETE "$U/web-0")"
+check "DELETE /pods/default/web-0 as reader" 403 '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,"message":"forbidden"}'  "$(drive token.reader -X DELETE "$U/web-0")"
 
 echo "== 8. AUTHN: no credential is refused before authorization runs =="
-check "GET  /pods/default/web-0 anonymous" 401 "no usable credential" "$(drive - "$U/web-0")"
+check "GET  /pods/default/web-0 anonymous" 401 '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Unauthorized","code":401,"message":"no usable credential"}'  "$(drive - "$U/web-0")"
 
 echo "== 9. WRITE: create returns 201 and the object is really in the store =="
 NEW='{"metadata":{"name":"web-1","namespace":"default"},"spec":{"replicas":2}}'
@@ -174,7 +174,8 @@ grep -q "web-1" "$D/store.log" || fail "create: /pods/default/web-1 is not in th
 echo "   /pods/default/web-1 present in the store — the write happened, not just the answer"
 
 echo "== 10. WRITE: creating it again is a 409, not a silent overwrite =="
-check "POST /pods/default (create web-1 again)" 409 "already exists" \
+check "POST /pods/default (create web-1 again)" 409 \
+  '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists","code":409}' \
   "$(drive token.admin -X POST --data-binary "$NEW" "$U")"
 
 echo "== 11. WRITE: update replaces it =="
@@ -184,14 +185,17 @@ check "PUT  /pods/default/web-1" 200 "$UPD" \
 check "GET  /pods/default/web-1 after update" 200 "$UPD" "$(drive token.reader "$U/web-1")"
 
 echo "== 12. WRITE: update of an absent object is a 404, not a create =="
-check "PUT  /pods/default/ghost" 404 "not found" \
+check "PUT  /pods/default/ghost" 404 \
+  '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}' \
   "$(drive token.admin -X PUT --data-binary '{"x":1}' "$U/ghost")"
 
 echo "== 13. WRITE: delete removes it =="
 check "DELETE /pods/default/web-1" 200 \
   '{"kind":"Status","apiVersion":"v1","status":"Success"}' \
   "$(drive token.admin -X DELETE "$U/web-1")"
-check "GET  /pods/default/web-1 after delete" 404 "not found" "$(drive token.reader "$U/web-1")"
+check "GET  /pods/default/web-1 after delete" 404 \
+  '{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}' \
+  "$(drive token.reader "$U/web-1")"
 
 CM="http://127.0.0.1:$PORT/api/v1/namespaces/default/configmaps"
 

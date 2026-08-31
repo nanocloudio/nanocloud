@@ -48,11 +48,21 @@ module nanocloud.apiplane {
   enum V_NO_KEY = 2;
   enum V_EXPIRED = 5;
 
+  // Every refusal answers the Kubernetes `Status` envelope, like every success
+  // answers its object: a client parses ONE shape whatever happened, and
+  // `kubectl` reads `reason` to decide whether to retry. Carrying a bare string
+  // here meant a caller had to know which outcomes were JSON and which were
+  // prose.
+  //
   // A verdict already reached. 0 means "still deciding" — every later stage
   // tests this FIRST and passes a non-zero verdict through untouched, which is
   // how a refusal at stage two reaches the response encoder at stage six
   // without a second path through the graph to maintain.
   enum PENDING = 0;
+  /// A verdict of "already authenticated, do not ask kagi" — an mTLS peer.
+  /// A distinct value rather than 200, because 200 is an ANSWER and this
+  /// request has not been authorised yet: the authz stage must still run.
+  enum PEER_OK = 1;
 
   // ---- records ----
 
@@ -67,6 +77,9 @@ module nanocloud.apiplane {
     credential: string = 8;
     target: string = 9;
     watch: int = 11;
+    // The verified mTLS peer, hex, from wave's peer-identity trailer. Empty on
+    // a plaintext connection.
+    peer: string = 12;
   }
 
   message VerifyCall {
@@ -281,10 +294,10 @@ module nanocloud.apiplane {
                    c_verdict: 200,
                    c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\"},{\"name\":\"statefulsets\"},{\"name\":\"daemonsets\"}]}" };
 
-    // `/openapi/v2` and `/metrics` are static documents in the module apiserver
-    // too — a stub swagger and a single liveness gauge, not generated and not
-    // live telemetry. Richer metrics ride fluxor's own telemetry, which is why
-    // serving this one as a literal is honest rather than a fake.
+    // `/openapi/v2` and `/metrics` are static documents: a stub swagger and a
+    // single liveness gauge, neither generated nor live telemetry. Richer
+    // metrics ride fluxor's own telemetry, which is what makes serving these
+    // as literals honest rather than a fake.
     when r.target == "/openapi/v2" ->
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
@@ -311,6 +324,25 @@ module nanocloud.apiplane {
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
                    c_verdict: 404, c_answer: "not found", c_watch: 0 };
 
+    // An mTLS PEER is already authenticated: fluxor's `tls` validated the
+    // chain and proved key possession, and wave only sets the flag when both
+    // ran. Re-checking it against kagi would be checking a bearer token that
+    // does not exist, so the identity is taken here and the verify stage is
+    // skipped with an OK verdict — `PEER_OK` rather than PENDING, so `authz`
+    // authorises the peer's name instead of waiting for a token.
+    //
+    // The identity is `peer:<hex>`, distinct from a ServiceAccount's
+    // `system:serviceaccount:…` by construction: two authentication methods
+    // must not be able to produce the same subject string, or a binding
+    // written for one silently grants the other.
+    when r.peer != "" ->
+      VerifyCall {
+        credential: "", c_cid: r.cid, c_method: r.method, c_key: r.key,
+        c_resource: r.resource, c_name: r.name, c_body: r.body,
+        c_namespace: r.namespace, c_verdict: PEER_OK, c_answer: r.peer,
+        c_watch: r.watch
+      };
+
     // The ordinary path: hand the credential to kagi and keep the request. No
     // branch on an absent credential, so that "no credential" and "a credential
     // that did not verify" reach the same refusal by the same path.
@@ -322,6 +354,34 @@ module nanocloud.apiplane {
         c_namespace: r.namespace, c_verdict: PENDING, c_answer: "",
         c_watch: r.watch
       };
+  }
+
+  // Normalise WHO the caller is, before the verb ladder runs.
+  //
+  // Two authentication methods reach this point: a bearer token kagi verified
+  // (its `subject`), and an mTLS peer the TLS layer authenticated (carried as
+  // `c_answer` with the `PEER_OK` verdict). The verb a request wants is a
+  // property of the REQUEST — method, name, watch — and has nothing to do with
+  // which of the two authenticated it, so selecting the identity HERE keeps one
+  // verb ladder instead of one per identity source.
+  //
+  // That is not only tidier. Duplicating the ladder made the decision silently
+  // stop producing records — no author error, no load error, just a request
+  // that never came back — so the duplicated form is also the one that does not
+  // work (.context/chronicle.md §32).
+  decision d_ident(v: Verified) -> Verified {
+    when v.c_verdict == PEER_OK ->
+      Verified { corr: v.corr, status: V_OK, subject: v.c_answer,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                 c_resource: v.c_resource, c_name: v.c_name, c_body: v.c_body,
+                 c_namespace: v.c_namespace, c_verdict: PENDING, c_answer: "",
+                 c_watch: v.c_watch };
+    default ->
+      Verified { corr: v.corr, status: v.status, subject: v.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                 c_resource: v.c_resource, c_name: v.c_name, c_body: v.c_body,
+                 c_namespace: v.c_namespace, c_verdict: v.c_verdict,
+                 c_answer: v.c_answer, c_watch: v.c_watch };
   }
 
   // Authentication's verdict, and the verb. The verb is (method, is-collection):
@@ -347,22 +407,22 @@ module nanocloud.apiplane {
       AuthzCall { identity: "", verb: "", resource: "",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: 503, c_name: v.c_name, c_body: v.c_body,
-                  c_reason: "no verification key", c_verb: "", c_resource: "", c_namespace: "" };
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"no verification key\"}", c_verb: "", c_resource: "", c_namespace: "" };
     when v.status == V_MALFORMED ->
       AuthzCall { identity: "", verb: "", resource: "",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
-                  c_reason: "no usable credential", c_verb: "", c_resource: "", c_namespace: "" };
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"no usable credential\"}", c_verb: "", c_resource: "", c_namespace: "" };
     when v.status == V_EXPIRED ->
       AuthzCall { identity: "", verb: "", resource: "",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
-                  c_reason: "credential expired", c_verb: "", c_resource: "", c_namespace: "" };
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"credential expired\"}", c_verb: "", c_resource: "", c_namespace: "" };
     when v.status != V_OK ->
       AuthzCall { identity: "", verb: "", resource: "",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
-                  c_reason: "credential rejected", c_verb: "", c_resource: "", c_namespace: "" };
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"credential rejected\"}", c_verb: "", c_resource: "", c_namespace: "" };
     when v.c_method == M_POST ->
       AuthzCall { identity: v.subject, verb: "create", resource: v.c_resource,
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
@@ -425,7 +485,7 @@ module nanocloud.apiplane {
     when a.allowed == 0 ->
       AdmitCall { verb: "", resource: "", namespace: "", object: a.c_body,
                   c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
-                  c_verdict: 403, c_name: a.c_name, c_reason: "forbidden",
+                  c_verdict: 403, c_name: a.c_name, c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"Forbidden\",\"code\":403,\"message\":\"forbidden\"}",
                   c_verb: a.c_verb };
     when a.c_verb == "create" ->
       AdmitCall { verb: "create", resource: a.c_resource, namespace: a.c_namespace,
@@ -495,10 +555,12 @@ module nanocloud.apiplane {
       ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
                 c_cid: r.c_cid, c_status: r.c_verdict, c_answer: r.c_reason, c_stream: 0 };
 
-    // A WATCH. The probe already LISTed the collection, so that listing is the
-    // stream's first slice — a client that asks to watch from the start gets
-    // the current state and then the changes, which is what `resourceVersion=0`
-    // means. The registration is a PUT keyed `/watch-reg` + the collection key,
+    // A WATCH. The stream opens EMPTY, not with the listing the probe
+    // performed: a client that asked to watch wants events, and a `List` is not
+    // one — it would have to special-case the first frame to parse the rest.
+    // (A `resourceVersion=0` watch should replay existing objects as ADDED
+    // events; this chain is level-triggered, so they arrive on the next change
+    // rather than immediately — see .context/chronicle.md §28.) The registration is a PUT keyed `/watch-reg` + the collection key,
     // carrying the connection id as its value, and the watch chain reads it to
     // learn where to send events.
     //
@@ -507,7 +569,7 @@ module nanocloud.apiplane {
     when r.c_verb == "watch" ->
       ActCall { cid: r.c_cid, op: OP_PUT, key: "/watch-reg", key2: r.c_key,
                 value: "cid=", value2: r.c_cid,
-                c_cid: r.c_cid, c_status: 200, c_answer: r.value, c_stream: 1 };
+                c_cid: r.c_cid, c_status: 200, c_answer: "", c_stream: 1 };
 
     // --- the probe found nothing ---
     // A create is the one verb an absent object ENABLES, so it comes first;
@@ -516,14 +578,21 @@ module nanocloud.apiplane {
     when r.status == 404 && r.c_method == M_POST ->
       ActCall { cid: r.c_cid, op: OP_PUT, key: r.c_key, key2: "", value: r.c_body,
                 c_cid: r.c_cid, c_status: 201, c_answer: r.c_body, c_stream: 0 };
+    // A failure answers the Kubernetes `Status` envelope, like a success
+    // answers its object: a client parses one shape either way, and `kubectl`
+    // reads `reason` to decide whether to retry.
     when r.status == 404 ->
       ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
-                c_cid: r.c_cid, c_status: 404, c_answer: "not found", c_stream: 0 };
+                c_cid: r.c_cid, c_status: 404,
+                c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}",
+                c_stream: 0 };
 
     // --- the probe found the object ---
     when r.c_method == M_POST ->
       ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
-                c_cid: r.c_cid, c_status: 409, c_answer: "already exists", c_stream: 0 };
+                c_cid: r.c_cid, c_status: 409,
+                c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"reason\":\"AlreadyExists\",\"code\":409}",
+                c_stream: 0 };
     // A delete answers the Kubernetes `Status` envelope, which is a LITERAL
     // and therefore params: what a successful delete says is API surface, not
     // something a module should hold.
@@ -559,10 +628,15 @@ module nanocloud.apiplane {
 
   // ---- identity stages (a codec-only node has no program and fails CLOSED) ----
 
+  // EVERY field, including `watch` and `peer`. A pass stage that drops one is
+  // not a smaller record — the decision after it reads a field that is not
+  // there and produces nothing at all, silently. This copy must grow with the
+  // message.
   transformation pass_req(r: Request) -> Request {
     Request { cid: r.cid, method: r.method, resource: r.resource,
               namespace: r.namespace, name: r.name, body: r.body,
-              key: r.key, credential: r.credential, target: r.target }
+              key: r.key, credential: r.credential, target: r.target,
+              watch: r.watch, peer: r.peer }
   }
   transformation pass_verified(v: Verified) -> Verified {
     Verified { corr: v.corr, status: v.status, subject: v.subject,
@@ -597,6 +671,11 @@ module nanocloud.apiplane {
   pipeline admit(r: Request) -> VerifyCall {
     call x = pass_req(r);
     call y = d_admit(x);
+    return y;
+  }
+  pipeline ident(v: Verified) -> Verified {
+    call x = pass_verified(v);
+    call y = d_ident(x);
     return y;
   }
   pipeline authz(v: Verified) -> AuthzCall {
@@ -638,6 +717,7 @@ module nanocloud.apiplane {
   }
 
   entry admit = admit;
+  entry ident = ident;
   entry authz = authz;
   entry gate = gate;
   entry probe = probe;

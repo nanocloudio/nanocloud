@@ -1,13 +1,13 @@
-//! Admission — the mutating/validating admission gate as a PIC module (the API
-//! write path: … → rbac_gate → admission → core_api). Every mutating request
-//! crosses admission before the store: it is a pure function of the request
-//! plus the policy + object counts read from the store — validate required
-//! fields, apply defaults (mutating the object), and enforce quota. No host
-//! facts.
+//! Admission — the mutating/validating admission gate as a PIC module. Every
+//! mutating request crosses admission before the store: it is a pure function
+//! of the request plus the policy + object counts read from the store —
+//! validate required fields, apply defaults (mutating the object), and enforce
+//! quota. No host facts.
 //!
-//! Data model (request/response over the store seam). The object is REAL
-//! nested JSON (the same bytes core_api stores and api_ingress round-trips);
-//! policy fields are dotted JSON paths:
+//! Data model (request/response over the store seam; the Chronicle connector
+//! seam carries the same fields as a record). The object is REAL nested JSON —
+//! the same bytes the store holds and the reply renders; policy fields are
+//! dotted JSON paths:
 //!   /admit-req/<reqid>         = "verb=<create|update>;resource=<r>;ns=<ns>;obj=<nested JSON>"
 //!   /admission-policy/<r>      = "required=<a.b.c>,...;defaults=<a.b>=<jsonval>,...;quota=<n>"
 //!   /<resource>/<ns>/<name>    = <the live objects counted for quota>

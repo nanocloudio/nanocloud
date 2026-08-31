@@ -47,51 +47,42 @@ exactly the Kubernetes watch contract: list at a fence revision, then the
 changes since it.
 
 The store is **single-writer**. That is why the HTTP edge lives *inside* the
-graph: `api_ingress` terminates the socket and writes the store from within the
-runtime, rather than a second process appending to the same file.
+graph: the front terminates the socket and the request path writes the store
+from within the runtime, rather than a second process appending to the same
+file.
 
 ## 2. The API plane
 
-`api_ingress` is the apiserver's front door: it terminates HTTP/1.1 directly off
-the `net_proto` stream that `tls` (or `linux_net`, in the cleartext graph) hands
-it, serves the static discovery surface itself, and drives every other request
-through the pipeline. It marshals Kubernetes JSON to the store's request form
-and back, and it is the store's single writer on the request path.
+The apiserver is a chain, not a module. Wave's `http` terminates HTTP/1.1
+behind `tls` and hands each request to the chain as an envelope; every stage
+after that is a decision carrying params, and every node between the decisions
+moves bytes and decides nothing:
 
-The pipeline stages are separate modules, reached over a request/response seam
-in the store — `api_ingress` writes `/<lane>-req/<corr>` and reads back
-`/<lane>-resp/<corr>`. Because the responders run in the same cooperative
-scheduler, each connection is a state machine that advances one store round-trip
-at a time, yielding so the responders run.
+```
+tls → http → kube_decode → admit → kagi_verify ⇄ token_verify → ident
+    → authz → rbac_gate → gate → api_admission → probe → store_effect
+    → act → store_effect → reply → http
+```
 
-| Module | Lane | Decision |
-| ------ | ---- | -------- |
-| `authn` | `/authn-req/` → `/authn-resp/` | credential → Kubernetes identity: a verified mTLS peer (remapped through `/peer-ids/` when a binding exists), or a bearer JWS verified against the published keyset |
-| `rbac_gate` | `/authz-req/` → `/authz-resp/` | `(identity, verb, resource)` → allow/deny, resolving RoleBindings → Roles → rules, `*` wildcards, deny by default |
-| `api_admission` | `/admit-req/` → `/admit-resp/` | required fields, defaulting (it mutates the object), and per-resource quota against live counts |
-| `core_api` | `/core-req/` → `/core-resp/` | get / list / create / update / delete against `/<resource>/<ns>/<name>` |
-| `watch_streamer` | `/watch-req/` → `/watch-resp/` | `?watch=true`: `since=0` is a full snapshot, `since>0` drains the change stream as `PUT`/`DELETE` events plus the new fence |
-| `api_responder` | `/api-req/` → `/api-resp/` | the small ops the edge answers without a full CRUD round-trip (`healthz`, `count:<prefix>`, `getjson:<key>`) |
+What a path names, which verb a method implies, whether a credential is good
+enough, what a refusal answers, which store operation to run: all of it is
+params compiled from `modules/app/_chronicle/apiplane.uproc`. Two nodes in the
+path hold Kubernetes meaning in compiled code, and only because a rules VM
+cannot walk a set:
 
-`kube_decode` sits beside them for the Chronicle graphs: it projects a wave
-`HttpRequest` envelope into a flat record frame — method, resource, namespace,
-name, body, the assembled store key, the bearer credential with its scheme
-stripped, and the raw request target. It decides nothing — Chronicle's VM cannot
-split a variable-arity path or scan a header block, so the reshaping happens in a
-domain module and the routing meaning stays in params.
+| Module | Answers | Why not params |
+| ------ | ------- | -------------- |
+| `rbac_gate` | did any binding → role → rule match this `(identity, verb, resource)` | the walk is over a set of bindings, and the 403 it implies stays in params |
+| `api_admission` | a status, and the object as admitted with defaults applied | quota counts live objects under a prefix; what a refusal does to the request stays in params |
 
-`rbac_gate` and `api_admission` each have two natures. Behind their store lanes
-they are the modules in the table above; behind `request_in`/`response_out` they
-are connectors for the Chronicle graphs. `rbac_gate` answers "did any binding→role→rule match" as a
-number while the 403 stays in params; `api_admission` answers a status and the
-object as admitted, defaults applied, while what a refusal does to the request
-stays in params. Walking a set and counting live objects for a quota are what
-Chronicle's VM cannot do, which is the same reason `store_source` walks a
-prefix. Every one of these port pairs is optional, so one build serves the
-modules-based apiserver and the Chronicle one.
+`kube_decode` is the chain's entry: it projects a wave `HttpRequest` envelope
+into a flat record frame — method, resource, namespace, name, body, the
+assembled store key, the bearer credential with its scheme stripped, the raw
+request target, and the verified peer identity the TLS trailer carried. It
+decides nothing; the routing meaning stays in params.
 
-`kagi_verify` is the other kind of node the Chronicle graphs need: a CONNECTOR,
-the role `store_source`/`store_effect` play for the store, but for kagi's
+`kagi_verify` is the chain's other connector — the role `store_source` and
+`store_effect` play for the store, played here for kagi's
 `token_verify`. A record arrives, the credential goes out on kagi's own
 `auth_wire`, a typed `VerifiedIdentity` comes back, and the request's identity
 rides across as carry-through in fields 30..=39. It decides nothing either — the
@@ -101,12 +92,9 @@ answer to "is this credential genuine". It holds one request in flight and drops
 rather than retries when the verifier's ring is full; `scripts/apiplane-auth-e2e.sh`
 drives the seam on its own.
 
-Together these make `packaging/debian/fluxor-apiplane.yaml`: the whole
-Kubernetes API request path — discovery, decode, authenticate, authorize, admit,
-read, write, answer — with every meaning in params
-(`modules/app/_chronicle/apiplane.uproc`) and no module in the path that does
-anything but move bytes or walk a set. `scripts/apiplane-e2e.sh` drives that
-shipped graph over the whole surface: the CRUD verbs, the Kubernetes `List` and
+This chain is what `packaging/debian/fluxor-controlplane.yaml` boots, and
+`packaging/debian/fluxor-apiplane.yaml` is the same path on its own for a test
+to drive. `scripts/apiplane-e2e.sh` covers the whole surface: the CRUD verbs, the Kubernetes `List` and
 `Status` envelopes, the discovery documents (literals in a decision — API
 surface is data), an unauthenticated refusal, an unauthorized one, and
 admission's defaulting and quota.
@@ -117,11 +105,15 @@ as its own RBAC verb, as Kubernetes does. Two limits ride with it: wave holds a
 watch connection for a 30 s idle deadline, and each change re-emits the object
 level-triggered rather than as a delta.
 
-Identity is a host fact and stays one: `tls` verifies the client certificate and
-emits a per-session peer-identity envelope carrying an SVID (a hash of the peer
-key). `api_ingress` maps connection to SVID and presents `peer=<svid>` as the
-credential; without a verified peer it falls back to the `Authorization` bearer
-token.
+Identity is a host fact and stays one. `tls` runs `peer_auth` against the
+cluster CA, so a client certificate that does not chain never opens a
+connection at all; an accepted leaf's public key is hashed into a 32-byte SVID
+and emitted on `peer_identity`, which wave's `http` carries into the request
+envelope's trailer. `kube_decode` lands it on the record, and the RBAC walk
+authorizes that SVID. Absent a verified peer, the `Authorization` bearer token
+is the credential, verified through `kagi_verify`. `scripts/apiplane-mtls-e2e.sh`
+proves both gates: an unissued certificate is refused at the handshake, and an
+issued one with no binding is refused at authorization.
 
 ## 3. Controllers
 
@@ -130,17 +122,13 @@ SUBSCRIBEs its inputs, recomputes, and writes its outputs back — guarding ever
 write with a read-compare, so a settled cluster spends no revisions and a
 controller that writes under a prefix it watches does not wake itself forever.
 That shape holds whether the rules are compiled into a module or carried as
-params. The workload tier is params; three controllers and the dataplane
-compilers are modules, the compilers because they render a whole ruleset from
-a walk over two prefixes.
-
-The modules:
+params. Almost all of it is params; what stays a module is what a rules VM
+cannot do — allocate from a free set, or render a whole ruleset from a walk
+over two prefixes.
 
 | Controller | Watches → writes |
 | ---------- | ---------------- |
-| `service_ipam` | `/services/` → the lowest free ClusterIP from 10.96.0.0/16 |
-| `service_dns` | `/endpoints/` → an A-record set at `<svc>.<ns>.svc.cluster.local` |
-| `webhook_validator` | `/webhooks/` → `/webhook-status/`, per-object validation |
+| `service_ipam` | `/services/` → the lowest free ClusterIP from 10.96.0.0/16, collision-safe against the addresses already held |
 
 The compilers are the same shape with a dataplane output:
 
@@ -175,9 +163,11 @@ Nothing in an `.fmod` holds what a Deployment means.
 | `pi_` | `pod_image.uproc` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
 | `sn_` | `snapshot.uproc` | VolumeSnapshot → a bound VolumeSnapshotContent, marked ready |
 | `dv_` | `device.uproc` | a Device's `/cert-req/`, and its provisioned SPIFFE identity |
+| `dns_` | `service_dns.uproc` | each Service's ready backends as an A-record set at `<svc>.<ns>.svc.cluster.local` |
+| `wh_` | `webhook_validator.uproc` | first-error Webhook validation → `/webhook-status/` |
 | — | `route.uproc` | the edge-route compile, below |
 | — | `route_validator.uproc` | first-error Route validation → `/route-status/` |
-| — | `apiserver.uproc`, `apiplane*.uproc` | the API request path (the API plane, above) |
+| — | `apiplane*.uproc` | the API request path (the API plane, above) |
 | — | `ttl.uproc` | delete a record once its `deadline=` passes, armed on the kernel timer |
 
 Params are baked into each graph because a `.deb` ships no compiler:
@@ -279,11 +269,12 @@ relaxed tick is safe for it.
 ## 7. Hot paths, as wiring
 
 ```
-API write:   linux_net → tls → api_ingress → authn → rbac_gate → admission
-             → core_api → store PUT (CAS) ─→ every watcher's change stream
+API write:   linux_net → tls → http → kube_decode → verify → authorize →
+             admit → store PUT (CAS) ─→ every watcher's change stream
 
-Watch:       watch_streamer: LIST at the fence → the changes since it → a
-             batch of JSON events + the new fence the client resumes from
+Watch:       the watch chain: a store change wakes it, the object is read and
+             wrapped, and the event is written into the request chain's reply
+             stage on the connection wave is holding open
 
 Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices → the folded
              /endpoints document → service_dns projects the zone;
@@ -292,7 +283,7 @@ Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices → the folded
 Pod start:   apps/v1 PUT → dp_ → rs_ → Pods → sc_ binds → pj_/pl_ project
              /sandboxes/ → image_fetcher + image_assembler materialise the
              rootfs → sandbox_runner CREATE/START → status written back →
-             watch_streamer serves it
+             the watch chain serves it
 ```
 
 ## 8. Repository layout and workflow
@@ -371,3 +362,20 @@ A new module is a directory under `modules/app/` with `mod.rs` and
 - **Prove it live.** Add a `scripts/<name>-e2e.sh` that boots the real `.fmod`
   in a runtime and asserts on the store. Inline `#[cfg(test)]` is forbidden
   under `modules/`: in a `no_std` module it compiles away silently.
+
+### Two more compilers became params
+
+`webhook_validator` and `service_dns` are gone. Both were "pure store
+transforms" that a decision plus the connectors' byte-joining express directly:
+
+* **webhook validation** is five comparisons in spec order — a first-hit
+  decision — and one status string. Its E2E passes unchanged, message text
+  included: the words a user reads are as much the contract as the verdict.
+* **the DNS zone** is a key of four parts and a value of the ready addresses
+  decorated as `a=<ip>` and joined with `;`. That per-element decoration used
+  to be the reason it needed a module; `store_source`'s `list_item`/`list_join`
+  do it while WALKING the children, so it is a property of the walk rather than
+  a computation over a list the VM cannot iterate.
+
+It reads `/endpointslices/` rather than the folded `/endpoints/` document, for
+the same reason the route compiler does: the elements are already separate.

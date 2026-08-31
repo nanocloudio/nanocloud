@@ -1,11 +1,17 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
-# RBAC gate — the authorization decision as a PIC module (the API plane's auth
-# chain: tls → api_ingress → authn → rbac_gate → admission → core_api). Given an authenticated identity plus the (verb,
-# resource) it wants, decide allow/deny against the RBAC objects in the store
-# — a pure store transform (resolve RoleBindings → Roles → rules). No host
-# facts.
+# RBAC gate — the authorization decision as a PIC module. Given an
+# authenticated identity plus the (verb, resource) it wants, decide allow/deny
+# against the RBAC objects in the store: resolve RoleBindings → Roles → rules.
+# A pure store transform, no host facts.
+#
+# Two seams, and a graph wires whichever it needs: a request/response lane in
+# the store (`/authz-req/` → `/authz-resp/`), and the `request_in`/
+# `response_out` connector pair the Chronicle request chain drives, where the
+# answer is a NUMBER and the 403 it implies stays in params. Walking the
+# binding set is the part a rules VM cannot do, which is why this is a module
+# at all.
 
 # Cadence-independent: it does no tick-based timekeeping, just polls its watch.
 timer_class = "agnostic"

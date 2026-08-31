@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Live E2E for the COMPLETE fluxor-native control plane: all 22 core
-# control-plane fmods — the API plane (authn, rbac_gate,
-# admission, core_api, api_responder, watch_streamer), every workload reconciler
-# (deployment/replicaset/daemonset/statefulset/job/hpa/gc/namespace_gc/
-# pod_lifecycle), the scheduler, and the supporting services (service_ipam,
-# cni_ipam, image_puller, volume_manager, crypto_signer, cert_manager) — run in
-# ONE fluxor graph over the shared control-plane store. This is the graph a
-# node bootstraps.
+# Live E2E for the COMPLETE fluxor-native control plane, as the node boots it:
+# the API request path (a Chronicle chain behind tls + http, with rbac_gate and
+# api_admission as its two module nodes), every workload chain
+# (deployment/replicaset/daemonset/statefulset/job/hpa/gc/namespace/scheduler/
+# pod-lifecycle), and the supporting modules (service_ipam, cni_ipam,
+# image_puller, volume_manager, crypto_signer, cert_manager) — composed into a
+# single graph over the shared control-plane store.
 #
 # Proves the full cascade in one process: a Deployment projected into the store
 # flows Deployment -> ReplicaSet -> Pods -> scheduled onto a node, entirely
-# through cooperating PIC modules.
+# through cooperating graph nodes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

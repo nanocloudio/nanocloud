@@ -8,9 +8,10 @@
 #      the profile carries no name rule — a client serves no hostname — so
 #      "ca_dns" here means exactly "issued by our CA".
 #   2. AUTHZ  — the accepted leaf's pubkey is hashed into a 32-byte SVID and
-#      emitted on `peer_identity` → api_ingress → `peer=<svid>` → authn, and
-#      rbac_gate decides. A CA-issued cert bound to admin gets 200/201; a
-#      CA-issued cert with no binding gets 403.
+#      emitted on `peer_identity` → wave's `http` → the envelope TRAILER →
+#      `kube_decode` field 12 → `admit`, and the RBAC walk decides. A CA-issued
+#      cert bound to admin gets 200/201; a CA-issued cert with no binding gets
+#      403.
 #
 # So: eve (self-signed, no CA) never reaches the apiserver at all; mallory
 # (properly issued, unbound) reaches it and is denied. Defence in depth —
@@ -22,7 +23,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
-PORT=7443
+PORT=7445
 
 . "$ROOT/scripts/fluxor-env.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -30,13 +31,13 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl not found"; exit 1; }
-for m in tls api_ingress authn rbac_gate api_admission core_api api_responder; do
+for m in kube_decode kagi_verify rbac_gate api_admission store_effect store_source token_verify decision pipeline http tls; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
-D="$(mktemp -d /tmp/nc-apisrv-mtls-XXXXXX)"
+D="$(mktemp -d /tmp/nc-apiplane-mtls-XXXXXX)"
 RUNTIME_PID=""
-cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; rm -rf "$D"; }
+cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi; }
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -30 "$D/run.log" 2>/dev/null || true; exit 1; }
 
@@ -99,55 +100,49 @@ echo "   cluster CA minted; alice SVID = $ALICE_SVID"
 
 echo "== 2. seed RBAC — bind alice's SVID (not mallory's) to admin =="
 wal_put "/roles/admin" "rules=*:*"
-wal_put "/rolebindings/alice" "subjects=$ALICE_SVID;role=admin"
+# The identity the chain produces is `peer:<hex>`, not the bare hex: two
+# authentication methods that could yield the same subject string would let
+# a binding written for one silently grant the other.
+wal_put "/rolebindings/alice" "subjects=peer:$ALICE_SVID;role=admin"
 
-echo "== 3. write the mTLS apiserver graph =="
-cat >"$D/graph.yaml" <<YAML
-target: linux
-tick_us: 1000
-platform:
-  net: {}
-scheduler:
-  accept_cycles: true
-modules:
+echo "== 3. write the mTLS Chronicle api-plane graph =="
+python3 - "$ROOT" "$D" <<'PYGEN'
+import sys
+root, d = sys.argv[1], sys.argv[2]
+# The SHIPPED graph with TLS spliced in front — same nodes, same params. A
+# hand-written copy of a 20-node chain would drift from the thing that ships,
+# and then this would be testing the copy.
+g = open(f"{root}/packaging/debian/fluxor-apiplane.yaml").read()
+g = g.replace("modules:\n  - name: http", f"""modules:
   - name: tls
     mode: 1
     verify_peer: 1
-    # The peer-auth profile is mandatory whenever this instance authenticates
-    # a peer. ca_dns + the cluster CA = "the client cert must be one we
-    # issued"; a server applies no name rule to a client.
+    # Mandatory whenever this instance authenticates a peer: ca_dns + the
+    # cluster CA = "the client cert must be one we issued".
     peer_auth: 2
-    trust_cert_file: "$D/ca.der"
-    cert_file: "$D/server.der"
-    key_file: "$D/server.key.der"
-  - name: api_ingress
-  - name: authn
-  - name: rbac_gate
-  - name: api_admission
-  - name: core_api
-  - name: api_responder
-wiring:
-  - from: linux_net.net_out
+    trust_cert_file: "{d}/ca.der"
+    cert_file: "{d}/server.der"
+    key_file: "{d}/server.key.der"
+  - name: http""")
+g = g.replace("    port: 7444", "    port: 7445")
+g = g.replace("""  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in""", """  - from: linux_net.net_out
     to: tls.cipher_in
   - from: tls.cipher_out
     to: linux_net.net_in
   - from: tls.clear_out
-    to: api_ingress.net_in
-  - from: api_ingress.net_out
+    to: http.net_in
+  - from: http.net_out
     to: tls.clear_in
+  # The whole point of the wave change: the verified peer reaches the
+  # application instead of stopping at the TLS boundary.
   - from: tls.peer_identity
-    to: api_ingress.peer_in
-  - from: authn.status
-    to: authn.changes
-  - from: rbac_gate.status
-    to: rbac_gate.changes
-  - from: api_admission.status
-    to: api_admission.changes
-  - from: core_api.status
-    to: core_api.changes
-  - from: api_responder.status
-    to: api_responder.changes
-YAML
+    to: http.peer_identity""")
+open(f"{d}/graph.yaml", "w").write(g)
+PYGEN
+
 
 echo "== 4. build config + module table =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
@@ -216,4 +211,4 @@ st="${out%%|*}"
 [ "$st" = "?" ] || fail "eve reached the apiserver and got '$st' — the CA chain gate did not fire"
 echo "   eve    GET configmaps/cm1 -> no response (refused at the handshake: leaf-is-ca, no path to the cluster CA)"
 
-echo "== E2E green: client certs must chain to the cluster CA; accepted peers flow tls→api_ingress→authn with per-SVID authz =="
+echo "== E2E green: mTLS end to end — tls -> http -> trailer -> params, per-SVID authz =="

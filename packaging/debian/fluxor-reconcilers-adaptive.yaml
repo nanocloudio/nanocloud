@@ -1,7 +1,7 @@
 # Adaptive-tick reconciler plane — the controller-manager
 # equivalent: the store-driven workload reconcilers as Chronicle chains on
 # ONE relaxable domain. This is the realistic unit that benefits from adaptive
-# cadence, as opposed to the apiserver front door (linux_net/tls/api_ingress),
+# cadence, as opposed to the apiserver front door (linux_net/tls/http),
 # which is socket-driven and stays hot — see fluxor-controlplane.yaml.
 #
 # Every engine and connector here declares timer_class = "agnostic" (a pure

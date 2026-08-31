@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live E2E for Deployment rollout (rolling update) over the fluxor-native store.
 # the Deployment chain stamps a pod-template-hash (a digest of spec.template) on
-# the ReplicaSet; replicaset_reconciler stamps it on each Pod. When the template
+# the ReplicaSet; the rs_ chain stamps it on each Pod. When the template
 # changes (image nginx → httpd) the hash changes, so running Pods become stale
 # and are rolled — deleted (bounded per pass = a gradual rolling update) and
 # recreated from the new template. Proven on real binaries in ONE process.

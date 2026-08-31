@@ -2,7 +2,7 @@
 # Live E2E for nanocloud's proxy_compiler module (modules/app/proxy_compiler) —
 # the store -> nft-ruleset seam for ClusterIP DNAT, verified UNPRIVILEGED.
 #
-# An EXTERNAL process (this script, playing endpoints_reconciler's output +
+# An EXTERNAL process (this script, playing the endpoints chain's output +
 # the service projection) writes Services + Endpoints into the shared WAL; the
 # proxy compiler fmod, inside the fluxor-linux runtime, compiles the node's nft
 # NAT ruleset (ClusterIP -> backend DNAT load-balancing) and PUBLISHES it to

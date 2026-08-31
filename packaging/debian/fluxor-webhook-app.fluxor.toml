@@ -2,7 +2,7 @@
 # publishes it into the node's OCI store, so `webhook-validator:1.0.0` resolves offline.
 # Portless — the validator drives the store provider via provider_call, not a
 # socket. The graph (linux.yaml, staged beside this file) runs the
-# webhook_validator module.
+# the webhook validation chain module.
 [workload]
 name = "webhook-validator"
 version = "1.0.0"

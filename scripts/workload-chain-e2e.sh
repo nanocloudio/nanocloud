@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Live E2E for the full workload chain: both
-# deployment_reconciler and replicaset_reconciler run in ONE fluxor graph on the
-# shared control-plane store, so a single Deployment cascades all the way to Pods
-# — Deployment → ReplicaSet → Pods — with no orchestration beyond the store.
+# Live E2E for the full workload chain: the `dp_` and `rs_` chains composed
+# into one graph on the shared control-plane store, so a single Deployment
+# cascades all the way to Pods — Deployment → ReplicaSet → Pods — with no
+# orchestration beyond the store.
 #
 # The store is single-process; the API plane's one Deployment is seeded into the
-# durable log ($D/store.log) and replayed at boot. deployment_reconciler projects
-# the ReplicaSet; its PUT synchronously pushes a namespace.change onto
-# replicaset_reconciler's sink, which materialises the Pods — the whole cascade
-# settles IN ONE PROCESS — cooperating modules over one store, end to end.
+# durable log ($D/store.log) and replayed at boot. The `dp_` chain projects the
+# ReplicaSet; its PUT synchronously pushes a namespace.change onto the `rs_`
+# chain's source, which materialises the Pods — the whole cascade settles IN ONE
+# PROCESS, cooperating nodes over one store, end to end.
 #
 #   /deployments.apps/<ns>/<name> = "replicas=<N>;image=<img>"
 #   /replicasets.apps/<ns>/<name> = "replicas=<N>;image=<img>;owner=<dep>"

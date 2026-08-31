@@ -4,12 +4,17 @@ hardware_targets = ["bcm2712"]
 # Kubernetes request decoder — the typed seam between wave's HTTP fan-out and
 # Chronicle's engines.
 #
-# Chronicle's VM has no iteration by construction, so it cannot split a
-# variable-arity URL path into segments; and its record frame is flat, so it
-# cannot read `spec.to.name` out of nested Kubernetes JSON. Both are ordinary
-# domain concerns, and domain logic lives in compiled per-domain modules
-# composed as graph nodes — the relationship wave's `s3` has to the OCI
-# registry example. This is nanocloud's counterpart.
+# Chronicle's record frame is flat, so it cannot read `metadata.name` out of
+# nested Kubernetes JSON, scan a header block for a name, or split a value on a
+# space. Those are ordinary domain concerns, and domain logic lives in compiled
+# per-domain modules composed as graph nodes — the relationship wave's `s3` has
+# to the OCI registry example. This is nanocloud's counterpart.
+#
+# It no longer includes PATH SPLITTING as a reason. `rd::UNTIL_OPT` reads a
+# delimited field and may run out, so N reads take a path of up to N segments
+# and pad the rest — the thing that was missing was never iteration, it was a
+# reader allowed to reach the end. That work could move to a decode program;
+# the JSON and header work could not, so the module stays either way.
 #
 # It reshapes bytes and decides nothing: no routing, no authorization, no
 # admission meaning. Those stay in params, which is what keeps the logic data.
@@ -30,6 +35,13 @@ hardware_targets = ["bcm2712"]
 #        9 = request target    (bytes) the path, WITHOUT the query string
 #       10 = query            (bytes) everything after the first `?`
 #       11 = watch            (i64)   1 when the query says `watch=true`
+#       12 = peer             (bytes) `peer:<fingerprint-hex>`, the verified mTLS
+#            peer. The PREFIX is the security property: two authentication
+#            methods that could produce the same subject string would let a
+#            binding written for one silently grant the other. Empty on
+#            plaintext. Read from wave's peer-identity TRAILER (flag
+#            0x02), which sits past `body_len` where a client cannot reach it —
+#            a header carrying this would be forgeable.
 #
 # `passthrough = 1` also emits a frame for a path that is NOT a Kubernetes
 # resource path — discovery documents and the like — with resource, namespace,

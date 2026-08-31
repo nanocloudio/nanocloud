@@ -1,4 +1,4 @@
-# dns-chain graph: the endpoints chain + service_dns
+# dns-chain graph: the endpoints chain + the DNS zone, both as Chronicle params
 # on one shared store — services + ready pods become endpoints, and endpoints
 # become the cluster DNS zone. /dns/<name>.<ns>.svc.cluster.local A-records fall
 # straight out of the store. The cluster-dns bundle then serves the zone.
@@ -79,7 +79,26 @@ modules:
   - name: ep_write
     type: store_effect
     key_prefix: "/endpoints/"
-  - name: service_dns
+  # The DNS zone is PARAMS: one record per Service, its key assembled from four
+  # parts and its value the ready addresses decorated as `a=<ip>` while the
+  # children are walked. Params from modules/app/_chronicle/service_dns.uproc.
+  - name: dns_src
+    type: store_source
+    prefix: "/endpoints/"
+    list_children: "/endpointslices/"
+    child_sep: "/"
+    list_values: 1
+    list_item: "a="
+    list_join: ";"
+    watch: "/endpointslices/"
+  - name: dns_zone
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/service_dns.uproc project
+      decision: "0013000000620001000201000000400100000010030000000000000040020000000100021d00000040030000001201002e40110000000100021c00000040120000001212002e7376632e636c75737465722e6c6f63616c401900000001000238000000400400000041"
+  - name: dns_write
+    type: store_effect
+    key_prefix: "/dns/"
 
 # Self-edges: each module's own output feeds its `changes` input, allocating a
 # module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
@@ -116,5 +135,10 @@ wiring:
   - from: ep_doc.result_out
     to: ep_write.request_in
     buffer_group: 95
-  - from: service_dns.status
-    to: service_dns.changes
+  - from: dns_src.status
+    to: dns_src.changes
+  - from: dns_src.record_out
+    to: dns_zone.record_in
+  - from: dns_zone.result_out
+    to: dns_write.request_in
+    buffer_group: 96

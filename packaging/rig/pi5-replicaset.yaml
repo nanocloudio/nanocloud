@@ -17,6 +17,7 @@
 # Expected UDP telemetry after a few seconds — three Pod records, each carrying
 # the ReplicaSet's template:
 #   [seed] rc=0 key=/replicasets.apps/default/web
+#   [stp]  ... wit_a=1 wit_b=3
 #   [debug] ... /pods/default/web-0 ... web-1 ... web-2
 target: pi5
 tick_us: 1000
@@ -102,9 +103,14 @@ modules:
   # it the run is silent even on success — the store is in RAM and there is no
   # filesystem to inspect afterwards.
   # The witness. The chain is asynchronous and the store is RAM, so there is
-  # nothing to inspect after the run — this counts /replicasets.apps/ and /pods/
-  # on every heartbeat and says so out loud.
+  # nothing to inspect after the run — `store_probe` counts whatever prefixes it
+  # is given, on every heartbeat, and says so out loud. The prefixes are OURS:
+  # fluxor's fixture supplies the counting and knows nothing of what a
+  # ReplicaSet or a Pod is.
+  #   wit_a = ReplicaSets seeded, wit_b = Pods the chain materialised.
   - name: store_probe
+    witness_a: "/replicasets.apps/"
+    witness_b: "/pods/"
   - name: pods_out
     type: store_source
     prefix: "/pods/"

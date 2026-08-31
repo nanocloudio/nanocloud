@@ -120,6 +120,16 @@ struct State {
     /// `join_paths = <path,…>`: the joined entry's own fields at 60..64.
     join_paths: [u8; MAX_PATHS_SPEC],
     join_paths_len: u16,
+    /// `list_item = <bytes>`: written before EVERY child, and
+    /// `list_join = <bytes>`: written BETWEEN them (default `,`). Together they
+    /// turn a set of children into whatever record shape the consumer already
+    /// reads — `a=<ip>;a=<ip>` for a DNS zone — without a per-element transform
+    /// the VM cannot express and without changing the consumer to suit the
+    /// producer.
+    list_item: [u8; 16],
+    list_item_len: u8,
+    list_join: [u8; 8],
+    list_join_len: u8,
     /// `list_values = 1`: field 56 carries the children's VALUES only, without
     /// the `<name>=` each is normally labelled with. A backend set is a list of
     /// values; a decision cannot strip the labels afterwards.
@@ -367,6 +377,20 @@ mod params_def {
                 let n = if len > 64 { 64 } else { len };
                 s.join_pick_len = n as u8;
                 if n > 0 { ptr_copy(s.join_pick.as_mut_ptr(), d, n); }
+            };
+
+        26, list_item, str, 0
+            => |s, d, len| {
+                let n = if len > 16 { 16 } else { len };
+                s.list_item_len = n as u8;
+                if n > 0 { ptr_copy(s.list_item.as_mut_ptr(), d, n); }
+            };
+
+        27, list_join, str, 0
+            => |s, d, len| {
+                let n = if len > 8 { 8 } else { len };
+                s.list_join_len = n as u8;
+                if n > 0 { ptr_copy(s.list_join.as_mut_ptr(), d, n); }
             };
 
         25, list_values, u32, 0
@@ -1158,12 +1182,21 @@ unsafe fn project(
         let sys = &*s.syscalls;
         if s.list_children_len > 0 {
             let mut lc = [0u8; 2048];
+            let view = ChildView {
+                sep: s.child_sep,
+                values_only: s.list_values != 0,
+                item_prefix: &s.list_item[..s.list_item_len as usize],
+                join: if s.list_join_len > 0 {
+                    &s.list_join[..s.list_join_len as usize]
+                } else {
+                    b","
+                },
+            };
             let ll = list_children(
                 sys,
                 &s.list_children[..s.list_children_len as usize],
                 key_tail,
-                s.child_sep,
-                s.list_values != 0,
+                &view,
                 &mut lc,
             );
             let Some(q) = put_field(out, p, 56, TY_BYTES, &lc[..ll]) else {
@@ -1451,6 +1484,20 @@ fn join_scope<'a>(s: &State, tail: &'a [u8]) -> &'a [u8] {
     }
 }
 
+/// How a children view renders: the separator below the object's key, whether
+/// entries carry their names, the literal each entry opens with, and the one
+/// placed between entries.
+///
+/// One parameter rather than four, because the four always travel together —
+/// they are read from this module's params once and describe a single view.
+#[derive(Clone, Copy)]
+struct ChildView<'a> {
+    sep: u8,
+    values_only: bool,
+    item_prefix: &'a [u8],
+    join: &'a [u8],
+}
+
 /// The object's children under `<prefix><tail><sep>`, as `<name>=<value>,…`
 /// in key order. Bounded by `out`; a set that does not fit is cut at a whole
 /// entry and reported, never corrupted.
@@ -1458,10 +1505,15 @@ unsafe fn list_children(
     sys: &SyscallTable,
     prefix: &[u8],
     tail: &[u8],
-    sep: u8,
-    values_only: bool,
+    view: &ChildView,
     out: &mut [u8],
 ) -> usize {
+    let ChildView {
+        sep,
+        values_only,
+        item_prefix,
+        join,
+    } = *view;
     let mut pfx = [0u8; MAX_PREFIX + MAX_KEY + 2];
     let mut pl = append_bytes(&mut pfx, 0, prefix);
     pl = append_bytes(&mut pfx, pl, tail);
@@ -1505,9 +1557,9 @@ unsafe fn list_children(
                 return o;
             }
             if o > 0 {
-                out[o] = b',';
-                o += 1;
+                o = append_bytes(out, o, join);
             }
+            o = append_bytes(out, o, item_prefix);
             // `<name>=<value>` is what a projection keyed BY child wants — the
             // endpoints document names its pods. A consumer that wants the
             // values as a list (an edge's backend set) wants them without the

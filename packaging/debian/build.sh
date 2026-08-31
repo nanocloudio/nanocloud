@@ -45,7 +45,7 @@ NANO_MODULES="${REPO_ROOT}/target/fluxor/${SILICON}/modules"
 FLUXOR_MODULES="${NANO_MODULES}"
 
 for f in "${FLUXOR_CLI}" "${FLUXOR_RUNTIME}" "${FLUXOR_DIR}/fluxor.toml" \
-         "${FLUXOR_DIR}/stacks" "${FLUXOR_DIR}/targets" "${NANO_MODULES}/api_ingress.fmod"; do
+         "${FLUXOR_DIR}/stacks" "${FLUXOR_DIR}/targets" "${NANO_MODULES}/kube_decode.fmod"; do
     [[ -e "$f" ]] || { echo "missing artifact: $f" >&2
         echo "  build the fluxor release CLI, then 'fluxor sync' and 'fluxor modules build --target ${SILICON}' here" >&2; exit 1; }
 done

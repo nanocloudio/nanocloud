@@ -5,10 +5,9 @@
 #
 # It exercises the spawn contract the node boot uses — `fluxor run
 # <control-plane-graph>` with `FLUXOR_STORE_DIR` pointed at a dedicated store —
-# against the real fluxor-controlplane.yaml (all 23 fmods,
-# api_ingress fronting the store on :7443). It proves the graph the bootstrap
-# spawns actually comes up and serves the API over the socket, with the store
-# written by exactly one process.
+# against the real fluxor-controlplane.yaml, which serves the API on :7443. It
+# proves the graph the bootstrap spawns actually comes up and answers over the
+# socket, with the store written by exactly one process.
 #
 # As with the ingress E2E, this script is a pure TCP client: it never writes
 # the store. Single-writer is the invariant under test.
@@ -26,7 +25,7 @@ fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl not found"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/api_ingress.fmod" "$MODULES_DIR/core_api.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -105,7 +104,7 @@ except OSError:
   sleep 0.1
 done
 
-echo "== 3. the API plane answers real HTTP, terminated by api_ingress in PIC =="
+echo "== 3. the API plane answers real HTTP, from params =="
 expect() { # expect <path> <want-status> <want-body-substr>
   local out st body; out="$(http_get "$1")"; st="${out%%|*}"; body="${out#*|}"
   [ "$st" = "$2" ] || fail "$1 status: got '$st' want '$2' (body: $body)"
@@ -113,10 +112,16 @@ expect() { # expect <path> <want-status> <want-body-substr>
   echo "   GET $1 -> $st $body"
 }
 expect /healthz 200 ok
-expect "/apis/nanocloud.io/v1/counts/pods" 200 0
-# CRUD runs the full pipeline; with no RBAC seeded here it is authorized-denied
-# (403). Full CRUD is proven in scripts/apiserver-crud-e2e.sh.
-expect "/api/v1/namespaces/default/configmaps/cm1" 403 '"status":"Failure"'
+
+# CRUD runs the full chain. With no credential the answer is 401, not 403: the
+# chain does not admit anonymous unless a graph opts in
+# (scripts/apiplane-anon-e2e.sh). "Who are you" and "you may not" are different
+# answers, and a client retries differently on each.
+expect "/api/v1/namespaces/default/configmaps/cm1" 401 '"reason":"Unauthorized"'
+
+# There is no unauthenticated count endpoint: a COUNT of a resource is a data
+# read and needs a credential like any other. Full CRUD is proven in
+# scripts/apiplane-e2e.sh.
 
 echo "== 4. the pidfile names the live runtime (adopt-on-restart contract) =="
 PIDFILE_PID="$(cat "$STATE/control-plane.pid")"
@@ -124,24 +129,32 @@ PIDFILE_PID="$(cat "$STATE/control-plane.pid")"
 kill -0 "$PIDFILE_PID" 2>/dev/null || fail "pidfile pid not alive"
 echo "   pidfile -> $PIDFILE_PID (alive)"
 
-echo "== 5. the control-plane store was written only by the graph =="
-[ -f "$STORE/store.log" ] || fail "no $STORE/store.log — the graph never wrote the store"
+echo "== 5. the API plane does not use the STORE as its request bus =="
+# The chain rides channel edges, so a request crossing it leaves no `/api-req/`
+# or `/api-resp/` record behind: the 401 above proves the chain ran end to end,
+# and the store log proves it did so without a seam key.
+#
+# Asserted rather than assumed, because "the store is not an IPC bus" is an
+# architectural claim, and an assertion is what keeps it from quietly
+# eroding.
+[ -f "$STORE/store.log" ] || fail "no $STORE/store.log — the store was never opened"
 python3 - "$STORE/store.log" <<'PY'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
-p, seam = 0, 0
+p, seam, total = 0, 0, 0
 while p + 15 <= len(data):
     rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
     if p + 15 + kl + vl > len(data):
         break
     key = data[p+15:p+15+kl].decode(errors="replace")
+    total += 1
     if key.startswith("/api-req/") or key.startswith("/api-resp/"):
         seam += 1
     p += 15 + kl + vl
-if seam == 0:
-    print("FAIL: no API seam records in the control-plane store")
+if seam:
+    print(f"FAIL: {seam} store-as-IPC seam record(s) — the request bus is back")
     sys.exit(1)
-print(f"   {seam} seam record(s), all written in-process by the graph")
+print(f"   {total} store record(s), 0 request-bus records: the chain answered over CHANNELS")
 PY
 
-echo "== E2E green: the bootstrap's control-plane graph serves the API, single-writer =="
+echo "== E2E green: the bootstrap's control-plane graph serves the API as Chronicle params, over channels =="

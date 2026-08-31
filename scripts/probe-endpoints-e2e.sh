@@ -106,7 +106,7 @@ while p + 15 <= len(data):
 PY
 }
 
-echo "== 1. compose the full-chain graph (+ sandbox_runner + probe_runner + endpoints_reconciler) =="
+echo "== 1. compose the full-chain graph (+ sandbox_runner + probe_runner + the endpoints chain) =="
 cat > "$D/graph.yaml" <<'YAML'
 # Full-chain readiness-bridge fixture: the
 # pod-lifecycle pipeline plus the endpoints reconciler, all over the one store.

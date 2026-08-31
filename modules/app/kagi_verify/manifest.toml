@@ -21,7 +21,7 @@ hardware_targets = ["bcm2712"]
 # identity protocols, and a second JOSE verifier here is a second place for "is
 # this credential genuine" to be answered differently. The wire is kagi's own
 # `auth_wire`, compiled from its published `kagi-common` tree rather than
-# restated — the same relationship `authn` already has to it.
+# restated, so there is one definition of the wire.
 #
 # In:  a Chronicle record frame on `request_in`.
 #        `credential_field` (default 8) holds the compact JWS; empty is legal

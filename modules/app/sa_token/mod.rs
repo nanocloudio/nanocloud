@@ -19,9 +19,9 @@
 //! mint, never a claim of the epoch.
 //!
 //! **The verification key is published as a kagi `MSG_KEY_ADD` frame** at
-//! `/authn-keys/sa`, which is where `authn` loads it. Minting and verification
-//! therefore share one key and one wire format: what this module signs is
-//! exactly what `authn` checks.
+//! `/authn-keys/sa`, which is where `kagi_verify` reads it and pushes it to
+//! kagi's verifier. Minting and verification therefore share one key and one
+//! wire format: what this module signs is exactly what checks it.
 //!
 //! **The signing key is opened by LABEL** (`OPEN_OR_GENERATE`), not drawn
 //! fresh on every start. That removes the race two instances would otherwise
@@ -103,7 +103,7 @@ const DEFAULT_AUD: &[u8] = b"https://kubernetes.default.svc";
 /// signed by a key nobody trusted then verifies whenever the header is
 /// ignored.
 const JWT_HEADER_B64: &[u8] = b"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNhLTEifQ";
-/// The `kid` inside that header, as `authn` will look it up.
+/// The `kid` inside that header, as the verifier looks it up.
 const SA_KID: &[u8] = b"sa-1";
 /// The vault label the signing key lives under. A LABEL, not a fresh key per
 /// start — see `kv_open_or_generate`.
@@ -114,7 +114,7 @@ const SA_KEY_LABEL: &[u8] = b"nanocloud-sa-signing-v1";
 /// disclosure compromises permanently, and there is no revocation here to
 /// contain it.
 const TOKEN_TTL_SECS: u64 = 3600;
-/// Where the verification key is published for `authn` to load.
+/// Where the verification key is published for `kagi_verify` to load.
 const AUTHN_KEYS_KEY: &[u8] = b"/authn-keys/sa";
 
 const MAX_KEY: usize = 96;
@@ -290,12 +290,12 @@ fn put_u64(dst: &mut [u8], at: usize, mut v: u64) -> usize {
     p
 }
 
-/// Publish the verification key as a kagi `MSG_KEY_ADD` frame, where `authn`
-/// loads it from.
+/// Publish the verification key as a kagi `MSG_KEY_ADD` frame, where
+/// `kagi_verify` loads it from.
 ///
-/// **This is what makes the pair compose.** `authn` verifies signatures, so
+/// **This is what makes the pair compose.** The verifier checks signatures, so
 /// the one thing it needs from the issuer is the verification key — published
-/// here, under the label `authn` looks for.
+/// here, under the label it looks for.
 ///
 /// kagi's wire format rather than a nanocloud one: kagi owns the key
 /// lifecycle, and a second encoding for "here is a verification key" is how
@@ -569,7 +569,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let n = hex_encode(&pubkey, &mut hex);
             put_value(sys, PUBKEY_KEY, &hex[..n]);
             // And the same key as a kagi `MSG_KEY_ADD` frame, which is what
-            // `authn` loads. `/sa-pubkey` stays as the human-readable hex an
+            // `kagi_verify` loads. `/sa-pubkey` stays as the readable hex an
             // operator can eyeball; this is the one a verifier consumes.
             publish_verification_key(sys, &pubkey);
 

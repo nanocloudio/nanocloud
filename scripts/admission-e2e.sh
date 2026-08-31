@@ -101,7 +101,7 @@ expect() { # expect <reqid> <want>
   [ "$got" = "$2" ] || fail "admission for $1 wrong: got '$got', want '$2'"
   echo "   $1: $got"
 }
-# The mutated object comes back as JSON, byte-for-byte what core_api will
+# The mutated object comes back as JSON, byte-for-byte what the store will
 # store — a defaulted field is inserted at the head of the object it belongs
 # to, so the expectation pins position as well as content.
 expect a1 '200;{"spec":{"priority":0,"image":"nginx"}}'   # valid + defaulted
