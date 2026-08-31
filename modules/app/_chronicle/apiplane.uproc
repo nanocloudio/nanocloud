@@ -1,0 +1,649 @@
+// The Kubernetes API request path, compiled to params.
+//
+// One request walks: decode -> authenticate -> authorize -> probe -> act ->
+// reply. Every stage between the connectors is a decision in this file; every
+// connector below moves bytes and decides nothing. Nothing about /api/v1, about
+// which verb a method means, or about what a refusal answers is in an .fmod.
+//
+// The chain, and which node each entry drives:
+//
+//   kube_decode        wave HttpRequest -> Request record
+//   admit    (here)    -> VerifyCall            credential out, request as carry
+//   kagi_verify        <-> kagi token_verify    the signature check
+//   authz    (here)    -> AuthzCall             identity + verb + resource
+//   rbac_gate          the binding -> role -> rule walk (a SET walk: no VM does it)
+//   probe    (here)    -> StoreCall             GET the object, or LIST the collection
+//   store_effect       the read
+//   act      (here)    -> StoreCall             PUT / DELETE / NOOP, and the answer
+//   store_effect       the write
+//   reply    (here)    -> Reply                 (cid, status, body)
+//   pipeline `ser`     -> wave HttpResponse
+//
+// CARRY. Everything a later stage needs must ride 30..=39 across each
+// connector, because once a record leaves, the fields that produced it are
+// gone. The widest point is `admit`, which carries eight: cid, method, key,
+// resource, namespace, name, body, and the running verdict. Two spare, so the
+// budget holds with room at the chain's widest point.
+module nanocloud.apiplane {
+
+  // ---- wire vocabularies, named rather than restated ----
+
+  // wave/modules/foundation/http/wire/method.rs
+  enum M_GET = 1;
+  enum M_POST = 3;
+  enum M_PUT = 5;
+  enum M_PATCH = 6;
+  enum M_DELETE = 7;
+
+  // store_effect ops
+  enum OP_NOOP = 0;
+  enum OP_GET = 1;
+  enum OP_PUT = 3;
+  enum OP_DELETE = 4;
+  enum OP_LIST = 7;
+
+  // kagi auth_wire verify_err
+  enum V_OK = 0;
+  enum V_MALFORMED = 1;
+  enum V_NO_KEY = 2;
+  enum V_EXPIRED = 5;
+
+  // A verdict already reached. 0 means "still deciding" — every later stage
+  // tests this FIRST and passes a non-zero verdict through untouched, which is
+  // how a refusal at stage two reaches the response encoder at stage six
+  // without a second path through the graph to maintain.
+  enum PENDING = 0;
+
+  // ---- records ----
+
+  message Request {
+    cid: int = 1;
+    method: int = 2;
+    resource: string = 3;
+    namespace: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+    credential: string = 8;
+    target: string = 9;
+    watch: int = 11;
+  }
+
+  message VerifyCall {
+    credential: string = 8;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+  }
+
+  message Verified {
+    corr: int = 1;
+    status: int = 2;
+    subject: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+  }
+
+  // What `rbac_gate` takes on its connector seam. `verb` is a LITERAL this
+  // file chooses per branch — the VM cannot build one, and which verb a method
+  // means is precisely the meaning that belongs here rather than in a module.
+  message AuthzCall {
+    identity: string = 3;
+    verb: string = 4;
+    resource: string = 5;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+  }
+
+  // THE FULL CARRY BUDGET. Ten fields is what a connector echoes, and this uses
+  // all ten: an authorized request that still has admission, a read and a write
+  // ahead of it has nothing left to remember. A fifth filter stage would have
+  // to fold two of these together, not add an eleventh.
+  message Authzed {
+    allowed: int = 2;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+  }
+
+  // What `api_admission` takes on its connector seam. An EMPTY verb means "not
+  // a mutating request": there is no object to validate, and a resource whose
+  // policy names a required field would otherwise reject every read of it.
+  message AdmitCall {
+    verb: string = 3;
+    resource: string = 4;
+    namespace: string = 5;
+    object: string = 6;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+
+  // What it answers: a status, and the object AS ADMITTED — defaults applied.
+  // The mutated object is what gets written, which is the whole point of a
+  // mutating admission stage.
+  message Admitted {
+    status: int = 2;
+    object: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+
+  message StoreCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    value: string = 4;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+
+  message StoreReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+
+  // The act stage's call, and what comes back. `c_status`/`c_answer` are the
+  // answer already decided: the write still has to happen, but what to tell
+  // the client does not depend on it.
+  message ActCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    // A second KEY PART, joined after field 3 by the connector: registering a
+    // watcher writes `/watch-reg` + the collection key, and the VM cannot
+    // concatenate the two.
+    key2: string = 17;
+    // VALUE PARTS, joined the same way: `cid=` + the connection id, which is a
+    // number the connector renders as digits.
+    value: string = 4;
+    value2: int = 5;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    // 1 when this response is the first slice of a STREAM rather than a
+    // complete answer — the wave envelope's MORE_BODY flag.
+    c_stream: int = 33;
+  }
+
+  message ActReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+  }
+
+  // The read path's reply shape, field for field, so the SAME `ser` encoder
+  // turns it into a wave HttpResponse.
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    // The wave envelope's FLAGS byte. 0 is a complete response; 1 is
+    // FLAG_MORE_BODY — this envelope is the first slice of a stream, and with
+    // no Content-Length declared the response is close-delimited. That is what
+    // a Kubernetes watch is on the wire.
+    flags: int = 4;
+  }
+
+  // ---- stages ----
+
+  // Hand the credential to kagi and keep the request. No branch: an absent
+  // credential is NOT shortcut to a 401, so that "no credential" and "a
+  // credential that did not verify" reach the same refusal by the same path.
+  decision d_admit(r: Request) -> VerifyCall {
+    // DISCOVERY, answered here and gone. These documents are static and
+    // UNAUTHENTICATED — a client has to read them to know how to authenticate
+    // at all — so they take a verdict before the credential is looked at, and
+    // ride the same single path to the encoder as every other answer.
+    //
+    // Literals in a decision, which is exactly right: what /api/v1 says it
+    // contains is API surface, and API surface is data. `kube_decode` needs
+    // `passthrough = 1` for these to arrive at all.
+    when r.target == "/version" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"major\":\"1\",\"minor\":\"29\",\"gitVersion\":\"v1.29.0-nanocloud\"}" };
+    when r.target == "/api" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIVersions\",\"versions\":[\"v1\"]}" };
+    when r.target == "/apis" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIGroupList\",\"groups\":[{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}]}]}" };
+    when r.target == "/api/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"v1\",\"resources\":[{\"name\":\"pods\"},{\"name\":\"configmaps\"},{\"name\":\"services\"}]}" };
+    when r.target == "/apis/apps/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\"},{\"name\":\"statefulsets\"},{\"name\":\"daemonsets\"}]}" };
+
+    // `/openapi/v2` and `/metrics` are static documents in the module apiserver
+    // too — a stub swagger and a single liveness gauge, not generated and not
+    // live telemetry. Richer metrics ride fluxor's own telemetry, which is why
+    // serving this one as a literal is honest rather than a fake.
+    when r.target == "/openapi/v2" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"swagger\":\"2.0\",\"info\":{\"title\":\"nanocloud\",\"version\":\"v1\"},\"paths\":{}}",
+                   c_watch: 0 };
+    when r.target == "/metrics" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "# HELP nanocloud_apiserver_up API server is serving.\n# TYPE nanocloud_apiserver_up gauge\nnanocloud_apiserver_up 1\n",
+                   c_watch: 0 };
+    when r.target == "/healthz" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200, c_answer: "ok", c_watch: 0 };
+
+    // A path that is neither a resource nor a document this server knows. Under
+    // `passthrough` it arrives here with an empty key, and answering 404 is the
+    // whole reason passthrough is safe: the frame's empty fields are never read
+    // as a resource.
+    when r.key == "" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 404, c_answer: "not found", c_watch: 0 };
+
+    // The ordinary path: hand the credential to kagi and keep the request. No
+    // branch on an absent credential, so that "no credential" and "a credential
+    // that did not verify" reach the same refusal by the same path.
+    default ->
+      VerifyCall {
+        credential: r.credential,
+        c_cid: r.cid, c_method: r.method, c_key: r.key,
+        c_resource: r.resource, c_name: r.name, c_body: r.body,
+        c_namespace: r.namespace, c_verdict: PENDING, c_answer: "",
+        c_watch: r.watch
+      };
+  }
+
+  // Authentication's verdict, and the verb. The verb is (method, is-collection):
+  // a GET with no name is a LIST, and a POST is a create regardless. Deciding
+  // that here is the point — it is the REST convention, and a convention is
+  // meaning.
+  //
+  // A refused credential still goes to `rbac_gate`, carrying its verdict: the
+  // walk it performs on a request already refused is wasted work, and paying it
+  // buys a single path through the graph instead of two, which is the trade
+  // this chain makes everywhere.
+  decision d_authz(v: Verified) -> AuthzCall {
+    // Already decided upstream — a discovery document, or a path this server
+    // does not serve. It rides through untouched, which is what keeps there
+    // being ONE way to the encoder.
+    when v.c_verdict != PENDING ->
+      AuthzCall { identity: "", verb: "", resource: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: v.c_verdict, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: v.c_answer, c_verb: "", c_resource: "",
+                  c_namespace: "" };
+    when v.status == V_NO_KEY ->
+      AuthzCall { identity: "", verb: "", resource: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: 503, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "no verification key", c_verb: "", c_resource: "", c_namespace: "" };
+    when v.status == V_MALFORMED ->
+      AuthzCall { identity: "", verb: "", resource: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "no usable credential", c_verb: "", c_resource: "", c_namespace: "" };
+    when v.status == V_EXPIRED ->
+      AuthzCall { identity: "", verb: "", resource: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "credential expired", c_verb: "", c_resource: "", c_namespace: "" };
+    when v.status != V_OK ->
+      AuthzCall { identity: "", verb: "", resource: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: 401, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "credential rejected", c_verb: "", c_resource: "", c_namespace: "" };
+    when v.c_method == M_POST ->
+      AuthzCall { identity: v.subject, verb: "create", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "create",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    when v.c_method == M_PUT ->
+      AuthzCall { identity: v.subject, verb: "update", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "update",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    when v.c_method == M_PATCH ->
+      AuthzCall { identity: v.subject, verb: "update", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "update",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    when v.c_method == M_DELETE ->
+      AuthzCall { identity: v.subject, verb: "delete", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "delete",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    // `watch` is a distinct Kubernetes RBAC verb, not a flavour of `list`, so
+    // a role that grants list does NOT grant watch. Deciding that here is the
+    // point: it is API semantics, and API semantics are data.
+    when v.c_watch == 1 ->
+      AuthzCall { identity: v.subject, verb: "watch", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "watch",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    when v.c_name == "" ->
+      AuthzCall { identity: v.subject, verb: "list", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "list",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+    default ->
+      AuthzCall { identity: v.subject, verb: "get", resource: v.c_resource,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "get",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace };
+  }
+
+  // Authorization's verdict becomes an admission call. A refusal still passes
+  // through — one path, not two — with an empty verb, so admission skips it.
+  //
+  // Only create and update present an object. A delete has none, a read has
+  // none, and handing admission an empty object under a policy with a required
+  // field would refuse a request that was never malformed.
+  decision d_gate(a: Authzed) -> AdmitCall {
+    when a.c_verdict != PENDING ->
+      AdmitCall { verb: "", resource: "", namespace: "", object: a.c_body,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: a.c_verdict, c_name: a.c_name, c_reason: a.c_reason,
+                  c_verb: a.c_verb };
+    when a.allowed == 0 ->
+      AdmitCall { verb: "", resource: "", namespace: "", object: a.c_body,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: 403, c_name: a.c_name, c_reason: "forbidden",
+                  c_verb: a.c_verb };
+    when a.c_verb == "create" ->
+      AdmitCall { verb: "create", resource: a.c_resource, namespace: a.c_namespace,
+                  object: a.c_body,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: PENDING, c_name: a.c_name, c_reason: "",
+                  c_verb: a.c_verb };
+    when a.c_verb == "update" ->
+      AdmitCall { verb: "update", resource: a.c_resource, namespace: a.c_namespace,
+                  object: a.c_body,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: PENDING, c_name: a.c_name, c_reason: "",
+                  c_verb: a.c_verb };
+    default ->
+      AdmitCall { verb: "", resource: "", namespace: "", object: a.c_body,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: PENDING, c_name: a.c_name, c_reason: "",
+                  c_verb: a.c_verb };
+  }
+
+  // The read that every verb needs. A GET reads the object; a collection GET
+  // LISTs the prefix; a create/update/delete reads first so the ACT stage knows
+  // whether the object was there — which is the whole difference between 201
+  // and 409, and between 200 and 404.
+  decision d_probe(a: Admitted) -> StoreCall {
+    when a.c_verdict != PENDING ->
+      StoreCall { cid: a.c_cid, op: OP_NOOP, key: "", value: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: a.c_verdict, c_body: a.object,
+                  c_reason: a.c_reason, c_verb: a.c_verb };
+    // Admission refused. Its `object` is the REASON in that case, which is why
+    // it becomes the answer rather than the body of a write.
+    when a.status != 200 ->
+      StoreCall { cid: a.c_cid, op: OP_NOOP, key: "", value: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: a.status, c_body: a.object,
+                  c_reason: a.object, c_verb: a.c_verb };
+    // A collection GET is the only LIST. A POST also arrives with no name in
+    // its path, but `kube_decode` has already addressed it from the body, so it
+    // reads the OBJECT — which is what tells `act` whether the create conflicts.
+    when a.c_method == M_GET && a.c_name == "" ->
+      StoreCall { cid: a.c_cid, op: OP_LIST, key: a.c_key, value: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: PENDING, c_body: a.object, c_reason: "",
+                  c_verb: a.c_verb };
+    default ->
+      StoreCall { cid: a.c_cid, op: OP_GET, key: a.c_key, value: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key,
+                  c_verdict: PENDING, c_body: a.object, c_reason: "",
+                  c_verb: a.c_verb };
+  }
+
+  // What the probe found, plus the verb, decides both the write and the answer.
+  //
+  // The answer is settled HERE, before the write is attempted, because what to
+  // tell the client does not depend on whether the store's write returns 200 or
+  // its unchanged-204 — and making it depend on that is how a successful create
+  // starts answering 204.
+  //
+  // ONE decision, not one per outcome: a graph edge cannot branch on a record's
+  // content, so "the object was there" and "it was not" are arms of the same
+  // decision rather than two nodes the probe chooses between. Arm ORDER carries
+  // the meaning — an absent object is not a conflict, so create-on-miss must be
+  // tested before the per-method arms below it.
+  decision d_act(r: StoreReply) -> ActCall {
+    when r.c_verdict != PENDING ->
+      ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
+                c_cid: r.c_cid, c_status: r.c_verdict, c_answer: r.c_reason, c_stream: 0 };
+
+    // A WATCH. The probe already LISTed the collection, so that listing is the
+    // stream's first slice — a client that asks to watch from the start gets
+    // the current state and then the changes, which is what `resourceVersion=0`
+    // means. The registration is a PUT keyed `/watch-reg` + the collection key,
+    // carrying the connection id as its value, and the watch chain reads it to
+    // learn where to send events.
+    //
+    // `c_stream: 1` sets MORE_BODY on the envelope: the response is not
+    // finished, and wave holds the connection open for the rest of it.
+    when r.c_verb == "watch" ->
+      ActCall { cid: r.c_cid, op: OP_PUT, key: "/watch-reg", key2: r.c_key,
+                value: "cid=", value2: r.c_cid,
+                c_cid: r.c_cid, c_status: 200, c_answer: r.value, c_stream: 1 };
+
+    // --- the probe found nothing ---
+    // A create is the one verb an absent object ENABLES, so it comes first;
+    // every other verb takes the store's own 404, and the graph never forms an
+    // opinion about it.
+    when r.status == 404 && r.c_method == M_POST ->
+      ActCall { cid: r.c_cid, op: OP_PUT, key: r.c_key, key2: "", value: r.c_body,
+                c_cid: r.c_cid, c_status: 201, c_answer: r.c_body, c_stream: 0 };
+    when r.status == 404 ->
+      ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
+                c_cid: r.c_cid, c_status: 404, c_answer: "not found", c_stream: 0 };
+
+    // --- the probe found the object ---
+    when r.c_method == M_POST ->
+      ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
+                c_cid: r.c_cid, c_status: 409, c_answer: "already exists", c_stream: 0 };
+    // A delete answers the Kubernetes `Status` envelope, which is a LITERAL
+    // and therefore params: what a successful delete says is API surface, not
+    // something a module should hold.
+    when r.c_method == M_DELETE ->
+      ActCall { cid: r.c_cid, op: OP_DELETE, key: r.c_key, key2: "", value: "",
+                c_cid: r.c_cid, c_status: 200,
+                c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Success\"}",
+                c_stream: 0 };
+    when r.c_method == M_PUT ->
+      ActCall { cid: r.c_cid, op: OP_PUT, key: r.c_key, key2: "", value: r.c_body,
+                c_cid: r.c_cid, c_status: 200, c_answer: r.c_body, c_stream: 0 };
+    when r.c_method == M_PATCH ->
+      ActCall { cid: r.c_cid, op: OP_PUT, key: r.c_key, key2: "", value: r.c_body,
+                c_cid: r.c_cid, c_status: 200, c_answer: r.c_body, c_stream: 0 };
+    // A read: the store already answered it, value and status both.
+    default ->
+      ActCall { cid: r.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
+                c_cid: r.c_cid, c_status: r.status, c_answer: r.value, c_stream: 0 };
+  }
+
+  // The answer, already decided. The write's own status is deliberately NOT
+  // consulted here; a 500 from the store is the one case worth adding when the
+  // store learns to report one distinctly.
+  // A status of 0 is "there is nothing to send" — the watch chain's way of
+  // saying no client is listening. The encoder would otherwise write a
+  // zero-status envelope, which is not a response at all.
+  decision d_reply(a: ActReply) -> Reply {
+    when a.c_status == 0 ->
+      Reply { cid: 0, status: 204, value: "", flags: 0 };
+    default -> Reply { cid: a.c_cid, status: a.c_status, value: a.c_answer,
+                       flags: a.c_stream };
+  }
+
+  // ---- identity stages (a codec-only node has no program and fails CLOSED) ----
+
+  transformation pass_req(r: Request) -> Request {
+    Request { cid: r.cid, method: r.method, resource: r.resource,
+              namespace: r.namespace, name: r.name, body: r.body,
+              key: r.key, credential: r.credential, target: r.target }
+  }
+  transformation pass_verified(v: Verified) -> Verified {
+    Verified { corr: v.corr, status: v.status, subject: v.subject,
+               c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+               c_resource: v.c_resource, c_name: v.c_name, c_body: v.c_body,
+               c_namespace: v.c_namespace, c_verdict: v.c_verdict,
+               c_answer: v.c_answer, c_watch: v.c_watch }
+  }
+  transformation pass_authzed(a: Authzed) -> Authzed {
+    Authzed { allowed: a.allowed, c_cid: a.c_cid, c_method: a.c_method,
+              c_key: a.c_key, c_verdict: a.c_verdict, c_name: a.c_name,
+              c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+              c_resource: a.c_resource, c_namespace: a.c_namespace }
+  }
+  transformation pass_admitted(a: Admitted) -> Admitted {
+    Admitted { status: a.status, object: a.object, c_cid: a.c_cid,
+               c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+               c_name: a.c_name, c_reason: a.c_reason, c_verb: a.c_verb }
+  }
+  transformation pass_sreply(r: StoreReply) -> StoreReply {
+    StoreReply { cid: r.cid, status: r.status, value: r.value,
+                 c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                 c_verdict: r.c_verdict, c_body: r.c_body, c_reason: r.c_reason,
+                 c_verb: r.c_verb }
+  }
+  transformation pass_areply(a: ActReply) -> ActReply {
+    ActReply { cid: a.cid, status: a.status, value: a.value,
+               c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer,
+               c_stream: a.c_stream }
+  }
+
+  pipeline admit(r: Request) -> VerifyCall {
+    call x = pass_req(r);
+    call y = d_admit(x);
+    return y;
+  }
+  pipeline authz(v: Verified) -> AuthzCall {
+    call x = pass_verified(v);
+    call y = d_authz(x);
+    return y;
+  }
+  pipeline gate(a: Authzed) -> AdmitCall {
+    call x = pass_authzed(a);
+    call y = d_gate(x);
+    return y;
+  }
+  pipeline probe(a: Admitted) -> StoreCall {
+    call x = pass_admitted(a);
+    call y = d_probe(x);
+    return y;
+  }
+  pipeline act(r: StoreReply) -> ActCall {
+    call x = pass_sreply(r);
+    call y = d_act(x);
+    return y;
+  }
+  // The encoder node's stage program: it rebuilds the Reply record so the
+  // `ser` program that follows sees every field. It must copy FOUR — the read
+  // path's copied three, and field 4 (the envelope flags) silently vanished
+  // when this chain started setting it.
+  transformation pass_reply(r: Reply) -> Reply {
+    Reply { cid: r.cid, status: r.status, value: r.value, flags: r.flags }
+  }
+  pipeline encode(r: Reply) -> Reply {
+    call x = pass_reply(r);
+    return x;
+  }
+
+  pipeline reply(a: ActReply) -> Reply {
+    call x = pass_areply(a);
+    call y = d_reply(x);
+    return y;
+  }
+
+  entry admit = admit;
+  entry authz = authz;
+  entry gate = gate;
+  entry probe = probe;
+  entry act = act;
+  entry reply = reply;
+  entry encode = encode;
+
+  provenance revision "apiplane-request-path" toolchain "chronicle-authoring";
+}

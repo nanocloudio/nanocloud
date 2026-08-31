@@ -35,7 +35,7 @@ done
 
 D="$(mktemp -d /tmp/nc-kubedec-XXXXXX)"
 RUNTIME_PID=""
-cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; rm -rf "$D"; }
+cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi; }
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -25 "$D/run.log" 2>/dev/null || true; exit 1; }
 
@@ -107,8 +107,15 @@ echo "== 4. a POST with a body (named group, collection — no name) =="
 drive "$D/post.log" -X POST --data-binary '{"metadata":{"name":"web"}}' \
   "http://127.0.0.1:$PORT/apis/apps/v1/namespaces/kube-system/deployments"
 
+echo "== 4b. a GET carrying a bearer credential =="
+drive "$D/auth.log" -H "Authorization: Bearer abc.def.ghi" \
+  "http://127.0.0.1:$PORT/api/v1/namespaces/default/pods/web-0"
+
+echo "== 4c. a collection GET with ?watch=true =="
+drive "$D/watch.log" "http://127.0.0.1:$PORT/api/v1/namespaces/default/pods?watch=true&resourceVersion=0"
+
 echo "== 5. assert the exact Chronicle v1 frames =="
-python3 - "$D/get.log" "$D/post.log" <<'PY'
+python3 - "$D/get.log" "$D/post.log" "$D/auth.log" "$D/watch.log" <<'PY'
 import struct, sys
 logs = [open(a, "rb").read() for a in sys.argv[1:]]
 
@@ -117,7 +124,8 @@ TY_BYTES, TY_I64 = 0, 1
 def field(num, ty, payload):
     return bytes([num, ty]) + struct.pack("<H", len(payload)) + payload
 
-def frame(wave_id_known, method, resource, namespace, name, body, key):
+def frame(wave_id_known, method, resource, namespace, name, body, key,
+          credential=b"", target=b"", query=b"", watch=0):
     """Every field except the correlation, which the graph assigns."""
     return (field(2, TY_I64, struct.pack("<q", method))
             + field(3, TY_BYTES, resource)
@@ -126,15 +134,41 @@ def frame(wave_id_known, method, resource, namespace, name, body, key):
             + field(6, TY_BYTES, body)
             # Field 7 is the STORE KEY, assembled here because the Chronicle VM
             # has no string concatenation (ADD is integer-only).
-            + field(7, TY_BYTES, key))
+            + field(7, TY_BYTES, key)
+            # Field 8 is the bearer CREDENTIAL with its scheme stripped, and 9
+            # the raw request target. Both are extracted for the same reason as
+            # the key: the VM cannot scan a header block or split on a space.
+            # An absent Authorization header is an EMPTY field, never a missing
+            # one — "no credential" is an authorization answer downstream, not
+            # an unroutable request here.
+            + field(8, TY_BYTES, credential)
+            + field(9, TY_BYTES, target)
+            # The QUERY, split off before the path is parsed, and `watch=true`
+            # as a NUMBER — the VM has no substring test, so the flag cannot be
+            # a comparison downstream.
+            + field(10, TY_BYTES, query)
+            + field(11, TY_I64, struct.pack("<q", watch)))
 
 # wave wire/method.rs: GET = 1, POST = 3 (the registry's uproc pins GET = 1).
 cases = [
     ("GET  /api/v1/namespaces/default/pods/web-0",
-     frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0")),
+     frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0",
+           b"", b"/api/v1/namespaces/default/pods/web-0")),
+    # A CREATE names its object in the BODY: the path has no name, so the key
+    # is addressed from `metadata.name`. Path name wins when there is one.
     ("POST /apis/apps/v1/namespaces/kube-system/deployments",
      frame(None, 3, b"deployments", b"kube-system", b"",
-           b'{"metadata":{"name":"web"}}', b"/deployments/kube-system/")),
+           b'{"metadata":{"name":"web"}}', b"/deployments/kube-system/web",
+           b"", b"/apis/apps/v1/namespaces/kube-system/deployments")),
+    ("GET  .../pods/web-0 with Authorization: Bearer",
+     frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0",
+           b"abc.def.ghi", b"/api/v1/namespaces/default/pods/web-0")),
+    # The query is split off BEFORE the path is parsed: without that, the
+    # resource here is literally named `pods?watch=true`.
+    ("GET  .../pods?watch=true (collection watch)",
+     frame(None, 1, b"pods", b"default", b"", b"", b"/pods/default/",
+           b"", b"/api/v1/namespaces/default/pods",
+           b"watch=true&resourceVersion=0", 1)),
 ]
 
 fails = []
@@ -147,14 +181,14 @@ for (label, tail), log in zip(cases, logs):
     # whole frame, not just the part that was easy to predict.
     corr_at = at - 12          # field 1: [1][TY_I64][8,0] + 8 payload bytes
     count_at = corr_at - 1
-    if count_at < 0 or log[count_at] != 7:
-        fails.append(label + " (field count != 7)")
+    if count_at < 0 or log[count_at] != 11:
+        fails.append(label + " (field count != 11)")
         continue
     if log[corr_at] != 1 or log[corr_at + 1] != TY_I64:
         fails.append(label + " (field 1 is not the i64 correlation)")
         continue
     corr = struct.unpack("<q", log[corr_at + 4:corr_at + 12])[0]
-    print("   ok  %-52s corr=0x%08x, 7 fields, byte-exact" % (label, corr))
+    print("   ok  %-52s corr=0x%08x, 11 fields, byte-exact" % (label, corr))
 
 if fails:
     for f in fails:

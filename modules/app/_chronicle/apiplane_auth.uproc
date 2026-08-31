@@ -1,0 +1,144 @@
+// The API plane's AUTH stage on its own, compiled to params.
+//
+// A FILTER in a Chronicle chain: the request leaves the graph, is answered by a
+// module that belongs to somebody else — kagi, which owns the signature check
+// — and comes back still knowing which request it was. The credential goes out
+// at field 8 and the request's own identity rides across as CARRY at 30..35,
+// six of the ten fields a connector echoes.
+//
+// The shipped apiserver graph (`apiplane.uproc`) carries this stage inline;
+// this file is the same two decisions standing alone, which is what lets
+// `scripts/apiplane-auth-e2e.sh` drive the seam without the rest of the plane.
+module nanocloud.apiplane {
+
+  // kube_decode's projection. Fields 1..7 are the read path's `ns.Request`
+  // unchanged; 8 is the bearer credential it now extracts from the header
+  // block, empty when the caller sent none.
+  message ap.Request {
+    cid: int = 1;
+    method: int = 2;
+    resource: string = 3;
+    namespace: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+    credential: string = 8;
+  }
+
+  // What `kagi_verify` takes. The credential at 8 is the only thing it reads;
+  // everything else is carry it must hand back untouched, because once the
+  // record leaves for kagi this decision's inputs are gone.
+  message ap.VerifyCall {
+    credential: string = 8;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_resource: string = 32;
+    c_namespace: string = 33;
+    c_name: string = 34;
+    c_key: string = 35;
+  }
+
+  // What `kagi_verify` answers with: kagi's typed VerifiedIdentity, plus the
+  // carry. `status` is a `verify_err` code, NOT an HTTP status — kagi hands
+  // back the typed reason precisely so the mapping to a response is a policy
+  // decision somebody can read, which is this file.
+  message ap.Verified {
+    corr: int = 1;
+    status: int = 2;
+    subject: string = 3;
+    issuer: string = 4;
+    audience: string = 5;
+    scope: string = 6;
+    expires: int = 7;
+    suite: int = 8;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_resource: string = 32;
+    c_namespace: string = 33;
+    c_name: string = 34;
+    c_key: string = 35;
+  }
+
+  // The read path's `ns.StoreReply`, field for field, so the SAME `ser`
+  // program encodes the HttpResponse. The response leg needs no module and no
+  // new bytecode — which is why there is no `kube_reply` here.
+  message ap.Reply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+  }
+
+  // kagi's `verify_err` codes (auth_wire.rs), named rather than restated: a
+  // number written twice is a number that disagrees with itself eventually.
+  enum V_OK = 0;
+  enum V_MALFORMED = 1;
+  enum V_NO_KEY = 2;
+  enum V_EXPIRED = 5;
+
+  // Hand the credential to kagi, keeping the request. There is no branch worth
+  // taking here: an ABSENT credential is not shortcut to a 401, because "no
+  // credential" and "a credential that did not verify" must reach the same
+  // refusal by the same path, or the two answers drift apart. kagi calls an
+  // empty credential MALFORMED and this file maps it below.
+  decision gate(r: ap.Request) -> ap.VerifyCall {
+    default ->
+      ap.VerifyCall {
+        credential: r.credential,
+        c_cid: r.cid, c_method: r.method, c_resource: r.resource,
+        c_namespace: r.namespace, c_name: r.name, c_key: r.key
+      };
+  }
+
+  // The refusal ladder. Distinct statuses because the distinctions are real
+  // and a caller can act on them: NO_KEY is the SERVER's fault and retrying
+  // may work, so it is a 503 — answering 401 there tells a caller with a
+  // perfectly good token that its token is bad.
+  decision authorize(v: ap.Verified) -> ap.Reply {
+    when v.status == V_OK ->
+      ap.Reply { cid: v.c_cid, status: 200, value: v.subject };
+    when v.status == V_NO_KEY ->
+      ap.Reply { cid: v.c_cid, status: 503, value: "no verification key" };
+    when v.status == V_MALFORMED ->
+      ap.Reply { cid: v.c_cid, status: 401, value: "no usable credential" };
+    when v.status == V_EXPIRED ->
+      ap.Reply { cid: v.c_cid, status: 401, value: "credential expired" };
+    default ->
+      ap.Reply { cid: v.c_cid, status: 401, value: "credential rejected" };
+  }
+
+  // Identity stages: a codec-only node has no program and fails CLOSED, so
+  // each pipeline pairs one with the decision that carries the meaning.
+  transformation pass_req(r: ap.Request) -> ap.Request {
+    ap.Request {
+      cid: r.cid, method: r.method, resource: r.resource,
+      namespace: r.namespace, name: r.name, body: r.body,
+      key: r.key, credential: r.credential
+    }
+  }
+
+  transformation pass_verified(v: ap.Verified) -> ap.Verified {
+    ap.Verified {
+      corr: v.corr, status: v.status, subject: v.subject, issuer: v.issuer,
+      audience: v.audience, scope: v.scope, expires: v.expires, suite: v.suite,
+      c_cid: v.c_cid, c_method: v.c_method, c_resource: v.c_resource,
+      c_namespace: v.c_namespace, c_name: v.c_name, c_key: v.c_key
+    }
+  }
+
+  pipeline admit(r: ap.Request) -> ap.VerifyCall {
+    call decoded = pass_req(r);
+    call called = gate(decoded);
+    return called;
+  }
+
+  pipeline decide(v: ap.Verified) -> ap.Reply {
+    call seen = pass_verified(v);
+    call answer = authorize(seen);
+    return answer;
+  }
+
+  entry admit = admit;
+  entry decide = decide;
+
+  provenance revision "apiplane-auth-stage" toolchain "chronicle-authoring";
+}

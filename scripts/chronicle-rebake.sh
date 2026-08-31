@@ -17,12 +17,22 @@ for i, l in enumerate(lines):
     m = re.search(r'chronicle-source:\s*(\S+)\s+(\S+)', l)
     if not m:
         continue
-    fresh = subprocess.run(["bash", "-c", f'. "{root}/scripts/fluxor-env.sh"; . "{root}/scripts/chronicle-params.sh"; nc_decision "{root}/{m.group(1)}" "{m.group(2)}"'],
+    # Which key follows decides which compiler answer to ask for: a decision
+    # container or an ir_stages one.
+    key = "decision"
+    for j in range(i + 1, min(i + 12, len(lines))):
+        if re.match(r'\s*ir_stages:\s*"', lines[j]):
+            key = "ir_stages"
+            break
+        if re.match(r'\s*decision:\s*"', lines[j]):
+            break
+    fn = "nc_decision" if key == "decision" else "nc_stages"
+    fresh = subprocess.run(["bash", "-c", f'. "{root}/scripts/fluxor-env.sh"; . "{root}/scripts/chronicle-params.sh"; {fn} "{root}/{m.group(1)}" "{m.group(2)}"'],
                            capture_output=True, text=True).stdout.strip()
     if not fresh:
         print(f"FAIL: {m.group(1)} {m.group(2)} did not compile"); sys.exit(1)
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.match(r'(\s*decision:\s*")([0-9a-f]+)(".*)', lines[j])
+        d = re.match(r'(\s*' + key + r':\s*")([0-9a-f]+)(".*)', lines[j])
         if d:
             if d.group(2) != fresh:
                 lines[j] = d.group(1) + fresh + d.group(3); changed += 1

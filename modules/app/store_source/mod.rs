@@ -120,6 +120,10 @@ struct State {
     /// `join_paths = <path,…>`: the joined entry's own fields at 60..64.
     join_paths: [u8; MAX_PATHS_SPEC],
     join_paths_len: u16,
+    /// `list_values = 1`: field 56 carries the children's VALUES only, without
+    /// the `<name>=` each is normally labelled with. A backend set is a list of
+    /// values; a decision cannot strip the labels afterwards.
+    list_values: u32,
     /// `list_children = <prefix>`: field 56 is the object's children under
     /// `<prefix><tail><child_sep>`, materialised as `<name>=<value>,…` in key
     /// order — a view of a set, for a document that has to state one.
@@ -364,6 +368,9 @@ mod params_def {
                 s.join_pick_len = n as u8;
                 if n > 0 { ptr_copy(s.join_pick.as_mut_ptr(), d, n); }
             };
+
+        25, list_values, u32, 0
+            => |s, d, len| { s.list_values = p_u32(d, len, 0, 0); };
 
         22, now, u32, 0
             => |s, d, len| { s.now = p_u32(d, len, 0, 0); };
@@ -646,7 +653,16 @@ unsafe fn project(
         let one = &spec[start..end];
         if !one.is_empty() {
             let (one, modifier) = split_mod(one);
-            let got = if s.flat != 0 {
+            let got = if one == b"." {
+                // The WHOLE VALUE, unparsed. A projection reads FIELDS out of
+                // an object, which is right for a reconciler and wrong for
+                // anything bridging the store to something that wants opaque
+                // bytes — a kagi key frame, an endpoint address, a document a
+                // decision only forwards. Without it, reaching a raw value
+                // takes a `store_effect` GET — a second round trip to read
+                // what this walk already has in hand.
+                value
+            } else if s.flat != 0 {
                 flat_field(value, one).unwrap_or(&[])
             } else if one.len() > 2 && one.ends_with(b".*") {
                 // `path.*`: the object's MEMBERS, braces stripped, so a
@@ -744,7 +760,19 @@ unsafe fn project(
             let one = &spec[start..end];
             if !one.is_empty() {
                 let colon = one.iter().position(|&b| b == b':').unwrap_or(one.len());
-                let prefix = &one[..colon];
+                let mut prefix = &one[..colon];
+                // `<prefix>!flat` reads the RELATED record as `k=v;k=v` rather
+                // than as JSON. The two shapes both live in the control plane —
+                // a Route is JSON, its `/route-status/` is flat — and a source
+                // only knows the shape of its OWN objects. Without this the
+                // projection silently reads nothing: `j_path` finds no path in
+                // a flat record, and an empty field looks exactly like an
+                // absent one.
+                let mut rel_flat = s.flat != 0;
+                if prefix.len() > 5 && prefix.ends_with(b"!flat") {
+                    rel_flat = true;
+                    prefix = &prefix[..prefix.len() - 5];
+                }
                 let paths = if colon < one.len() {
                     &one[colon + 1..]
                 } else {
@@ -782,7 +810,7 @@ unsafe fn project(
                         } else {
                             path
                         };
-                        let got = if s.flat != 0 {
+                        let got = if rel_flat {
                             flat_field(rval, path).unwrap_or(&[])
                         } else {
                             let mut segs: [&[u8]; 6] = [&[]; 6];
@@ -1031,11 +1059,19 @@ unsafe fn project(
                         .unwrap_or(spec.len());
                     let one = &spec[start..end];
                     if !one.is_empty() {
-                        let mut segs: [&[u8]; 6] = [&[]; 6];
-                        let ns = split_dots(one, &mut segs);
-                        let got = j_sub(jval, &segs[..ns])
-                            .or_else(|| j_path(jval, &segs[..ns]))
-                            .unwrap_or(&[]);
+                        // `.` is the joined entry's WHOLE VALUE — same reason
+                        // as `paths`: a joined record whose value is not JSON
+                        // (an endpoint address, a key frame) has no path to
+                        // read, and the walk already holds the bytes.
+                        let got = if one == b"." {
+                            jval
+                        } else {
+                            let mut segs: [&[u8]; 6] = [&[]; 6];
+                            let ns = split_dots(one, &mut segs);
+                            j_sub(jval, &segs[..ns])
+                                .or_else(|| j_path(jval, &segs[..ns]))
+                                .unwrap_or(&[])
+                        };
                         let Some(q) = put_field(out, p, fno, TY_BYTES, got) else {
                             return 0;
                         };
@@ -1127,6 +1163,7 @@ unsafe fn project(
                 &s.list_children[..s.list_children_len as usize],
                 key_tail,
                 s.child_sep,
+                s.list_values != 0,
                 &mut lc,
             );
             let Some(q) = put_field(out, p, 56, TY_BYTES, &lc[..ll]) else {
@@ -1422,6 +1459,7 @@ unsafe fn list_children(
     prefix: &[u8],
     tail: &[u8],
     sep: u8,
+    values_only: bool,
     out: &mut [u8],
 ) -> usize {
     let mut pfx = [0u8; MAX_PREFIX + MAX_KEY + 2];
@@ -1456,7 +1494,11 @@ unsafe fn list_children(
             let Some(vl) = get_value(sys, name, &mut v) else {
                 continue;
             };
-            let need = child.len() + 1 + vl + usize::from(o > 0);
+            let need = if values_only {
+                vl
+            } else {
+                child.len() + 1 + vl
+            } + usize::from(o > 0);
             if o + need > out.len() {
                 let m = b"[store_source] list_children does not fit - view CUT at a whole entry";
                 dev_log(sys, 1, m.as_ptr(), m.len());
@@ -1466,9 +1508,15 @@ unsafe fn list_children(
                 out[o] = b',';
                 o += 1;
             }
-            o = append_bytes(out, o, child);
-            out[o] = b'=';
-            o += 1;
+            // `<name>=<value>` is what a projection keyed BY child wants — the
+            // endpoints document names its pods. A consumer that wants the
+            // values as a list (an edge's backend set) wants them without the
+            // names, and cannot strip them afterwards: the VM has no iteration.
+            if !values_only {
+                o = append_bytes(out, o, child);
+                out[o] = b'=';
+                o += 1;
+            }
             o = append_bytes(out, o, &v[..vl]);
         }
         if nlen == 0 {

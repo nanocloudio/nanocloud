@@ -25,7 +25,12 @@ command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 checked=0
 fails=0
 while IFS= read -r graph; do
-  # pair each `chronicle-source:` marker with the `decision:` line that follows
+  # Pair each `chronicle-source:` marker with the param line that follows —
+  # `decision:` OR `ir_stages:`, whichever comes FIRST. Matching only
+  # `decision:` was not merely incomplete: a marker sitting above an
+  # `ir_stages:` param would scan past it and pair with the NEXT node's
+  # decision, so one param went unchecked and another was checked against the
+  # wrong source.
   python3 - "$graph" > /tmp/nc-drift-$$.txt <<'PY'
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
@@ -34,15 +39,19 @@ for i, l in enumerate(lines):
     if not m:
         continue
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.search(r'decision:\s*"([0-9a-f]+)"', lines[j])
+        d = re.search(r'(decision|ir_stages):\s*"([0-9a-f]+)"', lines[j])
         if d:
-            print(m.group(1), m.group(2), d.group(1))
+            print(m.group(1), m.group(2), d.group(1), d.group(2))
             break
 PY
-  while read -r uproc entry baked; do
+  while read -r uproc entry kind baked; do
     [ -n "$baked" ] || continue
     checked=$((checked + 1))
-    fresh="$(nc_decision "$ROOT/$uproc" "$entry")"
+    if [ "$kind" = "ir_stages" ]; then
+      fresh="$(nc_stages "$ROOT/$uproc" "$entry")"
+    else
+      fresh="$(nc_decision "$ROOT/$uproc" "$entry")"
+    fi
     if [ -z "$fresh" ]; then
       echo "   FAIL $graph: could not compile $uproc $entry"; fails=$((fails + 1)); continue
     fi
@@ -51,7 +60,7 @@ PY
       echo "        recompile and update the graph — a stale decision does not error, it decides something else"
       fails=$((fails + 1)); continue
     fi
-    echo "   ok   $(basename "$graph") <- $(basename "$uproc") $entry"
+    echo "   ok   $(basename "$graph") <- $(basename "$uproc") $entry ($kind)"
   done < /tmp/nc-drift-$$.txt
   rm -f /tmp/nc-drift-$$.txt
 done < <(grep -rl 'chronicle-source:' "$ROOT/packaging" 2>/dev/null)

@@ -16,7 +16,7 @@
 #
 # The path under test is Route → edge 443 → workload.
 # It runs the tls-fronted edge graph (packaging/debian/fluxor-edge.yaml shape),
-# seeds one /dataplane/edge/ row (the route_compiler seam is proven separately
+# seeds one /dataplane/edge/ row (the route-compiler seam is proven separately
 # in route-compiler-e2e.sh), and asserts the workload's body returns through the
 # relay — plus the fixed-surface fallback for unmatched requests.
 #
@@ -154,7 +154,7 @@ wiring:
 YAML
 
 echo "== 4. seed the compiled Route → /dataplane/edge/ row =="
-# One validated Route's backend set (route_compiler's output; its own seam is
+# One validated Route's backend set (the route compiler's output; its own seam is
 # proven in route-compiler-e2e.sh). host + longest-prefix path + one ready
 # backend pointing at the workload.
 wal_put "/dataplane/edge/default/web" \

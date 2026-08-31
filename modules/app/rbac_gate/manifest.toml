@@ -28,6 +28,41 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 4096
 
+# The CONNECTOR seam, alongside the store one above.
+#
+# Walking every RoleBinding and resolving its Role is exactly what Chronicle's
+# VM cannot do — it has no iteration, by construction — so authorization over a
+# SET is a connector's job for the same reason `store_source` walks a prefix.
+# What this pair does NOT carry is the meaning: it answers "did any rule match"
+# as a number, and whether an unmatched request is a 403 (it is — deny by
+# default) is a decision in params.
+#
+# In:  a Chronicle record frame on `request_in`
+#        3 = identity (bytes)   4 = verb (bytes)   5 = resource (bytes)
+#        30..=39 = carry, echoed with number and type
+# Out: a Chronicle record frame on `response_out`
+#        2 = allowed (i64, 1 or 0)
+#        30..=39 = carry
+#
+# Both ports are OPTIONAL: unwired they stay -1 and the module is the
+# store-seam responder it has always been, which is how the modules-based
+# apiserver graph and the Chronicle one can both run during the cutover.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+# A whole record per step: the boundary must be kept.
+framed = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
 [[resources]]
 requires_contract = "storage.namespace"
 access = "write"

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Live E2E for the pod_lifecycle -> sandbox_runner -> oci pipeline — the kubelet
-# decision half (a module) driving the effect half (a module) driving the oci
-# capability surface, over the fluxor-native control-plane store, verified
-# UNPRIVILEGED.
+# Live E2E for the pod-lifecycle chain -> sandbox_runner -> workload pipeline —
+# the kubelet's decision half (Chronicle params) driving the effect half (a
+# module) driving the workload capability surface, over the control-plane
+# store, verified UNPRIVILEGED.
 #
-# The store is single-process, owned by the fluxor-linux runtime, and seeded from
-# its durable append-log at init: this script (playing nanocloud after it
-# materialized the bundle) writes a /pod-specs/<uid> into `$D/store.log`. Inside
-# the runtime: pod_lifecycle (DECISION) projects /sandboxes/<uid>; sandbox_runner
-# (EFFECT) creates+starts the sandbox via the oci contract and writes
-# /sandbox-status/<uid>; pod_lifecycle maps that back to /pod-lifecycle-status/
-# <uid>. The decision<->effect handshake happens live in the one in-process store
-# during the run. A NULL sandbox (no isolate) keeps it unprivileged.
+# The store is single-process, owned by the fluxor-linux runtime, and seeded
+# from its durable append-log at init: this script (playing the control plane
+# after it materialized the bundle) writes a /pod-specs/<uid> into
+# `$D/store.log`. Inside the runtime: the lifecycle chain (DECISION) projects
+# /sandboxes/<uid>; sandbox_runner (EFFECT) creates+starts the sandbox via the
+# workload contract and writes /sandbox-status/<uid>; the chain maps that back
+# to /pod-lifecycle-status/<uid>. The decision<->effect handshake happens live
+# in the one in-process store during the run. A NULL sandbox (no isolate) keeps
+# it unprivileged.
 #
 # Compact format:
 #   /pod-specs/<uid>            = "cmd=<argv>;desired=<running|deleted>[;rootfs=<path>][;iso=1]"
@@ -28,7 +29,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/pod_lifecycle.fmod" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -127,7 +128,7 @@ echo "   pod1: Succeeded   pod-nf: Failed"
 
 echo "== 5. kill-with-grace + no-restart-during-delete pin =="
 # Flip a restart=always pod AND the live sleeper to desired=deleted. The
-# pin: reconcile_one evaluates desired==deleted BEFORE the restart branch, so
+# pin: the decision evaluates desired==deleted BEFORE the restart branch, so
 # neither pod may be relaunched by its restartPolicy. pod-slp is live, so the
 # two-phase kill runs: /sandbox-kill/ sig=term → SIGTERM kills sleep →
 # terminal → delete flow + the kill key is consumed.

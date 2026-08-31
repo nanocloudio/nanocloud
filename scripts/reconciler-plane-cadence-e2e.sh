@@ -32,7 +32,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-NEED_FMODS="scheduler deployment_reconciler replicaset_reconciler daemonset_reconciler statefulset_reconciler job_reconciler hpa_reconciler garbage_collector namespace_gc"
+NEED_FMODS="store_source store_effect decision"
 for m in $NEED_FMODS; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $MODULES_DIR/$m.fmod (fluxor modules build --target bcm2712)"; exit 1; }
 done

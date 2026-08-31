@@ -15,3 +15,15 @@ nc_decision() { # nc_decision <uproc-path> <entry>
   fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null \
     | grep -oP '(?<=decision: ")[0-9a-f]+' | head -1 | tr -d '\n'
 }
+
+# The same, for a pipeline that lowers to an `ir_stages` container rather than a
+# decision — a codec-only stage, such as the one that rebuilds a record for an
+# encoder. Baking these by hand is how a record grows a field the encoder never
+# sees: the stage program copies a FIXED list, and the symptom is an envelope
+# byte that silently stays zero.
+nc_stages() { # nc_stages <uproc-path> <entry>
+  local hex
+  hex="$(python3 -c "import sys;print(open(sys.argv[1],'rb').read().hex())" "$1")"
+  fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null \
+    | grep -oP '(?<=ir_stages: ")[0-9a-f]+' | head -1 | tr -d '\n'
+}

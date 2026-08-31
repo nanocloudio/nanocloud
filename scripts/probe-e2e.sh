@@ -30,7 +30,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/pod_lifecycle.fmod" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 

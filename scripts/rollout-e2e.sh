@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for Deployment rollout (rolling update) over the fluxor-native store.
-# deployment_reconciler stamps a pod-template-hash (a digest of spec.template) on
+# the Deployment chain stamps a pod-template-hash (a digest of spec.template) on
 # the ReplicaSet; replicaset_reconciler stamps it on each Pod. When the template
 # changes (image nginx → httpd) the hash changes, so running Pods become stale
 # and are rolled — deleted (bounded per pass = a gradual rolling update) and
@@ -17,8 +17,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/deployment_reconciler.fmod" \
-         "$MODULES_DIR/replicaset_reconciler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 

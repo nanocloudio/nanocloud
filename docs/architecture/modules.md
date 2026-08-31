@@ -74,9 +74,48 @@ at a time, yielding so the responders run.
 | `api_responder` | `/api-req/` → `/api-resp/` | the small ops the edge answers without a full CRUD round-trip (`healthz`, `count:<prefix>`, `getjson:<key>`) |
 
 `kube_decode` sits beside them for the Chronicle graphs: it projects a wave
-`HttpRequest` envelope into a flat record frame. It decides nothing — Chronicle's
-VM cannot split a variable-arity path, so the reshaping happens in a domain
-module and the routing meaning stays in params.
+`HttpRequest` envelope into a flat record frame — method, resource, namespace,
+name, body, the assembled store key, the bearer credential with its scheme
+stripped, and the raw request target. It decides nothing — Chronicle's VM cannot
+split a variable-arity path or scan a header block, so the reshaping happens in a
+domain module and the routing meaning stays in params.
+
+`rbac_gate` and `api_admission` each have two natures. Behind their store lanes
+they are the modules in the table above; behind `request_in`/`response_out` they
+are connectors for the Chronicle graphs. `rbac_gate` answers "did any binding→role→rule match" as a
+number while the 403 stays in params; `api_admission` answers a status and the
+object as admitted, defaults applied, while what a refusal does to the request
+stays in params. Walking a set and counting live objects for a quota are what
+Chronicle's VM cannot do, which is the same reason `store_source` walks a
+prefix. Every one of these port pairs is optional, so one build serves the
+modules-based apiserver and the Chronicle one.
+
+`kagi_verify` is the other kind of node the Chronicle graphs need: a CONNECTOR,
+the role `store_source`/`store_effect` play for the store, but for kagi's
+`token_verify`. A record arrives, the credential goes out on kagi's own
+`auth_wire`, a typed `VerifiedIdentity` comes back, and the request's identity
+rides across as carry-through in fields 30..=39. It decides nothing either — the
+200/401/503 ladder is params (`modules/app/_chronicle/apiplane_auth.uproc`), and
+the signature check is kagi's, because a second JOSE verifier here is a second
+answer to "is this credential genuine". It holds one request in flight and drops
+rather than retries when the verifier's ring is full; `scripts/apiplane-auth-e2e.sh`
+drives the seam on its own.
+
+Together these make `packaging/debian/fluxor-apiplane.yaml`: the whole
+Kubernetes API request path — discovery, decode, authenticate, authorize, admit,
+read, write, answer — with every meaning in params
+(`modules/app/_chronicle/apiplane.uproc`) and no module in the path that does
+anything but move bytes or walk a set. `scripts/apiplane-e2e.sh` drives that
+shipped graph over the whole surface: the CRUD verbs, the Kubernetes `List` and
+`Status` envelopes, the discovery documents (literals in a decision — API
+surface is data), an unauthenticated refusal, an unauthorized one, and
+admission's defaulting and quota.
+
+`?watch=true` is served too, by a second store-change-driven chain
+(`apiplane_watch.uproc`) merging into the same reply stage — `watch` is checked
+as its own RBAC verb, as Kubernetes does. Two limits ride with it: wave holds a
+watch connection for a 30 s idle deadline, and each change re-emits the object
+level-triggered rather than as a delta.
 
 Identity is a host fact and stays one: `tls` verifies the client certificate and
 emits a per-session peer-identity envelope carrying an SVID (a hash of the peer
@@ -86,28 +125,22 @@ token.
 
 ## 3. Controllers
 
-A controller is a pure function of store state, re-applied on change. Each one
+A controller is a pure function of store state, re-applied on change: it
 SUBSCRIBEs its inputs, recomputes, and writes its outputs back — guarding every
 write with a read-compare, so a settled cluster spends no revisions and a
 controller that writes under a prefix it watches does not wake itself forever.
+That shape holds whether the rules are compiled into a module or carried as
+params. The workload tier is params; three controllers and the dataplane
+compilers are modules, the compilers because they render a whole ruleset from
+a walk over two prefixes.
+
+The modules:
 
 | Controller | Watches → writes |
 | ---------- | ---------------- |
-| `deployment_reconciler` | `/deployments.apps/` → the owned ReplicaSet, plus rollout history and a scaling event |
-| `replicaset_reconciler` | `/replicasets.apps/`, `/pods/` → exactly `replicas` Pods; create-if-absent, delete the surplus |
-| `daemonset_reconciler` | `/daemonsets.apps/`, `/nodes/`, `/pods/` → one node-pinned Pod per ready Node, pruned when a Node goes not-ready |
-| `statefulset_reconciler` | `/statefulsets.apps/`, `/pods/` → ordered identities: bring `<sts>-<i>` up only once `<sts>-<i-1>` is ready, tear down highest-first, one change per pass |
-| `job_reconciler` | `/jobs.batch/`, `/pods/` → run-to-completion: launch `completions` Pods once, track Succeeded, write `/job-status/` |
-| `hpa_reconciler` | `/hpa/`, `/hpa-metrics/` → the target Deployment's `replicas`, `desired = ceil(R × currentCPU / targetCPU)` clamped to `[min, max]` |
-| `garbage_collector` | the workload prefixes → deletes any object whose owner no longer resolves; over successive passes the cascade walks Deployment → ReplicaSet → Pods |
-| `namespace_gc` | `/namespaces/` → on `phase=Terminating`, sweep every namespaced prefix, then remove the namespace record |
-| `scheduler` | `/pods/`, `/nodes/` → binds each unbound Pod to the least-loaded ready Node |
-| `endpoints_reconciler` | `/services/`, `/pods/`, `/probe-status/` → the selector-matched ready backends at `/endpoints/` |
 | `service_ipam` | `/services/` → the lowest free ClusterIP from 10.96.0.0/16 |
 | `service_dns` | `/endpoints/` → an A-record set at `<svc>.<ns>.svc.cluster.local` |
 | `webhook_validator` | `/webhooks/` → `/webhook-status/`, per-object validation |
-| `snapshot_reconciler` | VolumeSnapshots → a bound VolumeSnapshotContent, marked ready |
-| `device_reconciler` | `/devices.nanocloud.io/` → a `/cert-req/` per Device, then the provisioned SPIFFE identity once the mint returns |
 
 The compilers are the same shape with a dataplane output:
 
@@ -115,35 +148,78 @@ The compilers are the same shape with a dataplane output:
 | -------- | ------------------- |
 | `netpolicy_compiler` | `/networkpolicies/`, `/pods/` → the filter ruleset at `/dataplane/netpolicy` (per-pod allow chains aggregated across policies, then drop; a pod no policy selects gets no chain) |
 | `proxy_compiler` | `/services/`, `/endpoints/` → the NAT ruleset at `/dataplane/proxy` (ClusterIP DNAT, several backends load-balanced with `numgen random mod N map`) |
-| `route_compiler` | `/routes/`, `/route-status/`, `/endpoints/` → one row per route at `/dataplane/edge/`, carrying the complete backend set so a backend change is a single atomic PUT |
 | `cni_ipam` | `/ipam-request/` → the pod's address at `/ipam-lease/`, lowest free host in the pool CIDR |
 
-### Controllers as params
+### The workload controllers are params
 
-A controller's rules can also be carried as **Chronicle params** rather than
-compiled into a bespoke module: `store_source` turns a prefix subscription into
-record frames, a generic `decision` engine evaluates the rules, and
-`store_effect` performs the reads and writes. The rules are authored in
+Every workload controller is a **Chronicle chain**, not a compiled module:
+`store_source` turns a prefix subscription into record frames, a generic
+`decision` engine evaluates the rules one record at a time, and `store_effect`
+performs the reads and writes. The rules are authored in
 `modules/app/_chronicle/*.uproc` and compiled to the hex params a graph carries.
+Nothing in an `.fmod` holds what a Deployment means.
 
-The packaged control plane runs the params form for Deployment, ReplicaSet,
-DaemonSet, StatefulSet, Job, HPA, the ownerRef cascade, namespace teardown,
-scheduling and snapshots; the store, the keys and the observable behaviour are
-the same either way, which is what the paired E2Es assert. Params are baked into
-the graph because a `.deb` ships no compiler — `scripts/chronicle-params.sh`
-compiles them at test time, and `scripts/chronicle-param-drift-e2e.sh` fails if
-a baked param has drifted from its `.uproc`.
+| Chain | Rules | Does |
+| ----- | ----- | ---- |
+| `dp_` | `deployment.uproc` | Deployment → the owned ReplicaSet, the archived previous revision, the scaling event |
+| `rs_` | `replicaset.uproc` | ReplicaSet → exactly `replicas` Pods, ordinal by ordinal, rolled on a template-hash change |
+| `ds_` | `daemonset.uproc` | one node-pinned Pod per ready Node, pruned when a Node goes not-ready |
+| `st_` | `statefulset.uproc` | ordered identities: `<sts>-<i>` only once `<sts>-<i-1>` is ready; scale down highest-first |
+| `jb_` | `job.uproc` | run-to-completion: launch `completions` Pods once, count Succeeded, never recreate |
+| `hp_` | `hpa.uproc` | `desired = ceil(R × currentCPU / targetCPU)` clamped `[min,max]`, patched onto the target |
+| `gc_` | `gc.uproc` | the ownerRef cascade, plus the Event count cap |
+| `ns_` | `namespace.uproc` | sweep every namespaced prefix of a Terminating namespace, then finalize |
+| `sc_` | `scheduler.uproc` | bind the first unbound Pod to the least-loaded ready Node, one per pass |
+| `ep_` | `endpoints.uproc` | Services JOIN Pods by selector → per-pod slices → the folded `/endpoints/` document |
+| `pj_`, `pl_`, `pr_` | `pod_project.uproc`, `pod_lifecycle.uproc`, `pod_effect.uproc` | the kubelet's decision half: the sandbox artifact, the lifecycle state machine and its writes, and the prune of a runtime record whose spec is gone |
+| `pi_` | `pod_image.uproc` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
+| `sn_` | `snapshot.uproc` | VolumeSnapshot → a bound VolumeSnapshotContent, marked ready |
+| `dv_` | `device.uproc` | a Device's `/cert-req/`, and its provisioned SPIFFE identity |
+| — | `route.uproc` | the edge-route compile, below |
+| — | `route_validator.uproc` | first-error Route validation → `/route-status/` |
+| — | `apiserver.uproc`, `apiplane*.uproc` | the API request path (the API plane, above) |
+| — | `ttl.uproc` | delete a record once its `deadline=` passes, armed on the kernel timer |
+
+Params are baked into each graph because a `.deb` ships no compiler:
+`scripts/chronicle-params.sh` compiles a `.uproc` entry at test time, and
+`scripts/chronicle-param-drift-e2e.sh` fails if a baked param has drifted from
+the source it was compiled from.
+
+### The edge-route compile
+
+`route.uproc` (graph `fluxor-route-compiler.yaml`) turns `/routes/` +
+`/route-status/` + `/endpointslices/` into one row per route at
+`/dataplane/edge/`, which the `http` edge SUBSCRIBEs for its DynRoute table. It
+takes three passes, because the cardinality changes twice and the VM has no
+iteration — each change of shape is a store round trip whose fan-out a SOURCE
+performs:
+
+| pass | from | to |
+| --- | --- | --- |
+| A | `/routes/` | `/route-be/<ns>/<svc>` — rekeyed BY SERVICE |
+| B | `/route-be/` JOIN `/endpointslices/<ns>/<svc>/<pod>` | `/edge-be/<ns>/<svc>/<pod>` |
+| C | `/route-be/` + `list_children` over `/edge-be/` | `/dataplane/edge/<ns>/<route>` |
+
+The rekey in pass A is what makes it work: keying by service lets pass B scope
+its join to the object (`join_scoped: 1`) and get one record per backend without
+matching a middle key segment, which a decision cannot do. Reading the per-backend
+`/endpointslices/` rather than the folded `/endpoints/` document is what makes
+the per-element work a JOIN rather than a map over a list.
 
 ## 4. The node plane
 
-Running a container is two different things, and they are two different modules:
+Running a container is two different things, and they sit either side of the
+store:
 
 - **decision** — which namespaces, which mounts, which image layers, in what
-  order: a state machine over pod specs. That is `pod_lifecycle`. It watches
-  `/pod-specs/` and `/sandbox-status/`, projects `/sandboxes/`, and maps sandbox
-  state to a pod phase, including restart policy with exponential backoff
-  (`min(1s × 2^(n-1), 300s)`, reset after a run survives 600s), two-phase kill
-  with a grace deadline, and pause as a distinguishable non-terminal phase.
+  order: a state machine over pod specs. That is the pod-lifecycle chain
+  (`pl_`/`pj_`/`pr_`, params). It watches `/pod-specs/` and `/sandbox-status/`,
+  projects `/sandboxes/`, and maps sandbox state to a pod phase — restart policy
+  with exponential backoff (`min(1s × 2^(n-1), 300s)`, reset after a run
+  survives 600s), two-phase kill with a grace deadline, and pause as a
+  distinguishable non-terminal phase. Every deadline is a field on
+  `/pod-runtime/<uid>` rather than private module state, and the source arms the
+  kernel timer for whichever comes first.
 - **execution** — the `unshare`/`clone3`, `pivot_root` and mount assembly,
   cgroup2 limits, veth and address realization, spawning PID 1 and reaping it.
   That is the fluxor `workload` contract (`0x1A`), driven by `sandbox_runner`.
@@ -165,7 +241,7 @@ Around them:
 
 | Module | Role |
 | ------ | ---- |
-| `probe_runner` | liveness/readiness probes: exec probes through the `/sandbox-exec/` seam, verdicts at `/probe-status/`. `pod_lifecycle` folds `live=0` into restart+backoff; `endpoints_reconciler` gates membership on `ready` |
+| `probe_runner` | liveness/readiness probes: exec probes through the `/sandbox-exec/` seam, verdicts at `/probe-status/`. The lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates membership on `ready` |
 | `image_puller` | the pull *decision*: manifest layers minus the blobs already cached → `/image-pull-plan/` |
 | `image_fetcher` | the pull *effect*: HTTP/1.1 plus the OCI distribution API on its own net pair, multi-arch index → platform manifest → config → layers, digest-verified into the blob cache via `fs` |
 | `image_assembler` | rootfs assembly: projects an extraction job through `sandbox_runner` and maps its terminal status to `/image-rootfs/<name> state=ready\|failed` |
@@ -209,14 +285,14 @@ API write:   linux_net → tls → api_ingress → authn → rbac_gate → admis
 Watch:       watch_streamer: LIST at the fence → the changes since it → a
              batch of JSON events + the new fence the client resumes from
 
-Reconcile:   endpoints_reconciler: DRAIN(/services,/pods) → match → PUT
-             /endpoints → service_dns projects the zone; proxy_compiler
-             compiles the NAT ruleset → the node programs nft
+Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices → the folded
+             /endpoints document → service_dns projects the zone;
+             proxy_compiler compiles the NAT ruleset → the node programs nft
 
-Pod start:   apps/v1 PUT → deployment → replicaset → Pods → scheduler binds →
-             pod_lifecycle projects /sandboxes/ → image_fetcher +
-             image_assembler materialise the rootfs → sandbox_runner CREATE/
-             START → status written back → watch_streamer serves it
+Pod start:   apps/v1 PUT → dp_ → rs_ → Pods → sc_ binds → pj_/pl_ project
+             /sandboxes/ → image_fetcher + image_assembler materialise the
+             rootfs → sandbox_runner CREATE/START → status written back →
+             watch_streamer serves it
 ```
 
 ## 8. Repository layout and workflow
@@ -245,7 +321,25 @@ This checkout is a member of the user-local fluxor workspace
 (`~/.fluxor/workspace.toml`), so dependencies resolve live from the sibling
 fluxor tree during development and the lockfile pins take over outside it.
 
-## 9. Writing a module
+## 9. Adding to the graph
+
+### A new controller is a chain, not a module
+
+Start from the rules. A controller that watches prefixes, decides one record at
+a time and writes the answer back needs no new `.fmod`: author its rules in
+`modules/app/_chronicle/<name>.uproc`, wire `store_source → decision →
+store_effect` in the graph, and bake the compiled params in. Give the nodes a
+short shared prefix (`dp_`, `gc_`, …) so a graph of a hundred nodes still reads.
+A change of cardinality — one object becoming N records — is a store round trip
+whose fan-out a SOURCE performs, because the VM has no iteration by
+construction.
+
+Write a module only for what a rules VM cannot express: a walk over a set, a
+signature check, bytes moved to something outside the graph. Those are
+connectors and they decide nothing — `store_effect`, `kagi_verify`, and the
+connector halves of `rbac_gate` and `api_admission` are the pattern.
+
+### A new module
 
 A new module is a directory under `modules/app/` with `mod.rs` and
 `manifest.toml`, and it follows the conventions the existing ones share:

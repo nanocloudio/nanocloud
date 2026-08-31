@@ -1,20 +1,105 @@
-# daemonset-reconciler workload graph: the
-# daemonset_reconciler fmod, which watches /daemonsets.apps/, /nodes/ and /pods/
-# and ensures one Pod per ready Node (/pods/<ns>/<ds>-<node>, pre-bound),
-# pruning Pods whose Node is gone. Per-node coverage as a store transform.
+# daemonset graph: the DaemonSet chain as Chronicle params — the ready-node
+# projection, one Pod per node, and the prune for a node that leaves.
+#
+# The nodes and params are the SAME ones fluxor-controlplane.yaml ships; this
+# graph is that chain on its own so an E2E can drive it directly.
 target: linux
 tick_us: 1000
 
-# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
 modules:
-  - name: daemonset_reconciler
+  - name: ds_nodes
+    type: store_source
+    prefix: "/nodes/"
+    paths: "status.ready"
+  - name: ds_ready
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc rdy
+      decision: "01050000001000010002040000001204007472756520000b00000030000100020100000040010000001003000000000000004002000000010002030000004003000000120100314004000000410b0000002f000100020100000040010000001004000000000000004002000000010002030000004003000000120000400400000041"
+  - name: ds_mark
+    type: store_effect
+    key_prefix: "/ready-nodes/"
+  - name: ds_source
+    type: store_source
+    prefix: "/daemonsets.apps/"
+    paths: "spec.template.spec.*"
+    join: "/ready-nodes/"
+    watch: "/ready-nodes/,/pods/"
+  - name: ds_probe
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc prb
+      decision: "001b0000006f00010002010000004001000000100200000000000000400200000001000218000000400300000001000218000000401e00000001000204000000401f0000000100021500000040200000000100021c00000040220000000100021d00000040230000000100021a000000402700000041"
+  - name: ds_exists
+    type: store_effect
+    key_prefix: "/pods/"
+  - name: ds_create
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc mk
+      decision: "020a0000001e0001000202000000109401000000000000200100021f00000012000020300025000000080101000201000000400100000010030000000000000040020000000100021e00000040030000001215007b226d65746164617461223a7b226e616d65223a224004000000010002270000004005000000120f00222c226e616d657370616365223a224006000000010002220000004007000000123100222c226f776e65725265666572656e636573223a5b7b226b696e64223a224461656d6f6e536574222c226e616d65223a224008000000010002230000004009000000121900227d5d7d2c2273706563223a7b226e6f64654e616d65223a22400a00000001000220000000400b00000012010022400c000000120000400d000000120000400e0000001202007d7d400f00000041050000001200010002020000001094010000000000002000260000000d0101000201000000400100000010030000000000000040020000000100021e00000040030000001215007b226d65746164617461223a7b226e616d65223a224004000000010002270000004005000000120f00222c226e616d657370616365223a224006000000010002220000004007000000123100222c226f776e65725265666572656e636573223a5b7b226b696e64223a224461656d6f6e536574222c226e616d65223a224008000000010002230000004009000000121900227d5d7d2c2273706563223a7b226e6f64654e616d65223a22400a00000001000220000000400b000000120200222c400c0000000100021f000000400d000000120000400e0000001202007d7d400f000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: ds_apply
+    type: store_effect
+    key_prefix: "/pods/"
+  - name: ds_pods
+    type: store_source
+    prefix: "/pods/"
+    paths: "metadata.ownerReferences.0.kind,spec.nodeName"
+    watch: "/ready-nodes/"
+  - name: ds_ask
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc ask
+      decision: "010a0000002100010002040000001209004461656d6f6e53657420010002050000001200002130000c0000003300010002010000004001000000100200000000000000400200000001000205000000400300000001000203000000401e000000410b0000002f000100020100000040010000001000000000000000004002000000120000400300000001000203000000401e00000041"
+  - name: ds_known
+    type: store_effect
+    key_prefix: "/ready-nodes/"
+  - name: ds_prune
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/daemonset.uproc prn
+      decision: "0105000000120001000202000000109401000000000000200009000000270001000201000000400100000010040000000000000040020000000100021e0000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: ds_collect
+    type: store_effect
+    key_prefix: "/pods/"
+  # StatefulSet is PARAMS: the ReplicaSet chain with the gate asked of the
+  # NEIGHBOUR that matters — the predecessor's readiness in range, the
+  # successor's absence for a surplus — so bring-up is ordered and teardown is
+  # highest-first without a budget. Params from modules/app/_chronicle/statefulset.uproc.
 
-# Self-edge: the reconciler's own output feeds its `changes` input, allocating a
-# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
-# module never writes this output; it drains pushed events from the input.
 wiring:
-  - from: daemonset_reconciler.status
-    to: daemonset_reconciler.changes
+  - from: ds_nodes.status
+    to: ds_nodes.changes
+  - from: ds_nodes.record_out
+    to: ds_ready.record_in
+  - from: ds_ready.result_out
+    to: ds_mark.request_in
+    buffer_group: 41
+  - from: ds_source.status
+    to: ds_source.changes
+  - from: ds_source.record_out
+    to: ds_probe.record_in
+  - from: ds_probe.result_out
+    to: ds_exists.request_in
+    buffer_group: 42
+  - from: ds_exists.response_out
+    to: ds_create.record_in
+  - from: ds_create.result_out
+    to: ds_apply.request_in
+    buffer_group: 43
+  - from: ds_pods.status
+    to: ds_pods.changes
+  - from: ds_pods.record_out
+    to: ds_ask.record_in
+  - from: ds_ask.result_out
+    to: ds_known.request_in
+    buffer_group: 44
+  - from: ds_known.response_out
+    to: ds_prune.record_in
+  - from: ds_prune.result_out
+    to: ds_collect.request_in
+    buffer_group: 45

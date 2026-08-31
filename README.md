@@ -1,18 +1,23 @@
 # Nanocloud
 
 Nanocloud is a Kubernetes control plane built entirely from [fluxor](../fluxor/)
-modules. The apiserver, the request pipeline, every reconciler, the node
-runtime and the CLI are `no_std` position-independent modules (`.fmod`) that
-run as cooperating nodes of a fluxor graph over one shared store. There is no
-host binary and no separate database: install the package, start one systemd
-unit, and the node serves the Kubernetes API.
+modules. The apiserver, the node runtime and the CLI are `no_std`
+position-independent modules (`.fmod`); every controller is a chain of generic
+engines carrying compiled rules. Both run as cooperating nodes of a fluxor
+graph over one shared store. There is no host binary and no separate database:
+install the package, start one systemd unit, and the node serves the Kubernetes
+API.
 
 ## Highlights
 
 - **The control plane is a graph.** `fluxor run controlplane.yaml` starts the
   apiserver, the authn → authz → admission → CRUD pipeline, and every workload
-  controller as modules in a single runtime. Composition is a YAML graph, not a
-  process tree.
+  controller in a single runtime. Composition is a YAML graph, not a process
+  tree.
+- **Controllers are rules, not code.** A Deployment becoming a ReplicaSet, an
+  ownerRef cascade, a scheduler's placement: each is a chain of generic
+  Chronicle engines carrying params compiled from
+  `modules/app/_chronicle/*.uproc`. No `.fmod` holds what a Deployment means.
 - **Kubernetes-shaped API.** `kubectl` talks to it directly: core/v1,
   `apps/v1`, `discovery.k8s.io/v1`, `node.k8s.io/v1` and `nanocloud.io/v1`
   discovery documents, list/get/create/update/delete, and `?watch=true`
@@ -43,15 +48,15 @@ flowchart TD
     TLS --> Ingress["api_ingress<br/>HTTP/1.1 + k8s JSON"]
     Ingress --> Pipe["authn → rbac_gate → api_admission → core_api"]
     Pipe --> Store
-    Store --> Ctrl["controllers: deployment, replicaset, daemonset,<br/>statefulset, job, hpa, gc, namespace, scheduler"]
+    Store --> Ctrl["controller chains (params): deployment, replicaset,<br/>daemonset, statefulset, job, hpa, gc, namespace, scheduler"]
     Ctrl --> Store
-    Store --> Node["pod_lifecycle → sandbox_runner → workload contract"]
-    Store --> Net["endpoints, service_ipam, service_dns,<br/>proxy/netpolicy/route compilers"]
+    Store --> Node["pod-lifecycle chain → sandbox_runner → workload contract"]
+    Store --> Net["endpoints chain, service_ipam, service_dns,<br/>proxy/netpolicy/route compilers"]
 ```
 
-Every arrow into or out of the store is a contract call, and the API and
-controller modules never address each other directly — the only direct channels
-are the net streams at the edge and each module's own change sink. A request is
+Every arrow into or out of the store is a contract call, and no stage addresses
+another directly — the only direct channels are the net streams at the edge, the
+records a chain hands along, and each module's own change sink. A request is
 admitted at the edge, written once, and every controller that cares wakes on
 the change and writes its own outputs back. [docs/architecture/modules.md](docs/architecture/modules.md) describes
 each module, the keys it owns, and the capability surfaces it holds.
@@ -117,6 +122,13 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 | discovery.k8s.io/v1 | endpointslices |
 | node.k8s.io/v1 | runtimeclasses |
 | nanocloud.io/v1 | bundles, roles, rolebindings, volumesnapshots, certificates |
+
+The API plane ships in two forms over the same store and the same keys. The
+systemd unit's graph (`fluxor-controlplane.yaml`) runs `api_ingress` in front of
+the authn / rbac_gate / admission / core_api lanes;
+`fluxor-apiplane.yaml` runs the same request path as a Chronicle chain, where
+every routing and refusal decision is params and `rbac_gate` and `api_admission`
+appear as connectors for the set walks a rules VM cannot do.
 
 `api_ingress` serves the discovery documents (`/api`, `/apis`, `/api/v1`,
 `/apis/<group>/<version>`), `/version`, `/healthz`, `/openapi.json` and

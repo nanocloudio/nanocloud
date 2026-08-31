@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's scheduler module (modules/app/scheduler) — pod
-# placement over the fluxor-native control-plane store, consumed through the
-# standard storage contracts (`storage.object` 0x14 + `storage.namespace`
-# 0x13). The store is single-process, owned by the fluxor-linux runtime, and
-# seeded from its durable append-log at init.
+# Live E2E for the scheduler chain (`sc_*`, Chronicle params) as it ships in
+# packaging/debian/fluxor-scheduler.yaml — pod placement over the control-plane
+# store, consumed through the standard storage contracts (`storage.object` 0x14
+# + `storage.namespace` 0x13). The store is single-process, owned by the
+# fluxor-linux runtime, and seeded from its durable append-log at init.
 #
 # Proves the kube-scheduler loop on real binaries: unbound Pods and Nodes are
-# replayed from `$D/store.log` at boot; the scheduler fmod, inside the runtime,
-# cold-starts (SUBSCRIBE /pods/ + /nodes/ onto its `changes` input channel, then
-# a full LIST reconcile) and binds each unbound Pod to the least-loaded ready
-# Node by writing node=<name> onto it — spreading evenly, skipping not-ready
-# Nodes, and leaving already-bound Pods alone.
+# replayed from `$D/store.log` at boot; the chain, inside the runtime,
+# cold-starts and binds each unbound Pod to the least-loaded ready Node by
+# writing spec.nodeName onto it — spreading evenly, skipping not-ready Nodes,
+# and leaving already-bound Pods alone.
 #
 #   /nodes/<name>     = "ready=<0|1>"
 #   /pods/<ns>/<name> = "image=<img>[;node=<node>]"
@@ -26,7 +25,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/scheduler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

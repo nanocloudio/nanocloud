@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Live E2E for the device_reconciler + cert_manager: a Device CR is admitted and
-# a SPIFFE identity is provisioned end to end. The reconciler writes a /cert-req/
+# Live E2E for the Device identity chain + cert_manager: a Device CR is admitted
+# and a SPIFFE identity is provisioned end to end. The chain writes a /cert-req/
 # for the Device, cert_manager mints a real X.509 leaf carrying the SPIFFE URI
-# SAN, and the reconciler projects the identity at /deviceidentities…/<ns>/<name>.
+# SAN, and the chain projects the identity at /deviceidentities…/<ns>/<name>.
 # OpenSSL then proves the projected leaf is genuine, carries the family-canonical
 # SPIFFE id, and chains to the minter's CA.
 #
@@ -23,7 +23,7 @@ fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl required for this E2E"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/device_reconciler.fmod" "$MODULES_DIR/cert_manager.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/cert_manager.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -90,7 +90,7 @@ FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
 
 SPIFFE_ID="spiffe://nanocloud.local/device/default/alice"
 
-echo "== 4. the reconciler wrote a SPIFFE-shaped cert-req =="
+echo "== 4. the chain wrote a SPIFFE-shaped cert-req =="
 REQ="$(store_last /cert-req/default-alice)"
 [ -n "$REQ" ] || fail "device_reconciler did not write /cert-req/default-alice"
 echo "$REQ" | grep -q "spiffe=$SPIFFE_ID" || fail "cert-req missing the SPIFFE id: $REQ"
@@ -100,7 +100,7 @@ echo "== 5. cert_manager minted a response =="
 RESP="$(store_last /cert-resp/default-alice)"
 [ -n "$RESP" ] || fail "cert_manager did not mint /cert-resp/default-alice"
 
-echo "== 6. the reconciler projected the device identity =="
+echo "== 6. the chain projected the device identity =="
 IDENT="$(store_last /deviceidentities.nanocloud.io/default/alice)"
 [ -n "$IDENT" ] || fail "device_reconciler did not project the identity status"
 echo "$IDENT" | grep -q "spiffe=$SPIFFE_ID" || fail "identity missing the SPIFFE id"

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's statefulset_reconciler module (modules/app/
-# statefulset_reconciler) — ordered, stable-identity Pods over the fluxor-native
-# control-plane store, consumed through the standard storage contracts
-# (`storage.object` 0x14 + `storage.namespace` 0x13). The store is single-process, owned by the fluxor-linux
-# runtime, and seeded from its durable append-log at init.
+# Live E2E for the StatefulSet chain (`st_*`, Chronicle params) as it ships in
+# packaging/debian/fluxor-statefulset.yaml — ordered, stable-identity Pods over
+# the control-plane store, consumed through the standard storage contracts
+# (`storage.object` 0x14 + `storage.namespace` 0x13). The store is
+# single-process, owned by the fluxor-linux runtime, and seeded from its
+# durable append-log at init.
 #
 # Because the store lives INSIDE the runtime process (no shared WAL, no flock),
 # desired state and simulated kubelet readiness are replayed from `$D/store.log`
@@ -28,7 +29,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/statefulset_reconciler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

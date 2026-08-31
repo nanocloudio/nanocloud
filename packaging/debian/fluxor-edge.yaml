@@ -6,7 +6,7 @@
 # the matched backend and streams the request/response through — not just a
 # route table. Routes are programmed dynamically:
 # `routes_prefix` points the http table_consumer at /dataplane/edge/, which
-# route_compiler (fluxor-route-compiler.yaml) populates from validated Routes.
+# the route compiler (fluxor-route-compiler.yaml) populates from validated Routes.
 # Backend hops are cleartext within the host/cluster segment in v1;
 # TLS is terminated at the anchor.
 #

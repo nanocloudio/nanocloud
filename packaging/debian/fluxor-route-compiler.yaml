@@ -1,23 +1,137 @@
-# route-compiler workload graph:
-# the route_compiler fmod, sibling of proxy_compiler. It watches /routes/,
-# /route-status/, and /endpoints/ in the shared control-plane store, resolves
-# each validated Route's service to its ready backends, and publishes ONE KEY
-# PER ROUTE carrying the full backend set to /dataplane/edge/<ns>/<name>. The
-# `http`-module edge (fluxor-edge.yaml) SUBSCRIBEs that prefix and populates its
-# DynRoute table — decision here, effect there.
+# route-compiler workload graph — the edge-route compiler as Chronicle params.
+#
+# A validated Route plus its service's endpoints becomes ONE key per route
+# carrying the whole backend set at /dataplane/edge/<ns>/<name>. The `http`
+# edge (fluxor-edge.yaml) SUBSCRIBEs that prefix and populates its DynRoute
+# table — decision here, effect there.
+#
+# THREE PASSES, because the cardinality changes twice and Chronicle has no
+# iteration by construction, so each change of shape is a store round trip
+# whose fan-out a SOURCE performs:
+#
+#   A  /routes/          -> /route-be/<ns>/<svc>          keyed BY SERVICE
+#   B  /route-be/ JOIN /endpointslices/<ns>/<svc>/<pod>
+#                        -> /edge-be/<ns>/<svc>/<pod>     one per (route, backend)
+#   C  /route-be/ + list_children over /edge-be/
+#                        -> /dataplane/edge/<ns>/<route>  folded to one row
+#
+# Pass A rekeys BY SERVICE on purpose: that is what lets pass B scope its join
+# to the object (`join_scoped: 1` -> `/endpointslices/<tail>/…`) and get one
+# record per backend without matching a middle key segment, which a decision
+# cannot do. The rekey is the whole trick, and it is the same two-pass fold
+# `endpoints.uproc` uses.
+#
+# It reads /endpointslices/, NOT the folded /endpoints/ document: the slices are
+# already one key per backend, so the per-element work is a JOIN rather than a
+# map over a list. Params from modules/app/_chronicle/route.uproc.
 target: linux
 tick_us: 1000
 
-# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
 modules:
-  - name: route_compiler
+  # --- pass A: rekey a validated Route by its service ---
+  - name: rt_routes
+    type: store_source
+    prefix: "/routes/"
+    paths: "spec.host,spec.to.name,spec.port,spec.path"
+    related: "/route-status/!flat:ready"
+    watch: "/route-status/"
+  - name: rt_rekey
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/route.uproc rekey
+      decision: "01050000000d000100024600000012010031200022000000a40001000201000000400100000010030000000000000040020000000100021c00000040030000001201002f4011000000010002050000004012000000120500686f73743d40040000000100020400000040050000001206003b706174683d40060000000100020700000040070000001206003b706f72743d40080000000100020600000040090000001207003b726f7574653d400a0000000100021d000000400b000000411e0000007c0001000201000000400100000010040000000000000040020000000100021c00000040030000001201002f4011000000010002050000004012000000120000400400000012000040050000001200004006000000120000400700000012000040080000001200004009000000120000400a000000120000400b00000041"
+  - name: rt_be
+    type: store_effect
+    key_prefix: "/route-be/"
 
-# Self-edge: the compiler's own output feeds its `changes` input, allocating a
-# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
-# module never writes this output; it drains pushed events from the input.
+  # --- pass B: one row per (route, backend) ---
+  - name: rt_pairs
+    type: store_source
+    prefix: "/route-be/"
+    flat: 1
+    paths: "host,path,port,route"
+    join: "/endpointslices/"
+    join_scoped: 1
+    # `.` is the slice's WHOLE VALUE — a bare address, with no path to read.
+    join_paths: "."
+    watch: "/endpointslices/"
+  - name: rt_backend
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/route.uproc backend
+      decision: "01050000000c000100023c0000001200002000140000005300010002010000004001000000100000000000000000400200000012000040030000001200004011000000120000401200000012000040040000001200004005000000120000400600000012000040070000004118000000690001000201000000400100000010030000000000000040020000000100020300000040030000001201002f40110000000100021500000040120000000100023c00000040040000001201003a40050000000100020600000040060000001204003a313a31400700000041"
+  - name: rt_edgebe
+    type: store_effect
+    key_prefix: "/edge-be/"
+
+  # --- pass C: fold the backends into one row per route ---
+  - name: rt_fold
+    type: store_source
+    prefix: "/route-be/"
+    flat: 1
+    paths: "host,path,port,route"
+    list_children: "/edge-be/"
+    child_sep: "/"
+    # The VALUES alone: a backend set is a list of addresses, not of names.
+    list_values: 1
+    watch: "/edge-be/"
+  - name: rt_compile
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/route.uproc compile
+      decision: "001d000000870001000201000000400100000010030000000000000040020000000100021c00000040030000001201002f4011000000010002070000004012000000120500686f73743d40040000000100020400000040050000001206003b706174683d40060000000100020500000040070000001204003b62653d400800000001000238000000400900000041"
+  - name: rt_edge
+    type: store_effect
+    key_prefix: "/dataplane/edge/"
+
+  # --- the prune: an edge row whose Route is gone ---
+  - name: rt_rows
+    type: store_source
+    prefix: "/dataplane/edge/"
+    related: "/routes/:spec.host"
+    watch: "/routes/"
+  - name: rt_sweep
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/route.uproc sweep
+      decision: "01050000000c000100024600000012000020000900000027000100020100000040010000001004000000000000004002000000010002030000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: rt_drop
+    type: store_effect
+    key_prefix: "/dataplane/edge/"
+
 wiring:
-  - from: route_compiler.status
-    to: route_compiler.changes
+  - from: rt_routes.status
+    to: rt_routes.changes
+  - from: rt_routes.record_out
+    to: rt_rekey.record_in
+  - from: rt_rekey.result_out
+    to: rt_be.request_in
+    buffer_group: 1
+
+  - from: rt_pairs.status
+    to: rt_pairs.changes
+  - from: rt_pairs.record_out
+    to: rt_backend.record_in
+  - from: rt_backend.result_out
+    to: rt_edgebe.request_in
+    buffer_group: 2
+
+  - from: rt_fold.status
+    to: rt_fold.changes
+  - from: rt_fold.record_out
+    to: rt_compile.record_in
+  - from: rt_compile.result_out
+    to: rt_edge.request_in
+    buffer_group: 3
+
+  - from: rt_rows.status
+    to: rt_rows.changes
+  - from: rt_rows.record_out
+    to: rt_sweep.record_in
+  - from: rt_sweep.result_out
+    to: rt_drop.request_in
+    buffer_group: 4

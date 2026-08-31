@@ -1,8 +1,9 @@
 # Workload source manifest for the route-compiler bundle. postinst emits it and
 # publishes it into the node's OCI store, so `route-compiler:1.0.0` resolves offline.
 # Portless — the compiler drives the store provider via provider_call, not a
-# socket. The graph (linux.yaml, staged beside this file) runs the
-# route_compiler module.
+# socket. The graph (linux.yaml, staged beside this file) is Chronicle engines
+# carrying params from modules/app/_chronicle/route.uproc; there is no
+# route-compiler module any more.
 [workload]
 name = "route-compiler"
 version = "1.0.0"

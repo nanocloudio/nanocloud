@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's daemonset_reconciler module (modules/app/
-# daemonset_reconciler) — one Pod per ready Node over the fluxor-native
+# Live E2E for the DaemonSet chain (`ds_*`, Chronicle params) as it ships in
+# packaging/debian/fluxor-daemonset.yaml — one Pod per ready Node over the
 # control-plane store, consumed through the standard storage contracts
-# (`storage.object` 0x14 + `storage.namespace` 0x13). The store is single-process, owned by the fluxor-linux
-# runtime, and seeded from its durable append-log at init.
+# (`storage.object` 0x14 + `storage.namespace` 0x13). The store is
+# single-process, owned by the fluxor-linux runtime, and seeded from its
+# durable append-log at init.
 #
 # Because the store lives INSIDE the runtime process (no shared WAL, no flock),
 # desired state is replayed from `$D/store.log` at boot rather than raced in live
-# from an external writer. The reconciler cold-starts: SUBSCRIBE /daemonsets.apps/,
-# /nodes/ and /pods/ onto its `changes` input channel, then a full LIST pass
-# creates one pre-bound Pod per ready Node and prunes Pods on dead Nodes.
+# from an external writer. The chain cold-starts: its sources SUBSCRIBE
+# /daemonsets.apps/, /nodes/ and /pods/, then a full pass creates one pre-bound
+# Pod per ready Node and prunes Pods on dead Nodes.
 #
 #   /daemonsets.apps/<ns>/<name> = "image=<img>"
 #   /nodes/<node>                = "ready=<0|1>"
@@ -33,7 +34,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/daemonset_reconciler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

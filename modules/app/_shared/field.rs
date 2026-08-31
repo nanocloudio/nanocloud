@@ -6,7 +6,7 @@
 //
 //   * `,` as an additional delimiter (11 modules) — for records like
 //     `sel=k=v,k=v` where a comma separates entries rather than ending one.
-//   * `>=` instead of `>` (image_assembler, route_compiler, hpa_reconciler) —
+//   * `>=` instead of `>` (image_assembler, hpa_reconciler) —
 //     so a drained `pull=` reads `Some("")` rather than None. image_assembler
 //     depends on exactly that: the empty value is how it knows a pull plan
 //     completed, and the strict form would report it as missing.

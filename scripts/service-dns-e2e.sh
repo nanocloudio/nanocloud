@@ -28,7 +28,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for m in endpoints_reconciler service_dns; do
+for m in service_dns; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 [ -e "$FLUXOR_RUNTIME" ] || { echo "FAIL: missing $FLUXOR_RUNTIME"; exit 1; }

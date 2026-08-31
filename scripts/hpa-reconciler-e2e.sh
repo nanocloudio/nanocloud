@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's hpa_reconciler module (modules/app/hpa_reconciler) —
-# closed-loop autoscaling over the fluxor-native control-plane store, consumed
-# through the standard storage contracts (`storage.object` 0x14 +
-# `storage.namespace` 0x13). Runs the HPA WITH deployment_reconciler +
-# replicaset_reconciler so the whole feedback loop is visible: the HPA turns the
-# Deployment's replicas knob from a metric, and the reconcilers cascade the new
-# count to Pods. the store is
-# single-process, owned by the fluxor-linux runtime, and seeded from its durable
-# append-log at init.
+# Live E2E for the HPA chain (`hp_*`, Chronicle params) as it ships in
+# packaging/debian/fluxor-autoscale.yaml — closed-loop autoscaling over the
+# control-plane store, consumed through the standard storage contracts
+# (`storage.object` 0x14 + `storage.namespace` 0x13). The graph carries the
+# Deployment and ReplicaSet chains too, so the whole feedback loop is visible:
+# the HPA turns the Deployment's replicas knob from a metric, and those chains
+# cascade the new count to Pods. The store is single-process, owned by the
+# fluxor-linux runtime, and seeded from its durable append-log at init.
 #
 # Because the store lives INSIDE the runtime process (no shared WAL, no flock),
 # metrics are replayed from `$D/store.log` at boot rather than raced in live. The
@@ -35,7 +34,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for m in hpa_reconciler deployment_reconciler replicaset_reconciler; do
+for m in store_source store_effect decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 [ -e "$FLUXOR_RUNTIME" ] || { echo "FAIL: missing $FLUXOR_RUNTIME"; exit 1; }

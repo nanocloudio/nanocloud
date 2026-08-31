@@ -213,4 +213,92 @@ print("   ok  all %d objects delivered whole — across LIST pages and backpress
 PY
 [ $? -eq 0 ] || fail "pagination assertion failed"
 
+echo "== 6. `.` projects a raw value, and list_values drops the child names =="
+# Two byte-moving options that exist because the VM cannot do either job: read a
+# record that is NOT JSON with paths in it, and strip a label off every element
+# of a list.
+D2="$(mktemp -d /tmp/nc-ss2-XXXXXX)"
+store_put2() {
+  python3 - "$D2/store.log" "$1" "$2" <<'PY'
+import struct, sys, os
+path, key, val = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode()
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+with os.fdopen(fd, "r+b") as f:
+    data = f.read(); p = last = 0
+    while p + 15 <= len(data):
+        rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    f.write(struct.pack("<QBHI", last + 1, 1, len(key), len(val)) + key + val)
+    f.flush(); os.fsync(f.fileno())
+PY
+}
+# A svc whose slices are BARE ADDRESSES — no JSON, no `k=v`, nothing a path can
+# reach. This is the shape endpoints.uproc actually writes.
+store_put2 "/svc/default/web" "x=1"
+store_put2 "/slices/default/web/pod-a" "10.0.0.1"
+store_put2 "/slices/default/web/pod-b" "10.0.0.2"
+cat >"$D2/graph.yaml" <<YAML
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true
+modules:
+  # `join` and `list_children` are alternative branches of the same projection,
+  # never both on one node — so the two options are exercised by two nodes over
+  # the same data.
+  - name: store_source
+    prefix: "/svc/"
+    flat: 1
+    paths: "x"
+    join: "/slices/"
+    join_scoped: 1
+    join_paths: "."
+  - name: fold
+    type: store_source
+    prefix: "/svc/"
+    flat: 1
+    paths: "x"
+    list_children: "/slices/"
+    child_sep: "/"
+    list_values: 1
+  - name: debug
+    mode: 1
+wiring:
+  - from: store_source.status
+    to: store_source.changes
+  - from: fold.status
+    to: fold.changes
+  - from: store_source.record_out
+    to: debug.data
+    buffer_group: 1
+  - from: fold.record_out
+    to: debug.data
+    buffer_group: 1
+YAML
+nc_build_workload "$ROOT" "$D2/graph.yaml" "$D2/config.bin" "$D2/modules.bin"
+FLUXOR_STORE_DIR="$D2" RUST_LOG=info "$FLUXOR_RUNTIME" \
+  --config "$D2/config.bin" --modules "$D2/modules.bin" >"$D2/run.log" 2>&1 &
+RUNTIME_PID=$!
+sleep 2
+kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""
+python3 - "$D2/run.log" <<'PY' || { echo "FAIL: raw/list_values projection"; rm -rf "$D2"; exit 1; }
+import sys
+log = open(sys.argv[1], "rb").read()
+# join_paths "." puts the joined entry's WHOLE VALUE at field 60 — here a bare
+# IP that no path could have reached.
+ok_raw = b"\x3c\x00\x09\x0010.0.0.1" in log or b"10.0.0.1" in log
+# list_values drops the `<name>=`: the children arrive as values alone.
+ok_vals = b"10.0.0.1,10.0.0.2" in log
+if not ok_raw:
+    print("   FAIL: join_paths '.' did not project the raw joined value"); sys.exit(1)
+if not ok_vals:
+    print("   FAIL: list_values still labelled the children"); sys.exit(1)
+if b"pod-a=10.0.0.1" in log:
+    print("   FAIL: list_values did not drop the `<name>=` labels"); sys.exit(1)
+print("   ok  join_paths '.' -> the bare address; list_values -> 10.0.0.1,10.0.0.2")
+PY
+rm -rf "$D2"
+
 echo "== E2E green: store_source projects nested Kubernetes objects into byte-exact Chronicle v1 frames, driven by a store subscription, surviving backpressure without loss =="

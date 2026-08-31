@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's route_compiler module (modules/app/route_compiler) —
-# the /routes/+/endpoints/ -> /dataplane/edge/ seam,
-# verified UNPRIVILEGED over the shared control-plane store.
+# Live E2E for the route-compile chain (Chronicle params) as it ships in
+# packaging/debian/fluxor-route-compiler.yaml — the /routes/ + /endpointslices/
+# -> /dataplane/edge/ seam, verified UNPRIVILEGED over the control-plane store.
 #
-# An EXTERNAL process (this script, playing the API projection +
-# route_validator's /route-status/ + endpoints_reconciler's /endpoints/) writes
-# Routes, route-statuses, and Endpoints into the shared WAL; the route_compiler
-# fmod, inside the fluxor-linux runtime, resolves each validated Route's service
-# to its ready backends and PUBLISHES one key per route to
+# An EXTERNAL process (this script, playing the API projection, the route
+# validation's /route-status/ and the endpoints chain's slices) writes Routes,
+# route-statuses and endpoint slices into the shared WAL; the chain, inside the
+# fluxor-linux runtime, resolves each validated Route's service to its ready
+# backends and PUBLISHES one key per route to
 # /dataplane/edge/<ns>/<name> carrying the full backend set. That key IS the
 # `http`-module edge's DynRoute table source (fluxor-edge.yaml `routes_prefix`).
 #
-# What this proves (and, per, deliberately does NOT): this asserts the
-# route TABLE is compiled and store-visible, not that traffic flows. The proxy
-# RELAY that consumes this table is now live — the
-# full Route → edge 443 → workload data path is exercised by scripts/ingress-e2e.sh.
+# What this proves, and deliberately does NOT: it asserts the route TABLE is
+# compiled and store-visible, not that traffic flows. The full Route → edge 443
+# → workload data path is exercised by scripts/ingress-e2e.sh.
 # The edge-side ingestion of these rows into the in-module DynRoute arena
 # (in-module state, not store-visible) is unit-tested in the fluxor harness:
 #   fluxor/tests/harness/tests/dyn_routes.rs (table_consumer_* + dyn_route_*).
@@ -36,12 +35,12 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/route_compiler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/store_source.fmod" "$MODULES_DIR/store_effect.fmod" "$MODULES_DIR/decision.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
 D="$(mktemp -d /tmp/nc-rc-e2e-XXXXXX)"
-trap 'rm -rf "$D"' EXIT
+trap 'if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi' EXIT
 fail() { echo "FAIL: $1"; echo "--- edge rows ---"; grep -a "/dataplane/edge/" "$D/store.log" 2>/dev/null | tr -c '[:print:]\n' '.'; tail -10 "$D/run.log" 2>/dev/null || true; exit 1; }
 
 wal_put() { # wal_put <key> <value>   (op=1 PUT)
@@ -114,10 +113,16 @@ echo "== 2. project Routes + route-status + endpoints =="
 # A validated, multi-backend route.
 wal_put "/routes/default/web"        '{"spec":{"host":"api.example.com","to":{"name":"web"},"port":8080,"path":"/v1/"}}'
 wal_put "/route-status/default/web"  "ready=1;endpoint=web:8080"
+# One key per backend, which is what endpoints.uproc materialises on the way to
+# building the /endpoints/ document. The compiler joins these rather than
+# mapping over the folded list — the per-element work is already done.
+wal_put "/endpointslices/default/web/web-1" "10.0.0.1"
+wal_put "/endpointslices/default/web/web-2" "10.0.0.2"
 wal_put "/endpoints/default/web"     "web-1=10.0.0.1,web-2=10.0.0.2"
 # A route that failed validation (ready=0) — must NOT be compiled.
 wal_put "/routes/default/bad"        '{"spec":{"to":{"name":"nohost"},"port":9090,"path":"/"}}'
 wal_put "/route-status/default/bad"  "ready=0;msg=host must be set"
+wal_put "/endpointslices/default/nohost/n-1" "10.0.0.9"
 wal_put "/endpoints/default/nohost"  "n-1=10.0.0.9"
 
 echo "== 3. run the compiler; it PUBLISHES one key per validated route =="

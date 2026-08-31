@@ -28,6 +28,7 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/kube_path.rs");
+include!("../_shared/json.rs");
 
 /// wave HttpRequest fixed head: conn_id, stream_id, method, flags, then the
 /// three section lengths.
@@ -49,6 +50,8 @@ struct State {
     req_in: i32,
     record_out: i32,
     max_body: u32,
+    /// Emit a frame for a path that is not a Kubernetes resource path.
+    passthrough: u32,
     /// Requests seen; requests emitted; requests dropped as unroutable.
     seen: u32,
     emitted: u32,
@@ -68,6 +71,9 @@ mod params_def {
 
         1, max_body, u32, DEFAULT_MAX_BODY
             => |s, d, len| { s.max_body = p_u32(d, len, 0, DEFAULT_MAX_BODY); };
+
+        2, passthrough, u32, 0
+            => |s, d, len| { s.passthrough = p_u32(d, len, 0, 0); };
     }
 }
 
@@ -88,11 +94,103 @@ fn put_i64(out: &mut [u8], at: usize, number: u8, v: i64) -> Option<usize> {
     put_field(out, at, number, TY_I64, &v.to_le_bytes())
 }
 
+/// Is `name=true` (or `name=1`) present in a `&`-separated query string?
+///
+/// Kubernetes spells a boolean query parameter `?watch=true`; `?watch=1` is
+/// accepted the same way, and a bare `?watch` is NOT — an explicit value is
+/// what the API takes, and inventing a third spelling here would make this
+/// server answer requests the real one refuses.
+fn query_flag(query: &[u8], name: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at <= query.len() {
+        let end = query[at..]
+            .iter()
+            .position(|&b| b == b'&')
+            .map(|i| at + i)
+            .unwrap_or(query.len());
+        let pair = &query[at..end];
+        if let Some(eq) = pair.iter().position(|&b| b == b'=') {
+            if &pair[..eq] == name {
+                let v = &pair[eq + 1..];
+                if v == b"true" || v == b"1" {
+                    return true;
+                }
+            }
+        }
+        if end >= query.len() {
+            break;
+        }
+        at = end + 1;
+    }
+    false
+}
+
+/// Find one header's value in wave's RAW header block.
+///
+/// The block is the bytes as they arrived: `Name: value` lines separated by
+/// CRLF (wave hands the application the block unparsed on purpose — it owns
+/// framing, not meaning). Names are compared ASCII-case-insensitively because
+/// HTTP field names are case-insensitive and a client that sends
+/// `authorization:` lowercase is not sending a different header.
+fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut at = 0usize;
+    while at < headers.len() {
+        let mut end = at;
+        while end < headers.len() && headers[end] != b'\n' {
+            end += 1;
+        }
+        let mut line = &headers[at..end];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let (n, v) = (&line[..colon], &line[colon + 1..]);
+            if n.eq_ignore_ascii_case(name) {
+                let mut v = v;
+                while let [b' ' | b'\t', rest @ ..] = v {
+                    v = rest;
+                }
+                return Some(v);
+            }
+        }
+        at = end + 1;
+    }
+    None
+}
+
+/// `Bearer <token>` -> `<token>`. Any other scheme is not a bearer credential
+/// and yields `None` rather than the whole value: handing `Basic dXNlcjpwdw==`
+/// to a JWS verifier as though it were a token is how a credential of one kind
+/// gets checked by the rules of another.
+fn strip_bearer(value: &[u8]) -> Option<&[u8]> {
+    const SCHEME: &[u8] = b"bearer ";
+    if value.len() <= SCHEME.len() {
+        return None;
+    }
+    let (head, rest) = value.split_at(SCHEME.len());
+    if !head
+        .iter()
+        .zip(SCHEME)
+        .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    {
+        return None;
+    }
+    let mut rest = rest;
+    while let [b' ' | b'\t', tail @ ..] = rest {
+        rest = tail;
+    }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
 /// Project one wave HttpRequest envelope into a Chronicle record frame.
 /// Returns the frame length in `out`, or 0 when the request is not a Kubernetes
 /// resource path (discovery documents, health probes — the graph does not route
 /// them and a frame claiming empty fields would be a lie).
-fn project(req: &[u8], out: &mut [u8], max_body: u32) -> usize {
+fn project(req: &[u8], out: &mut [u8], max_body: u32, passthrough: u32) -> usize {
     if req.len() < REQ_HEAD {
         return 0;
     }
@@ -113,10 +211,65 @@ fn project(req: &[u8], out: &mut [u8], max_body: u32) -> usize {
     if body_at + body_len > req.len() {
         return 0; // truncated envelope — refuse rather than project garbage
     }
-    let path = &req[path_at..path_at + path_len];
+    let raw_target = &req[path_at..path_at + path_len];
+    // Split the QUERY off before anything parses the path. Nothing upstream
+    // does it — wave hands the application the request-target exactly as it
+    // arrived — and without it `/…/pods?watch=true` parses as a resource
+    // literally named `pods?watch=true`.
+    let qmark = raw_target.iter().position(|&b| b == b'?');
+    let path = match qmark {
+        Some(i) => &raw_target[..i],
+        None => raw_target,
+    };
+    let query = match qmark {
+        Some(i) => &raw_target[i + 1..],
+        None => &raw_target[..0],
+    };
+    let headers = &req[path_at + path_len..body_at];
     let body = &req[body_at..body_at + body_len];
 
     let Some((resource, namespace, name)) = parse_rest_path(path) else {
+        // Not a resource path: a discovery document, a health probe, something
+        // this graph may or may not answer. DROPPED by default, because a frame
+        // claiming empty resource/namespace/name would be a lie a decision then
+        // routes on.
+        //
+        // `passthrough = 1` emits it anyway, with those fields EMPTY and the
+        // request target at 9 — for a graph whose first decision answers static
+        // documents by target and refuses everything else. The lie is only a lie
+        // when somebody reads it as a resource, and such a graph does not.
+        if passthrough != 0 {
+            let mut p = 1usize;
+            let mut n = 0u8;
+            macro_rules! pfield {
+                ($e:expr) => {
+                    match $e {
+                        Some(v) => {
+                            p = v;
+                            n += 1;
+                        }
+                        None => return 0,
+                    }
+                };
+            }
+            let capped = body.len().min(max_body as usize);
+            pfield!(put_i64(out, p, 1, wave_request_id as i64));
+            pfield!(put_i64(out, p, 2, method as i64));
+            pfield!(put_field(out, p, 3, TY_BYTES, b""));
+            pfield!(put_field(out, p, 4, TY_BYTES, b""));
+            pfield!(put_field(out, p, 5, TY_BYTES, b""));
+            pfield!(put_field(out, p, 6, TY_BYTES, &body[..capped]));
+            pfield!(put_field(out, p, 7, TY_BYTES, b""));
+            let credential = header_value(headers, b"authorization")
+                .and_then(strip_bearer)
+                .unwrap_or(b"");
+            pfield!(put_field(out, p, 8, TY_BYTES, credential));
+            pfield!(put_field(out, p, 9, TY_BYTES, path));
+            pfield!(put_field(out, p, 10, TY_BYTES, query));
+            pfield!(put_i64(out, p, 11, i64::from(query_flag(query, b"watch"))));
+            out[0] = n;
+            return p;
+        }
         return 0;
     };
 
@@ -168,8 +321,59 @@ fn project(req: &[u8], out: &mut [u8], max_body: u32) -> usize {
         push(namespace, &mut k);
         push(b"/", &mut k);
     }
-    push(name, &mut k);
+    // A CREATE names its object in the BODY, not the path: `POST /pods` with
+    // `{"metadata":{"name":"web-1"}}` addresses `/pods/<ns>/web-1`. That is the
+    // Kubernetes key convention, which this module already owns (it assembles
+    // the key at all because the VM cannot concatenate), so it is the same
+    // knowledge and not a new kind of it.
+    //
+    // Path name WINS when present: a PUT to `.../pods/web-0` carrying a body
+    // that says `web-1` must not write `web-1`. The request-target is the
+    // address; the body is a payload that may disagree with it.
+    // The path is built on the STACK, never written as `&[b"metadata", b"name"]`.
+    // A slice-of-slices literal lands in `.rodata` as an array of fat pointers,
+    // and this PIC build does not relocate them: the callee reads wild pointers
+    // and the module wedges in the panic handler's `loop {}` — no log, no
+    // record, just a request that never comes back. Every other `j_path` caller
+    // in this repo passes a runtime-built `&segs[..n]` for the same reason.
+    let mut segs: [&[u8]; 2] = [b"", b""];
+    segs[0] = b"metadata";
+    segs[1] = b"name";
+    let body_name = if name.is_empty() {
+        j_path(&body[..capped], &segs).unwrap_or(b"")
+    } else {
+        b""
+    };
+    push(if name.is_empty() { body_name } else { name }, &mut k);
     field!(put_field(out, p, 7, TY_BYTES, &key[..k]));
+
+    // Field 8: the bearer CREDENTIAL, scheme stripped. Extracted here for the
+    // same reason as the key: the VM cannot scan a header block for a name and
+    // split a value on a space. What it is NOT is a decision — this module does
+    // not check the token, does not know which suite signed it and does not
+    // care whether it is empty. An absent or non-bearer Authorization header
+    // yields an empty field, and a downstream decision refuses on emptiness
+    // rather than this module dropping the request: "no credential" is an
+    // authorization answer (401), not an unroutable envelope.
+    let credential = header_value(headers, b"authorization")
+        .and_then(strip_bearer)
+        .unwrap_or(b"");
+    field!(put_field(out, p, 8, TY_BYTES, credential));
+
+    // Field 9: the raw request-target, carried verbatim. A proof-of-possession
+    // credential is bound to the method and URI it was presented with, so the
+    // verifier needs the URI as the client sent it — not the reassembly of it
+    // that field 7 performs.
+    field!(put_field(out, p, 9, TY_BYTES, path));
+
+    // Field 10: the query string, and field 11: `watch=true` as a NUMBER.
+    //
+    // The flag is extracted here rather than compared downstream because the VM
+    // has no substring test: a decision can compare a whole field, and
+    // `watch=true&resourceVersion=0` is not equal to anything useful. Which
+    // parameters exist is HTTP; what a watch MEANS stays in params.
+    field!(put_field(out, p, 10, TY_BYTES, query));
+    field!(put_i64(out, p, 11, i64::from(query_flag(query, b"watch"))));
 
     out[0] = n;
     p
@@ -218,6 +422,7 @@ pub unsafe extern "C" fn module_new(
         s.seen = 0;
         s.emitted = 0;
         s.dropped = 0;
+        s.passthrough = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         if s.max_body == 0 {
@@ -252,7 +457,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let req = core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize);
         let mut out = [0u8; BUF];
-        let flen = project(req, &mut out, s.max_body);
+        let flen = project(req, &mut out, s.max_body, s.passthrough);
         if flen == 0 {
             // Not a resource path, or an envelope we will not vouch for. Drop it
             // rather than emit a frame with empty fields a decision would then

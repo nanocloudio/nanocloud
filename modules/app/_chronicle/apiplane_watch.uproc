@@ -1,0 +1,140 @@
+// The WATCH chain, compiled to params — the API plane's second chain.
+//
+// A watch is not a longer request; it is a chain driven by STORE CHANGES rather
+// than by the client, writing into the same reply stage the request chain uses.
+// The request chain (apiplane.uproc) authorizes the watch, registers the
+// watcher at `/watch-reg` + the collection key = "cid=<n>", and answers the
+// current listing with MORE_BODY set so wave holds the connection open. This
+// file turns each subsequent change into one event on that connection.
+//
+//   store_source(prefix, watch) -> event -> store_effect  the object, wrapped
+//                              -> reg   -> store_effect  who is watching
+//                              -> emit  -> apiplane.uproc's reply stage
+//
+// A SEPARATE MODULE, not more of apiplane.uproc: chronicle caps declarations
+// per module and that file reached the cap. The split is the right shape
+// anyway — a different trigger and a different lifetime.
+module nanocloud.apiplane_watch {
+
+  enum OP_GET = 1;
+  enum OP_LIST = 7;
+
+  // What `store_source` emits for each object under the watched prefix.
+  message Changed {
+    seq: int = 1;
+    key: string = 3;
+    ns: string = 28;
+  }
+
+  // Fetch the object AS AN EVENT. The connector reads it during the same prefix
+  // walk and wraps it in the envelope literals (`list_open`/`list_close` on the
+  // node), so composing `{"type":…,"object":…}` needs no concatenation the VM
+  // does not have. The object's own key is the LIST prefix — a degenerate
+  // listing of exactly one object.
+  message EventCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_seq: int = 30;
+    c_ns: string = 31;
+  }
+
+  message EventReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_seq: int = 30;
+    c_ns: string = 31;
+  }
+
+  // Look up which connection is watching this collection. The registration's
+  // value is read as an INTEGER (`ints` on the node) because the envelope wants
+  // the connection id as a number and the VM cannot parse digits.
+  message RegCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    c_seq: int = 30;
+    c_event: string = 31;
+  }
+
+  message RegReply {
+    cid: int = 1;
+    status: int = 2;
+    c_seq: int = 30;
+    c_event: string = 31;
+    reg_cid: int = 50;
+  }
+
+  // apiplane.uproc's ActReply, field for field — a separate module cannot share
+  // the declaration, and the FIELD NUMBERS are the contract between them.
+  message ActReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+  }
+
+  decision d_event(c: Changed) -> EventCall {
+    default ->
+      EventCall { cid: c.seq, op: OP_LIST, key: c.key,
+                  c_seq: c.seq, c_ns: c.ns };
+  }
+
+  decision d_reg(e: EventReply) -> RegCall {
+    default ->
+      RegCall { cid: e.c_seq, op: OP_GET, key: e.c_ns, key2: "/",
+                c_seq: e.c_seq, c_event: e.value };
+  }
+
+  // No registration means nobody is watching. `c_status: 0` is the reply
+  // stage's "there is nothing to send": guessing a connection id would send
+  // this object to whoever holds that id now.
+  decision d_emit(r: RegReply) -> ActReply {
+    when r.status != 200 ->
+      ActReply { cid: r.c_seq, status: 0, value: "",
+                 c_cid: 0, c_status: 0, c_answer: "", c_stream: 0 };
+    default ->
+      ActReply { cid: r.c_seq, status: 200, value: r.c_event,
+                 c_cid: r.reg_cid, c_status: 200, c_answer: r.c_event,
+                 c_stream: 1 };
+  }
+
+  transformation pass_changed(c: Changed) -> Changed {
+    Changed { seq: c.seq, key: c.key, ns: c.ns }
+  }
+  transformation pass_event(e: EventReply) -> EventReply {
+    EventReply { cid: e.cid, status: e.status, value: e.value,
+                 c_seq: e.c_seq, c_ns: e.c_ns }
+  }
+  transformation pass_reg(r: RegReply) -> RegReply {
+    RegReply { cid: r.cid, status: r.status, c_seq: r.c_seq,
+               c_event: r.c_event, reg_cid: r.reg_cid }
+  }
+
+  pipeline event(c: Changed) -> EventCall {
+    call x = pass_changed(c);
+    call y = d_event(x);
+    return y;
+  }
+  pipeline reg(e: EventReply) -> RegCall {
+    call x = pass_event(e);
+    call y = d_reg(x);
+    return y;
+  }
+  pipeline emit(r: RegReply) -> ActReply {
+    call x = pass_reg(r);
+    call y = d_emit(x);
+    return y;
+  }
+
+  entry event = event;
+  entry reg = reg;
+  entry emit = emit;
+
+  provenance revision "apiplane-watch" toolchain "chronicle-authoring";
+}

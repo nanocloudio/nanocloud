@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for the full workload lifecycle:
-# deployment_reconciler + replicaset_reconciler + garbage_collector on ONE fluxor
+# deployment_reconciler + replicaset_reconciler + the gc_ chain on ONE fluxor
 # graph over the fluxor-native control-plane store, consumed through the standard
 # storage contracts (`storage.object` 0x14 + `storage.namespace` 0x13). The
 # store is single-process, owned by the fluxor-linux runtime, and seeded from its durable append-log at
@@ -28,8 +28,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/deployment_reconciler.fmod" \
-         "$MODULES_DIR/replicaset_reconciler.fmod" "$MODULES_DIR/garbage_collector.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

@@ -47,6 +47,12 @@ const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
 const NS_SUBSCRIBE: u32 = 0x1305;
 const PORT_INPUT: u8 = 0;
+const PORT_OUTPUT: u8 = 1;
+
+/// Chronicle record-frame value types (`pipeline_core.rs`).
+const TY_BYTES: u8 = 0;
+const TY_I64: u8 = 1;
+const REC_BUF: usize = 8192;
 const EVENT_HEADER_SIZE: usize = 32;
 
 const REQ_PREFIX: &[u8] = b"/authz-req/";
@@ -67,6 +73,9 @@ struct State {
     /// 0 until the prefix SUBSCRIBE + cold-start pass have run.
     subscribed: u8,
     decisions: u32,
+    /// The connector seam. -1 when the graph left these unwired.
+    request_in: i32,
+    response_out: i32,
 }
 
 // ---- helpers ----
@@ -163,6 +172,90 @@ unsafe fn authorize(sys: &SyscallTable, id: &[u8], verb: &[u8], resource: &[u8])
     false
 }
 
+fn frame_field(frame: &[u8], number: u8) -> Option<(u8, &[u8])> {
+    if frame.is_empty() {
+        return None;
+    }
+    let count = frame[0] as usize;
+    let mut p = 1usize;
+    for _ in 0..count {
+        if p + 4 > frame.len() {
+            return None;
+        }
+        let num = frame[p];
+        let ty = frame[p + 1];
+        let len = u16::from_le_bytes(frame[p + 2..p + 4].try_into().unwrap()) as usize;
+        if p + 4 + len > frame.len() {
+            return None;
+        }
+        if num == number {
+            return Some((ty, &frame[p + 4..p + 4 + len]));
+        }
+        p += 4 + len;
+    }
+    None
+}
+
+fn put_rec_field(out: &mut [u8], at: usize, number: u8, ty: u8, payload: &[u8]) -> Option<usize> {
+    if payload.len() > u16::MAX as usize || at + 4 + payload.len() > out.len() {
+        return None;
+    }
+    out[at] = number;
+    out[at + 1] = ty;
+    out[at + 2..at + 4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    out[at + 4..at + 4 + payload.len()].copy_from_slice(payload);
+    Some(at + 4 + payload.len())
+}
+
+/// Answer one record on the connector seam: the verdict as a NUMBER, plus the
+/// request's carry echoed untouched. Nothing here decides what an unmatched
+/// request means — that is params.
+unsafe fn serve_record(s: &mut State, sys: &SyscallTable) {
+    if s.request_in < 0 || s.response_out < 0 {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return;
+    }
+    let mut in_buf = [0u8; REC_BUF];
+    let n = (sys.channel_read)(s.request_in, in_buf.as_mut_ptr(), REC_BUF);
+    if n <= 0 {
+        return;
+    }
+    let req = &in_buf[..n as usize];
+    let g = |f: u8| match frame_field(req, f) {
+        Some((TY_BYTES, v)) => v,
+        _ => &b""[..],
+    };
+    let allowed = authorize(sys, g(3), g(4), g(5));
+
+    let mut out = [0u8; REC_BUF];
+    let mut p = 1usize;
+    let mut cnt = 0u8;
+    match put_rec_field(&mut out, p, 2, TY_I64, &(i64::from(allowed)).to_le_bytes()) {
+        Some(q) => {
+            p = q;
+            cnt += 1;
+        }
+        None => return,
+    }
+    for f in 30u8..=39 {
+        if let Some((ty, v)) = frame_field(req, f) {
+            match put_rec_field(&mut out, p, f, ty, v) {
+                Some(q) => {
+                    p = q;
+                    cnt += 1;
+                }
+                None => return,
+            }
+        }
+    }
+    out[0] = cnt;
+    (sys.channel_write)(s.response_out, out.as_ptr(), p);
+    s.decisions = s.decisions.wrapping_add(1);
+}
+
 /// Service every /authz-req/ without a response yet.
 unsafe fn reconcile(sys: &SyscallTable) -> u32 {
     let mut walk = ListWalk::new(REQ_PREFIX);
@@ -245,6 +338,8 @@ pub extern "C" fn module_new(
         // The `changes` input port is the store's event sink (self-edge alloc).
         s.sink = in_chan;
         s.subscribed = 0;
+        s.request_in = -1;
+        s.response_out = -1;
         s.decisions = 0;
         0
     }
@@ -272,9 +367,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.sink >= 0 {
                 store_subscribe(sys, REQ_PREFIX, s.sink, 0);
             }
+            // The connector ports, if the graph wired them. Unwired they stay
+            // -1 and this module is the store-seam responder it has always
+            // been — both apiserver graphs run during the cutover.
+            s.request_in = dev_channel_port(sys, PORT_INPUT, 1);
+            s.response_out = dev_channel_port(sys, PORT_OUTPUT, 1);
             s.subscribed = 1;
             s.decisions = s.decisions.wrapping_add(reconcile(sys));
         }
+        serve_record(s, sys);
         // A pushed namespace.change means new /authz-req/ to service.
         if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
             s.decisions = s.decisions.wrapping_add(reconcile(sys));

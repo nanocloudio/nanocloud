@@ -6,9 +6,8 @@ hardware_targets = ["bcm2712"]
 # `store_source` is the subscription half: the store pushes and the graph runs.
 # This is the other shape — a pipeline asks for a key and gets an answer, the
 # client-side mirror of wave's `s3` driven mode, and what the apiserver read
-# path needs. Deliberately TWO ops: the doc's Tier 1 is "the smallest connector
-# that can serve a read", so the thesis is tested on two ops rather than ten
-# built ahead of the test.
+# path needs. Deliberately SMALL: the smallest connector that can serve a read,
+# rather than ten ops built ahead of a caller for them.
 #
 # Wire (Chronicle v1 record frames, both ports):
 #   request_in   1 = cid (i64)    correlation, echoed verbatim
@@ -41,12 +40,31 @@ hardware_targets = ["bcm2712"]
 # silently consuming another's fields):
 #     1,2,3   cid / op / key
 #     4..16   value parts
-#     17,18   extra key parts
+#     17,18   extra key parts, joined after field 3
+#     25..27  three MORE key parts, for keys the first three cannot build —
+#             `/authz/<subject>/<verb>/<resource>` is five parts and two
+#             literal separators. The gap before the carry range at 30 is
+#             deliberate: widening either range must never start echoing the
+#             other's fields.
 #     20..22  reserved for store_source's expansion trailer
 #     30..39  carry-through (echoed with their TYPE)
 #     40..49  `paths` projected from a GET, as bytes
 #     50..54  `ints` projected from a GET, as i64 (absent -> 0)
 # Ops: 0 NOOP, 1 GET, 2 EXISTS, 3 PUT (204 when unchanged), 4 DELETE,
+# 7 LIST (the key is a PREFIX; answers 200 with the children's last segments
+# joined by `list_sep`, default ","). LIST is the request-driven counterpart to
+# `store_source`'s `list_children`: a collection GET needs the names under a
+# prefix and the VM has no iteration, so walking one is a connector's job by
+# construction. An empty prefix answers 200 with an EMPTY value, never 404 —
+# the collection exists and is empty, and 404 tells a client the resource kind
+# is unknown. A listing that would overflow the reply REFUSES with 500 rather
+# than answering a short list, which reads as a complete one — and so does one
+# whose object cannot be read, for the same reason.
+# `list_values = 1` answers the children's VALUES instead of their names, and
+# `list_open`/`list_close` wrap the result in literals: together they build a
+# Kubernetes `List` envelope without a store round trip per item and without a
+# VM that can concatenate. The literals are PARAMS because which envelope a
+# listing wears is the graph's choice, not this module's.
 # 5 PATCH (set the scalar at dotted path field 19 to field 4 — an i64 is
 # rendered as digits — inside the object at the key; 404 when absent),
 # 6 MERGE (upsert the joined `k=v;…` value parts into the flat record at the
@@ -85,6 +103,13 @@ required = false
 [[resources]]
 requires_contract = "storage.object"
 access = "write"
+
+# OP_LIST walks a prefix, which is the namespace contract, not the object one.
+# READ only: this module lists and reads through it, and never subscribes or
+# writes a namespace.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
 
 [observability]
 exempt = "a read-only store effect at the graph edge — observed through the store it reads and the engine it answers"

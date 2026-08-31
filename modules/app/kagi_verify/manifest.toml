@@ -1,0 +1,123 @@
+name = "kagi_verify"
+version = "0.1.0"
+description = "Chronicle connector for kagi's token_verify — record in, verified identity out"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The kagi seam, as a connector.
+#
+# Every Chronicle chain in this repo has the same shape: a SOURCE produces
+# records, a DECISION decides one record at a time, and a CONNECTOR moves bytes
+# to something outside the graph and hands back a record. `store_source` and
+# `store_effect` are that pair for the control-plane store. This is the same
+# role for kagi's `token_verify`: it decides NOTHING about authorization, it
+# carries a credential out and a verified identity back.
+#
+# Why a connector and not a decision: verification is a signature check against
+# a loaded key, which is neither a fold nor a comparison and could not be
+# params. Why not a nanocloud module doing the check itself: kagi owns the
+# identity protocols, and a second JOSE verifier here is a second place for "is
+# this credential genuine" to be answered differently. The wire is kagi's own
+# `auth_wire`, compiled from its published `kagi-common` tree rather than
+# restated — the same relationship `authn` already has to it.
+#
+# In:  a Chronicle record frame on `request_in`.
+#        `credential_field` (default 8) holds the compact JWS; empty is legal
+#        and yields `verify_err::MALFORMED` without troubling the verifier.
+#        Fields 30..=39 are CARRY: echoed onto the reply with their number and
+#        type, untouched. Ten of them, which is the whole correlation budget a
+#        filter stage has.
+# Out: `MSG_VERIFY_REQ` on `verify_out`, `MSG_VERIFY_RESP` back on `verify_in`,
+#      and a Chronicle record on `response_out`:
+#        1 = correlation (i64)   2 = status (i64, `verify_err`, 0 = OK)
+#        3 = subject (bytes)     4 = issuer (bytes)
+#        5 = audience (bytes)    6 = scope (bytes)
+#        7 = expires_at (i64)    8 = suite (i64)
+#        30..=39 = carry, echoed
+#
+# `status` is a `verify_err` code, NOT an HTTP status. Mapping a refusal to a
+# response is an authorization decision and belongs in params, which is the
+# whole point of handing back the typed reason rather than a 401.
+#
+# KEY DELIVERY. kagi's verifier is PUSHED its keys on `verify_key` and answers
+# ST_NO_KEY until one lands; nanocloud keeps its truth in the store, where
+# `sa_token` already publishes the verification key as a kagi `MSG_KEY_ADD`
+# frame at `/authn-keys/sa`. So this connector reads that key once and forwards
+# the frame VERBATIM on `key_out` — it never parses it, because the frame is
+# kagi's and the moment nanocloud interprets it there are two readings of it.
+#
+# The store read is a direct `storage.object` GET rather than a `store_source`
+# edge: the key is read once at start, forwarded whole, and never watched, so a
+# subscription and a graph edge would buy nothing. (A source CAN carry an
+# opaque value — a `paths` entry of `.` is the whole record — which is what the
+# endpoint addresses and this same key frame use elsewhere.)
+#
+# One request in flight at a time, by construction. The alternative is a
+# correlation table, and the table is only worth its bounds check when the
+# verifier is the chain's bottleneck — it is not; a signature check is
+# microseconds and the store round-trips around it are not.
+#
+# NOT DONE, deliberately: proof-of-possession binding. `VerifyRequest` carries
+# `method`/`uri` so a DPoP-style proof can be bound to the request it was
+# presented with, and kagi's wire says they are "empty when the credential is
+# not presented with a proof". This sends them empty. Filling them needs the
+# method NAME, and all this connector has is wave's method BYTE — inventing a
+# byte->name table here would be nanocloud restating wave's `wire::method`,
+# which is the reinvention this module exists to avoid.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# Whole records: this module reads one frame per step and needs the boundary
+# kept, so it asks for mailbox delivery on its own input (see kube_decode's
+# manifest for why the producer must NOT declare it).
+framed = true
+
+[[ports]]
+name = "verify_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "verify_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+# kagi's `token_verify` sets `max_record = 2048` on its `results` port; this is
+# the matching ceiling on the reading side.
+max_record = 2048
+framed = true
+
+[[ports]]
+name = "key_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 4096
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+# READ-ONLY on the store. This module fetches exactly one object — the
+# verification key `sa_token` published — and writes nothing: a connector that
+# could write the keyset is a connector that could install a key it then
+# accepts tokens against.
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+[observability]
+metrics = ["verify_sent", "verify_ok", "verify_refused", "verify_dropped", "key_published"]

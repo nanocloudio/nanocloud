@@ -1,0 +1,55 @@
+# nanocloud on BARE METAL.
+#
+# The board must provide a control-plane store, and that is not incidental:
+# every source SUBSCRIBEs a prefix and every effect PUTs a key, so a target
+# registering neither `storage.object` nor `storage.namespace` answers ENOSYS
+# and the whole chain sits idle without an error anyone would see.
+#
+# A ReplicaSet is seeded into the store; the `rs_` chain — the same nodes and
+# the same compiled params fluxor-controlplane.yaml ships on Linux — wakes on
+# the namespace.change PUSH and materialises one Pod per ordinal. The observer
+# source logs whatever landed under /pods/.
+#
+# Pass signal: `pods=3` counted IN THE STORE by a module that provably logs from
+# this board, plus the store's own `push=` telemetry showing the changes were
+# delivered rather than merely generated.
+#
+# The obvious signal — a Pod record logged by a `debug` node on the observer's
+# output — is NOT usable and it is worth saying why: `store_source` emits the
+# key TAIL (`default/web-0`), not the full key, and the record is a binary
+# Chronicle frame, so a regex over the log can neither find the key nor be sure
+# what it matched. Counting the objects the chain actually created is the
+# stronger claim and the simpler one.
+
+# Lives beside its graph rather than under tests/: the fluxor standard reserves
+# tests/** for shadow-tracking, and nanocloud has no shadow repo — a scenario
+# there would be untracked with no recovery path, which is the exact failure
+# that standard exists to prevent.
+
+name = "pi5_replicaset"
+target = "pi5"
+config = "pi5-replicaset.yaml"
+
+requires_tags = ["nvme"]
+
+requires = [
+    "deploy.netboot_tftp",
+    "power.cycle",
+    "telemetry.monitor_udp",
+]
+
+timeout_s = 150
+
+# The seed landing is the precondition; the Pod is the result. Gate on the
+# result — a seed that wrote but a chain that never woke is exactly the failure
+# mode this is here to catch, and it would pass a seed-only rule.
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[stp\\] .* seeded=1 pods=3 err=0"
+
+# The store must have DELIVERED the changes, not just recorded them: `blk` is
+# a change generated for a watcher whose channel was full, and a source that is
+# never told is indistinguishable from one that never woke.
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[store\\] .* push=[1-9][0-9]* blk=0 lost=0"

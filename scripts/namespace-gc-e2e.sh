@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's namespace_gc module (modules/app/namespace_gc) —
-# namespaced teardown over the fluxor-native control-plane store, consumed
-# through the standard storage contracts (`storage.object` 0x14 +
-# `storage.namespace` 0x13).
-# the store is single-process, owned by the fluxor-linux runtime, and seeded from
-# its durable append-log at init.
+# Live E2E for the namespace teardown chain (`ns_*`, Chronicle params) as it
+# ships in packaging/debian/fluxor-namespace-gc.yaml — teardown over the
+# control-plane store, consumed through the standard storage contracts
+# (`storage.object` 0x14 + `storage.namespace` 0x13). The store is
+# single-process, owned by the fluxor-linux runtime, and seeded from its
+# durable append-log at init.
 #
 # Proves the namespace controller's teardown on real binaries: a namespace marked
 # phase=Terminating has every object under it (across all namespaced resource
@@ -25,7 +25,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/namespace_gc.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

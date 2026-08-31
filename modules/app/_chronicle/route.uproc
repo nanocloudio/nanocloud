@@ -1,0 +1,216 @@
+// The edge-route compiler, as params.
+//
+// A validated Route plus its service's endpoints becomes ONE key per route
+// carrying the whole backend set — the row wave's `http` edge SUBSCRIBEs to
+// populate its DynRoute table. `route_validator.uproc` already decides what
+// makes a Route admissible; this decides what a validated one COMPILES to.
+//
+// Three passes, because the cardinality changes twice and Chronicle has no
+// iteration by construction — so each change of shape is a store round trip
+// whose fan-out a SOURCE performs:
+//
+//   A  /routes/          -> /route-be/<ns>/<svc>        one per route, keyed BY SERVICE
+//   B  /route-be/ JOIN /endpointslices/<ns>/<svc>/<pod>
+//                        -> /edge-be/<ns>/<svc>/<pod>   one per (route, backend)
+//   C  /route-be/ + list_children over /edge-be/
+//                        -> /dataplane/edge/<ns>/<route>  folded back to one row
+//
+// Pass A rekeys BY SERVICE on purpose: that is what lets pass B scope its join
+// to the object (`join_scoped = 1`, `/endpointslices/<tail>/…`) and get one
+// record per backend with no key matching a decision cannot do. Rekeying is the
+// whole trick, and it is the same two-pass fold `endpoints.uproc` uses.
+module nanocloud.route {
+
+  enum OP_NOOP = 0;
+  enum OP_PUT = 3;
+  enum OP_DELETE = 4;
+
+  // ---- pass A: a validated Route, rekeyed by its service ----
+
+  message Route {
+    seq: int = 1;
+    key: string = 3;        // "<ns>/<name>"
+    host: string = 4;
+    svc: string = 5;
+    port: string = 6;
+    path: string = 7;
+    ns: string = 28;
+    name: string = 29;
+    ready: string = 70;     // related /route-status/: "ready="
+  }
+
+  // `/route-be/<ns>/<svc>` — key parts joined by the connector after its
+  // key_prefix, because the VM cannot concatenate and the separator is a
+  // literal only a decision knows to emit.
+  message Be {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;        // <ns>
+    sep: string = 17;       // "/"
+    svc: string = 18;
+    v1: string = 4;         // "host="
+    v2: string = 5;
+    v3: string = 6;         // ";path="
+    v4: string = 7;
+    v5: string = 8;         // ";port="
+    v6: string = 9;
+    v7: string = 10;        // ";route="
+    v8: string = 11;
+  }
+
+  // Only a route the validator passed is compiled. An unready one writes
+  // nothing — and pass C's prune removes any row it previously had, so a route
+  // that BECOMES invalid stops serving rather than serving stale backends.
+  decision be(r: Route) -> Be {
+    when r.ready == "1" ->
+      Be { cid: r.seq, op: OP_PUT, key: r.ns, sep: "/", svc: r.svc,
+           v1: "host=", v2: r.host, v3: ";path=", v4: r.path,
+           v5: ";port=", v6: r.port, v7: ";route=", v8: r.name };
+    default ->
+      Be { cid: r.seq, op: OP_DELETE, key: r.ns, sep: "/", svc: r.svc,
+           v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "" };
+  }
+
+  // ---- pass B: one record per (route, backend) ----
+
+  message Pair {
+    seq: int = 1;
+    key: string = 3;        // "<ns>/<svc>"
+    host: string = 4;
+    path: string = 5;
+    port: string = 6;
+    route: string = 7;
+    pod: string = 21;       // the joined entry's last segment
+    addr: string = 60;      // join_paths "." — the slice's raw value, an IP
+  }
+
+  // `/edge-be/<ns>/<svc>/<pod>` = "<ip>:<port>:<weight>:<ready>". The weight and
+  // readiness are 1 here: a slice exists only for a ready endpoint (the
+  // endpoints chain prunes the rest), and per-backend weighting has no source
+  // to read yet. Written as VALUE PARTS because the VM cannot join them.
+  message EdgeBe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;        // "<ns>/<svc>"
+    sep: string = 17;       // "/"
+    pod: string = 18;
+    v1: string = 4;         // <ip>
+    v2: string = 5;         // ":"
+    v3: string = 6;         // <port>
+    v4: string = 7;         // ":1:1"
+  }
+
+  decision edge_be(p: Pair) -> EdgeBe {
+    when p.addr == "" ->
+      EdgeBe { cid: p.seq, op: OP_NOOP, key: "", sep: "", pod: "",
+               v1: "", v2: "", v3: "", v4: "" };
+    default ->
+      EdgeBe { cid: p.seq, op: OP_PUT, key: p.key, sep: "/", pod: p.pod,
+               v1: p.addr, v2: ":", v3: p.port, v4: ":1:1" };
+  }
+
+  // ---- pass C: fold the backends back into one row per route ----
+
+  message Fold {
+    seq: int = 1;
+    key: string = 3;        // "<ns>/<svc>"
+    host: string = 4;
+    path: string = 5;
+    route: string = 7;
+    ns: string = 28;
+    backends: string = 56;  // list_children + list_values: "<ip>:<port>:1:1,…"
+  }
+
+  message Edge {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;        // <ns>
+    sep: string = 17;       // "/"
+    route: string = 18;
+    v1: string = 4;         // "host="
+    v2: string = 5;
+    v3: string = 6;         // ";path="
+    v4: string = 7;
+    v5: string = 8;         // ";be="
+    v6: string = 9;
+  }
+
+  // A route with NO ready backend still gets its row, with an empty backend
+  // set: the edge then knows the route exists and has nowhere to send it, which
+  // is a 503. Deleting the row instead would make it a 404, and "this route is
+  // not configured" is a different answer from "nothing is up".
+  decision edge(f: Fold) -> Edge {
+    default ->
+      Edge { cid: f.seq, op: OP_PUT, key: f.ns, sep: "/", route: f.route,
+             v1: "host=", v2: f.host, v3: ";path=", v4: f.path,
+             v5: ";be=", v6: f.backends };
+  }
+
+  // ---- the prune: an edge row whose /route-be/ is gone ----
+
+  message Row {
+    seq: int = 1;
+    key: string = 3;        // "<ns>/<route>"
+    live: string = 70;      // related /routes/: "spec.host" — absent when gone
+  }
+
+  message Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+
+  // The route's own object is the liveness test, not `/route-be/`: pass A keys
+  // that BY SERVICE, so it cannot be looked up by route name. A row whose Route
+  // has been deleted — or whose host has been emptied — is removed.
+  decision prune(r: Row) -> Drop {
+    when r.live == "" ->
+      Drop { cid: r.seq, op: OP_DELETE, key: r.key };
+    default ->
+      Drop { cid: r.seq, op: OP_NOOP, key: "" };
+  }
+
+  transformation pass_route(r: Route) -> Route {
+    Route { seq: r.seq, key: r.key, host: r.host, svc: r.svc, port: r.port,
+            path: r.path, ns: r.ns, name: r.name, ready: r.ready }
+  }
+  transformation pass_pair(p: Pair) -> Pair {
+    Pair { seq: p.seq, key: p.key, host: p.host, path: p.path, port: p.port,
+           route: p.route, pod: p.pod, addr: p.addr }
+  }
+  transformation pass_fold(f: Fold) -> Fold {
+    Fold { seq: f.seq, key: f.key, host: f.host, path: f.path, route: f.route,
+           ns: f.ns, backends: f.backends }
+  }
+  transformation pass_row(r: Row) -> Row {
+    Row { seq: r.seq, key: r.key, live: r.live }
+  }
+
+  pipeline rekey(r: Route) -> Be {
+    call x = pass_route(r);
+    call y = be(x);
+    return y;
+  }
+  pipeline backend(p: Pair) -> EdgeBe {
+    call x = pass_pair(p);
+    call y = edge_be(x);
+    return y;
+  }
+  pipeline compile(f: Fold) -> Edge {
+    call x = pass_fold(f);
+    call y = edge(x);
+    return y;
+  }
+  pipeline sweep(r: Row) -> Drop {
+    call x = pass_row(r);
+    call y = prune(x);
+    return y;
+  }
+
+  entry rekey = rekey;
+  entry backend = backend;
+  entry compile = compile;
+  entry sweep = sweep;
+
+  provenance revision "route-compiler" toolchain "chronicle-authoring";
+}

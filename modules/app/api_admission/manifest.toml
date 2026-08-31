@@ -28,6 +28,41 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 4096
 
+# The CONNECTOR seam, alongside the store one above — the same shape
+# `rbac_gate` has.
+#
+# Admission reads a POLICY and COUNTS live objects for quota: a store lookup and
+# a prefix walk, neither of which Chronicle's VM can do. What it does not carry
+# is the meaning — it answers a status and the (possibly defaulted) object, and
+# what a 403 does to the request is params.
+#
+# In:  a Chronicle record frame on `request_in`
+#        3 = verb (bytes)      EMPTY means "not a mutating request": the object
+#                              is returned unchanged and no policy is consulted,
+#                              because a read has no object to validate and a
+#                              required-field rule would reject it
+#        4 = resource (bytes)  5 = namespace (bytes)  6 = object (bytes, JSON)
+#        30..=39 = carry
+# Out: 2 = status (i64, 200 or 403), 3 = the object as admitted (defaults
+#      applied) or the refusal reason, 30..=39 = carry
+#
+# Both ports are OPTIONAL: unwired they stay -1 and this is the store-seam
+# responder it has always been.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+framed = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
 [[resources]]
 requires_contract = "storage.namespace"
 access = "write"

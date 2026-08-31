@@ -24,7 +24,12 @@ hardware_targets = ["bcm2712"]
 #                      subscription entry has instead of a request id
 #   2 = rev   (i64)    store revision the object was read at
 #   3 = key   (bytes)  the object's key tail, below the prefix
-#   4.. = one field per `paths` entry, in order, as bytes ("" when absent)
+#   4.. = one field per `paths` entry, in order, as bytes ("" when absent).
+#         A `paths` (or `join_paths`) entry of `.` is the WHOLE VALUE, unparsed
+#         — for a record that is not JSON with paths in it (an endpoint
+#         address, a kagi key frame) or one a decision only forwards. Without
+#         it, reaching a raw value takes a `store_effect` GET — a second round
+#         trip to read what the walk already holds.
 # `flat = 1` reads `k=v;k=v` records instead of nested JSON, each `paths` entry
 # naming a field. Both shapes are in the control plane — k8s objects are JSON,
 # the internal projections are flat.
@@ -59,6 +64,11 @@ hardware_targets = ["bcm2712"]
 # 22 (and as digits at 21) on a plain record; `desired = <path>` puts that
 # path, as an integer, at 20 — a per-object fold and its target, comparable.
 #
+# `<prefix>!flat` reads that related record as `k=v;k=v` instead of JSON — both
+# shapes live in the control plane (a Route is JSON, its `/route-status/` is
+# flat) and a source only knows its OWN objects' shape. Without it the
+# projection silently reads nothing, and an empty field looks exactly like an
+# absent one.
 # `related = "<prefix>:<path>,…;<prefix>:<path>"` projects the SAME KEY under
 # another prefix — ten fields per prefix from 70 (70..79, 80..89, …). Every
 # plane here is keyed by the same id, so "the other facts about this object"

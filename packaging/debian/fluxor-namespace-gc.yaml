@@ -1,20 +1,69 @@
-# namespace-gc graph: the namespace_gc fmod, which
-# watches /namespaces/ and, for a namespace marked phase=Terminating, deletes
-# every object under it across all namespaced resource prefixes and then removes
-# the namespace record. Namespaced teardown as a store transform.
+# namespace-gc graph: the namespace teardown chain as Chronicle params — a
+# terminating Namespace's objects are collected, then its finalizer removed.
+#
+# The nodes and params are the SAME ones fluxor-controlplane.yaml ships; this
+# graph is that chain on its own so an E2E can drive it directly.
 target: linux
 tick_us: 1000
 
-# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
+# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
 modules:
-  - name: namespace_gc
+  - name: ns_objects
+    type: store_source
+    prefix: "/namespaces/"
+    paths: "status.phase"
+    join: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+    join_scoped: 1
+  - name: ns_sweep
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/namespace.uproc sw
+      decision: "0105000000170001000204000000120b005465726d696e6174696e6720000900000027000100020100000040010000001004000000000000004002000000010002180000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: ns_collect
+    type: store_effect
+  - name: ns_source
+    type: store_source
+    prefix: "/namespaces/"
+    paths: "status.phase"
+    count_children: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+    child_sep: "/"
+    watch: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+  - name: ns_finalize
+    type: decision
+    params:
+      # chronicle-source: modules/app/_chronicle/namespace.uproc fin
+      decision: "010a000000290001000204000000120b005465726d696e6174696e6720010002160000001000000000000000002030000900000027000100020100000040010000001004000000000000004002000000010002030000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+  - name: ns_remove
+    type: store_effect
+    key_prefix: "/namespaces/"
+  # The node plane is NOT here. Nothing in the control plane writes
+  # /pod-specs/, so the pod-lifecycle chain belongs to the image plane
+  # (`fluxor-image-fetch.yaml` -> /etc/nanocloud.io/fluxor/image-plane.yaml),
+  # which the deb installs alongside this one and which carries the whole
+  # chain: pull, resolve, project, lifecycle, prune. It also keeps this graph
+  # inside MAX_MODULES — that chain is 35 nodes, and 101 + 35 is past 128.
+  # The scheduler is PARAMS: the FIRST unbound Pod (where spec.nodeName=,
+  # count index 0) JOIN /ready-nodes/ picked by the fewest Pods bound to it —
+  # measured from the Pods themselves at pick time — PATCHes spec.nodeName;
+  # one bind per pass, the spread emergent. Then the Scheduled event. Reads
+  # /ready-nodes/ from the DaemonSet chain's projection. Params from
+  # modules/app/_chronicle/scheduler.uproc.
 
-# Self-edge: the GC's own output feeds its `changes` input, allocating a
-# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
-# module never writes this output; it drains pushed events from the input.
 wiring:
-  - from: namespace_gc.status
-    to: namespace_gc.changes
+  - from: ns_objects.status
+    to: ns_objects.changes
+  - from: ns_objects.record_out
+    to: ns_sweep.record_in
+  - from: ns_sweep.result_out
+    to: ns_collect.request_in
+    buffer_group: 81
+  - from: ns_source.status
+    to: ns_source.changes
+  - from: ns_source.record_out
+    to: ns_finalize.record_in
+  - from: ns_finalize.result_out
+    to: ns_remove.request_in
+    buffer_group: 82

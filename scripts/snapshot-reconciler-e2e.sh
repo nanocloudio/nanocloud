@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's snapshot_reconciler (modules/app/snapshot_reconciler)
-# — the VolumeSnapshot controller. For a VolumeSnapshot with a source PVC it
-# provisions a bound VolumeSnapshotContent and marks the pair readyToUse. The
-# physical data snapshot is a backend effect (a PIC module has no filesystem);
-# this proves the control-plane binding over the fluxor-native store.
+# Live E2E for the VolumeSnapshot chain (`sn_*`, Chronicle params) as it ships
+# in packaging/debian/fluxor-snapshot.yaml. For a VolumeSnapshot with a source
+# PVC it provisions a bound VolumeSnapshotContent and marks the pair
+# readyToUse. The physical data snapshot is a node-backend effect; this proves
+# the control-plane binding over the store.
 #
 #   /volumesnapshots.snapshot.storage.k8s.io/<ns>/<name>          spec.source.persistentVolumeClaimName
 #   /volumesnapshotcontents.snapshot.storage.k8s.io/snapcontent-<name>   (created)
@@ -19,7 +19,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/snapshot_reconciler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 

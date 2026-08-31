@@ -18,8 +18,8 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/nanocloud_cli.fmod" \
-         "$MODULES_DIR/deployment_reconciler.fmod" "$CLI_GRAPH" "$CP_GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/store_source.fmod" "$MODULES_DIR/store_effect.fmod" "$MODULES_DIR/decision.fmod" "$MODULES_DIR/nanocloud_cli.fmod" \
+         "$CLI_GRAPH" "$CP_GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 

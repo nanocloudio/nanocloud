@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's deployment_reconciler module (modules/app/
-# deployment_reconciler) — the Deployment → ReplicaSet projection over the
-# fluxor-native control-plane store, consumed through the standard storage
-# contracts (`storage.object` 0x14 + `storage.namespace` 0x13). The store is
-# single-process, owned by the fluxor-linux runtime, and seeded from its durable append-log at init.
+# Live E2E for the Deployment chain (`dp_*`, Chronicle params) as it ships in
+# packaging/debian/fluxor-deployment.yaml — the Deployment → ReplicaSet
+# projection over the control-plane store, consumed through the standard
+# storage contracts (`storage.object` 0x14 + `storage.namespace` 0x13). The
+# store is single-process, owned by the fluxor-linux runtime, and seeded from
+# its durable append-log at init.
 #
 # Because the store lives INSIDE the runtime process (no shared WAL, no flock),
 # the API plane's writes are replayed from `$D/store.log` at boot rather than
-# raced in live from an external writer. The reconciler cold-starts: SUBSCRIBE
-# /deployments.apps/ onto its `changes` input channel, then a full LIST pass
-# projects the owned ReplicaSet at /replicasets.apps/<ns>/<name>.
+# raced in live from an external writer. The chain cold-starts: `dp_source`
+# SUBSCRIBEs /deployments.apps/, then a full pass projects the owned ReplicaSet
+# at /replicasets.apps/<ns>/<name>.
 #
 #   /deployments.apps/<ns>/<name>  = "replicas=<N>;image=<img>"
 #   /replicasets.apps/<ns>/<name>  = "replicas=<N>;image=<img>;owner=<name>"
@@ -31,7 +32,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/deployment_reconciler.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

@@ -132,7 +132,7 @@ YAML
 echo "== 3. seed the Route → /dataplane/edge/ and the desired listener =="
 wal_op 1 "/dataplane/edge/default/web" \
   "host=${ROUTE_HOST};path=${ROUTE_PATH};be=${BACKEND_ADDR}:1:1"
-# The compiled dynamic listener the edge mid-life-binds (route_compiler's
+# The compiled dynamic listener the edge mid-life-binds (the route compiler's
 # /listeners/ → /dataplane/edge-listeners/ seam is proven separately).
 wal_op 1 "/dataplane/edge-listeners/${DYN_PORT}" "proto=tcp;tls=0"
 

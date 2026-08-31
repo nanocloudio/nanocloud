@@ -12,8 +12,7 @@ hardware_targets = ["bcm2712"]
 # registry example. This is nanocloud's counterpart.
 #
 # It reshapes bytes and decides nothing: no routing, no authorization, no
-# admission meaning. Those stay in params, which is what keeps the thesis
-# ("the logic is data") intact.
+# admission meaning. Those stay in params, which is what keeps the logic data.
 #
 # In:  wave HttpRequest envelope on `req_in`
 #        [conn_id u16][stream_id u16][method u8][flags u8]
@@ -26,6 +25,17 @@ hardware_targets = ["bcm2712"]
 #        4 = namespace        (bytes)
 #        5 = name             (bytes)
 #        6 = body             (bytes, truncated at `max_body`)
+#        7 = store key         (bytes) `/<resource>/<ns>/<name>`
+#        8 = credential        (bytes) bearer token, scheme stripped, may be empty
+#        9 = request target    (bytes) the path, WITHOUT the query string
+#       10 = query            (bytes) everything after the first `?`
+#       11 = watch            (i64)   1 when the query says `watch=true`
+#
+# `passthrough = 1` also emits a frame for a path that is NOT a Kubernetes
+# resource path — discovery documents and the like — with resource, namespace,
+# name and key EMPTY and the target at 9. Off by default: such a frame is a lie
+# to anything that reads it as a resource, and it is only safe in a graph whose
+# first decision answers by TARGET and refuses everything it does not know.
 #
 # Field 1 is the four correlation bytes carried whole and never re-split, per
 # webhook.md's "shared invocation context": conn_id alone mis-routes as soon as

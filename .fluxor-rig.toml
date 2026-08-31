@@ -1,0 +1,12 @@
+# How the rig builds a nanocloud image for a board.
+#
+# nanocloud is not a kernel project: the pi5 firmware comes from fluxor, and
+# `fluxor build` packs a nanocloud graph on top of it. So the recipe stages
+# fluxor's firmware, then builds the graph named by the scenario.
+#
+# `${scenario.config}` is the graph the scenario points at, so ONE recipe serves
+# every nanocloud rig scenario rather than one recipe per graph.
+
+[build.pi5]
+command = ["bash", "scripts/rig-build-pi5.sh", "${scenario.config}"]
+artifact = "target/pi5/packed.img"

@@ -7,7 +7,7 @@
 #
 # The store contract: watch /routes/, write /route-status/<ns>/<name> =
 # "ready=1;endpoint=<svc>:<port>" | "ready=0;msg=…", guarded, so
-# route_compiler's ready=1 gate reads a settled verdict.
+# the compiler's ready=1 gate reads a settled verdict.
 target: linux
 tick_us: 1000
 

@@ -35,7 +35,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/scheduler.fmod" "$FIXED_GRAPH" "$ADAPTIVE_GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$FIXED_GRAPH" "$ADAPTIVE_GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 

@@ -18,6 +18,14 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+// The store fragment, not a local copy. store_effect carried its own
+// `get_value` that returned a TRUNCATED value when the object exceeded the
+// buffer instead of refusing — the silent-truncation class this repo has been
+// bitten by four times, still live in the one module whose whole job is moving
+// stored bytes. The shared reader probes one byte past a full buffer and
+// REFUSES. `ListWalk` (paged, cursor-following) comes with it, which is what
+// OP_LIST needs.
+include!("../_shared/store.rs");
 include!("../_shared/json.rs");
 include!("../_shared/pathmod.rs");
 
@@ -51,8 +59,24 @@ const OP_MERGE: i64 = 6;
 /// operation" has to be expressible as an operation. Answering 204 keeps the
 /// chain linear instead of demanding a second graph.
 const OP_NOOP: i64 = 0;
+/// LIST the children under the key, answering with their LAST SEGMENTS joined
+/// by `list_sep` (default ","). The request-driven counterpart to
+/// `store_source`'s `list_children`: a collection GET needs the names under a
+/// prefix, and there is no other way to get them — the VM has no iteration, so
+/// walking a prefix is a connector's job by construction.
+///
+/// 200 with the joined names, including 200 with an EMPTY value for a prefix
+/// with no children. An empty collection is not a 404: the collection exists
+/// and is empty, and answering 404 tells a client the resource kind is
+/// unknown.
+const OP_LIST: i64 = 7;
 
 const MAX_KEY: usize = 256;
+// Contracts the shared store fragment dispatches on; it takes its opcodes from
+// whoever mounts it.
+const NS_LIST: u32 = 0x1302;
+const NS_SUBSCRIBE: u32 = 0x1305;
+const EVENT_HEADER_SIZE: usize = 32;
 const MAX_PREFIX: usize = 64;
 const MAX_PATHS_SPEC: usize = 192;
 const MAX_VALUE: usize = 4096;
@@ -60,6 +84,17 @@ const BUF: usize = 8192;
 
 #[repr(C)]
 struct State {
+    list_sep: [u8; 8],
+    list_sep_len: u8,
+    /// 0 = LIST answers the children's NAMES; 1 = their VALUES.
+    list_values: u32,
+    /// Literals wrapped around a LIST answer. Bytes, joined by this module
+    /// because the VM cannot concatenate — the ENVELOPE they spell is the
+    /// graph's to choose, which is why they are params and not a constant.
+    list_open: [u8; 64],
+    list_open_len: u8,
+    list_close: [u8; 64],
+    list_close_len: u8,
     syscalls: *const SyscallTable,
     request_in: i32,
     response_out: i32,
@@ -432,96 +467,6 @@ fn reply(out: &mut [u8], cid: i64, status: i64, value: &[u8], carry: &[(u8, u8, 
     p
 }
 
-unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> Option<usize> {
-    let mut garg = [0u8; MAX_KEY];
-    if key.is_empty() || key.len() > garg.len() {
-        return None;
-    }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
-    if h < 0 {
-        return None;
-    }
-    let mut rarg = [0u8; 20];
-    rarg[8..12].copy_from_slice(&(dst.len() as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
-    if n < 0 {
-        None
-    } else {
-        Some(n as usize)
-    }
-}
-
-/// The raw storage.object PUT, in the same arg layout every reconciler uses:
-/// the layout is the provider's, the value goes by POINTER (not inline), and
-/// the `[precondition][etag_len]` pair is two bytes. Any deviation hands the
-/// provider a misaligned pointer and the write is silently lost.
-unsafe fn put_value(sys: &SyscallTable, key: &[u8], value: &[u8]) -> bool {
-    let mut arg = [0u8; MAX_KEY + MAX_VALUE + 64];
-    // `1 + 1` is the precondition PAIR — `[precondition][etag_len]`. The
-    // bound counts both bytes: the buffer's slack would otherwise hide an
-    // undercount until a long key made it overflow.
-    if 2 + key.len() + 1 + 8 + 8 + 1 + 1 + 8 + 2 > arg.len() {
-        return false;
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = 0; // content_type_len
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-    p += 8;
-    // storage.object writes carry a precondition PAIR — `[precondition:u8]
-    // [etag_len:u8]` — two bytes, not one. Every field after it (including
-    // `fence_out_ptr`) is positioned off that width, so getting it wrong hands
-    // the provider a misaligned pointer and the write is silently lost. `ANY`
-    // is the explicit "apply unconditionally".
-    arg[p] = 0; // precondition::ANY
-    p += 1;
-    arg[p] = 0; // etag_len (none, under ANY)
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p) == 0
-}
-
-unsafe fn delete_value(sys: &SyscallTable, key: &[u8]) -> bool {
-    let mut arg = [0u8; MAX_KEY + 32];
-    if 2 + key.len() + 1 + 8 + 2 > arg.len() {
-        return false;
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    // storage.object writes carry a precondition PAIR — `[precondition:u8]
-    // [etag_len:u8]` — two bytes, not one. Every field after it (including
-    // `fence_out_ptr`) is positioned off that width, so getting it wrong hands
-    // the provider a misaligned pointer and the write is silently lost. `ANY`
-    // is the explicit "apply unconditionally".
-    arg[p] = 0; // precondition::ANY
-    p += 1;
-    arg[p] = 0; // etag_len (none, under ANY)
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    (sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p) == 0
-}
-
 /// PUT, guarded: a write whose value already matches is skipped, so a converged
 /// cluster spends no revisions and a graph writing under a prefix it also
 /// watches does not wake itself forever. Every nanocloud reconciler holds this
@@ -546,6 +491,30 @@ mod params_def {
 
     define_params! {
         State;
+
+        8, list_values, u32, 0
+            => |s, d, len| { s.list_values = super::p_u32(d, len, 0, 0); };
+
+        9, list_open, str, 0
+            => |s, d, len| {
+                let n = if len > 64 { 64 } else { len };
+                s.list_open_len = n as u8;
+                if n > 0 { ptr_copy(s.list_open.as_mut_ptr(), d, n); }
+            };
+
+        10, list_close, str, 0
+            => |s, d, len| {
+                let n = if len > 64 { 64 } else { len };
+                s.list_close_len = n as u8;
+                if n > 0 { ptr_copy(s.list_close.as_mut_ptr(), d, n); }
+            };
+
+        7, list_sep, str, 0
+            => |s, d, len| {
+                let n = if len > 8 { 8 } else { len };
+                s.list_sep_len = n as u8;
+                if n > 0 { ptr_copy(s.list_sep.as_mut_ptr(), d, n); }
+            };
 
         1, key_prefix, str, 0
             => |s, d, len| {
@@ -724,7 +693,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             *klen += n;
         };
         append_part(key, &mut klen);
-        for f in [17u8, 18] {
+        // 25, 26 and 27 extend the same idea: a projection key like
+        // `/authz/<subject>/<verb>/<resource>` is five parts and two literal
+        // separators, and two extra parts could not build it. They are the
+        // WIDEST the key ranges go — the carry range starts at 30 and the gap
+        // is deliberate.
+        for f in [17u8, 18, 25, 26, 27] {
             if let Some((TY_BYTES, part)) = frame_field(req, f) {
                 append_part(part, &mut klen);
             }
@@ -733,7 +707,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let key = if klen == pl { &full[..0] } else { key };
 
         // Opaque carry-through: fields 30..=39 come back untouched. Kept clear
-        // of the value parts (4..16) and the key parts (3, 17, 18) so widening
+        // of the value parts (4..16) and the key parts (3, 17, 18, 25..27) so widening
         // either range can never silently start echoing a value fragment.
         // Sized to the WHOLE 30..=39 range. It was 4 while the range was
         // 30..=33; widening the range without widening this silently dropped
@@ -775,6 +749,69 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             reply_projected(&mut out, cid, 400, &[], carry, &proj)
         } else {
             match op {
+                OP_LIST => {
+                    // The key is a PREFIX here. `ListWalk` hands one key at a
+                    // time and follows the provider's cursor, so a collection
+                    // larger than one page is not silently cut off — the
+                    // truncation class this repo has already been bitten by
+                    // four times.
+                    let sep: &[u8] = if s.list_sep_len > 0 {
+                        &s.list_sep[..s.list_sep_len as usize]
+                    } else {
+                        b","
+                    };
+                    let mut names = [0u8; MAX_VALUE];
+                    let mut at = 0usize;
+                    if s.list_open_len > 0 {
+                        at = append(&mut names, at, &s.list_open[..s.list_open_len as usize]);
+                    }
+                    let opened = at;
+                    let mut walk = ListWalk::new(key);
+                    let mut overflow = false;
+                    let mut vbuf = [0u8; MAX_VALUE];
+                    while let Some(k) = walk.next(sys) {
+                        // NAMES or VALUES. A collection GET that must answer a
+                        // Kubernetes `List` needs the objects, not their keys,
+                        // and reading them here is the same prefix walk either
+                        // way — asking the graph to fetch each one would be a
+                        // store round trip per item.
+                        let name: &[u8] = if s.list_values != 0 {
+                            let mut kb = [0u8; MAX_KEY];
+                            let kl = k.len().min(MAX_KEY);
+                            kb[..kl].copy_from_slice(&k[..kl]);
+                            match get_value(sys, &kb[..kl], &mut vbuf) {
+                                Some(vl) => &vbuf[..vl],
+                                // Refused (oversized) or vanished mid-walk. A
+                                // listing that quietly omits an object reads as
+                                // a complete one, so the whole answer fails.
+                                None => {
+                                    overflow = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            last_seg(k)
+                        };
+                        let need = name.len() + if at == opened { 0 } else { sep.len() };
+                        if at + need + s.list_close_len as usize > names.len() {
+                            // REFUSE rather than answer a short list: a
+                            // truncated collection reads as a complete one and
+                            // a client concludes the missing objects are gone.
+                            overflow = true;
+                            break;
+                        }
+                        if at > opened {
+                            at = append(&mut names, at, sep);
+                        }
+                        at = append(&mut names, at, name);
+                    }
+                    if s.list_close_len > 0 {
+                        at = append(&mut names, at, &s.list_close[..s.list_close_len as usize]);
+                    }
+                    let status = if overflow || walk.failed { 500 } else { 200 };
+                    let body: &[u8] = if status == 200 { &names[..at] } else { &[] };
+                    reply_projected(&mut out, cid, status, body, carry, &proj)
+                }
                 OP_DELETE => {
                     // delete-if-present, so a converged cluster spends no
                     // revisions and a repeated verdict is a no-op.
