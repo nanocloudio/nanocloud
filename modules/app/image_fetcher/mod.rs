@@ -49,6 +49,10 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::contracts::net::net_proto::{
+    write_connect_to, Target, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
+    REQUESTER_TAG_NONE,
+};
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
@@ -83,7 +87,6 @@ const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
 
 /// Input-port kind for `dev_channel_port` (resolving the changes port).
 const PORT_INPUT: u8 = 0;
@@ -104,7 +107,11 @@ const MAX_TAG: usize = 32;
 const MAX_REF: usize = 72;
 /// `platform.architecture` / `platform.os` match tokens.
 const MAX_PLAT: usize = 16;
-const MAX_HOST: usize = 64;
+/// The registry authority, `host[:port]`. A longer one is refused at
+/// construction: a prefix of a name is a different host.
+const MAX_AUTHORITY: usize = 64;
+/// The port an authority that names none is dialled on.
+const REGISTRY_PORT: u16 = 5000;
 const MAX_DIR: usize = 96;
 const MAX_LAYERS: usize = 32;
 
@@ -126,7 +133,7 @@ const BACKOFF_MAX_MS: u64 = 60_000;
 enum Phase {
     /// Waiting out the boot delay, then a cold-start scan.
     Init = 0,
-    /// CMD_CONNECT queued for the current request.
+    /// CMD_CONNECT_TO queued for the current request.
     Connecting = 1,
     /// Waiting for MSG_CONNECTED with our requester tag.
     WaitConnect = 2,
@@ -167,12 +174,17 @@ struct State {
     dirty: u8,
 
     // Params.
-    registry_ip: u32,
-    registry_port: u16,
+    /// The registry as configured, `host[:port]`: the `CMD_CONNECT_TO`
+    /// target and, verbatim, the HTTP `Host:` header.
+    authority: [u8; MAX_AUTHORITY],
+    authority_len: u8,
+    /// The configured authority was longer than the buffer; construction
+    /// refuses rather than dial a prefix of the name.
+    authority_over: u8,
+    /// The authority's port, or `REGISTRY_PORT` when it names none.
+    port: u16,
     chunk_bytes: u32,
     boot_delay_ms: u32,
-    host: [u8; MAX_HOST],
-    host_len: u8,
     blob_dir: [u8; MAX_DIR],
     blob_dir_len: u8,
     /// Platform selector applied to a manifest index.
@@ -230,27 +242,24 @@ struct State {
 }
 
 mod params_def {
-    use super::p_u16;
     use super::p_u32;
     use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::{MAX_DIR, MAX_HOST, MAX_PLAT};
+    use super::{MAX_AUTHORITY, MAX_DIR, MAX_PLAT};
 
     define_params! {
         State;
 
-        1, registry_ip, u32, 0
-            => |s, d, len| { s.registry_ip = p_u32(d, len, 0, 0); };
-
-        2, registry_port, u16, 5000
-            => |s, d, len| { s.registry_port = p_u16(d, len, 0, 5000); };
-
-        3, host, str, 0
+        // Tags 1, 2 and 3 are retired.
+        9, authority, str, 0
             => |s, d, len| {
-                let n = if len > MAX_HOST { MAX_HOST } else { len };
-                s.host_len = n as u8;
-                if n > 0 { ptr_copy(s.host.as_mut_ptr(), d, n); }
+                if len > MAX_AUTHORITY {
+                    s.authority_over = 1;
+                    return;
+                }
+                s.authority_len = len as u8;
+                if len > 0 { ptr_copy(s.authority.as_mut_ptr(), d, len); }
             };
 
         4, blob_dir, str, 0
@@ -344,6 +353,22 @@ unsafe fn log_err(s: &State, msg: &[u8]) {
     dev_log(sys, 2, msg.as_ptr(), msg.len());
 }
 
+/// The registry as configured: what is dialled and what the `Host:` header
+/// carries are the same bytes.
+fn authority(s: &State) -> &[u8] {
+    &s.authority[..s.authority_len as usize]
+}
+
+/// Compose the registry dial into `buf`, answering its length. A name
+/// travels as a name for the network provider to resolve, a literal as its
+/// address, on the authority's port or `REGISTRY_PORT`.
+fn connect_record(s: &State, buf: &mut [u8], tag: u8) -> usize {
+    let Some((target, _)) = Target::parse(authority(s)) else {
+        return 0;
+    };
+    write_connect_to(buf, SOCK_TYPE_STREAM, s.port, &target, Some(tag))
+}
+
 // ---- fetch machine ----
 
 unsafe fn enter_backoff(s: &mut State) {
@@ -424,7 +449,7 @@ unsafe fn build_request(s: &mut State) -> usize {
         o = append(&mut buf, o, &s.blob_hex);
     }
     o = append(&mut buf, o, b" HTTP/1.1\r\nHost: ");
-    o = append(&mut buf, o, &s.host[..s.host_len as usize]);
+    o = append(&mut buf, o, authority(s));
     if s.fetching == FETCH_MANIFEST {
         // Both manifest flavours AND both index flavours: a real registry
         // answers a tag with an index (the multi-arch shape), and only offers
@@ -945,8 +970,12 @@ unsafe fn pump_net(s: &mut State) -> bool {
     match msg_type {
         NET_MSG_CONNECTED => {
             if s.phase == Phase::WaitConnect && payload_len >= 2 {
-                let tag = if payload_len >= 3 { payload[2] } else { 0 };
-                if tag == 0 || tag == dev_requester_tag(sys) {
+                let tag = if payload_len >= 3 {
+                    payload[2]
+                } else {
+                    REQUESTER_TAG_NONE
+                };
+                if tag == REQUESTER_TAG_NONE || tag == dev_requester_tag(sys) {
                     s.conn_id = u16::from_le_bytes([payload[0], payload[1]]);
                     s.conn_present = 1;
                     let len = build_request(s);
@@ -1397,9 +1426,21 @@ pub unsafe extern "C" fn module_new(
         s.conn_present = 0;
         s.file_fd = -1;
         s.backoff_ms = 0;
+        s.authority_len = 0;
+        s.authority_over = 0;
+        s.port = 0;
         // Defaults, then TLV params.
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
+        if s.authority_over == 1 || s.authority_len == 0 {
+            log_err(s, b"[image_fetcher] authority (host[:port]) is required");
+            return -2;
+        }
+        let Some((_, port)) = Target::parse(authority(s)) else {
+            log_err(s, b"[image_fetcher] authority is not host[:port]");
+            return -2;
+        };
+        s.port = port.unwrap_or(REGISTRY_PORT);
         if s.arch_len == 0 {
             let a = b"arm64"; // the nanocloud node fleet is aarch64
             s.arch[..a.len()].copy_from_slice(a);
@@ -1474,17 +1515,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if s.net_out < 0 {
                     return 0;
                 }
-                let mut payload = [0u8; 8];
-                payload[0] = SOCK_TYPE_STREAM;
-                payload[1..5].copy_from_slice(&s.registry_ip.to_le_bytes());
-                payload[5..7].copy_from_slice(&s.registry_port.to_le_bytes());
-                payload[7] = dev_requester_tag(sys);
+                let mut payload = [0u8; CONNECT_TO_MAX];
+                let n = connect_record(s, &mut payload, dev_requester_tag(sys));
+                if n == 0 {
+                    log_err(s, b"[image_fetcher] authority is not dialable");
+                    enter_backoff(s);
+                    return 0;
+                }
                 let wrote = net_write_frame(
                     sys,
                     s.net_out,
-                    NET_CMD_CONNECT,
+                    NET_CMD_CONNECT_TO,
                     payload.as_ptr(),
-                    8,
+                    n,
                     s.net_buf.as_mut_ptr(),
                     NET_BUF_SIZE,
                 );

@@ -3,6 +3,11 @@
 # image_fetcher performs the OCI distribution-API fetch (effect) — manifest →
 # missing digests → fetch → digest-verify → content-addressed blob cache.
 #
+# The fetcher is given a NAME authority (localhost:<port>), so its dial travels
+# as an AF_NAME CMD_CONNECT_TO record the network provider resolves, and the
+# same bytes go out as the HTTP Host: header. image-run-e2e.sh dials a literal,
+# which travels as AF_INET.
+#
 # The script plays the registry: a local HTTP stub serving a docker-v2 image
 # manifest (2 layers) + its blobs. It seeds /image-requests/<name>, runs the
 # graph (linux_net + image_fetcher + image_puller), and asserts the settled
@@ -190,9 +195,7 @@ scheduler:
 modules:
   - name: image_puller
   - name: image_fetcher
-    registry_ip: 2130706433
-    registry_port: $PORT
-    host: "127.0.0.1"
+    authority: "localhost:$PORT"
     blob_dir: "$D/blobcache"
     chunk_bytes: 0
     boot_delay_ms: 200

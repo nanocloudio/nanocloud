@@ -5,6 +5,8 @@ hardware_targets = ["bcm2712"]
 # missing digests → fetch → verify → assemble, with the container blob cache
 # as the assemble backend.
 #
+# `authority` (`host[:port]`, port 5000 when it names none) is the registry:
+# the `CMD_CONNECT_TO` target and, verbatim, the HTTP `Host:` header.
 # `arch`/`os` (default arm64/linux) select the platform manifest out of a
 # multi-arch index; the image config blob is fetched and projected as
 # /image-config/<name>, the runtime contract (Entrypoint/Cmd/Env/WorkingDir/
@@ -24,7 +26,7 @@ hardware_targets = ["bcm2712"]
 timer_class = "wall_clock"
 
 # Stream Surface v1 (net_proto): MSG_CONNECTED / MSG_DATA / MSG_CLOSED /
-# MSG_ERROR inbound; CMD_CONNECT / CMD_SEND / CMD_CLOSE outbound. Sized to
+# MSG_ERROR inbound; CMD_CONNECT_TO / CMD_SEND / CMD_CLOSE outbound. Sized to
 # absorb one full TLS-module step burst (cipher ring 16 KiB, decrypt fan-out
 # ~1:1) with headroom — a blob download is a sustained inbound stream.
 [[ports]]

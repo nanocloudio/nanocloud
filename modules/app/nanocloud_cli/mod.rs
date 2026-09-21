@@ -212,8 +212,9 @@ struct State {
 
 // ---- store ----
 
-/// storage.namespace LIST into `raw`; returns bytes written (entries are
-/// `[name_len:u8][kind:u8][name]` terminated by 0xFF), or 0.
+/// storage.namespace LIST into `raw`; returns bytes written, or 0. Entries are
+/// `[name_len:u8][kind:u8][name]`, closed by a `[0xFF][0xFF][cursor_len:u8]`
+/// trailer — read them with `list_entry`, never by testing `name_len` alone.
 unsafe fn ns_list(sys: &SyscallTable, prefix: &[u8], raw: &mut [u8]) -> usize {
     let mut larg = [0u8; MAX_KEY + 32];
     if 2 + prefix.len() + 2 + 8 + 4 + 8 + 2 > larg.len() {
@@ -248,15 +249,32 @@ unsafe fn count_prefix(sys: &SyscallTable, prefix: &[u8]) -> u32 {
     let n = ns_list(sys, prefix, &mut raw);
     let mut rp = 0usize;
     let mut count = 0u32;
-    while rp < n {
-        let nl = raw[rp] as usize;
-        if nl == 0xFF || rp + 2 + nl > n {
-            break;
-        }
-        rp += 2 + nl;
+    while let Some((_, next)) = list_entry(&raw[..n], rp) {
+        rp = next;
         count += 1;
     }
     count
+}
+
+/// The entry at `rp` in a LIST page, and the offset just past it; `None` at
+/// the trailing record or the end of the page.
+///
+/// BOTH sentinel bytes decide the trailer. A name of exactly 255 bytes makes
+/// `name_len` 0xFF as well, so testing that byte alone ends the listing one
+/// entry early and loses every entry after it; `kind` never takes the value
+/// 0xFF. One reader for every walk below, so the rule is stated once.
+fn list_entry(page: &[u8], rp: usize) -> Option<(&[u8], usize)> {
+    if rp >= page.len() {
+        return None;
+    }
+    let nl = page[rp] as usize;
+    if nl == 0xFF && rp + 1 < page.len() && page[rp + 1] == 0xFF {
+        return None;
+    }
+    if rp + 2 + nl > page.len() {
+        return None;
+    }
+    Some((&page[rp + 2..rp + 2 + nl], rp + 2 + nl))
 }
 
 /// Build a full store key `<prefix><subpath>` into `buf`; returns its length
@@ -392,16 +410,12 @@ unsafe fn list_names_into(
     let n = ns_list(sys, prefix, &mut raw);
     let mut rp = 0usize;
     let mut any = false;
-    while rp < n {
-        let nl = raw[rp] as usize;
-        if nl == 0xFF || rp + 2 + nl > n {
-            break;
-        }
+    while let Some((key, next)) = list_entry(&raw[..n], rp) {
         p = append(out, p, b"  ");
-        p = append(out, p, last_seg(&raw[rp + 2..rp + 2 + nl]));
+        p = append(out, p, last_seg(key));
         p = append(out, p, b"\n");
         any = true;
-        rp += 2 + nl;
+        rp = next;
     }
     if !any {
         p = append(out, p, b"  (none)\n");
@@ -537,12 +551,7 @@ unsafe fn export_prefix(sys: &SyscallTable, out_chan: i32, prefix: &[u8]) {
     let mut raw = [0u8; LIST_BUF];
     let n = ns_list(sys, prefix, &mut raw);
     let mut rp = 0usize;
-    while rp < n {
-        let nl = raw[rp] as usize;
-        if nl == 0xFF || rp + 2 + nl > n {
-            break;
-        }
-        let key = &raw[rp + 2..rp + 2 + nl];
+    while let Some((key, next)) = list_entry(&raw[..n], rp) {
         let mut val = [0u8; MAX_VALUE];
         if let Some(vlen) = get_value(sys, key, &mut val) {
             if out_chan >= 0 {
@@ -552,7 +561,7 @@ unsafe fn export_prefix(sys: &SyscallTable, out_chan: i32, prefix: &[u8]) {
                 let _ = (sys.channel_write)(out_chan, b"\n".as_ptr(), 1);
             }
         }
-        rp += 2 + nl;
+        rp = next;
     }
 }
 
@@ -616,16 +625,12 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.out_chan, b" ----\n".as_ptr(), 6);
             let mut rp = 0usize;
             let mut any = false;
-            while rp < n {
-                let nl = raw[rp] as usize;
-                if nl == 0xFF || rp + 2 + nl > n {
-                    break;
-                }
-                let name = last_seg(&raw[rp + 2..rp + 2 + nl]);
+            while let Some((key, next)) = list_entry(&raw[..n], rp) {
+                let name = last_seg(key);
                 let _ = (sys.channel_write)(s.out_chan, name.as_ptr(), name.len());
                 let _ = (sys.channel_write)(s.out_chan, b"\n".as_ptr(), 1);
                 any = true;
-                rp += 2 + nl;
+                rp = next;
             }
             if !any {
                 let e = b"(none)\n";
@@ -738,16 +743,12 @@ unsafe fn cmd_get(sys: &SyscallTable, resource: &[u8], out: &mut [u8]) -> (usize
     let mut p = 0usize;
     let mut rp = 0usize;
     let mut any = false;
-    while rp < n {
-        let nl = raw[rp] as usize;
-        if nl == 0xFF || rp + 2 + nl > n {
-            break;
-        }
-        let name = last_seg(&raw[rp + 2..rp + 2 + nl]);
+    while let Some((key, next)) = list_entry(&raw[..n], rp) {
+        let name = last_seg(key);
         p = append(out, p, name);
         p = append(out, p, b"\n");
         any = true;
-        rp += 2 + nl;
+        rp = next;
     }
     if !any {
         p = append(out, p, b"(none)\n");

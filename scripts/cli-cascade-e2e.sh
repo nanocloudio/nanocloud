@@ -49,7 +49,17 @@ with open(os.sys.argv[1],"wb") as f:
 PY
 
 echo "== 2. build both graphs (control plane + cli) =="
-nc_build_workload "$ROOT" "$CP_GRAPH" "$D/cp.bin" "$D/cp.mods"
+# The packaged control-plane graph references /etc/nanocloud.io/certs/... (which
+# postinst provisions). For the test, generate a P-256 cert and point a copy of
+# the graph at it — so this exercises the REAL production graph structure (TLS).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout "$D/k.pem" -out "$D/c.pem" -days 1 -subj "/CN=nanocloud" 2>/dev/null
+openssl x509 -in "$D/c.pem" -outform DER -out "$D/server.der" 2>/dev/null
+openssl ec   -in "$D/k.pem" -outform DER -out "$D/server.key.der" 2>/dev/null
+sed -e "s#/etc/nanocloud.io/certs/server.der#$D/server.der#" \
+    -e "s#/etc/nanocloud.io/certs/server.key.der#$D/server.key.der#" \
+    "$CP_GRAPH" > "$D/cp-graph.yaml"
+nc_build_workload "$ROOT" "$D/cp-graph.yaml" "$D/cp.bin" "$D/cp.mods"
 nc_build_workload "$ROOT" "$CLI_GRAPH" "$D/cli.bin" "$D/cli.mods"
 
 cp_run()  { FLUXOR_STORE_DIR="$D" timeout 3 "$FLUXOR_RUNTIME" --config "$D/cp.bin"  --modules "$D/cp.mods"  >/dev/null 2>&1 || true; }

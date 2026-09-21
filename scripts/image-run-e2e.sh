@@ -260,9 +260,7 @@ scheduler:
 modules:
   - name: image_puller
   - name: image_fetcher
-    registry_ip: 2130706433
-    registry_port: $PORT
-    host: "127.0.0.1"
+    authority: "127.0.0.1:$PORT"
     blob_dir: "$D/blobcache"
     chunk_bytes: 0
     boot_delay_ms: 200

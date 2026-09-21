@@ -8,7 +8,7 @@
 #   sandbox_runner   runs the assembly job, then the pod (pivot_root)
 #
 # The tls client posture mirrors ota_registry's (alpn_h1_only — registry:2 is
-# a Go server that would select h2; trust_cert_file = the nanocloud deployment
+# a Go server that would select h2; trust = the nanocloud deployment
 # CA in DER). The node blob cache is content-addressed — pulls skip blobs the
 # cache already holds, layers dedup across images.
 #
@@ -33,15 +33,13 @@ modules:
     # A TLS client always authenticates its peer, so the profile must be
     # declared: ca_dns = chain to the deployment CA AND match the name we
     # dialled. `verify_hostname` is required of a client under this profile
-    # (an IP literal is rejected) — hence the DNS name, not registry_ip.
+    # (an IP literal is rejected), and it is the name the fetcher dials.
     peer_auth: 2
-    trust_cert_file: "/etc/nanocloud.io/certs/ca.der"
+    trust: "${file:/etc/nanocloud.io/certs/ca.der}"
     verify_hostname: "registry.nanocloud.io"
   - name: image_puller
   - name: image_fetcher
-    registry_ip: 3232235786   # 192.168.1.10 — registry.nanocloud.io
-    registry_port: 5000
-    host: "registry.nanocloud.io"
+    authority: "registry.nanocloud.io:5000"
     blob_dir: "/var/lib/nanocloud.io/image/blobs"
     chunk_bytes: 0
     boot_delay_ms: 500

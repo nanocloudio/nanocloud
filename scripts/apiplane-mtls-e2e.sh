@@ -120,7 +120,7 @@ g = g.replace("modules:\n  - name: http", f"""modules:
     # Mandatory whenever this instance authenticates a peer: ca_dns + the
     # cluster CA = "the client cert must be one we issued".
     peer_auth: 2
-    trust_cert_file: "{d}/ca.der"
+    trust: "${{file:{d}/ca.der}}"
     cert_file: "{d}/server.der"
     key_file: "{d}/server.key.der"
   - name: http""")

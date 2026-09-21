@@ -158,7 +158,7 @@ modules:
   # without one — which for a cluster is:
   #     verify_peer: 1
   #     peer_auth: 2                                   # chain to the CA below
-  #     trust_cert_file: "/etc/nanocloud.io/certs/ca.der"
+  #     trust: "${file:/etc/nanocloud.io/certs/ca.der}"
   # Client certs must then be CA-issued with EKU clientAuth; the wired
   # peer_identity below carries the accepted leaf's SPIFFE SVID to `http`,
   # where rbac_gate binds it. See scripts/apiserver-mtls-e2e.sh for the whole

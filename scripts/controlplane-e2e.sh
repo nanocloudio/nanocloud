@@ -66,8 +66,18 @@ print(out.decode() if out is not None else "")
 PY
 }
 
-echo "== 1. build config + module table from the 22-module control-plane graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+echo "== 1. build config + module table from the control-plane graph =="
+# The packaged control-plane graph references /etc/nanocloud.io/certs/... (which
+# postinst provisions). For the test, generate a P-256 cert and point a copy of
+# the graph at it — so this exercises the REAL production graph structure (TLS).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout "$D/k.pem" -out "$D/c.pem" -days 1 -subj "/CN=nanocloud" 2>/dev/null
+openssl x509 -in "$D/c.pem" -outform DER -out "$D/server.der" 2>/dev/null
+openssl ec   -in "$D/k.pem" -outform DER -out "$D/server.key.der" 2>/dev/null
+sed -e "s#/etc/nanocloud.io/certs/server.der#$D/server.der#" \
+    -e "s#/etc/nanocloud.io/certs/server.key.der#$D/server.key.der#" \
+    "$GRAPH" > "$D/graph.yaml"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. project one Deployment (replicas=2) + a ready node (the API plane's role) =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'

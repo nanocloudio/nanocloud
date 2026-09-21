@@ -486,7 +486,7 @@ unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
 
 /// One page of a storage.namespace LIST, RAW: `out` is handed to the provider
 /// and comes back as `[name_len:u8][kind:u8][name]…` entries followed by the
-/// trailing `[0xFF][cursor_len:u8][cursor]` record. Nothing is repacked, so
+/// trailing `[0xFF][0xFF][cursor_len:u8][cursor]` record. Nothing is repacked, so
 /// there is no second buffer for a page to overflow, and the trailing record
 /// is always reached: "listing complete" can only ever come from the provider
 /// saying so with a zero-length cursor.
@@ -541,11 +541,14 @@ unsafe fn list_page(
     let mut clen = 0usize;
     while rp < n {
         let name_len = out[rp] as usize;
-        if name_len == 0xFF {
-            if rp + 2 <= n {
-                let cl = out[rp + 1] as usize;
-                if cl > 0 && rp + 2 + cl <= n && cl <= cursor_out.len() {
-                    cursor_out[..cl].copy_from_slice(&out[rp + 2..rp + 2 + cl]);
+        // The trailer is BOTH sentinel bytes. A name of exactly 255 bytes
+        // makes `name_len` 0xFF too, and stopping on that alone drops the
+        // entry and every one after it; `kind` never takes the value 0xFF.
+        if name_len == 0xFF && rp + 1 < n && out[rp + 1] == 0xFF {
+            if rp + 3 <= n {
+                let cl = out[rp + 2] as usize;
+                if cl > 0 && rp + 3 + cl <= n && cl <= cursor_out.len() {
+                    cursor_out[..cl].copy_from_slice(&out[rp + 3..rp + 3 + cl]);
                     clen = cl;
                 } else if cl > 0 {
                     let m = b"[store_source] LIST cursor does not fit - scan INCOMPLETE";
@@ -571,7 +574,12 @@ fn raw_entry(page: &[u8], rp: usize) -> Option<(&[u8], usize)> {
         return None;
     }
     let name_len = page[rp] as usize;
-    if name_len == 0xFF || rp + 2 + name_len > page.len() {
+    // Trailer = both sentinel bytes; `name_len` alone would also match a
+    // 255-byte name and end the page one entry early.
+    if name_len == 0xFF && rp + 1 < page.len() && page[rp + 1] == 0xFF {
+        return None;
+    }
+    if rp + 2 + name_len > page.len() {
         return None;
     }
     Some((&page[rp + 2..rp + 2 + name_len], rp + 2 + name_len))

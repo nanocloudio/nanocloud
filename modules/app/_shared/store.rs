@@ -245,7 +245,14 @@ impl ListWalk {
             if self.rp >= self.n && !self.fetch(sys) {
                 return None;
             }
-            // entries: [name_len:u8][kind:u8][name]; trailer [0xFF][cursor_len:u8][cursor]
+            // entries: [name_len:u8][kind:u8][name]
+            // trailer: [0xFF][0xFF][cursor_len:u8][cursor]
+            //
+            // BOTH sentinel bytes decide. `name_len` alone is ambiguous — a
+            // name of exactly 255 bytes makes it 0xFF — and reading that as
+            // the trailer drops the entry and every one after it, silently.
+            // `kind` has three valid values, so 0xFF in the second position
+            // can never begin an entry.
             let rp = self.rp;
             if rp >= self.n {
                 // An empty page with no trailer: the provider is required to
@@ -257,14 +264,14 @@ impl ListWalk {
                 return None;
             }
             let name_len = self.page[rp] as usize;
-            if name_len == 0xFF {
-                let cl = if rp + 2 <= self.n {
-                    self.page[rp + 1] as usize
+            if name_len == 0xFF && rp + 1 < self.n && self.page[rp + 1] == 0xFF {
+                let cl = if rp + 3 <= self.n {
+                    self.page[rp + 2] as usize
                 } else {
                     0
                 };
-                if cl > 0 && rp + 2 + cl <= self.n {
-                    self.cursor[..cl].copy_from_slice(&self.page[rp + 2..rp + 2 + cl]);
+                if cl > 0 && rp + 3 + cl <= self.n && cl <= self.cursor.len() {
+                    self.cursor[..cl].copy_from_slice(&self.page[rp + 3..rp + 3 + cl]);
                     self.clen = cl;
                 } else if cl > 0 {
                     let m = b"[store] LIST cursor malformed - walk INCOMPLETE";
