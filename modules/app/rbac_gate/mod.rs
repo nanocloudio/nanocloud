@@ -62,7 +62,6 @@ const ROLE_PREFIX: &[u8] = b"/roles/";
 
 const MAX_KEY: usize = 160;
 const MAX_VALUE: usize = 512;
-const LIST_BUF: usize = 2048;
 
 #[repr(C)]
 struct State {

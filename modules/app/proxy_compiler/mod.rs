@@ -33,7 +33,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -70,7 +69,6 @@ const RULESET_KEY: &[u8] = b"/dataplane/proxy";
 
 const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 4096;
-const LIST_BUF: usize = 2048;
 const RULESET: usize = 8192;
 const SVC_SECTION: usize = 4096;
 const MAP_BUF: usize = 1024;

@@ -41,7 +41,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -66,12 +65,9 @@ const NS_SUBSCRIBE: u32 = 0x1305;
 const PORT_INPUT: u8 = 0;
 const EVENT_HEADER_SIZE: usize = 32;
 
-const KV_STORE: u32 = 0x1001;
 const KV_SIGN: u32 = 0x1003;
 /// `key_vault::suite::P256` — the suite id the key is created under.
 const KV_SUITE_P256: u16 = 1;
-/// `usage::SIGN`, sealed at creation and checked per operation.
-const KV_USAGE_SIGN: u32 = 1;
 /// `usage::SIGN | usage::PERSIST` — what the LABELLED signing key is opened
 /// with.
 ///
@@ -119,7 +115,6 @@ const AUTHN_KEYS_KEY: &[u8] = b"/authn-keys/sa";
 
 const MAX_KEY: usize = 96;
 const MAX_VALUE: usize = 512;
-const LIST_BUF: usize = 1024;
 const JWT_CAP: usize = 1024;
 
 #[repr(C)]
@@ -136,16 +131,6 @@ struct State {
 // ---- storage.object / storage.namespace ----
 
 // ---- KEY_VAULT ----
-
-unsafe fn kv_store(sys: &SyscallTable, scalar: &[u8; 32]) -> i32 {
-    // KEY_VAULT: `[suite:u16][usage_mask:u32][key_len:u32][key]`.
-    let mut arg = [0u8; 10 + 32];
-    arg[0..2].copy_from_slice(&KV_SUITE_P256.to_le_bytes());
-    arg[2..6].copy_from_slice(&KV_USAGE_SIGN.to_le_bytes());
-    arg[6..10].copy_from_slice(&32u32.to_le_bytes());
-    arg[10..42].copy_from_slice(scalar);
-    (sys.provider_call)(-1, KV_STORE, arg.as_mut_ptr(), arg.len())
-}
 
 unsafe fn kv_sign(sys: &SyscallTable, handle: i32, hash: &[u8; 32]) -> Option<[u8; 64]> {
     // KEY_VAULT: `[sign_mode:u8][_pad:u8][input_len:u32][input]

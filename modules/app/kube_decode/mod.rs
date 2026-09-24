@@ -51,9 +51,6 @@ const TY_I64: u8 = 1;
 const BUF: usize = 8192;
 const DEFAULT_MAX_BODY: u32 = 4096;
 
-const PORT_INPUT: u8 = 0;
-const PORT_OUTPUT: u8 = 1;
-
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,

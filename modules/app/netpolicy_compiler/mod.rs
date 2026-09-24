@@ -30,7 +30,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -81,7 +80,6 @@ const RULESET_KEY: &[u8] = b"/dataplane/netpolicy";
 
 const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 4096;
-const LIST_BUF: usize = 2048;
 const RULESET: usize = 8192;
 const SECTION: usize = 4096;
 const PODCHAIN: usize = 1024;
@@ -108,49 +106,6 @@ unsafe fn publish_ruleset(sys: &SyscallTable, ruleset: &[u8]) -> bool {
 }
 
 // ---- parsing + helpers ----
-
-fn labels_contain(labels: &[u8], token: &[u8]) -> bool {
-    let mut start = 0;
-    while start <= labels.len() {
-        let end = labels[start..]
-            .iter()
-            .position(|&b| b == b',')
-            .map(|i| start + i)
-            .unwrap_or(labels.len());
-        if &labels[start..end] == token {
-            return true;
-        }
-        if end >= labels.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    false
-}
-
-/// Every selector token appears in the pod's labels. An EMPTY selector matches
-/// ALL pods (a NetworkPolicy with `podSelector: {}` applies namespace-wide).
-fn selector_matches(selector: &[u8], labels: &[u8]) -> bool {
-    if selector.is_empty() {
-        return true;
-    }
-    let mut start = 0;
-    while start <= selector.len() {
-        let end = selector[start..]
-            .iter()
-            .position(|&b| b == b',')
-            .map(|i| start + i)
-            .unwrap_or(selector.len());
-        if !labels_contain(labels, &selector[start..end]) {
-            return false;
-        }
-        if end >= selector.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    true
-}
 
 /// FNV-1a over bytes (chain-name hashing + ruleset change detection).
 fn nf_hash(seed: u64, bytes: &[u8]) -> u64 {

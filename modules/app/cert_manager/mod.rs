@@ -28,7 +28,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -67,7 +66,6 @@ const KV_USAGE_SIGN: u32 = 1;
 /// `sign_mode::DIGEST` — P-256 signs the digest, stated on the wire rather
 /// than inferred from the key type.
 const KV_SIGN_MODE_DIGEST: u8 = 1;
-const RANDOM_FILL: u32 = 0x0C3C;
 
 const REQ_PREFIX: &[u8] = b"/cert-req/";
 const RESP_PREFIX: &[u8] = b"/cert-resp/";
@@ -89,7 +87,6 @@ const NOT_AFTER: &[u8] = b"350101000000Z";
 const MAX_KEY: usize = 96;
 const MAX_VALUE: usize = 256;
 const RESP_MAX: usize = 1600;
-const LIST_BUF: usize = 1024;
 const DER_CAP: usize = 900;
 // ── Development gate ───────────────────────────────────────────────────────
 //

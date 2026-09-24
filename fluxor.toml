@@ -42,3 +42,14 @@ scripts = ["scripts/*-e2e.sh"]
 # silently and a green run would mean nothing, so inline tests are banned there.
 # Behaviour is proven by the graph E2Es (`scripts/*-e2e.sh`, `make test`).
 forbid_inline_tests = ["modules"]
+
+# Every module mounts the SDK wholesale: `include!` of `runtime.rs` and a
+# `#[path]` mod of `abi.rs` put the ENTIRE ABI surface into each compile —
+# every contract, every platform, including targets this module never runs on.
+# One module uses a handful of it, so a compile without the suppression carries
+# ~1100 dead-code warnings, all but a couple of them from the mounted source
+# rather than from the module. There is no item to move an attribute onto,
+# which is what this declaration is for.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the SDK wholesale via include!, so each compile sees the entire surface and uses a subset."""

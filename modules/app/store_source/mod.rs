@@ -10,7 +10,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -30,9 +29,6 @@ const NS_SUBSCRIBE: u32 = 0x1305;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
-
-const PORT_INPUT: u8 = 0;
-const PORT_OUTPUT: u8 = 1;
 
 const MAX_KEY: usize = 160;
 const MAX_VALUE: usize = 4096;

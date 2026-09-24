@@ -28,7 +28,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -74,7 +73,6 @@ const KV_USAGE_SIGN: u32 = 1;
 /// caller cannot hand a P-256 slot a whole message and get back a valid
 /// signature over the wrong thing.
 const KV_SIGN_MODE_DIGEST: u8 = 1;
-const RANDOM_FILL: u32 = 0x0C3C;
 
 const REQ_PREFIX: &[u8] = b"/sign-req/";
 const RESP_PREFIX: &[u8] = b"/sign-resp/";
@@ -82,7 +80,6 @@ const PUBKEY_KEY: &[u8] = b"/signer-pubkey";
 
 const MAX_KEY: usize = 96;
 const MAX_VALUE: usize = 512;
-const LIST_BUF: usize = 2048;
 // ── Development gate ───────────────────────────────────────────────────────
 //
 // This module REFUSES TO CONSTRUCT unless the graph sets `development: 1`.

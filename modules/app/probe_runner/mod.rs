@@ -60,7 +60,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -103,7 +102,6 @@ const MS_PER_SEC: u64 = 1000;
 
 const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 256;
-const LIST_BUF: usize = 2048;
 const MAX_UID: usize = 96;
 /// Bounded tracking (same degradation contract as the siblings' tables: an
 /// overflowing cluster loses probes, never correctness).

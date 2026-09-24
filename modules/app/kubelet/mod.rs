@@ -142,7 +142,6 @@ const IPAM_POOL_KEY: &[u8] = b"/ipam-pool";
 
 const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 256;
-const LIST_BUF: usize = 2048;
 const MAX_ID: usize = 96;
 const MAX_POD: usize = 16;
 // A composed FLXA blob is bounded: header (34) + up to a few modules/edges. A

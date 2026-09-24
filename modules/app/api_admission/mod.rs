@@ -73,7 +73,6 @@ const POLICY_PREFIX: &[u8] = b"/admission-policy/";
 
 const MAX_KEY: usize = 160;
 const MAX_VALUE: usize = 4096;
-const LIST_BUF: usize = 2048;
 
 #[repr(C)]
 struct State {

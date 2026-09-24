@@ -34,7 +34,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -816,42 +815,6 @@ unsafe fn cmd_delete(
         p = append(out, p, &key[..klen]);
         (append(out, p, b"\n"), 1)
     }
-}
-
-/// Rewrite the `replicas=` field of a `;`-separated doc to `new`, preserving the
-/// other fields (appends `replicas=` if absent); returns the new length.
-fn set_replicas(value: &[u8], new: &[u8], out: &mut [u8]) -> usize {
-    let mut p = 0usize;
-    let mut start = 0usize;
-    let mut first = true;
-    let mut replaced = false;
-    let mut i = 0usize;
-    while i <= value.len() {
-        if i == value.len() || value[i] == b';' {
-            let field = &value[start..i];
-            if !first {
-                p = append(out, p, b";");
-            }
-            first = false;
-            if field.len() >= 9 && &field[..9] == b"replicas=" {
-                p = append(out, p, b"replicas=");
-                p = append(out, p, new);
-                replaced = true;
-            } else {
-                p = append(out, p, field);
-            }
-            start = i + 1;
-        }
-        i += 1;
-    }
-    if !replaced {
-        if !first {
-            p = append(out, p, b";");
-        }
-        p = append(out, p, b"replicas=");
-        p = append(out, p, new);
-    }
-    p
 }
 
 /// `scale <resource> <ns/name> <replicas>` — read-modify-write of desired state:

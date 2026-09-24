@@ -23,7 +23,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -55,7 +54,6 @@ const PLAN_PREFIX: &[u8] = b"/image-pull-plan/";
 
 const MAX_KEY: usize = 160;
 const MAX_VALUE: usize = 1024;
-const LIST_BUF: usize = 2048;
 
 #[repr(C)]
 struct State {

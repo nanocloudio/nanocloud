@@ -68,7 +68,6 @@ const MAX_KEY: usize = 160;
 /// a chain that changes connectors must not change how much it can remember.
 const CARRY_LO: u8 = 30;
 const CARRY_HI: u8 = 39;
-const CARRY_MAX: usize = (CARRY_HI - CARRY_LO + 1) as usize;
 
 /// `TIMER::TRUSTED_UNIX` record offsets (`kernel_abi::trusted_time`).
 const TT_UNIX_SECONDS: usize = 0;

@@ -208,7 +208,6 @@ const MAX_KEY: usize = 128;
 /// silently drops trailing fields (`;phase=start` — a created-never-started
 /// sandbox), so this must be ≥ the assembler's own value cap (4096).
 const MAX_VALUE: usize = 4096;
-const LIST_BUF: usize = 2048;
 const MAX_ID: usize = 96;
 const MAX_SB: usize = 16;
 

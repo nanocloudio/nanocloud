@@ -12,7 +12,14 @@
 // it keeps its own copy, and that divergence stays visible instead of being
 // flattened into a shared default that would quietly break it.
 //
-// The including module must define `MAX_KEY`, `OBJ_GET` and `OBJ_CLOSE`.
+// The including module must define the opcodes and bounds these helpers name:
+// `MAX_KEY`, `MAX_VALUE`, `EVENT_HEADER_SIZE`, `OBJ_GET`, `OBJ_PUT`,
+// `OBJ_RANGE_GET`, `OBJ_CLOSE`, `OBJ_DELETE`, `NS_LIST` and `NS_SUBSCRIBE`.
+//
+// ALL of them, even the ones that module never calls: the reference here is
+// lexical, so a const that looks dead to `dead_code` is still what makes this
+// file compile. Deleting one because the compiler called it unused is a build
+// break, not a cleanup.
 
 fn append(dst: &mut [u8], at: usize, src: &[u8]) -> usize {
     let n = src.len().min(dst.len().saturating_sub(at));

@@ -22,7 +22,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 
-use core::convert::TryInto;
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -53,7 +52,6 @@ const LEASE_PREFIX: &[u8] = b"/ipam-lease/";
 
 const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 256;
-const LIST_BUF: usize = 4096;
 /// Max hosts we track for the free-scan bitmap (a /24 → 256; larger pools are
 /// bounded to this window from the base).
 const MAX_HOSTS: usize = 1024;
