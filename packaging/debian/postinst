@@ -22,7 +22,7 @@ setup_fluxor() {
     # dir; it differs from the staging dir for the endpoints reconciler.
     # Per-bundle skip-if-present (upgrade path); re-publish manually to refresh.
     NEED=""
-    for pair in "dns:dns" "edge:edge" "endpoints:endpoints-reconciler" "sandbox:sandbox-runner" "webhook:webhook-validator" "route:route-validator" "netpolicy:netpolicy-compiler" "proxy:proxy-compiler"; do
+    for pair in "dns:dns" "edge:edge" "endpoints:endpoints-reconciler" "sandbox:sandbox-runner" "webhook:webhook-validator" "route:route-validator" "netpolicy:netpolicy" "proxy:proxy"; do
         SVC="${pair%%:*}"; BUNDLE="${pair##*:}"
         if [ -f "/usr/share/nanocloud/fluxor/${SVC}/app.fluxor.toml" ]             && ! /usr/bin/fluxor store ls --store "$STORE" 2>/dev/null | grep -q "^${BUNDLE}:1.0.0 "; then
             NEED="$NEED $pair"
@@ -60,6 +60,71 @@ gen_node_cert() {
     fi
 }
 
+gen_peer_pki() {
+    # The node's identity in the store's group: a P-256 peer key (DER, as the
+    # tls module wants) and an operator key for this node's administrator
+    # (`nanocloud-cluster add-node`), under /etc/nanocloud.io/pki, and a
+    # cluster.env for a single node: the control plane, replica 0, alone.
+    # A node joining a cluster is given the other replicas' certificates as
+    # peers/<id>.pem and its own values in cluster.env. Written once; never
+    # replaced here.
+    PKI=/etc/nanocloud.io/pki
+    ENV=/etc/nanocloud.io/cluster.env
+    command -v openssl >/dev/null 2>&1 || {
+        echo "nanocloud: openssl not found; cannot generate the peer keys" >&2; return 0; }
+    mkdir -p "$PKI/peers" "$PKI/operators" "$PKI/observers"
+    chmod 0700 "$PKI"
+    HOST="$(hostname -s 2>/dev/null || hostname)"
+    for n in peer operator; do
+        [ -f "$PKI/$n.pem" ] && continue
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$PKI/$n.key.pem" -out "$PKI/$n.pem" -days 3650 -subj "/CN=${HOST}-$n" \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=digitalSignature" \
+            -addext "extendedKeyUsage=serverAuth,clientAuth" >/dev/null 2>&1 \
+            || { echo "nanocloud: $n key generation failed" >&2; return 0; }
+        chmod 0600 "$PKI/$n.key.pem"
+    done
+    if [ ! -f "$PKI/peer.der" ]; then
+        openssl x509 -in "$PKI/peer.pem" -outform DER -out "$PKI/peer.der" 2>/dev/null
+        openssl ec -in "$PKI/peer.key.pem" -outform DER -out "$PKI/peer.key.der" 2>/dev/null
+        chmod 0600 "$PKI/peer.key.der"
+    fi
+    [ -f "$PKI/operators/local.pem" ] || cp "$PKI/operator.pem" "$PKI/operators/local.pem"
+    if [ ! -f "$ENV" ]; then
+        cp "$PKI/peer.pem" "$PKI/peers/0.pem"
+        umask 022
+        cat >"$ENV" <<EOF
+# This node in the store's group (nanocloud-graph.sh renders its graph from
+# these at each start). A single node: the control plane, replica 0, alone.
+NANOCLOUD_ROLE=plane
+NANOCLOUD_NODE_NAME=$HOST
+NANOCLOUD_REPLICA_ID=0
+NANOCLOUD_VOTERS=1
+NANOCLOUD_PEER_PORT=7450
+NANOCLOUD_PEERS="0=127.0.0.1:7450"
+EOF
+    fi
+}
+
+gen_seal_key() {
+    # The node's ONE symmetric root: the key the fluxor vault seals its keys
+    # under. The signing root — `nanocloud.ca`, which issues certificates and
+    # ServiceAccount tokens — is generated INSIDE the vault on first use and is
+    # only ever stored sealed under this; nothing else is provisioned. Written
+    # once and never rotated here: a new seal key orphans every sealed key, and
+    # with them every certificate and token already issued.
+    SEAL=/etc/nanocloud.io/seal.env
+    [ -f "$SEAL" ] && return 0
+    mkdir -p /etc/nanocloud.io
+    umask 077
+    if HEX="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')" && [ "${#HEX}" = 64 ]; then
+        printf 'FLUXOR_SEAL_KEY=%s\n' "$HEX" > "$SEAL"
+        chmod 0600 "$SEAL"
+    else
+        echo "nanocloud: cannot generate the seal key; vault keys will not survive a restart" >&2
+    fi
+}
+
 install_cli_applet() {
     # Register the `nanocloud` CLI applet into the
     # system applet catalogue, so the busybox symlink /usr/bin/nanocloud → fluxor
@@ -67,11 +132,23 @@ install_cli_applet() {
     # /etc/profile.d/nanocloud.sh → FLUXOR_APPLETS). Best-effort + loud.
     [ -x /usr/bin/fluxor ] || return 0
     [ -f /usr/share/nanocloud/fluxor/cli/app.fluxor.toml ] || return 0
+    # The applet runs as this node's replica: its graph is rendered first.
+    /usr/lib/nanocloud/nanocloud-graph.sh /usr/share/nanocloud/fluxor/cli/linux.yaml.in \
+        /usr/share/nanocloud/fluxor/cli/linux.yaml \
+        || { echo "nanocloud: the CLI applet's graph did not render" >&2; return 0; }
     mkdir -p /var/lib/nanocloud.io/fluxor
     FLUXOR_APPLETS=/var/lib/nanocloud.io/fluxor/applets.toml \
     FLUXOR_PROJECT_ROOT=/usr/lib/nanocloud/fluxor \
         /usr/bin/fluxor install /usr/share/nanocloud/fluxor/cli/app.fluxor.toml >/dev/null 2>&1 \
         || echo "nanocloud: CLI applet install failed; 'nanocloud <cmd>' unavailable until 'fluxor install' is re-run" >&2
+}
+
+apply_nbd_rule() {
+    # NBD devices that already exist take the queue bound now, not at the
+    # next boot (60-nanocloud-nbd.rules).
+    command -v udevadm >/dev/null 2>&1 || return 0
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --action=change --subsystem-match=block --sysname-match='nbd*' >/dev/null 2>&1 || true
 }
 
 case "$1" in
@@ -84,8 +161,11 @@ case "$1" in
         chmod 0640 "${LOG_FILE}" || true
 
         gen_node_cert || true
+        gen_peer_pki || true
+        gen_seal_key || true
         setup_fluxor || true
         install_cli_applet || true
+        apply_nbd_rule || true
 
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true

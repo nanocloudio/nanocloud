@@ -8,10 +8,10 @@
 #      the profile carries no name rule — a client serves no hostname — so
 #      "ca_dns" here means exactly "issued by our CA".
 #   2. AUTHZ  — the accepted leaf's pubkey is hashed into a 32-byte SVID and
-#      emitted on `peer_identity` → wave's `http` → the envelope TRAILER →
-#      `kube_decode` field 12 → `admit`, and the RBAC walk decides. A CA-issued
-#      cert bound to admin gets 200/201; a CA-issued cert with no binding gets
-#      403.
+#      emitted on `peer_identity` → wave's `http` → the exchange's peer →
+#      `http_chain`'s envelope TRAILER → `kube_decode` field 12 → `admit`, and
+#      the RBAC walk decides. A CA-issued cert bound to admin gets 200/201; a
+#      CA-issued cert with no binding gets 403.
 #
 # So: eve (self-signed, no CA) never reaches the apiserver at all; mallory
 # (properly issued, unbound) reaches it and is denied. Defence in depth —
@@ -31,11 +31,15 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl not found"; exit 1; }
-for m in kube_decode kagi_verify rbac_gate api_admission store_effect store_source token_verify decision pipeline http tls; do
+for m in kagi_verify store_effect store_source token_verify decision pipeline http http_chain tls; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
 D="$(mktemp -d /tmp/nc-apiplane-mtls-XXXXXX)"
+# The store is lattice's (the graph's `kv_state_worker_store`): the runtime
+# runs in $D, where the store lives (lattice/) and the seeded host log
+# (store.log) is imported from.
+nc_lattice_prepare "$D"
 RUNTIME_PID=""
 cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi; }
 trap cleanup EXIT
@@ -99,11 +103,12 @@ ALICE_SVID="$(svid_of alice)"
 echo "   cluster CA minted; alice SVID = $ALICE_SVID"
 
 echo "== 2. seed RBAC — bind alice's SVID (not mallory's) to admin =="
-wal_put "/roles/admin" "rules=*:*"
+. "$ROOT/scripts/support/rbac.sh"
+rbac_clusterrole "$D/store.log" admin "*" "*"
 # The identity the chain produces is `peer:<hex>`, not the bare hex: two
 # authentication methods that could yield the same subject string would let
-# a binding written for one silently grant the other.
-wal_put "/rolebindings/alice" "subjects=peer:$ALICE_SVID;role=admin"
+# a binding written for one silently grant the other. It binds as a User.
+rbac_crb "$D/store.log" alice admin User "peer:$ALICE_SVID"
 
 echo "== 3. write the mTLS Chronicle api-plane graph =="
 python3 - "$ROOT" "$D" <<'PYGEN'
@@ -136,8 +141,8 @@ g = g.replace("""  - from: linux_net.net_out
     to: http.net_in
   - from: http.net_out
     to: tls.clear_in
-  # The whole point of the wave change: the verified peer reaches the
-  # application instead of stopping at the TLS boundary.
+  # The verified peer reaches the application instead of stopping at the TLS
+  # boundary.
   - from: tls.peer_identity
     to: http.peer_identity""")
 open(f"{d}/graph.yaml", "w").write(g)
@@ -146,9 +151,11 @@ PYGEN
 
 echo "== 4. build config + module table =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+echo "   settling the RBAC grant index"
+rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present "/rbac-g/peer:$ALICE_SVID/*|*|*|*|*"
 
 echo "== 5. start the graph =="
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do

@@ -1,0 +1,88 @@
+name = "http_fetch"
+version = "1.0.0"
+description = "Chronicle connector for an HTTP origin — a record in, a GET out on the net pair, the answer back as a record or a digest-verified file"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# `store_effect`'s role for a remote HTTP origin: a registry, an artifact
+# server. The chain decides WHAT to fetch (params — the OCI distribution API is
+# `image.uproc`); this carries one GET at a time over its net pair (through
+# `tls` in client mode, or straight to `linux_net`) and hands back what the
+# chain asked of the answer. It knows no API: the path, the Accept header, the
+# file name, the digest and the JSON members to read are the record's.
+#
+# In (`request_in`, a byte stream, self-framed, or a mailbox):
+#   1      = correlation (i64), echoed
+#   2      = sink (i64): 1 the answer's JSON members come back in the reply;
+#            2 the body lands in `<dir>/<file>`, sha256-verified, fsynced;
+#            0 = no request (a decision's filter)
+#   3..6   = the path, in parts joined in field order
+#   7      = Accept
+#   8..10  = the file name (sink 2), in parts
+#   11     = the expected sha256, 64 hex (required for sink 2; checked for 1
+#            when present)
+#   12, 22 = skip: a store key, in two parts (a prefix and a name); when it
+#            exists the request is answered
+#            304 without a byte on the wire. Level-triggered chains re-offer
+#            work each scan — this is how a layer is fetched once.
+#   13     = expected size (i64): the body must be exactly that; with the
+#            `chunk_bytes` param a file is fetched in Range chunks of it
+#   14..21 = JSON queries over the body (sink 1), each answered at 40..47:
+#            dotted paths, `a[].b[!mod]` collect, `a[k=v].b` select — see
+#            `_shared/jsonq.rs`
+#   30..39 = carry, echoed with number and type
+# Out (`response_out`): 1 correlation, 2 status (the HTTP status; 304 skipped;
+#   422 digest or size mismatch; 0 when the origin could not be reached after
+#   retries), 3 bytes received (i64), 4 Content-Type, 40..47 the answers,
+#   30..39 carry.
+#
+# A transport failure (no connection, a dropped stream, a timeout) is retried
+# with exponential backoff, a bounded number of times, before it is answered
+# 0: the origin being briefly away is not the chain's decision to make. An
+# HTTP answer is final and goes straight back.
+timer_class = "wall_clock"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 65536
+max_record = 8600
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 8600
+required = true
+
+[[ports]]
+name = "request_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "control-plane fetch connector — discrete request/answer records, not a sustained byte data path"

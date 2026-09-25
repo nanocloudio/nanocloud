@@ -1,0 +1,256 @@
+// The typed-effect seam of the data-side encrypted-volume pipelines: snapshot
+// and restore (volume_snapshot.uproc), recovery-authority use
+// (volume_recovery.uproc) and secure deletion (volume_delete.uproc). Same
+// contract as volume_effect.uproc: only a step MERGE the store accepted
+// issues the effect its phase names, the typed outcome comes back as
+// `out=<phase>:<code>[;<result>=<value>…]`, and no key material, ticket-bound
+// bundle or share crosses it. A recovery's lease and instance are held by the
+// owner `rc:<claim>` (a5 `recovery`), never under the attachment's own name.
+//
+// Effect request: 1 cid  2 op  3 key  4..8 a1..a5  9 n1  10 n2  254 carry
+//   op  1 LEASE_ACQUIRE      a1 vol -> fence lease_exp | held
+//       3 LEASE_RELEASE      a1 vol n1 fence
+//      10 GRAPH_START        a1 vol a2 fresh a3 device n1 fence -> inst
+//                            (loam_volume + crypt_block attach=1, quiesced,
+//                            unpublished, on that device)
+//      11 RECIPIENT          a1 inst
+//      12 BUNDLE_DELIVER     a1 inst -> ready | eacces
+//      14 FLUSH              a1 inst
+//      16 GRAPH_DESTROY      a1 inst
+//      62 ATT_DETACH         a1 reason a2 erase
+//      63 ATT_GRANT          a1 device
+//      70 EPOCH_PINS         a1 key resource a2 epoch ("0": any) a3 claim -> n
+//      73 LOAM_SNAPSHOT      a1 vol a2 snapshot -> r1 manifest, r2 r3 the
+//                            lowest and highest key epoch the pinned root's
+//                            units use (loam-client snapshot_create: one bind
+//                            of the committed root under the snapshot's own
+//                            root, named by the snapshot)
+//      74 LOAM_RESTORE       a1 root a2 target claim -> r1 the clone's volume
+//                            (snapshot_restore into a fresh root: no bytes move)
+//      75 CLONE_PERSIST      a1 clone a2 key resource a3 elo a4 ehi a5 the
+//                            snapshot  (CREATE the target's attachment
+//                            identity — fs, access, grant and set copied from
+//                            the snapshot's source — and its `/volume-keys/`:
+//                            kvol, epoch=elo, next=ehi when they differ)
+//      76 LOAM_SNAP_DELETE   a1 snapshot  (snapshot_delete of its root;
+//                            nothing there is ok)
+//      77 AUDIT              a1 event a2 actor a3 approver a4 device
+//      78 KAGI_RECOVERY_AUTHORISE  a1 vol a2 epoch a3 device a4 actor n1 ttl s
+//                            -> r1 the one-time ticket  (Kagi op 11)
+//      79 KAGI_RECOVER       a1 inst a2 vol a3 device a4 epoch a5 ticket
+//                            n1 fence -> n custodians who unwrapped | refused |
+//                            custodians (fewer than two)  (Kagi op 12)
+//      80 KAGI_REGRANT       a1 vol a2 device a3 actor a4 the device the grant
+//                            names now  (Kagi op 7 from it, or op 4 over a
+//                            revoked grant: the grant names the recovered
+//                            device)
+//      81 KAGI_ERASE         a1 vol a2 actor a3 the current key epoch the pin
+//                            scan covered ("": the first) n1 the pins it found
+//                            (every epoch retired, every recovery set
+//                            destroyed, the grant revoked; Kagi op 14)
+//      82 LOAM_DELETE        a1 vol -> ok | held  (delete_volume under lease)
+//      83 VOLUME_FORGET      —  (DELETE the attachment identity, its
+//                            `/volume-keys/` and the PV)
+//
+// Outcome: volume_effect.uproc's twelve fields, then 13 n (i64), 14 r1,
+// 15 r2, 16 r3, 254 the carry.
+module nanocloud.volume_data_effect {
+
+  // The shared carry (volume_effect.uproc's numbers, extended from 50).
+  // carried by: Reply, Eff, Outcome
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    epoch: string = 48;
+    kvol: string = 49;
+    actor: string = 54;
+    reason: string = 55;
+    erase: string = 56;
+    root: string = 57;
+    target: string = 58;
+    elo: string = 59;
+    ehi: string = 60;
+    approver: string = 61;
+    ticket: string = 62;
+    ttl: int = 63;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+
+  enum LEASE_ACQUIRE = 1;
+  enum LEASE_RELEASE = 3;
+  enum GRAPH_START = 10;
+  enum RECIPIENT = 11;
+  enum BUNDLE_DELIVER = 12;
+  enum FLUSH = 14;
+  enum GRAPH_DESTROY = 16;
+  enum ATT_DETACH = 62;
+  enum ATT_GRANT = 63;
+  enum EPOCH_PINS = 70;
+  enum LOAM_SNAPSHOT = 73;
+  enum LOAM_RESTORE = 74;
+  enum CLONE_PERSIST = 75;
+  enum LOAM_SNAP_DELETE = 76;
+  enum AUDIT = 77;
+  enum KAGI_RECOVERY_AUTHORISE = 78;
+  enum KAGI_RECOVER = 79;
+  enum KAGI_REGRANT = 80;
+  enum KAGI_ERASE = 81;
+  enum LOAM_DELETE = 82;
+  enum VOLUME_FORGET = 83;
+
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Eff {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    a1: string = 4; a2: string = 5; a3: string = 6; a4: string = 7; a5: string = 8;
+    n1: int = 9; n2: int = 10;
+    ctx: Ctx = 254;
+  }
+  decision act(r: Reply) -> Eff {
+    when r.status < 200 || r.status >= 300 || r.ctx.ph == "" ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+    // ── snapshot and restore ──
+    when r.ctx.ph == "s_flush" ->
+      Eff { cid: r.cid, op: FLUSH, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "s_capture" ->
+      Eff { cid: r.cid, op: LOAM_SNAPSHOT, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "s_clone" ->
+      Eff { cid: r.cid, op: LOAM_RESTORE, key: r.ctx.claim, a1: r.ctx.root, a2: r.ctx.target, ctx: r.ctx };
+    when r.ctx.ph == "s_identity" ->
+      Eff { cid: r.cid, op: CLONE_PERSIST, key: r.ctx.target, a1: r.ctx.vol, a2: r.ctx.kvol, a3: r.ctx.elo, a4: r.ctx.ehi,
+            a5: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "s_drop" ->
+      Eff { cid: r.cid, op: LOAM_SNAP_DELETE, key: r.ctx.claim, a1: r.ctx.claim, ctx: r.ctx };
+    // ── recovery authority: the lease and instance are the recovery's own ──
+    when r.ctx.ph == "rc_audit" ->
+      Eff { cid: r.cid, op: AUDIT, key: r.ctx.claim, a1: "recovery", a2: r.ctx.actor, a3: r.ctx.approver, a4: r.ctx.device, ctx: r.ctx };
+    when r.ctx.ph == "rc_ticket" ->
+      Eff { cid: r.cid, op: KAGI_RECOVERY_AUTHORISE, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.epoch, a3: r.ctx.device,
+            a4: r.ctx.actor, n1: r.ctx.ttl, ctx: r.ctx };
+    when r.ctx.ph == "rc_lease" ->
+      Eff { cid: r.cid, op: LEASE_ACQUIRE, key: r.ctx.claim, a1: r.ctx.vol, a5: "recovery", ctx: r.ctx };
+    when r.ctx.ph == "rc_start" ->
+      Eff { cid: r.cid, op: GRAPH_START, key: r.ctx.claim, a1: r.ctx.vol, a2: "", a3: r.ctx.device, a5: "recovery",
+            n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "rc_recipient" ->
+      Eff { cid: r.cid, op: RECIPIENT, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "rc_recover" ->
+      Eff { cid: r.cid, op: KAGI_RECOVER, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.vol, a3: r.ctx.device,
+            a4: r.ctx.epoch, a5: r.ctx.ticket, n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "rc_unlock" ->
+      Eff { cid: r.cid, op: BUNDLE_DELIVER, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "rc_regrant" ->
+      Eff { cid: r.cid, op: KAGI_REGRANT, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.device, a3: r.ctx.actor,
+            a4: r.ctx.grant, ctx: r.ctx };
+    when r.ctx.ph == "rc_flush" ->
+      Eff { cid: r.cid, op: FLUSH, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "rc_destroy" ->
+      Eff { cid: r.cid, op: GRAPH_DESTROY, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "rc_release" ->
+      Eff { cid: r.cid, op: LEASE_RELEASE, key: r.ctx.claim, a1: r.ctx.vol, a5: "recovery", n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "rc_grant" ->
+      Eff { cid: r.cid, op: ATT_GRANT, key: r.ctx.claim, a1: r.ctx.device, ctx: r.ctx };
+    // ── secure deletion ──
+    when r.ctx.ph == "x_pins" ->
+      Eff { cid: r.cid, op: EPOCH_PINS, key: r.ctx.claim, a1: r.ctx.vol, a2: "0", a3: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "x_quiesce" ->
+      Eff { cid: r.cid, op: ATT_DETACH, key: r.ctx.claim, a1: "deleting", a2: r.ctx.erase, ctx: r.ctx };
+    when r.ctx.ph == "x_kagi" ->
+      Eff { cid: r.cid, op: KAGI_ERASE, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.actor, a3: r.ctx.epoch, ctx: r.ctx };
+    when r.ctx.ph == "x_loam" ->
+      Eff { cid: r.cid, op: LOAM_DELETE, key: r.ctx.claim, a1: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "x_forget" ->
+      Eff { cid: r.cid, op: VOLUME_FORGET, key: r.ctx.claim, ctx: r.ctx };
+    default ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+  }
+
+  message Outcome {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    code: string = 4;
+    fence: int = 5;
+    inst: string = 8;
+    n: int = 13;
+    r1: string = 14;
+    r2: string = 15;
+    r3: string = 16;
+    ctx: Ctx = 254;
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: int = 9; v7: string = 10; v8: int = 11;
+    v9: string = 12; v10: string = 13; v11: string = 14; v12: string = 15;
+  }
+
+  decision record(o: Outcome) -> Row {
+    when o.ctx.ph == "" ->
+      Row { cid: o.cid, op: NOOP, key: "" };
+    // The exact epochs of the pinned root replace the write-ahead pin. An
+    // effector that cannot read them (a root's epochs are not readable
+    // without its key) answers none, and the write-ahead pin stands: a
+    // blank never releases an epoch the snapshot may need.
+    when o.ctx.ph == "s_capture" && o.code == "ok" && o.r2 == "" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";root=", v7: o.r1 };
+    when o.ctx.ph == "s_capture" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";root=", v7: o.r1, v9: ";elo=", v10: o.r2, v11: ";ehi=", v12: o.r3 };
+    when o.ctx.ph == "s_clone" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";clone=", v7: o.r1 };
+    // Loam dropped the snapshot's binds: only now is its pin released.
+    when o.ctx.ph == "s_drop" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";elo=;ehi=" };
+    when o.ctx.ph == "rc_ticket" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ticket=", v7: o.r1 };
+    when o.ctx.ph == "rc_lease" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";fence=", v6: o.fence };
+    when o.ctx.ph == "rc_start" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";inst=", v7: o.inst };
+    when o.ctx.ph == "rc_recover" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";custodians=", v6: o.n };
+    when o.ctx.ph == "rc_unlock" && o.code == "ready" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ready=1" };
+    when o.ctx.ph == "rc_flush" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ready=0" };
+    when o.ctx.ph == "rc_destroy" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";inst=;ready=0" };
+    when o.ctx.ph == "rc_release" && (o.code == "ok" || o.code == "lost") ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";fence=0" };
+    when o.ctx.ph == "x_pins" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";pins=", v6: o.n };
+    default ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code };
+  }
+  pipeline vl_act(r: Reply) -> Eff { call y = act(r); return y; }
+  pipeline vl_record(o: Outcome) -> Row { call y = record(o); return y; }
+  entry vl_act = vl_act;
+  entry vl_record = vl_record;
+  provenance revision "volume-data-effect" toolchain "chronicle-authoring";
+}

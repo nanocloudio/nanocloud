@@ -4,7 +4,8 @@
 # store.
 #
 # It exercises the spawn contract the node boot uses — `fluxor run
-# <control-plane-graph>` with `FLUXOR_STORE_DIR` pointed at a dedicated store —
+# <control-plane-graph>` in a dedicated store directory (the graph's lattice store,
+# `lattice/`, and the host log it imports, `store.log`) —
 # against the real fluxor-controlplane.yaml, which serves the API on :7443. It
 # proves the graph the bootstrap spawns actually comes up and answers over the
 # socket, with the store written by exactly one process.
@@ -30,9 +31,10 @@ for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
 done
 
 D="$(mktemp -d /tmp/nc-cp-boot-XXXXXX)"
-STORE="$D/store"          # the control-plane store (FLUXOR_STORE_DIR)
+STORE="$D/store"          # the control-plane store's directory (the runtime's cwd)
 STATE="$D/state"          # the runtime pidfile + log (state_root)
 mkdir -p "$STORE" "$STATE"
+nc_lattice_prepare "$STORE"
 RUNTIME_PID=""
 cleanup() {
   [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true
@@ -68,24 +70,21 @@ print(f"{status}|{body.decode(errors='replace')}")
 PY
 }
 
-echo "== 1. generate a node cert + template the graph's cert paths to it =="
-# The packaged control-plane graph references /etc/nanocloud.io/certs/... (which
-# postinst provisions). For the test, generate a P-256 cert and point a copy of
-# the graph at it — so this exercises the REAL production graph structure (TLS).
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout "$D/k.pem" -out "$D/c.pem" -days 1 -subj "/CN=nanocloud" 2>/dev/null
-openssl x509 -in "$D/c.pem" -outform DER -out "$D/server.der" 2>/dev/null
-openssl ec   -in "$D/k.pem" -outform DER -out "$D/server.key.der" 2>/dev/null
-sed -e "s#/etc/nanocloud.io/certs/server.der#$D/server.der#" \
-    -e "s#/etc/nanocloud.io/certs/server.key.der#$D/server.key.der#" \
-    "$GRAPH" > "$D/graph.yaml"
+echo "== 1. render the graph for this node: its replica of the store, a node cert =="
+# The packaged control-plane graph is rendered per node (its replica of the
+# store's group, its peer PKI) and references /etc/nanocloud.io/certs/...
+# (which postinst provisions). For the test: a one-voter group, a P-256 API
+# cert, and a reader — so this exercises the REAL production graph (TLS, the
+# replicated store).
+nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 
 echo "== 1b. build the config + module table from the control-plane graph =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. spawn the graph exactly as ControlPlaneRuntime::ensure_running does =="
-# FLUXOR_STORE_DIR -> the sole-writer control-plane store; pidfile in state_root.
-FLUXOR_STORE_DIR="$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+# The store directory is the runtime's working directory (the graph's lattice
+# store is the sole writer); pidfile in state_root.
+env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$STATE/control-plane.log" 2>&1 &
 RUNTIME_PID=$!
 echo "$RUNTIME_PID" >"$STATE/control-plane.pid"
@@ -113,6 +112,13 @@ expect() { # expect <path> <want-status> <want-body-substr>
 }
 expect /healthz 200 ok
 
+# The store is one replica of a group: its first writes (the API's signing
+# key among them) are decided through the group's log, so for a moment
+# after boot the API answers 503 "not yet". It answers within seconds.
+for _ in $(seq 40); do
+  case "$(http_get /api/v1/namespaces/default/configmaps/cm1)" in 503\|*) sleep 0.25 ;; *) break ;; esac
+done
+
 # CRUD runs the full chain. With no credential the answer is 401, not 403: the
 # chain does not admit anonymous unless a graph opts in
 # (scripts/apiplane-anon-e2e.sh). "Who are you" and "you may not" are different
@@ -132,29 +138,17 @@ echo "   pidfile -> $PIDFILE_PID (alive)"
 echo "== 5. the API plane does not use the STORE as its request bus =="
 # The chain rides channel edges, so a request crossing it leaves no `/api-req/`
 # or `/api-resp/` record behind: the 401 above proves the chain ran end to end,
-# and the store log proves it did so without a seam key.
+# and the store's keys prove it did so without a seam key.
 #
 # Asserted rather than assumed, because "the store is not an IPC bus" is an
 # architectural claim, and an assertion is what keeps it from quietly
 # eroding.
-[ -f "$STORE/store.log" ] || fail "no $STORE/store.log — the store was never opened"
-python3 - "$STORE/store.log" <<'PY'
-import struct, sys
-data = open(sys.argv[1], "rb").read()
-p, seam, total = 0, 0, 0
-while p + 15 <= len(data):
-    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
-    if p + 15 + kl + vl > len(data):
-        break
-    key = data[p+15:p+15+kl].decode(errors="replace")
-    total += 1
-    if key.startswith("/api-req/") or key.startswith("/api-resp/"):
-        seam += 1
-    p += 15 + kl + vl
-if seam:
-    print(f"FAIL: {seam} store-as-IPC seam record(s) — the request bus is back")
-    sys.exit(1)
-print(f"   {total} store record(s), 0 request-bus records: the chain answered over CHANNELS")
-PY
+ls "$STORE/lattice"/K*.KMN >/dev/null 2>&1 || fail "no store in $STORE/lattice — the store was never opened"
+nc_store_ready "$STORE" || fail "the store never answered its reader"
+KEYS="$(nc_store_keys "$STORE")"
+TOTAL="$(printf '%s\n' "$KEYS" | grep -c . || true)"
+SEAM="$(printf '%s\n' "$KEYS" | grep -c '^/api-req/\|^/api-resp/' || true)"
+[ "$SEAM" = 0 ] || fail "$SEAM store-as-IPC seam record(s) — the request bus is back"
+echo "   $TOTAL store record(s), 0 request-bus records: the chain answered over CHANNELS"
 
 echo "== E2E green: the bootstrap's control-plane graph serves the API as Chronicle params, over channels =="

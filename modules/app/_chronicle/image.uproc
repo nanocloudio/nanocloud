@@ -1,0 +1,258 @@
+// Pulling and assembling an image as params — the OCI distribution API over
+// the `http_fetch` connector, and the rootfs assembly over the sandbox seam.
+//
+// Everything that needs the origin goes through ONE work queue, /fetch-q/,
+// because one connector serves one request stream: the writers below put rows,
+// one source reads them, and one reply decision records what came back.
+//
+//   qm   /image-requests/<n> (repo, tag) with no manifest yet -> the manifest
+//        row, by tag — or by digest once an index has named the platform
+//        manifest (/image-index/<n>)
+//   qc   a manifest whose config is not recorded -> the config row
+//   le,lr each layer of a manifest (the flat list, expanded): present in the
+//        blob cache -> /image-layer-ok/<n>-<i>; absent -> the layer row
+//   fq   a queue row -> the GET: a manifest or config answered as the JSON
+//        members this needs, a layer landed as a sha256-verified file. Each
+//        names the record that means it is DONE, so a row whose work is done
+//        is answered 304 without a byte on the wire
+//   ans  the answer -> /image-manifests/ (repo, layers, sizes, config,
+//        configsize, n), /image-index/ (an index: the arm64/linux entry),
+//        /image-config/ (the runtime contract, escaped lists), /blobs/<hex>;
+//        a 304 deletes the row
+// Assembly is image_asm.uproc.
+module nanocloud.image {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: Ask, Have
+  message Ctx {
+    name: string = 30;
+    hex: string = 31;
+    repo: string = 32;
+    size: string = 33;
+    at: string = 34;
+  }
+  // carried by: Get, Ans
+  message Ctx2 {
+    q: string = 30;
+    kind: string = 31;
+    name: string = 32;
+    repo: string = 33;
+    size: string = 34;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum REPLY = 1;
+  enum FILE = 2;
+
+  // ---- the queue writers ----
+  message Req {
+    seq: int = 1;
+    key: string = 3;
+    repo: string = 4;
+    tag: string = 5;
+    digest: string = 70;   // /image-index/<n> digest=
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+  decision qm(r: Req) -> Row {
+    when r.digest != "" ->
+      Row { cid: r.seq, op: PUT, key: "/fetch-q/m-", k2: r.key,
+            v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";path=/v2/",
+            v6: r.repo, v7: "/manifests/", v8: r.digest, v9: "", v10: "" };
+    default ->
+      Row { cid: r.seq, op: PUT, key: "/fetch-q/m-", k2: r.key,
+            v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";path=/v2/",
+            v6: r.repo, v7: "/manifests/", v8: r.tag, v9: "", v10: "" };
+  }
+
+  message Man {
+    seq: int = 1;
+    key: string = 3;
+    repo: string = 4;
+    config: string = 5;
+    csize: string = 6;
+  }
+  decision qc(m: Man) -> Row {
+    when m.config == "" ->
+      Row { cid: m.seq, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      Row { cid: m.seq, op: PUT, key: "/fetch-q/c-", k2: m.key,
+            v1: "kind=c;name=", v2: m.key, v3: ";path=/v2/", v4: m.repo,
+            v5: "/blobs/sha256:", v6: m.config, v7: ";digest=", v8: m.config,
+            v9: ";size=", v10: m.csize };
+  }
+
+  message Lay {
+    seq: int = 1;
+    key: string = 3;
+    repo: string = 4;
+    hex: string = 5;       // layers.#
+    size: string = 6;      // sizes.#
+    at: string = 21;       // the index, as digits
+  }
+  message Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    ctx: Ctx = 254;
+  }
+  decision le(l: Lay) -> Ask {
+    when l.hex == "" ->
+      Ask { cid: l.seq, op: NOOP, key: "", k2: "", ctx: Ctx { name: "", hex: "", repo: "", size: "", at: "" } };
+    default ->
+      Ask { cid: l.seq, op: EXISTS, key: "/blobs/", k2: l.hex, ctx: Ctx { name: l.key, hex: l.hex, repo: l.repo, size: l.size, at: l.at } };
+  }
+  message Have {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Row2 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    k4: string = 25;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+  decision lr(h: Have) -> Row2 {
+    when h.status == 200 ->
+      Row2 { cid: h.cid, op: PUT, key: "/image-layer-ok/", k2: h.ctx.name, k3: "-", k4: h.ctx.at,
+             v1: "1", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when h.status == 404 ->
+      Row2 { cid: h.cid, op: PUT, key: "/fetch-q/l-", k2: h.ctx.hex, k3: "", k4: "",
+             v1: "kind=l;name=", v2: h.ctx.hex, v3: ";path=/v2/", v4: h.ctx.repo,
+             v5: "/blobs/sha256:", v6: h.ctx.hex, v7: ";digest=", v8: h.ctx.hex,
+             v9: ";size=", v10: h.ctx.size };
+    default ->
+      Row2 { cid: h.cid, op: NOOP, key: "", k2: "", k3: "", k4: "",
+             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- the fetch ----
+  message Q {
+    seq: int = 1;
+    key: string = 3;       // the row: m-<n>, c-<n>, l-<hex>
+    kind: string = 4;
+    name: string = 5;
+    path: string = 6;
+    digest: string = 7;
+    repo: string = 8;
+    ssize: string = 9;     // size, as text (carried to the marker)
+    size: int = 50;
+  }
+  message Get {
+    cid: int = 1;
+    sink: int = 2;
+    path: string = 3;
+    accept: string = 7;
+    file: string = 8;
+    sha: string = 11;
+    skip: string = 12;
+    skip2: string = 22;
+    size: int = 13;
+    q0: string = 14; q1: string = 15; q2: string = 16; q3: string = 17; q4: string = 18; q5: string = 19;
+    ctx: Ctx2 = 254;
+  }
+  decision fq(q: Q) -> Get {
+    when q.kind == "m" ->
+      Get { cid: q.seq, sink: REPLY, path: q.path,
+            accept: "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
+            file: "", sha: "", skip: "/image-manifests/", skip2: q.name, size: 0,
+            q0: "layers[].digest!tag", q1: "layers[].size", q2: "config.digest!tag",
+            q3: "config.size", q4: "manifests[platform.architecture=arm64&platform.os=linux].digest",
+            q5: "layers[]#", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize } };
+    when q.kind == "c" ->
+      Get { cid: q.seq, sink: REPLY, path: q.path, accept: "",
+            file: "", sha: q.digest, skip: "/image-config/", skip2: q.name, size: q.size,
+            q0: "config.Entrypoint[]", q1: "config.Cmd[]", q2: "config.Env[]",
+            q3: "config.WorkingDir!esc", q4: "config.User!esc", q5: "", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize } };
+    when q.kind == "l" ->
+      Get { cid: q.seq, sink: FILE, path: q.path, accept: "",
+            file: q.name, sha: q.digest, skip: "/blobs/", skip2: q.name, size: q.size,
+            q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize } };
+    default ->
+      Get { cid: q.seq, sink: 0, path: "", accept: "", file: "", sha: "", skip: "", skip2: "",
+            size: 0, q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", ctx: Ctx2 { q: "", kind: "", name: "", repo: "", size: "" } };
+  }
+
+  message Ans {
+    cid: int = 1;
+    status: int = 2;
+    a0: string = 40; a1: string = 41; a2: string = 42; a3: string = 43; a4: string = 44; a5: string = 45;
+    ctx: Ctx2 = 254;
+  }
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13; v11: string = 14; v12: string = 15;
+  }
+  decision ans(a: Ans) -> Put {
+    when a.status == 304 ->
+      Put { cid: a.cid, op: DELETE, key: "/fetch-q/", k2: a.ctx.q,
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "" };
+    when a.status == 200 && a.ctx.kind == "m" && a.a0 != "" ->
+      Put { cid: a.cid, op: PUT, key: "/image-manifests/", k2: a.ctx.name,
+            v1: "repo=", v2: a.ctx.repo, v3: ";layers=", v4: a.a0, v5: ";sizes=", v6: a.a1,
+            v7: ";config=", v8: a.a2, v9: ";configsize=", v10: a.a3, v11: ";n=", v12: a.a5 };
+    when a.status == 200 && a.ctx.kind == "m" && a.a4 != "" ->
+      Put { cid: a.cid, op: PUT, key: "/image-index/", k2: a.ctx.name,
+            v1: "digest=", v2: a.a4, v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "" };
+    when a.status == 200 && a.ctx.kind == "c" ->
+      Put { cid: a.cid, op: PUT, key: "/image-config/", k2: a.ctx.name,
+            v1: "entrypoint=", v2: a.a0, v3: ";cmd=", v4: a.a1, v5: ";env=", v6: a.a2,
+            v7: ";workdir=", v8: a.a3, v9: ";user=", v10: a.a4, v11: "", v12: "" };
+    when a.status == 200 && a.ctx.kind == "l" ->
+      Put { cid: a.cid, op: PUT, key: "/blobs/", k2: a.ctx.name,
+            v1: "size=", v2: a.ctx.size, v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "" };
+    default ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "" };
+  }
+
+  transformation t_req(r: Req) -> Req { Req { seq: r.seq, key: r.key, repo: r.repo, tag: r.tag, digest: r.digest } }
+  transformation t_man(m: Man) -> Man { Man { seq: m.seq, key: m.key, repo: m.repo, config: m.config, csize: m.csize } }
+  transformation t_lay(l: Lay) -> Lay { Lay { seq: l.seq, key: l.key, repo: l.repo, hex: l.hex, size: l.size, at: l.at } }
+  transformation t_have(h: Have) -> Have {
+    Have { cid: h.cid, status: h.status, ctx: h.ctx }
+  }
+  transformation t_q(q: Q) -> Q {
+    Q { seq: q.seq, key: q.key, kind: q.kind, name: q.name, path: q.path, digest: q.digest,
+        repo: q.repo, ssize: q.ssize, size: q.size }
+  }
+  transformation t_ans(a: Ans) -> Ans {
+    Ans { cid: a.cid, status: a.status, a0: a.a0, a1: a.a1, a2: a.a2, a3: a.a3, a4: a.a4, a5: a.a5, ctx: a.ctx }
+  }
+  pipeline im_qm(r: Req) -> Row { call x = t_req(r); call y = qm(x); return y; }
+  pipeline im_qc(m: Man) -> Row { call x = t_man(m); call y = qc(x); return y; }
+  pipeline im_le(l: Lay) -> Ask { call x = t_lay(l); call y = le(x); return y; }
+  pipeline im_lr(h: Have) -> Row2 { call x = t_have(h); call y = lr(x); return y; }
+  pipeline im_fq(q: Q) -> Get { call x = t_q(q); call y = fq(x); return y; }
+  pipeline im_ans(a: Ans) -> Put { call x = t_ans(a); call y = ans(x); return y; }
+  entry im_qm = im_qm;
+  entry im_qc = im_qc;
+  entry im_le = im_le;
+  entry im_lr = im_lr;
+  entry im_fq = im_fq;
+  entry im_ans = im_ans;
+  provenance revision "image-pull" toolchain "chronicle-authoring";
+}

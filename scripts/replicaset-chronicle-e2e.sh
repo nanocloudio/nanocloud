@@ -101,64 +101,40 @@ modules:
     # pass, and without this nothing would wake the ReplicaSet to do it.
     watch: "/pods/"
   # Stage 1 — the PREDECESSOR, so a rollout proceeds strictly in ordinal order.
-  - name: prev
-    type: decision
-    params:
-      decision: "${DEC_PREV}"
   - name: prevget
     type: store_effect
+    decision: "${DEC_PREV}"
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 2 — THIS ordinal, carrying the predecessor verdict.
-  - name: probe
-    type: decision
-    params:
-      decision: "${DEC_ASK}"
   - name: selfget
     type: store_effect
+    decision: "${DEC_ASK}"
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 3 — create, delete, roll, or nothing.
-  - name: act
-    type: decision
-    params:
-      decision: "${DEC_ACT}"
   - name: apply
     type: store_effect
+    decision: "${DEC_ACT}"
     key_prefix: "/pods/"
   # Stage 4 — record what stage 3 did. The write's own reply carries the tag,
   # so the event is decided from the effect that produced it, not guessed from
   # a second read of the store.
-  - name: record
-    type: decision
-    params:
-      decision: "${DEC_REC}"
   - name: events
     type: store_effect
+    decision: "${DEC_REC}"
     key_prefix: "/events/"
 wiring:
   - from: store_source.status
     to: store_source.changes
   - from: store_source.record_out
-    to: prev.record_in
-  - from: prev.result_out
     to: prevget.request_in
-    buffer_group: 1
   - from: prevget.response_out
-    to: probe.record_in
-  - from: probe.result_out
     to: selfget.request_in
-    buffer_group: 2
   - from: selfget.response_out
-    to: act.record_in
-  - from: act.result_out
     to: apply.request_in
-    buffer_group: 3
   - from: apply.response_out
-    to: record.record_in
-  - from: record.result_out
     to: events.request_in
-    buffer_group: 4
 YAML
 }
 

@@ -1,0 +1,98 @@
+// A scheduled Pod as the node's ask: /pods/ with spec.nodeName -> the flat
+// /pod-specs/<uid> record the node's pod-lifecycle chain runs.
+//
+//   spec    /pods/<ns>/<name> bound to a node -> /pod-specs/<uid>
+//           node image restart grace desired cmd; desired=deleted once the
+//           Pod carries a deletionTimestamp
+//   gone    /~tomb/pods/<ns>/<name> (a Pod deleted outright: its last state)
+//           -> /pod-specs/<uid> desired=deleted
+//
+// Each record is written into its node's scope, /~node/<node>/pod-specs/
+// <uid> (the effect's key_prefix is /~node/): a worker's store keeps
+// /pod-specs/ as its own, so its chains read only what is asked of it, by
+// the plain name. The record also names its node. It is put-if-changed, so
+// a Pod that did not change spends no revision on the node's side.
+module nanocloud.podspecs {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+
+  message ps.Pod {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // "<ns>/<name>"
+    uid: string = 4;       // metadata.uid
+    node: string = 5;      // spec.nodeName ("" until scheduled)
+    cmd: string = 6;       // spec.containers.0.command, as argv
+    args: string = 7;      // spec.containers.0.args, as argv
+    image: string = 8;     // spec.containers.0.image
+    restart: string = 9;   // spec.restartPolicy, lowercased
+    grace: string = 10;    // spec.terminationGracePeriodSeconds
+    deleting: string = 11; // metadata.deletionTimestamp
+  }
+  // Value parts 4..16 are joined into the record; the node reads it as flat
+  // `k=v;` fields, in any order.
+  message ps.Spec {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;   p4: string = 7;
+    p5: string = 8;   p6: string = 9;   p7: string = 10;  p8: string = 11;
+    p9: string = 12;  p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+  }
+  // An unstated grace period is the upstream default, 30 seconds: 0 would
+  // kill a deleted Pod's process without its SIGTERM window.
+  decision spec(p: ps.Pod) -> ps.Spec {
+    when p.node == "" || p.uid == "" ->
+      ps.Spec { cid: p.seq, op: NOOP, key: "" };
+    when p.deleting != "" && p.grace == "" ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";grace=30;desired=deleted;cmd=",
+                p4: p.cmd, p5: " ", p6: p.args };
+    when p.deleting != "" ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";grace=", p4: p.grace,
+                p5: ";desired=deleted;cmd=", p6: p.cmd, p7: " ", p8: p.args };
+    when p.grace == "" ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";image=", p4: p.image,
+                p5: ";restart=", p6: p.restart,
+                p7: ";grace=30;desired=running;cmd=", p8: p.cmd,
+                p9: " ", p10: p.args };
+    default ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";image=", p4: p.image,
+                p5: ";restart=", p6: p.restart, p7: ";grace=", p8: p.grace,
+                p9: ";desired=running;cmd=", p10: p.cmd, p11: " ", p12: p.args };
+  }
+
+  message ps.Tomb {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<name>"
+    uid: string = 4;      // obj.metadata.uid
+    node: string = 5;     // obj.spec.nodeName
+  }
+  decision gone(t: ps.Tomb) -> ps.Spec {
+    when t.uid == "" || t.node == "" ->
+      ps.Spec { cid: t.seq, op: NOOP, key: "" };
+    default ->
+      ps.Spec { cid: t.seq, op: PUT, key: t.node + "/pod-specs/" + t.uid,
+                p1: "node=", p2: t.node, p3: ";grace=0;desired=deleted;cmd=" };
+  }
+
+  pipeline spec_p(p: ps.Pod) -> ps.Spec {
+    call x = spec(p);
+    return x;
+  }
+  pipeline gone_p(t: ps.Tomb) -> ps.Spec {
+    call x = gone(t);
+    return x;
+  }
+
+  entry spec = spec_p;
+  entry gone = gone_p;
+
+  provenance revision "pod-specs" toolchain "chronicle-authoring";
+}

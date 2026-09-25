@@ -1,0 +1,125 @@
+name = "volume_host"
+version = "0.1.0"
+description = "The encrypted-volume pipelines' node effector — a volume's subgraph staged, unlocked through Kagi, published over NBD and torn down"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The node half of the encrypted-volume pipelines (docs/design/
+# encrypted-volumes.md). It decides nothing: each effect is run on this node
+# and its raw outcome answered for the pipeline to map.
+#
+# GRAPH_START stages the volume's subgraph (`_shared/volume_graph.rs`: tls,
+# loam_volume, crypt_block in attach mode, nbd_serve) as a workload under its
+# own owner, starts it and reads its lanes back: the recipient crypt_block
+# announces, its status record, its control input. The subgraph's
+# `loam_volume` dials Loam's admin gate (`loam_authority`) through a
+# client-mode `tls` under this node's certificate (`cert_file`, `key_file`,
+# `trust`, `verify_hostname`), presents this node's capability
+# (`loam_capability`, a file of `fxcap1.` chains), and holds the lease the
+# attach flow acquired (holder sha256(claim)[..16], or of `rc:<claim>` for a
+# recovery) at its fence. The gate binds a lease to the certificate that
+# took it, so this node's `loam_effect` runs its lease ops under the same
+# certificate.
+#
+# KAGI_RELEASE / KAGI_RENEW / KAGI_RECOVER run the attach client
+# (`_shared/kagi_attach_ops.rs`): a challenge, then the request proven by this
+# node's device key (`device_key_label`, generated in the vault on first open;
+# its public half is logged at start for enrolment), each request one
+# exchange: `POST /storage-key`, the body the storage-key REQUEST payload
+# `[op][resource kind][resource 16][body]`, on `request_out` to the graph's
+# HTTP client (Wave `http`, `exchange`, pinned to the endpoint, behind a
+# client `tls`), answered on `response_in` with a 200 whose body is the REPLY
+# payload. The exchange id is the correlation. A call the client loses to
+# `LINK DOWN` is sent again after its `LINK UP`; an exchange that ends without
+# a REPLY is `unavailable` for a 5xx or an ABORT and `failed` for a refusal. The bundle
+# a release carries is held for this instance and spent by BUNDLE_DELIVER or
+# CB_BUNDLE on crypt_block's control input; it never leaves the node.
+#
+# NBD_START, FLUSH and NBD_STOP run `nbd-client` (with a 30 s I/O timeout: a
+# server that stops answering fails the device's I/O rather than hanging it),
+# `blockdev --flushbufs` and `nbd-client -d` through the process executor
+# (`SECTOR_PROC_ALLOW`); the
+# device is /dev/nbd<nbd_index_base + slot>, served on 127.0.0.1:<nbd_port_base
+# + slot>. The timeout runs from when a request is sent, so the host bounds
+# what is in flight (the package's udev rule: 128 KiB requests, four queued);
+# with the kernel's defaults the requests sent last time out under a write
+# burst.
+#
+# In (`request_in`, a Chronicle record):
+#   1 cid  2 op  3 key: the claim  4..8 a1..a5  9 n1  10 n2  254 carry
+# Ops:
+#   10 GRAPH_START      a1 vol a2 fresh ("1": format) a5 recovery n1 fence
+#                       -> inst (8)
+#   11 RECIPIENT        a1 inst  (crypt_block's FXRK announced)
+#   12 BUNDLE_DELIVER   a1 inst -> ready | eacces
+#   13 NBD_START        a1 inst -> dev (9)
+#   14 FLUSH            a1 inst
+#   15 NBD_STOP         a1 inst
+#   16 GRAPH_DESTROY    a1 inst
+#   22 KAGI_RELEASE     a1 inst a2 vol a3 device a4 epoch a5 key resource
+#                       n1 fence -> exp (7, this node's monotonic ms)
+#   23 KAGI_RENEW       as 22 -> exp | fence_changed | expired | conflict
+#   67 CB_STATUS        a1 inst a2 epoch -> r1 (14) none | prepared | active |
+#                       migrating | retiring | steady
+#   68 CB_RECIPIENT     a1 inst a2 epoch  (FXRT: a fresh recipient)
+#   69 CB_BUNDLE        a1 inst a2 epoch -> ready | stale | eacces
+#   72 CB_ERASE         a1 inst  (FXER)
+#   79 KAGI_RECOVER     a1 inst a2 vol a3 device a4 epoch a5 ticket (hex)
+#                       n1 fence -> n (13) custodians | custodians
+#   Any other op is not this node's and is dropped unanswered.
+# Out (`response_out`): the pipelines' Outcome, every field present:
+#   1 cid 2 op 3 key 4 code 5 fence 6 lease_exp 7 exp 8 inst 9 dev 10 vol
+#   11 set 12 grant 13 n 14 r1 15 r2 16 r3, 254 carry
+# Codes: ok ready stale eacces refused custodians fence_changed expired
+# conflict failed unavailable.
+#
+# One effect in flight; one unanswered for `timeout_ms` is `unavailable`, and
+# a storage-key exchange still open for it is aborted.
+timer_class = "wall_clock"
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# The HTTP client's `response_out`.
+[[ports]]
+name = "response_in"
+direction = "input"
+index = 1
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+# To the HTTP client's `request_in`.
+[[ports]]
+name = "request_out"
+direction = "output"
+index = 1
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
+[[resources]]
+requires_contract = "proc"
+access = "write"
+
+[observability]
+exempt = "connector — each effect's outcome is a record in the store; Kagi audits every decision, the subgraph's modules observe the data path"

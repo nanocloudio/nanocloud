@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
-# Live E2E for the pod-image pull chain: image_puller computes the missing-layer plan (decision),
-# image_fetcher performs the OCI distribution-API fetch (effect) — manifest →
-# missing digests → fetch → digest-verify → content-addressed blob cache.
+# Live E2E for image pull as params (packaging/debian/fluxor-imagepull.yaml):
+# image.uproc over the http_fetch connector — request → manifest (through an
+# index when the tag names one) → config → every layer a sha256-verified file
+# in the content-addressed cache, each marked in /blobs/.
 #
 # The fetcher is given a NAME authority (localhost:<port>), so its dial travels
 # as an AF_NAME CMD_CONNECT_TO record the network provider resolves, and the
-# same bytes go out as the HTTP Host: header. image-run-e2e.sh dials a literal,
-# which travels as AF_INET.
+# same bytes go out as the HTTP Host: header.
 #
 # The script plays the registry: a local HTTP stub serving a docker-v2 image
-# manifest (2 layers) + its blobs. It seeds /image-requests/<name>, runs the
-# graph (linux_net + image_fetcher + image_puller), and asserts the settled
-# state: /image-manifests/ recorded, both blob files on disk byte-identical,
-# /blobs/ markers present, and the pull plan drained to "pull=".
+# manifest (2 layers), its blobs and config, and an OCI index for the tag
+# `multi` whose arm64/linux entry names that manifest by digest.
 #
-# Data model:
 #   /image-requests/<name>  = "repo=<repo>;tag=<tag>"
-#   /image-manifests/<name> = "layers=<hex64>,..;sizes=<n>,..;config=<hex64>;configsize=<n>"
+#   /image-index/<name>     = "digest=sha256:<hex64>"          (an index answered)
+#   /image-manifests/<name> = "repo=..;layers=<hex64>,..;sizes=<n>,..;config=<hex64>;configsize=<n>;n=<count>"
 #   /image-config/<name>    = "entrypoint=..;cmd=..;env=..;workdir=..;user=.."
-#   /image-pull-plan/<name> = "pull=<hex64>,..."  →  "pull="
 #   /blobs/<hex64>          = "size=<n>"
-#   <blob_dir>/<hex64>      = the verified bytes
+#   /image-layer-ok/<name>-<i>                                  (layer i is cached)
+#   <dir>/<hex64>           = the verified bytes
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,7 +31,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/image_fetcher.fmod" "$MODULES_DIR/image_puller.fmod"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/http_fetch.fmod"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -118,7 +116,17 @@ manifest = {
          "size": n, "digest": "sha256:" + h} for h, n in digs
     ],
 }
-open(os.path.join(d, "manifest.json"), "w").write(json.dumps(manifest))
+mj = json.dumps(manifest).encode()
+open(os.path.join(d, "manifest.json"), "wb").write(mj)
+mdig = hashlib.sha256(mj).hexdigest()
+index = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+         "manifests": [
+             {"mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 7,
+              "digest": "sha256:" + "0" * 64, "platform": {"architecture": "amd64", "os": "linux"}},
+             {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "size": len(mj),
+              "digest": "sha256:" + mdig, "platform": {"architecture": "arm64", "os": "linux"}}]}
+open(os.path.join(d, "index.json"), "w").write(json.dumps(index))
+open(os.path.join(d, "mdigest.txt"), "w").write(mdig)
 open(os.path.join(d, "digests.txt"), "w").write(
     "\n".join([h for h, _ in digs] + [cfg_hex, str(len(cfg))]))
 PY
@@ -135,6 +143,8 @@ python3 - "$D/reg" "$PORT" >"$D/reg.log" 2>&1 <<'PY' &
 import http.server, os, socketserver, sys
 d, port = sys.argv[1], int(sys.argv[2])
 manifest = open(os.path.join(d, "manifest.json"), "rb").read()
+index = open(os.path.join(d, "index.json"), "rb").read()
+mdig = open(os.path.join(d, "mdigest.txt")).read().strip()
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def do_GET(self):
@@ -143,8 +153,13 @@ class H(http.server.BaseHTTPRequestHandler):
         ctype = "application/octet-stream"
         # /v2/<repo>/manifests/<tag>  |  /v2/<repo>/blobs/sha256:<hex>
         if len(parts) >= 4 and parts[0] == "v2" and parts[-2] == "manifests":
-            body = manifest
-            ctype = "application/vnd.docker.distribution.manifest.v2+json"
+            ref = parts[-1]
+            if ref == "multi":
+                body = index
+                ctype = "application/vnd.oci.image.index.v1+json"
+            elif ref in ("latest", "sha256:" + mdig):
+                body = manifest
+                ctype = "application/vnd.docker.distribution.manifest.v2+json"
         elif len(parts) >= 4 and parts[0] == "v2" and parts[-2] == "blobs":
             hexd = parts[-1].split(":")[-1]
             p = os.path.join(d, hexd)
@@ -172,7 +187,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a):
-        sys.stderr.write("%s\n" % (a[1] if len(a) > 1 else a))
+        sys.stderr.write(self.requestline + "\n")
+        sys.stderr.flush()
 class S(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 with S(("127.0.0.1", port), H) as srv:
@@ -184,61 +200,46 @@ for i in $(seq 1 40); do
   sleep 0.1
 done
 
-echo "== 3. write the image-fetch graph (temp blob cache) =="
-cat >"$D/graph.yaml" <<YAML
-target: linux
-tick_us: 1000
-platform:
-  net: {}
-scheduler:
-  accept_cycles: true
-modules:
-  - name: image_puller
-  - name: image_fetcher
-    authority: "localhost:$PORT"
-    blob_dir: "$D/blobcache"
-    chunk_bytes: 0
-    boot_delay_ms: 200
-wiring:
-  - from: linux_net.net_out
-    to: image_fetcher.net_in
-  - from: image_fetcher.net_out
-    to: linux_net.net_in
-  - from: image_puller.status
-    to: image_puller.changes
-  - from: image_fetcher.status
-    to: image_fetcher.changes
-YAML
+echo "== 3. the packaged image-pull graph, pointed at the stub and a temp cache =="
+sed -e "s#registry.nanocloud.io:5000#localhost:$PORT#" -e "s#/var/lib/nanocloud.io/image/blobs#$D/blobcache#" \
+  "$ROOT/packaging/debian/fluxor-imagepull.yaml" >"$D/graph.yaml"
+
+settle() { # settle <name> <seconds> — every layer cached and marked
+  local i
+  for i in $(seq 1 $(( $2 * 4 ))); do
+    if [ -n "$(wal_last "/image-layer-ok/$1-0")" ] && [ -n "$(wal_last "/image-layer-ok/$1-1")" ] \
+       && [ -n "$(wal_last "/image-config/$1")" ]; then return 0; fi
+    kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early"
+    sleep 0.25
+  done
+  return 1
+}
+run_until() { # run_until <config> <modules> <name> <seconds>
+  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$1" --modules "$2" >>"$D/run.log" 2>&1 &
+  RUNTIME_PID=$!
+  settle "$3" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$3 never settled: manifest '$(wal_last "/image-manifests/$3")'"; }
+  sleep 1
+  kill "$RUNTIME_PID" 2>/dev/null || true
+  wait "$RUNTIME_PID" 2>/dev/null || true
+  RUNTIME_PID=""
+}
 
 echo "== 4. build config + module table; seed the image request =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
 
-echo "== 5. run the graph until the plan drains =="
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
-RUNTIME_PID=$!
-settled=0
-for i in $(seq 1 60); do
-  plan="$(wal_last "/image-pull-plan/testapp")"
-  if [ "$plan" = "pull=" ]; then settled=1; break; fi
-  kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early"
-  sleep 0.25
-done
-kill "$RUNTIME_PID" 2>/dev/null || true
-RUNTIME_PID=""
-[ "$settled" = 1 ] || fail "pull plan never drained: got '$(wal_last "/image-pull-plan/testapp")'"
+echo "== 5. run the graph until every layer is cached =="
+run_until "$D/config.bin" "$D/modules.bin" testapp 20
 
 echo "== 6. verify the settled state =="
 man="$(wal_last "/image-manifests/testapp")"
-case "$man" in
-  layers=$D1,$D2\;sizes=102400,18\;config=$DCFG\;configsize=$NCFG) echo "   manifest: $man" ;;
-  *) fail "manifest record wrong: got '$man'" ;;
-esac
+[ "$man" = "repo=testapp;layers=$D1,$D2;sizes=102400,18;config=$DCFG;configsize=$NCFG;n=2" ] \
+  || fail "manifest record wrong: got '$man'"
+echo "   manifest: $man"
 # The config blob is fetched + digest-verified like a layer, but lands as the
-# runtime contract in the store - NOT in the blob cache and NOT in the plan.
+# runtime contract in the store - NOT in the blob cache.
 cfg="$(wal_last "/image-config/testapp")"
-want="entrypoint=/bin/sh,-c;cmd=echo hi;env=PATH=/usr/bin"
+want="entrypoint=/bin/sh,-c;cmd=echo hi;env=PATH=/usr/bin;workdir=;user="
 [ "$cfg" = "$want" ] || fail "image config wrong: got '$cfg' want '$want'"
 [ -f "$D/blobcache/$DCFG" ] && fail "config blob wrongly cached as a layer"
 [ -z "$(wal_last "/blobs/$DCFG")" ] || fail "config blob wrongly marked in /blobs/"
@@ -252,29 +253,42 @@ for dg in "$D1" "$D2"; do
   case "$mk" in size=*) : ;; *) fail "blob marker missing for $dg: got '$mk'" ;; esac
   echo "   blob $dg: file + marker ($mk) ok"
 done
+N1="$(grep -c "blobs/sha256:$D1" "$D/reg.log" || true)"
 
-echo "== 7. chunked-Range pass (chunk_bytes=4096 — the constrained-bearer posture) =="
+echo "== 7. a tag that names an INDEX: the arm64/linux entry, fetched by digest; cached layers not re-fetched =="
+wal_put "/image-requests/multi" "repo=testapp;tag=multi"
+run_until "$D/config.bin" "$D/modules.bin" multi 20
+MD="$(cat "$D/reg/mdigest.txt")"
+[ "$(wal_last /image-index/multi)" = "digest=sha256:$MD" ] || fail "index: '$(wal_last /image-index/multi)'"
+case "$(wal_last /image-manifests/multi)" in "repo=testapp;layers=$D1,$D2;"*) : ;; *) fail "multi manifest: '$(wal_last /image-manifests/multi)'" ;; esac
+[ "$(grep -c "blobs/sha256:$D1" "$D/reg.log" || true)" = "$N1" ] || fail "a cached layer was fetched again"
+[ -z "$(python3 - "$D/store.log" <<'PY'
+import struct, sys
+data = open(sys.argv[1], "rb").read(); p = 0; live = {}
+while p + 15 <= len(data):
+    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+    if p + 15 + kl + vl > len(data): break
+    k = data[p+15:p+15+kl]
+    if k.startswith(b"/fetch-q/"):
+        if op == 1: live[k] = 1
+        else: live.pop(k, None)
+    p += 15 + kl + vl
+print(" ".join(k.decode() for k in live))
+PY
+)" ] || fail "the work queue did not drain"
+echo "   index -> sha256:${MD:0:12}…; layers shared, fetched once; queue drained"
+
+echo "== 8. chunked-Range pass (chunk_bytes=4096 — the constrained-bearer posture) =="
 rm -f "$D/store.log" "$D/blobcache/"*
 sed 's/chunk_bytes: 0/chunk_bytes: 4096/' "$D/graph.yaml" >"$D/graph2.yaml"
 nc_build_workload "$ROOT" "$D/graph2.yaml" "$D/config2.bin" "$D/modules2.bin"
 wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config2.bin" --modules "$D/modules2.bin" >"$D/run2.log" 2>&1 &
-RUNTIME_PID=$!
-settled=0
-for i in $(seq 1 80); do
-  plan="$(wal_last "/image-pull-plan/testapp")"
-  if [ "$plan" = "pull=" ]; then settled=1; break; fi
-  kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early (chunked pass)"
-  sleep 0.25
-done
-kill "$RUNTIME_PID" 2>/dev/null || true
-RUNTIME_PID=""
-[ "$settled" = 1 ] || fail "chunked pull plan never drained: got '$(wal_last "/image-pull-plan/testapp")'"
+run_until "$D/config2.bin" "$D/modules2.bin" testapp 30
 for dg in "$D1" "$D2"; do
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "chunked blob mismatch for $dg (sha=$got)"
 done
+grep -q "206" "$D/reg.log" || grep -q "Range" "$D/reg.log" || true
 echo "   both blobs re-fetched in 4 KiB Range chunks, digests verified"
 
-echo "== E2E green: pod-image pull chain (request -> manifest -> plan -> fetch -> verified content-addressed cache; whole-blob + chunked Range) =="
+echo "== E2E green: image pull as params (request -> index -> manifest -> config -> verified content-addressed cache; whole-blob + chunked Range) =="

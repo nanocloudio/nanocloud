@@ -35,20 +35,36 @@ while IFS= read -r graph; do
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
 for i, l in enumerate(lines):
+    # A decode program: `# rd-source: <path.rd>` above `decode: "<hex>"`.
+    r = re.search(r'rd-source:\s*(\S+)', l)
+    if r:
+        for j in range(i + 1, min(i + 12, len(lines))):
+            d = re.search(r'decode:\s*"([0-9a-f]+)"', lines[j])
+            if d:
+                print(r.group(1), "-", "decode", d.group(1))
+                break
+        continue
     m = re.search(r'chronicle-source:\s*(\S+)\s+(\S+)', l)
     if not m:
         continue
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.search(r'(decision|ir_stages):\s*"([0-9a-f]+)"', lines[j])
+        d = re.search(r'(decision|ir_stages|count_where):\s*"([0-9a-f]+)"', lines[j])
         if d:
             print(m.group(1), m.group(2), d.group(1), d.group(2))
+            if d.group(1) == "ir_stages":
+                k = re.search(r'stage_kinds:\s*"([0-9a-f]*)"', lines[j + 1] if j + 1 < len(lines) else "")
+                print(m.group(1), m.group(2), "stage_kinds", k.group(1) if k else "-")
             break
 PY
   while read -r uproc entry kind baked; do
     [ -n "$baked" ] || continue
     checked=$((checked + 1))
-    if [ "$kind" = "ir_stages" ]; then
+    if [ "$kind" = "decode" ]; then
+      fresh="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/$uproc")"
+    elif [ "$kind" = "ir_stages" ]; then
       fresh="$(nc_stages "$ROOT/$uproc" "$entry")"
+    elif [ "$kind" = "stage_kinds" ]; then
+      fresh="$(nc_stage_kinds "$ROOT/$uproc" "$entry")"; fresh="${fresh:--}"
     else
       fresh="$(nc_decision "$ROOT/$uproc" "$entry")"
     fi
@@ -63,7 +79,12 @@ PY
     echo "   ok   $(basename "$graph") <- $(basename "$uproc") $entry ($kind)"
   done < /tmp/nc-drift-$$.txt
   rm -f /tmp/nc-drift-$$.txt
-done < <(grep -rl 'chronicle-source:' "$ROOT/packaging" 2>/dev/null)
+done < <(
+  # The shipped graphs, and every E2E that composes its own graph with baked
+  # params inline — a stale param there makes the test prove the wrong chain.
+  grep -rl 'chronicle-source:' "$ROOT/packaging" 2>/dev/null
+  grep -l 'chronicle-source:' "$ROOT"/scripts/*-e2e.sh 2>/dev/null | grep -v '/chronicle-param-drift-e2e.sh$'
+)
 
 [ "$checked" -gt 0 ] || { echo "FAIL: no chronicle-source markers found — the guard would pass vacuously"; exit 1; }
 [ "$fails" -eq 0 ] || { echo "FAIL: $fails baked param(s) drifted"; exit 1; }

@@ -1,0 +1,216 @@
+// Grant rotation, device replacement and revocation for an encrypted volume —
+// the key-policy half of the encrypted-storage design's other pipelines. None
+// of them rewrites data: the volume key stays, and only which device may be
+// issued a fresh attachment bundle changes. A device that may have kept key
+// material is evicted only by a data-key rotation (`evict=1` asks for one).
+//
+//   /volume-grants/<ns>/<pvc>   (flat; written by an operator or controller)
+//     op        rotate | replace | revoke
+//     custody tier lifetime   rotate: the new grant policy
+//     new       replace: the replacement device
+//     evict     "1": follow with a data-key rotation (replace, revoke)
+//     actor     who asked: carried into Kagi's audited decision
+//     phase out at tries wake reason note   as every lifecycle record
+//   related: /volume-attachments/<ns>/<pvc> vol grant phase desired device,
+//            /volume-keys/<ns>/<pvc> kvol
+//
+// rotate    g_rotate  KAGI_ROTATE_GRANT  same device, new policy (Kagi op 8).
+//                                        The live attachment carries on; its
+//                                        next renewal is decided under it.
+// replace   g_wait    —                  until the scheduler no longer asks for
+//                                        the old device
+//           g_detach  ATT_DETACH         only if attached there: the attachment
+//                                        tears down (`device_replaced`,
+//                                        retryable) in the detach order
+//           g_quiesce —                  until nothing is attached
+//           g_replace KAGI_REPLACE       old -> new (Kagi op 7)
+//           g_grant   ATT_GRANT          the attachment's `grant`, so attach
+//                                        does not move it back
+// revoke    g_revoke  KAGI_REVOKE        first: no bundle or renewal is issued
+//                                        from here (Kagi op 6)
+//           g_detach  ATT_DETACH         then, if attached, the attachment is
+//                                        torn down (`grant_revoked`, final)
+//           g_quiesce —                  until nothing is attached
+// then      g_evict   ROTATION_REQUEST   with `evict=1`
+//           done
+//
+// Revocation cannot reach back into a node that already holds a handle, so
+// it is Kagi first, then quiesce, withdraw, release and destroy (detach).
+// A clone shares its source's key resource and grant: it is refused
+// `shared_key`, and the source's grant is the one to change.
+module nanocloud.volume_grant {
+
+  // The shared carry (volume_key_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    grant: string = 37;
+    custody: string = 42;
+    tier: int = 46;
+    lifetime: int = 47;
+    new: string = 52;
+    actor: string = 54;
+    reason: string = 55;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum TIMEOUT_MS = 30000;
+  enum POLL_MS = 5000;
+  enum MAX_TRIES = 5;
+  enum MAX_LIFETIME_S = 86400;
+
+  message Gr {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    op: string = 4;
+    new: string = 5;
+    custody: string = 6;
+    evict: string = 7;
+    actor: string = 8;
+    phase: string = 9;
+    out: string = 10;
+    reason: string = 11;
+    note: string = 12;
+    tier: int = 50;
+    lifetime: int = 51;
+    at: int = 52;
+    tries: int = 53;
+    wake: int = 54;
+    now: int = 58;
+    vol: string = 70;      // /volume-attachments/<claim> (related, flat)
+    grant: string = 71;
+    aphase: string = 72;
+    desired: string = 73;
+    device: string = 74;
+    kvol: string = 80;     // /volume-keys/<claim> (related, flat)
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision gstep(g: Gr) -> Step {
+    when g.phase == "done" || g.phase == "failed" ->
+      Step { cid: g.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // Nothing here holds a resource: each step is one Kagi decision or one
+    // record write, so a failure is recorded and left for an operator.
+    when g.reason != "" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=failed;out=", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── validate ──
+    when g.phase == "" && g.vol == "" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=no_volume", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    when g.phase == "" && g.kvol != "" && g.kvol != g.vol ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=shared_key", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    when g.phase == "" && g.op == "rotate" && ((g.custody != "possession" && g.custody != "hardware")
+         || g.tier < 0 || g.lifetime <= 0 || g.lifetime > MAX_LIFETIME_S) ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=policy_invalid", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    when g.phase == "" && ((g.op == "replace" && (g.new == "" || g.new == g.grant))
+         || (g.op != "rotate" && g.op != "replace" && g.op != "revoke")) ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=request_invalid", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── start ──
+    when g.phase == "" && g.op == "rotate" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_rotate;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_rotate", vol: g.vol, grant: g.grant, custody: g.custody, tier: g.tier,
+                        lifetime: g.lifetime, actor: g.actor } };
+    when g.phase == "" && g.op == "revoke" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_revoke;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_revoke", vol: g.vol, grant: g.grant, actor: g.actor } };
+    when g.phase == "" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_wait;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // g_quiesce holds until the attachment has released everything.
+    when g.phase == "g_quiesce" && g.aphase != "" && g.aphase != "idle" && g.aphase != "detached" && g.aphase != "failed"
+         && g.now >= g.wake ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "note=quiescing", v3: ";at=", n1: g.at,
+             v4: ";wake=", n2: g.now + POLL_MS, ctx: Ctx { claim: "", ph: "" } };
+    when g.phase == "g_quiesce" && g.aphase != "" && g.aphase != "idle" && g.aphase != "detached" && g.aphase != "failed" ->
+      Step { cid: g.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+
+    // ── replace: off the old device first ──
+    when g.phase == "g_wait" && !(g.desired == "attached" && g.device == g.grant)
+         && g.aphase != "" && g.aphase != "idle" && g.aphase != "detached" && g.aphase != "failed" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_detach;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_detach", vol: g.vol, reason: "device_replaced" } };
+    when (g.phase == "g_wait" && !(g.desired == "attached" && g.device == g.grant))
+         || (g.phase == "g_quiesce" && g.op == "replace") ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_replace;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_replace", vol: g.vol, grant: g.grant, new: g.new, actor: g.actor } };
+    when g.phase == "g_replace" && g.out == "g_replace:ok" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_grant;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_grant", vol: g.vol, new: g.new } };
+
+    // ── revoke: Kagi first, then quiesce ──
+    when g.phase == "g_revoke" && g.out == "g_revoke:ok"
+         && g.aphase != "" && g.aphase != "idle" && g.aphase != "detached" && g.aphase != "failed" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_detach;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_detach", vol: g.vol, reason: "grant_revoked" } };
+    when g.phase == "g_detach" && g.out == "g_detach:ok" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_quiesce;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    // ── the end, and eviction ──
+    when ((g.phase == "g_quiesce" && g.op == "revoke") || (g.phase == "g_revoke" && g.out == "g_revoke:ok")
+          || (g.phase == "g_grant" && g.out == "g_grant:ok")) && g.evict == "1" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=g_evict;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: "g_evict", vol: g.vol, actor: g.actor } };
+    when (g.phase == "g_quiesce" && g.op == "revoke") || (g.phase == "g_revoke" && g.out == "g_revoke:ok")
+         || (g.phase == "g_grant" && g.out == "g_grant:ok") || (g.phase == "g_rotate" && g.out == "g_rotate:ok")
+         || (g.phase == "g_evict" && g.out == "g_evict:ok") ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "phase=done;out=;tries=0", v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // A refusal ends it with the answer as the reason.
+    when g.out != "" && g.out != "g_rotate:ok" && g.out != "g_revoke:ok" && g.out != "g_detach:ok"
+         && g.out != "g_replace:ok" && g.out != "g_grant:ok" && g.out != "g_evict:ok" ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=", v2: g.out, v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    // Unanswered: ask again, then give up.
+    when g.phase == "g_detach" && g.op == "revoke" && g.now >= g.at + TIMEOUT_MS && g.tries < MAX_TRIES ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "out=", v3: ";tries=", n1: g.tries + 1,
+             v4: ";at=", n2: g.now, v5: ";wake=", n3: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: g.phase, vol: g.vol, reason: "grant_revoked" } };
+    when (g.phase == "g_rotate" || g.phase == "g_revoke" || g.phase == "g_detach" || g.phase == "g_replace"
+          || g.phase == "g_grant" || g.phase == "g_evict") && g.now >= g.at + TIMEOUT_MS && g.tries < MAX_TRIES ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "out=", v3: ";tries=", n1: g.tries + 1,
+             v4: ";at=", n2: g.now, v5: ";wake=", n3: g.now + TIMEOUT_MS,
+             ctx: Ctx { claim: g.key, ph: g.phase, vol: g.vol, grant: g.grant, custody: g.custody, tier: g.tier,
+                        lifetime: g.lifetime, new: g.new, actor: g.actor,
+                        reason: "device_replaced" } };
+    when (g.phase == "g_rotate" || g.phase == "g_revoke" || g.phase == "g_detach" || g.phase == "g_replace"
+          || g.phase == "g_grant" || g.phase == "g_evict") && g.now >= g.at + TIMEOUT_MS ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "reason=exhausted:", v2: g.phase, v3: ";at=", n1: g.now,
+             v4: ";wake=", n2: g.now, ctx: Ctx { claim: "", ph: "" } };
+    // g_wait: the scheduler still asks for the old device.
+    when g.phase == "g_wait" && g.now >= g.wake ->
+      Step { cid: g.seq, op: MERGE, key: g.key, v1: "note=scheduled_on_old_device", v3: ";at=", n1: g.at,
+             v4: ";wake=", n2: g.now + POLL_MS, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: g.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline vg_step(g: Gr) -> Step { call y = gstep(g); return y; }
+  entry vg_step = vg_step;
+  provenance revision "volume-grant" toolchain "chronicle-authoring";
+}

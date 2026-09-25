@@ -7,6 +7,18 @@
 // pick time — not from a projection that could lag the bind that just
 // happened — so the spread is exact, and emergent, as k8s's is.
 module nanocloud.scheduler {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: sc.Bind, sc.Bound
+  message Ctx {
+    key: string = 30;
+    ns: string = 34;
+    pod: string = 35;
+    node: string = 36;
+  }
   message sc.Unbound {
     seq: int = 1;
     rev: int = 2;
@@ -22,19 +34,13 @@ module nanocloud.scheduler {
     key: string = 3;
     path: string = 19;
     v1: string = 4; v2: string = 5; v3: string = 6;   // a JSON string: quote, node, quote
-    c_key: string = 30;
-    c_ns: string = 34;
-    c_pod: string = 35;
-    c_node: string = 36;
+    ctx: Ctx = 254;
   }
   message sc.Bound {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_ns: string = 34;
-    c_pod: string = 35;
-    c_node: string = 36;
+    ctx: Ctx = 254;
   }
   message sc.Evt {
     cid: int = 1;
@@ -53,25 +59,23 @@ module nanocloud.scheduler {
   decision bind(u: sc.Unbound) -> sc.Bind {
     when u.idx == 0 && u.node != "" ->
       sc.Bind { cid: u.seq, op: PATCH, key: u.key, path: "spec.nodeName",
-                v1: "\"", v2: u.node, v3: "\"",
-                c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node };
+                v1: "\"", v2: u.node, v3: "\"", ctx: Ctx { key: u.key, ns: u.ns, pod: u.pod, node: u.node } };
     default ->
-      sc.Bind { cid: u.seq, op: NOOP, key: "", path: "", v1: "", v2: "", v3: "",
-                c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node };
+      sc.Bind { cid: u.seq, op: NOOP, key: "", path: "", v1: "", v2: "", v3: "", ctx: Ctx { key: u.key, ns: u.ns, pod: u.pod, node: u.node } };
   }
   decision record(b: sc.Bound) -> sc.Evt {
     when b.status == 200 ->
-      sc.Evt { cid: b.cid, op: PUT, key: b.c_key, xk: ".Scheduled.0",
+      sc.Evt { cid: b.cid, op: PUT, key: b.ctx.key, xk: ".Scheduled.0",
                v1: "{\"metadata\":{\"name\":\"",
-               v2: b.c_pod,
+               v2: b.ctx.pod,
                v3: ".Scheduled.0\",\"namespace\":\"",
-               v4: b.c_ns,
+               v4: b.ctx.ns,
                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
-               v6: b.c_ns,
+               v6: b.ctx.ns,
                v7: "\",\"name\":\"",
-               v8: b.c_pod,
+               v8: b.ctx.pod,
                v9: "\"},\"reason\":\"Scheduled\",\"message\":\"Successfully assigned to ",
-               v10: b.c_node,
+               v10: b.ctx.node,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
     default ->
       sc.Evt { cid: b.cid, op: NOOP, key: "", xk: "" };
@@ -80,7 +84,7 @@ module nanocloud.scheduler {
     sc.Unbound { seq: u.seq, rev: u.rev, key: u.key, idx: u.idx, node: u.node, ns: u.ns, pod: u.pod }
   }
   transformation pass_bound(b: sc.Bound) -> sc.Bound {
-    sc.Bound { cid: b.cid, status: b.status, value: b.value, c_key: b.c_key, c_ns: b.c_ns, c_pod: b.c_pod, c_node: b.c_node }
+    sc.Bound { cid: b.cid, status: b.status, value: b.value, ctx: b.ctx }
   }
   pipeline bd(u: sc.Unbound) -> sc.Bind { call x = pass_unbound(u); call y = bind(x); return y; }
   pipeline rc(b: sc.Bound) -> sc.Evt { call x = pass_bound(b); call y = record(x); return y; }

@@ -1,12 +1,34 @@
 // HorizontalPodAutoscaler as params: the closed loop. Three reads feed one
-// arithmetic decision, and the write is a PATCH of spec.replicas on the
-// target Deployment — the VM computes the number, the connector places it.
+// arithmetic decision, a sliding window STABILISES it, and the write is a
+// PATCH of spec.replicas on the target Deployment.
 //
 //   /hpa/<ns>/<name>            target name, min, max, targetCPU (ints)
 //   /deployments.apps/<ns>/<t>  current replicas (int projection)
-//   /hpa-metrics/<ns>/<t>       cpu=<pct>, flat (int projection)
-//   desired = ceil(current * cpu / target), clamped to [min, max]
+//   /hpa-metrics/<ns>/<t>       cpu=<pct>;ts=<sample time>, flat — a metric
+//                               SAMPLE: every scrape is a change, so every
+//                               scrape is an evaluation, as upstream's 15 s loop
+//   recommendation = ceil(current * cpu / target), clamped to [min, max]
+//   applied        = the MAX recommendation over the window (aggregation
+//                    `stab`: sliding window, one lane per <ns>/<target>)
+// Upstream's default behaviour falls out: a scale-up applies at once (the new
+// recommendation is the window's max), a scale-down only after every higher
+// recommendation has left the window (scale-down stabilisation, 300 s).
 module nanocloud.hpa {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: hp.DepQ, hp.DepA, hp.MetQ, hp.MetA
+  message Ctx {
+    ns: string = 30;
+    target: string = 31;
+    mn: int = 32;
+    mx: int = 33;
+    tgt: int = 34;
+    cur: int = 35;
+    t: int = 36;          // the evaluation's time (the source's clock)
+  }
 
   message hp.Hpa {
     seq: int = 1;
@@ -17,6 +39,7 @@ module nanocloud.hpa {
     mn: int = 50;         // spec.minReplicas (0 = unset -> 1)
     mx: int = 51;         // spec.maxReplicas (0 = unset -> no ceiling)
     tgt: int = 52;        // spec.targetCPUUtilizationPercentage (0 -> hold)
+    now: int = 58;        // the source's clock (`now: 1`)
   }
   // Read 1: the Deployment. Key parts: ns + "/" + target.
   message hp.DepQ {
@@ -25,22 +48,14 @@ module nanocloud.hpa {
     key: string = 3;
     sep: string = 17;
     name: string = 18;
-    c_ns: string = 30;
-    c_target: string = 31;
-    c_mn: int = 32;
-    c_mx: int = 33;
-    c_tgt: int = 34;
+    ctx: Ctx = 254;
   }
   message hp.DepA {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_ns: string = 30;
-    c_target: string = 31;
-    c_mn: int = 32;
-    c_mx: int = 33;
-    c_tgt: int = 34;
     cur: int = 50;        // spec.replicas
+    ctx: Ctx = 254;
   }
   // Read 2: the metric.
   message hp.MetQ {
@@ -49,24 +64,14 @@ module nanocloud.hpa {
     key: string = 3;
     sep: string = 17;
     name: string = 18;
-    c_ns: string = 30;
-    c_target: string = 31;
-    c_mn: int = 32;
-    c_mx: int = 33;
-    c_tgt: int = 34;
-    c_cur: int = 35;
+    ctx: Ctx = 254;
   }
   message hp.MetA {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_ns: string = 30;
-    c_target: string = 31;
-    c_mn: int = 32;
-    c_mx: int = 33;
-    c_tgt: int = 34;
-    c_cur: int = 35;
     cpu: int = 50;        // cpu=<pct>
+    ctx: Ctx = 254;
   }
   // The write: PATCH spec.replicas.
   message hp.Scale {
@@ -85,63 +90,65 @@ module nanocloud.hpa {
 
   decision dep(h: hp.Hpa) -> hp.DepQ {
     when h.target == "" || h.tgt == 0 ->
-      hp.DepQ { cid: h.seq, op: NOOP, key: "", sep: "", name: "",
-                c_ns: h.ns, c_target: h.target, c_mn: h.mn, c_mx: h.mx, c_tgt: h.tgt };
+      hp.DepQ { cid: h.seq, op: NOOP, key: "", sep: "", name: "", ctx: Ctx { ns: h.ns, target: h.target, mn: h.mn, mx: h.mx, tgt: h.tgt, t: h.now } };
     default ->
-      hp.DepQ { cid: h.seq, op: GET, key: h.ns, sep: "/", name: h.target,
-                c_ns: h.ns, c_target: h.target, c_mn: h.mn, c_mx: h.mx, c_tgt: h.tgt };
+      hp.DepQ { cid: h.seq, op: GET, key: h.ns, sep: "/", name: h.target, ctx: Ctx { ns: h.ns, target: h.target, mn: h.mn, mx: h.mx, tgt: h.tgt, t: h.now } };
   }
   decision met(a: hp.DepA) -> hp.MetQ {
     when a.status == 200 && a.cur > 0 ->
-      hp.MetQ { cid: a.cid, op: GET, key: a.c_ns, sep: "/", name: a.c_target,
-                c_ns: a.c_ns, c_target: a.c_target, c_mn: a.c_mn, c_mx: a.c_mx,
-                c_tgt: a.c_tgt, c_cur: a.cur };
+      hp.MetQ { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", name: a.ctx.target, ctx: Ctx { ns: a.ctx.ns, target: a.ctx.target, mn: a.ctx.mn, mx: a.ctx.mx, tgt: a.ctx.tgt, cur: a.cur, t: a.ctx.t } };
     default ->
-      hp.MetQ { cid: a.cid, op: NOOP, key: "", sep: "", name: "",
-                c_ns: a.c_ns, c_target: a.c_target, c_mn: a.c_mn, c_mx: a.c_mx,
-                c_tgt: a.c_tgt, c_cur: 0 };
+      hp.MetQ { cid: a.cid, op: NOOP, key: "", sep: "", name: "", ctx: Ctx { ns: a.ctx.ns, target: a.ctx.target, mn: a.ctx.mn, mx: a.ctx.mx, tgt: a.ctx.tgt, cur: 0, t: a.ctx.t } };
   }
-  // desired = ceil(cur * cpu / tgt) = (cur * cpu + tgt - 1) / tgt, clamped.
-  // Each branch restates the expression: the VM binds no locals here, and a
-  // restated expression is still one expression.
-  decision scale(m: hp.MetA) -> hp.Scale {
-    when m.status != 200 || m.c_cur == 0 || m.c_tgt == 0 ->
-      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
-    // below the floor: the floor (minReplicas, or 1 when unset)
-    when m.c_mn >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < m.c_mn && m.c_cur != m.c_mn ->
-      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
-                 val: m.c_mn };
-    when m.c_mn >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < m.c_mn ->
-      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
-    when m.c_mn < 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < 1 && m.c_cur != 1 ->
-      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
-                 val: 1 };
-    when m.c_mn < 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt < 1 ->
-      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
-    // above the ceiling
-    when m.c_mx >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt > m.c_mx && m.c_cur != m.c_mx ->
-      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
-                 val: m.c_mx };
-    when m.c_mx >= 1 && (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt > m.c_mx ->
-      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
-    // within bounds
-    when (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt == m.c_cur ->
-      hp.Scale { cid: m.cid, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+  // One RECOMMENDATION per evaluation, for the window to fold. The clamp is
+  // one expression: floor max(1, minReplicas), ceiling maxReplicas (a huge
+  // one when unset). An evaluation with nothing to go on (no Deployment, no
+  // metric, no target) has an EMPTY key: its own lane, which `apply` ignores.
+  message hp.Rec {
+    key: string = 1;     // <ns>/<target>
+    t: int = 2;
+    desired: int = 3;
+  }
+  decision rec(m: hp.MetA) -> hp.Rec {
+    when m.status != 200 || m.ctx.cur == 0 || m.ctx.tgt == 0 ->
+      hp.Rec { key: "", t: m.ctx.t, desired: 0 };
     default ->
-      hp.Scale { cid: m.cid, op: PATCH, key: m.c_ns, sep: "/", name: m.c_target, path: "spec.replicas",
-                 val: (m.c_cur * m.cpu + m.c_tgt - 1) / m.c_tgt };
+      hp.Rec { key: m.ctx.ns + "/" + m.ctx.target, t: m.ctx.t,
+               desired: math.least(
+                 math.greatest((m.ctx.cur * m.cpu + m.ctx.tgt - 1) / m.ctx.tgt, math.greatest(1, m.ctx.mn)),
+                 m.ctx.mx + (1 - math.least(1, m.ctx.mx)) * 1000000) };
+  }
+  // What the window emits (aggregation `stab`, built by scripts/hpa-agg.sh):
+  // per lane and window, the max recommendation, the latest evaluation's time
+  // and the window's end. Every event touches every window it falls in; ONE
+  // of those spans the whole lookback — the oldest still open, ending within a
+  // step of the event — and only its max is applied.
+  message hp.Stab {
+    key: string = 1;
+    desired: int = 2;
+    tmax: int = 3;
+    wend: int = 4;
+  }
+  enum STEP = 60000;    // the window step (scripts/hpa-agg.sh); size/step stays under 8 panes
+  enum WIN = 300000;    // the window size
+  // Windows start at 0 or later: until the clock passes one window, the one
+  // that starts at 0 (ending at WIN) holds everything seen, and is the one.
+  decision apply(s: hp.Stab) -> hp.Scale {
+    when s.key == "" || s.desired < 1 || (s.wend - s.tmax > STEP && s.wend != WIN) ->
+      hp.Scale { cid: 0, op: NOOP, key: "", sep: "", name: "", path: "", val: 0 };
+    // PATCH is idempotent: an unchanged count spends no revision.
+    default ->
+      hp.Scale { cid: 0, op: PATCH, key: s.key, sep: "", name: "", path: "spec.replicas", val: s.desired };
   }
 
   transformation pass_hpa(h: hp.Hpa) -> hp.Hpa {
-    hp.Hpa { seq: h.seq, rev: h.rev, key: h.key, target: h.target, ns: h.ns, mn: h.mn, mx: h.mx, tgt: h.tgt }
+    hp.Hpa { seq: h.seq, rev: h.rev, key: h.key, target: h.target, ns: h.ns, mn: h.mn, mx: h.mx, tgt: h.tgt, now: h.now }
   }
   transformation pass_dep(a: hp.DepA) -> hp.DepA {
-    hp.DepA { cid: a.cid, status: a.status, value: a.value, c_ns: a.c_ns, c_target: a.c_target,
-              c_mn: a.c_mn, c_mx: a.c_mx, c_tgt: a.c_tgt, cur: a.cur }
+    hp.DepA { cid: a.cid, status: a.status, value: a.value, cur: a.cur, ctx: a.ctx }
   }
   transformation pass_met(m: hp.MetA) -> hp.MetA {
-    hp.MetA { cid: m.cid, status: m.status, value: m.value, c_ns: m.c_ns, c_target: m.c_target,
-              c_mn: m.c_mn, c_mx: m.c_mx, c_tgt: m.c_tgt, c_cur: m.c_cur, cpu: m.cpu }
+    hp.MetA { cid: m.cid, status: m.status, value: m.value, cpu: m.cpu, ctx: m.ctx }
   }
   pipeline rd(h: hp.Hpa) -> hp.DepQ {
     call x = pass_hpa(h);
@@ -153,13 +160,22 @@ module nanocloud.hpa {
     call y = met(x);
     return y;
   }
-  pipeline sc(m: hp.MetA) -> hp.Scale {
+  pipeline rc(m: hp.MetA) -> hp.Rec {
     call x = pass_met(m);
-    call y = scale(x);
+    call y = rec(x);
+    return y;
+  }
+  transformation pass_stab(s: hp.Stab) -> hp.Stab {
+    hp.Stab { key: s.key, desired: s.desired, tmax: s.tmax, wend: s.wend }
+  }
+  pipeline ap(s: hp.Stab) -> hp.Scale {
+    call x = pass_stab(s);
+    call y = apply(x);
     return y;
   }
   entry rd = rd;
   entry mt = mt;
-  entry sc = sc;
+  entry rc = rc;
+  entry ap = ap;
   provenance revision "hpa-closed-loop" toolchain "chronicle-authoring";
 }

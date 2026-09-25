@@ -1,0 +1,253 @@
+// Recovery-authority use for an encrypted volume — the path that rebuilds a
+// volume key on a fresh node when the ordinary grant path cannot, under
+// stronger admission than an attach and audited end to end. As params over
+// ONE record per claim; vr_recover drives it forward, vr_unwind tears down
+// what it acquired, in the detach order, and the two never both write:
+//
+//   /volume-recoveries/<ns>/<pvc>   (flat; written by an operator)
+//     actor approver  who asks, and a DIFFERENT principal who authorises it
+//     device          the fresh recovering node's Kagi device identity
+//     ttl             the ticket's lifetime, 1 … 3600 s (Kagi's ceiling)
+//     ticket          Kagi's one-time recovery ticket id
+//     inst fence ready custodians   the recovery's instance, its lease fence,
+//                     "crypt_block reported ready", the custodians who unwrapped
+//     phase out at tries wake reason note   as every lifecycle record
+//   related: /volume-attachments/<ns>/<pvc> vol phase grant,
+//            /volume-keys/<ns>/<pvc> kvol epoch next
+//
+// Admission, before anything runs: an actor and a second, different approver;
+// the volume itself, not a clone (recover the source); no rotation in flight
+// (a ticket names one epoch); nothing attached; a device that is not the one
+// the grant already names; a ttl Kagi accepts. Then:
+//
+//   rc_audit     AUDIT                   the authorisation is recorded first
+//   rc_ticket    KAGI_RECOVERY_AUTHORISE a one-time ticket for this epoch and
+//                                        device (Kagi op 11, audited by Kagi)
+//   rc_lease     LEASE_ACQUIRE           the writer lease, held as `rc:<claim>`
+//   rc_start     GRAPH_START             loam_volume + crypt_block (attach=1)
+//                                        on the recovering node, quiesced
+//   rc_recipient RECIPIENT               its fresh FXRK recipient
+//   rc_recover   KAGI_RECOVER            Kagi spends the ticket and two
+//                                        custodians unwrap their shares to that
+//                                        recipient (op 12). Fewer than two is
+//                                        `custodians`; no ticket, refused.
+//   rc_unlock    BUNDLE_DELIVER          crypt_block rebuilds the key and
+//                                        verifies the superblock under it
+//   rc_regrant   KAGI_REGRANT            the grant names the recovered node,
+//                                        in place of the one it names now
+//   then vr_unwind, reason `recovered`:
+//   rc_flush · rc_destroy · rc_release   the recovery instance and lease go,
+//                                        in the detach order
+//   rc_grant     ATT_GRANT               the attachment's `grant`: the ordinary
+//                                        attach pipeline serves it from here
+//   recovered
+//
+// No single custodian, this record, Nanocloud or Kagi can rebuild the key:
+// two custodians wrap to a recipient only the recovering node's vault holds.
+// Any refusal ends the record with its reason after the same teardown; the
+// ticket is not reused (a new request is a new ticket).
+module nanocloud.volume_recovery {
+
+  // The shared carry (volume_data_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    epoch: string = 48;
+    actor: string = 54;
+    approver: string = 61;
+    ticket: string = 62;
+    ttl: int = 63;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum MAX_TRIES = 5;
+  enum MAX_TICKET_S = 3600;
+
+  message Rec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    actor: string = 4;
+    approver: string = 5;
+    device: string = 6;
+    phase: string = 7;
+    out: string = 8;
+    reason: string = 9;
+    ticket: string = 10;
+    inst: string = 11;
+    note: string = 12;
+    ttl: int = 50;
+    fence: int = 51;
+    ready: int = 52;
+    custodians: int = 53;
+    at: int = 54;
+    tries: int = 55;
+    wake: int = 56;
+    now: int = 58;
+    vol: string = 70;      // /volume-attachments/<claim> (related, flat)
+    aphase: string = 71;
+    grant: string = 72;
+    kvol: string = 80;     // /volume-keys/<claim>
+    kepoch: string = 81;
+    knext: string = 82;
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision recover(r: Rec) -> Step {
+    when r.reason != "" || r.phase == "recovered" || r.phase == "failed" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // ── admission ──
+    when r.phase == "" && (r.actor == "" || r.approver == "" || r.approver == r.actor) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=authorisation", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && (r.vol == "" || r.kvol != r.vol) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=volume_invalid", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && r.knext != "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=rotation_in_progress", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && r.aphase != "" && r.aphase != "idle" && r.aphase != "detached" && r.aphase != "failed" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=attached", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && (r.device == "" || r.device == r.grant || r.ttl <= 0 || r.ttl > MAX_TICKET_S) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=request_invalid", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── forward ──
+    when r.phase == "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_audit;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "rc_audit", device: r.device, actor: r.actor, approver: r.approver } };
+    when r.phase == "rc_audit" && r.out == "rc_audit:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_ticket;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "rc_ticket", vol: r.vol, device: r.device, epoch: r.kepoch, actor: r.actor, ttl: r.ttl } };
+    when r.phase == "rc_ticket" && r.out == "rc_ticket:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_lease;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_lease", vol: r.vol } };
+    when r.phase == "rc_lease" && r.out == "rc_lease:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_start;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "rc_start", vol: r.vol, device: r.device, fence: r.fence } };
+    when r.phase == "rc_start" && r.out == "rc_start:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_recipient;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_recipient", inst: r.inst } };
+    when r.phase == "rc_recipient" && r.out == "rc_recipient:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_recover;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "rc_recover", vol: r.vol, inst: r.inst, device: r.device, fence: r.fence,
+                        epoch: r.kepoch, ticket: r.ticket } };
+    // Two custodians, exactly: the key is rebuilt from two shares or not at all.
+    when r.phase == "rc_recover" && r.out == "rc_recover:ok" && r.custodians == 2 ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_unlock;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_unlock", inst: r.inst } };
+    when r.phase == "rc_recover" && r.out == "rc_recover:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=rc_recover:custodians", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "rc_unlock" && r.out == "rc_unlock:ready" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_regrant;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "rc_regrant", vol: r.vol, device: r.device, grant: r.grant, actor: r.actor } };
+    // Verified and re-granted: the recovery instance makes way for an attach.
+    when r.phase == "rc_regrant" && r.out == "rc_regrant:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=recovered", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── refusal, retry ──
+    // Every success moved on above; an unavailable service is asked again below.
+    when r.out != "" && r.out != "rc_audit:unavailable" && r.out != "rc_ticket:unavailable" && r.out != "rc_lease:unavailable"
+         && r.out != "rc_start:unavailable" && r.out != "rc_recipient:unavailable" && r.out != "rc_recover:unavailable"
+         && r.out != "rc_unlock:unavailable" && r.out != "rc_regrant:unavailable" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=", v2: r.out, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase != "" && (r.out != "" || r.now >= r.at + TIMEOUT_MS) && r.now >= r.at + RETRY_MS && r.tries < MAX_TRIES ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: r.phase, vol: r.vol, inst: r.inst, device: r.device, grant: r.grant, fence: r.fence,
+                        epoch: r.kepoch, actor: r.actor, approver: r.approver, ticket: r.ticket, ttl: r.ttl } };
+    when r.phase != "" && (r.out != "" || r.now >= r.at + TIMEOUT_MS) && r.now >= r.at + RETRY_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=exhausted:", v2: r.phase, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  // Release only what the record holds, in the detach order: flush, destroy
+  // the instance (its recipient and key handles with it), then the lease.
+  decision unwind(r: Rec) -> Step {
+    when r.reason == "" || r.phase == "recovered" || r.phase == "failed" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // A forward effect still in flight answers first.
+    when r.out == "" && r.now < r.at + TIMEOUT_MS && r.phase != "" && r.phase != "rc_flush" && r.phase != "rc_destroy"
+         && r.phase != "rc_release" && r.phase != "rc_grant" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    when r.ready == 1 && r.phase != "rc_flush" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_flush;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_flush", inst: r.inst } };
+    when r.ready == 1 && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) && r.tries < MAX_TRIES ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_flush", inst: r.inst } };
+    when r.ready == 1 && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "ready=0;note=flush_failed", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.ready == 1 ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    when r.inst != "" && r.phase != "rc_destroy" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_destroy;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_destroy", inst: r.inst } };
+    when r.inst != "" && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_destroy", inst: r.inst } };
+    when r.inst != "" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    when r.fence != 0 && r.phase != "rc_release" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_release;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_release", vol: r.vol, fence: r.fence } };
+    when r.fence != 0 && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) && r.tries < MAX_TRIES ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_release", vol: r.vol, fence: r.fence } };
+    when r.fence != 0 && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "fence=0;note=lease_lapses", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.fence != 0 ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // Recovered: hand the attachment its new grant.
+    when r.reason == "recovered" && r.phase == "rc_grant" && r.out == "rc_grant:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=recovered;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+    when r.reason == "recovered" && (r.phase != "rc_grant" || (r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=rc_grant;out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS, ctx: Ctx { claim: r.key, ph: "rc_grant", device: r.device } };
+    when r.reason == "recovered" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=failed;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline vr_recover(r: Rec) -> Step { call y = recover(r); return y; }
+  pipeline vr_unwind(r: Rec) -> Step { call y = unwind(r); return y; }
+  entry vr_recover = vr_recover;
+  entry vr_unwind = vr_unwind;
+  provenance revision "volume-recovery" toolchain "chronicle-authoring";
+}

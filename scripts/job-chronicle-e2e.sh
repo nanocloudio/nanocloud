@@ -91,30 +91,21 @@ modules:
     expand: "spec.completions"
     expand_tail: 0
     watch: "/pods/"
-  - name: probe
-    type: decision
-    params:
-      decision: "${DEC_PRB}"
   - name: exists
     type: store_effect
+    decision: "${DEC_PRB}"
     key_prefix: "/pods/"
-  - name: launch
-    type: decision
-    params:
-      decision: "${DEC_MK}"
   - name: apply
     type: store_effect
+    decision: "${DEC_MK}"
     key_prefix: "/pods/"
   - name: pods
     type: store_source
     prefix: "/pods/"
     paths: "metadata.ownerReferences.0.kind,status.phase"
-  - name: done
-    type: decision
-    params:
-      decision: "${DEC_DN}"
   - name: mark
     type: store_effect
+    decision: "${DEC_DN}"
     key_prefix: "/job-done/"
   - name: jobstat
     type: store_source
@@ -123,40 +114,25 @@ modules:
     desired: "spec.completions"
     count_children: "/job-done/"
     watch: "/job-done/"
-  - name: status
-    type: decision
-    params:
-      decision: "${DEC_ST}"
   - name: write
     type: store_effect
+    decision: "${DEC_ST}"
     key_prefix: "/job-status/"
 wiring:
   - from: jobs.status
     to: jobs.changes
   - from: jobs.record_out
-    to: probe.record_in
-  - from: probe.result_out
     to: exists.request_in
-    buffer_group: 1
   - from: exists.response_out
-    to: launch.record_in
-  - from: launch.result_out
     to: apply.request_in
-    buffer_group: 2
   - from: pods.status
     to: pods.changes
   - from: pods.record_out
-    to: done.record_in
-  - from: done.result_out
     to: mark.request_in
-    buffer_group: 3
   - from: jobstat.status
     to: jobstat.changes
   - from: jobstat.record_out
-    to: status.record_in
-  - from: status.result_out
     to: write.request_in
-    buffer_group: 4
 YAML
 
 run() { # run <seconds>

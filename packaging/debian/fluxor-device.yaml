@@ -1,95 +1,59 @@
-# device graph: the device_reconciler + cert_manager, cooperating over the
-# shared control-plane store to provision a SPIFFE identity per Device CR.
-# device_reconciler watches /devices.nanocloud.io/, writes a /cert-req/ for each
-# Device; cert_manager mints /cert-resp/ (real in-module X.509 with the SPIFFE
-# URI SAN); device_reconciler projects the identity at
-# /deviceidentities.nanocloud.io/<ns>/<name>. No new capability surface.
+# Device identities as Chronicle params (device.uproc), issued by kagi's
+# certificate_endpoint. A Device names the public key it holds
+# (spec.publicKey); one with no /deviceidentities.nanocloud.io/ entry yet is
+# certified once — POST /pki/certificate through http_effect — and its identity
+# (SPIFFE id, leaf, CA) is written back, and the CA to /ca-cert. The authority
+# signs under the vault key `nanocloud.ca`, the node's one signing root
+# (generated in the vault, sealed under FLUXOR_SEAL_KEY, never exported); no
+# private key is ever issued or stored.
 target: linux
 tick_us: 1000
 
-# Each module self-wires status -> changes (a 1-node cycle) to allocate its
-# store-change sink channel.
 scheduler:
   accept_cycles: true
 
 modules:
-  # The Device identity is PARAMS: PUT the SPIFFE-shaped cert-req, GET the
-  # minted response, GET the CA, PUT the identity — four stages from one
-  # record, every write put-if-changed. Params from modules/app/_chronicle/device.uproc.
   - name: dv_source
     type: store_source
     prefix: "/devices.nanocloud.io/"
-    watch: "/cert-resp/,/ca-cert"
-  - name: dv_req
+    paths: "spec.publicKey"
+    unless: "/deviceidentities.nanocloud.io/"
+  - name: dv_dec
     type: decision
     params:
       # chronicle-source: modules/app/_chronicle/device.uproc rq
-      decision: "002b000000e80001000201000000400100000010030000000000000040020000000100021c00000040030000001201002d40110000000100021d0000004012000000120a00636e3d6465766963653a40040000000100021d00000040050000001205003b646e733d40060000000100021d00000040070000001228003b7370696666653d7370696666653a2f2f6e616e6f636c6f75642e6c6f63616c2f6465766963652f40080000000100021c00000040090000001201002f400a0000000100021d000000400b00000001000203000000401e0000000100021c00000040220000000100021d000000402300000041"
-  - name: dv_reqs
-    type: store_effect
-    key_prefix: "/cert-req/"
-  - name: dv_resp
-    type: decision
-    params:
-      # chronicle-source: modules/app/_chronicle/device.uproc rs
-      decision: "0017000000600001000201000000400100000010010000000000000040020000000100022200000040030000001201002d40110000000100022300000040120000000100021e000000401e00000001000222000000402200000001000223000000402300000041"
-  - name: dv_resps
-    type: store_effect
-    key_prefix: "/cert-resp/"
-    flat: 1
-    paths: "crt"
-  - name: dv_ca
-    type: decision
-    params:
-      # chronicle-source: modules/app/_chronicle/device.uproc cg
-      decision: "010a0000001e000100020200000010c8000000000000002001000228000000120000213000140000005b0001000201000000400100000010010000000000000040020000001208002f63612d6365727440030000000100021e000000401e00000001000222000000402200000001000223000000402300000001000228000000402400000041130000004f00010002010000004001000000100000000000000000400200000012000040030000000100021e000000401e000000010002220000004022000000010002230000004023000000120000402400000041"
-  - name: dv_cacert
-    type: store_effect
-  - name: dv_id
-    type: decision
-    params:
-      # chronicle-source: modules/app/_chronicle/device.uproc idn
-      decision: "01050000000c000100022400000012000021001f000000b00001000201000000400100000010030000000000000040020000000100021e00000040030000001227007370696666653d7370696666653a2f2f6e616e6f636c6f75642e6c6f63616c2f6465766963652f40040000000100022200000040050000001201002f40060000000100022300000040070000001205003b6372743d40080000000100022400000040090000001204003b63613d400a00000001000203000000400b000000120000400c000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+      decision: "01050000000c000100020400000012000020001f0000007a000100020100000040010000001000000000000000004002000000120000400300000012000040080000001200004009000000120000400a000000120000400b000000120000400c000000120000400d000000120000400e000000120000400f00000012000040100000000100020300000042011e40fe0000004123000000da0001000201000000400100000010030000000000000040020000001210002f706b692f636572746966696361746540030000001216007b227375626a656374223a22434e3d6465766963653a40080000000100021d0000004009000000120c00222c2274656e616e74223a22400a0000000100021c000000400b000000120c00222c22646576696365223a22400c0000000100021d000000400d000000121000222c227075626c69635f6b6579223a22400e00000001000204000000400f000000120200227d40100000000100020300000042011e40fe00000041"
+  - name: dv_http
+    type: http_effect
+    paths: "certificate,ca,spiffe_id"
+  - name: certificate_endpoint
+    issuer_cn: "nanocloud-ca"
+    trust_domain: "nanocloud.local"
+    dns_suffix: ".svc.cluster.local"
+    key_label: "nanocloud.ca"
   - name: dv_ids
     type: store_effect
+    # chronicle-source: modules/app/_chronicle/device.uproc idn
+    decision: "010a0000001e000100020200000010c80000000000000020010002040000001200002130001e00000087000100020100000040010000001003000000000000004002000000010002fe000000021e00000040030000001207007370696666653d40040000000100020600000040050000001205003b6372743d40060000000100020400000040070000001204003b63613d40080000000100020500000040090000000100020500000042011f40fe00000041180000005e000100020100000040010000001000000000000000004002000000120000400300000012000040040000001200004005000000120000400600000012000040070000001200004008000000120000400900000012000042011f40fe00000041"
     key_prefix: "/deviceidentities.nanocloud.io/"
-  # DEVELOPMENT DECLARATION, not a preference. `cert_manager` refuses to
-  # construct without it — see the development gate in its `mod.rs`. It
-  # regenerates its CA at every startup, returns leaf PRIVATE KEYS as
-  # plaintext hex on the control-plane store, and lets the caller choose its own
-  # CN/DNS/SPIFFE. A deployment issues from kagi's `certificate_endpoint`.
-  #
-  # It stands only because nothing else answers the `/cert-req/` seam
-  # `device_reconciler` writes to, and removing an issuer before its
-  # replacement exists is a regression rather than a fix. What the flag buys
-  # is that any graph naming this module fails closed instead of quietly
-  # inheriting an issuing authority.
-  - name: cert_manager
-    params:
-      development: 1
+  - name: dv_ca
+    type: store_effect
+    # chronicle-source: modules/app/_chronicle/device.uproc cap
+    decision: "011000000035000100020200000010c8000000000000002501000202000000102c010000000000002230010002fe000000021f0000001200002130000c0000003c0001000201000000400100000010030000000000000040020000001208002f63612d636572744003000000010002fe000000021f0000004004000000410a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000400400000041"
 
 wiring:
   - from: dv_source.status
     to: dv_source.changes
   - from: dv_source.record_out
-    to: dv_req.record_in
-  - from: dv_req.result_out
-    to: dv_reqs.request_in
-    buffer_group: 121
-  - from: dv_reqs.response_out
-    to: dv_resp.record_in
-  - from: dv_resp.result_out
-    to: dv_resps.request_in
-    buffer_group: 122
-  - from: dv_resps.response_out
-    to: dv_ca.record_in
-  - from: dv_ca.result_out
-    to: dv_cacert.request_in
-    buffer_group: 123
-  - from: dv_cacert.response_out
-    to: dv_id.record_in
-  - from: dv_id.result_out
+    to: dv_dec.record_in
+  - from: dv_dec.result_out
+    to: dv_http.request_in
+  # The certificate call: one exchange per record, http_effect the requester.
+  - from: dv_http.request_out
+    to: certificate_endpoint.request_in
+  - from: certificate_endpoint.response_out
+    to: dv_http.response_in
+  - from: dv_http.response_out
     to: dv_ids.request_in
-    buffer_group: 124
-  - from: cert_manager.status
-    to: cert_manager.changes
+  - from: dv_ids.response_out
+    to: dv_ca.request_in

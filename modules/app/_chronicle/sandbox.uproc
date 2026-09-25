@@ -1,0 +1,268 @@
+// The container runtime's DECISIONS as params, over the `workload_effect`
+// connector (which performs the ops, holds the live handles and reports what it
+// observes).
+//
+//   spec   /sandboxes/<id> (phase, cmd, rootfs, iso, net, tasks) against its
+//          /sandbox-status/: CREATE when it has no workload under this boot
+//          (an own-network sandbox waits for its /ipam-lease/; a sandbox
+//          naming volumes waits until each is bound, /volume-binds/), START a
+//          created one whose phase is start, DESTROY one whose phase is delete
+//   exec   /sandbox-exec/<id>/<req> with no result -> EXEC in sandbox <id>
+//   kill   /sandbox-kill/<id> sig=term|kill -> SIGNAL
+//   pause  /sandbox-pause/<id> pause|resume -> PAUSE / RESUME
+//   tty    /tty/<id>/<sid>/ctl open|close -> the pty session; /in -> its input
+//   ev     what the connector reports -> /sandbox-status/<id> (state, code)
+//          and the boot it holds under (/sandbox-boot-of/<id>), /sandbox-logs/<id> and /tty/…/out (bounded tails),
+//          /sandbox-exec-result/ (+ -output/), /tty/…/status, /sandbox-boot;
+//          consumed pty input is cleared (conditional on its revision)
+//
+// A status recorded under another boot describes a workload that no longer
+// exists — the node restarted — so the sandbox is created again, as a runtime
+// with an empty table would.
+module nanocloud.sandbox {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: Op
+  message Ctx {
+    tag: string = 30;
+  }
+  // carried by: TOp, Ev, W, Done
+  message Ctx2 {
+    key: string = 30;
+    rev: int = 31;
+    out: string = 32;
+    tag: string = 33;
+    id: string = 34;
+    boot: string = 35;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum APPEND = 11;
+  enum CREATE = 1;
+  enum START = 2;
+  enum DESTROY = 3;
+  enum SIGNAL = 4;
+  enum PAUSE = 5;
+  enum RESUME = 6;
+  enum EXEC = 7;
+  enum TTY_OPEN = 8;
+  enum TTY_CLOSE = 9;
+  enum TTY_IN = 10;
+
+  message Spec {
+    seq: int = 1;
+    key: string = 3;
+    phase: string = 4;
+    cmd: string = 5;
+    rootfs: string = 6;
+    iso: string = 7;
+    net: string = 8;
+    tasks: string = 9;
+    bound: int = 22;       // /volume-binds/<id>-* present
+    binds: string = 56;    // their values
+    st: string = 70;       // /sandbox-status/ state
+    sboot: string = 120;   // /sandbox-boot-of/: the boot it was recorded under
+    lease: string = 80;    // /ipam-lease/<id>
+    pfx: string = 90;      // /ipam-pool, its prefix length
+    boot: string = 100;    // /sandbox-boot: this runtime's
+    nvol: int = 110;       // /pod-specs/<id> volumes, counted
+  }
+  message Op {
+    cid: int = 1;
+    op: int = 2;
+    id: string = 3;
+    a4: string = 4; a5: string = 5; a6: string = 6; a7: string = 7;
+    a8: string = 8; a9: string = 9; a10: string = 10;
+    rev: int = 11;
+    ctx: Ctx = 254;
+  }
+  decision spec(s: Spec) -> Op {
+    when s.phase == "delete" && s.st != "" && s.st != "destroyed" && s.sboot == s.boot ->
+      Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != "" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
+           a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && s.bound >= s.nvol && s.net != "own" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
+           a8: "", a9: "", a10: s.binds, rev: 0, ctx: Ctx { tag: "" } };
+    when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
+      Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    default ->
+      Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+  }
+
+  message Req {            // /sandbox-exec/, /sandbox-kill/, /sandbox-pause/
+    seq: int = 1;
+    rev: int = 2;          // exec: the request's revision (source `rev = 1`)
+    key: string = 3;
+    val: string = 4;       // the whole value
+    first: string = 28;    // the sandbox id (the tail's first segment)
+    st: string = 70;       // exec: that sandbox's state (related ^1)
+    phase: string = 80;    // exec: its desired phase — "" when there is no such sandbox
+  }
+  // An exec waits for its sandbox to be running; one for a sandbox that does
+  // not exist, or has ended, is answered (255) rather than left to hang.
+  decision exec(r: Req) -> Op {
+    when r.phase != "" && r.phase != "delete" && (r.st == "" || r.st == "created") ->
+      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    default ->
+      Op { cid: r.seq, op: EXEC, id: r.first, a4: r.val, a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: r.rev, ctx: Ctx { tag: r.key } };
+  }
+  decision sig(r: Req) -> Op {
+    when r.val == "sig=term" ->
+      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "term", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    when r.val == "sig=kill" ->
+      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "kill", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    when r.val == "pause" ->
+      Op { cid: r.seq, op: PAUSE, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    when r.val == "resume" ->
+      Op { cid: r.seq, op: RESUME, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+    default ->
+      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+  }
+
+  message Tty {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // <id>/<sid>/<leaf>
+    val: string = 4;       // the whole value
+    rows: string = 5;
+    cols: string = 6;
+    cmd: string = 7;
+    first: string = 28;    // the sandbox id
+    st: string = 70;       // the session's status (sibling key)
+  }
+  message TOp {
+    cid: int = 1;
+    op: int = 2;
+    id: string = 3;
+    a4: string = 4; a5: string = 5; a6: string = 6; a7: string = 7;
+    rev: int = 11;
+    ctx: Ctx2 = 254;
+  }
+  decision tty(t: Tty) -> TOp {
+    when t.key.endsWith("/ctl") && t.val.startsWith("open") && t.st != "open"
+         && !t.st.startsWith("exited") && !t.st.startsWith("failed") ->
+      TOp { cid: t.seq, op: TTY_OPEN, id: t.key.substring(0, size(t.key) - 4),
+            a4: t.first, a5: t.rows, a6: t.cols, a7: t.cmd, rev: 0, ctx: Ctx2 { key: "", rev: 0 } };
+    when t.key.endsWith("/ctl") && t.val.startsWith("close") ->
+      TOp { cid: t.seq, op: TTY_CLOSE, id: t.key.substring(0, size(t.key) - 4),
+            a4: "", a5: "", a6: "", a7: "", rev: 0, ctx: Ctx2 { key: "", rev: 0 } };
+    when t.key.endsWith("/in") && t.val != "" ->
+      TOp { cid: t.seq, op: TTY_IN, id: t.key.substring(0, size(t.key) - 3),
+            a4: t.val, a5: "", a6: "", a7: "", rev: t.rev, ctx: Ctx2 { key: t.key, rev: t.rev } };
+    default ->
+      TOp { cid: t.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", rev: 0, ctx: Ctx2 { key: "", rev: 0 } };
+  }
+
+  message Ev {
+    cid: int = 1;
+    kind: int = 2;
+    id: string = 3;
+    label: string = 4;
+    bytes: string = 6;
+    boot: string = 7;
+    code: string = 8;
+// an exec request's name / a pty input key
+    ctx: Ctx2 = 254;
+  }
+  message W {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    rev: int = 28;
+    ctx: Ctx2 = 254;
+  }
+  decision ev(e: Ev) -> W {
+    when e.kind == 1 ->
+      W { cid: e.cid, op: PUT, key: "/sandbox-status/", k2: e.id, k3: "",
+          v1: "state=", v2: e.label, v3: ";code=", v4: e.code, v5: "", v6: "",
+          rev: 0, ctx: Ctx2 { out: "", tag: "", id: e.id, boot: e.boot } };
+    when e.kind == 2 ->
+      W { cid: e.cid, op: APPEND, key: "/sandbox-logs/", k2: e.id, k3: "",
+          v1: e.bytes, v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    when e.kind == 3 ->
+      W { cid: e.cid, op: PUT, key: "/sandbox-exec-result/", k2: e.ctx.key, k3: "",
+          v1: e.code, v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: e.bytes, tag: e.ctx.key, id: "", boot: "" } };
+    when e.kind == 4 ->
+      W { cid: e.cid, op: APPEND, key: "/tty/", k2: e.id, k3: "/out",
+          v1: e.bytes, v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    when e.kind == 5 && e.label == "exited" ->
+      W { cid: e.cid, op: PUT, key: "/tty/", k2: e.id, k3: "/status",
+          v1: "exited;code=", v2: e.code, v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    when e.kind == 5 ->
+      W { cid: e.cid, op: PUT, key: "/tty/", k2: e.id, k3: "/status",
+          v1: e.label, v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    when e.kind == 6 ->
+      W { cid: e.cid, op: PUT, key: "/sandbox-boot", k2: "", k3: "",
+          v1: "id=", v2: e.boot, v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    when e.kind == 7 ->
+      W { cid: e.cid, op: DELETE, key: "/tty/", k2: e.ctx.key, k3: "",
+          v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", rev: e.ctx.rev, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+    default ->
+      W { cid: e.cid, op: NOOP, key: "", k2: "", k3: "",
+          v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
+  }
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx2 = 254;
+  }
+  message W2 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4;
+  }
+  decision evout(d: Done) -> W2 {
+    when d.ctx.tag != "" && d.ctx.out != "" ->
+      W2 { cid: d.cid, op: PUT, key: "/sandbox-exec-output/", k2: d.ctx.tag, v1: d.ctx.out };
+    // The boot a status was recorded under, beside it (the status itself stays
+    // `state=;code=` for every reader of it).
+    when d.ctx.id != "" && d.ctx.boot != "" ->
+      W2 { cid: d.cid, op: PUT, key: "/sandbox-boot-of/", k2: d.ctx.id, v1: d.ctx.boot };
+    default -> W2 { cid: d.cid, op: NOOP, key: "", k2: "", v1: "" };
+  }
+
+  transformation t_spec(s: Spec) -> Spec {
+    Spec { seq: s.seq, key: s.key, phase: s.phase, cmd: s.cmd, rootfs: s.rootfs, iso: s.iso,
+           net: s.net, tasks: s.tasks, bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
+           lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol }
+  }
+  transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }
+  transformation t_tty(t: Tty) -> Tty {
+    Tty { seq: t.seq, rev: t.rev, key: t.key, val: t.val, rows: t.rows, cols: t.cols, cmd: t.cmd,
+          first: t.first, st: t.st }
+  }
+  transformation t_ev(e: Ev) -> Ev {
+    Ev { cid: e.cid, kind: e.kind, id: e.id, label: e.label, bytes: e.bytes, boot: e.boot,
+         code: e.code, ctx: e.ctx }
+  }
+  transformation t_done(d: Done) -> Done {
+    Done { cid: d.cid, status: d.status, ctx: d.ctx }
+  }
+  pipeline sb_spec(s: Spec) -> Op { call x = t_spec(s); call y = spec(x); return y; }
+  pipeline sb_exec(r: Req) -> Op { call x = t_req(r); call y = exec(x); return y; }
+  pipeline sb_sig(r: Req) -> Op { call x = t_req(r); call y = sig(x); return y; }
+  pipeline sb_tty(t: Tty) -> TOp { call x = t_tty(t); call y = tty(x); return y; }
+  pipeline sb_ev(e: Ev) -> W { call x = t_ev(e); call y = ev(x); return y; }
+  pipeline sb_evout(d: Done) -> W2 { call x = t_done(d); call y = evout(x); return y; }
+  entry sb_spec = sb_spec;
+  entry sb_exec = sb_exec;
+  entry sb_sig = sb_sig;
+  entry sb_tty = sb_tty;
+  entry sb_ev = sb_ev;
+  entry sb_evout = sb_evout;
+  provenance revision "sandbox-runtime" toolchain "chronicle-authoring";
+}

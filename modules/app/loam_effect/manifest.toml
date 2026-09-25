@@ -1,0 +1,143 @@
+name = "loam_effect"
+version = "0.1.0"
+description = "Chronicle connector for Loam — a volume effect in, admin-wire jobs out, the typed outcome back as a record"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The encrypted-volume pipelines' effector for Loam (docs/design/
+# encrypted-volumes.md). It decides nothing: it runs the op a record names as
+# a job of Loam admin-wire exchanges (`_shared/loam_ops.rs`, over loam-common's
+# own codecs) and answers the outcome the pipeline maps.
+#
+# Loam's admin plane is its `admin_gate`, reached the way a node's volume
+# graph reaches it: `admin_out` / `admin_in` are net_proto to and from the
+# clear side of a client-mode `tls` under this node's certificate, which
+# dials the gate (`admin`). Before any request the session presents this
+# node's capability (`capability`, a file of `fxcap1.` chains, one per line,
+# minted by the operator from the mesh root) through loam-common's
+# `admin_client`; the gate admits each request only under a grant the
+# session holds. The capability must grant `read_state,send_command` on
+# `<root>/` and on the body plane's object (the node's volume graphs, which
+# present the same file, read bodies back). A session that
+# ends is dialed again after a second, the capability file read again, and
+# an effect in flight or arriving meanwhile waits for the next session
+# within `timeout_ms` (its current request sent again: every step is
+# idempotent at the gate). Only when no session will help without an
+# operator is an effect answered at once: `refused` while the gate refuses
+# this node's capability (dialed again after thirty seconds), `unavailable`
+# while the file cannot be read. The gate binds a lease to the certificate
+# that took it, so a node runs its own lease ops, under the certificate its
+# volume graphs use; the control plane its creates, snapshots and deletes.
+#
+# Parameters:
+# | Tag | Name         | Type | Default | Description |
+# |-----|--------------|------|---------|-------------|
+# | 1   | lease_ttl_ms | u32  | 30000   | The lease a LEASE_ACQUIRE / RENEW asks for; within the capability's life, or the gate refuses it |
+# | 2   | extent       | u32  | 4096    | A created volume's extent size |
+# | 3   | timeout_ms   | u32  | 10000   | An effect unanswered this long is `unavailable` |
+# | 4   | admin        | str  | —       | The gate's `host:port`; required |
+# | 5   | capability   | str  | —       | Path of this node's capability file; required |
+# | 6   | root         | str  | —       | The namespace root every volume lives under; required |
+#
+# In (`request_in`, a Chronicle record; a byte stream, self-framed, or a
+# mailbox):
+#   1 cid (i64)  2 op (i64)  3 key: the claim  4..8 a1..a5  9 n1 (i64)  10 n2
+#   254 carry, echoed
+# Ops:
+#   1  LEASE_ACQUIRE   a1 vol            -> fence (5), lease_exp (6)
+#   2  LEASE_RENEW     a1 vol, n1 fence  -> lease_exp (6); lost
+#   3  LEASE_RELEASE   a1 vol, n1 fence  -> ok; lost
+#   (a5 `recovery`: held by the recovery's owner `rc:<claim>`)
+#   30 LOAM_CREATE     a1 namespace, a2 pvc, a3 size (a Kubernetes quantity
+#                      of bytes: 1048576, 64Mi, 1Gi, 500M) -> vol (10)
+#   73 LOAM_SNAPSHOT   a1 vol, a2 snapshot key `<ns>/<pvc>/<snapshot>`
+#                      -> r1 the snapshot's volume
+#   74 LOAM_RESTORE    a1 snapshot volume, a2 target claim `<ns>/<pvc>`
+#                      -> r1 the clone
+#   76 LOAM_SNAP_DELETE a1 snapshot key  -> ok
+#   82 LOAM_DELETE     a1 vol            -> ok; held while a writer holds it
+#   Any other op is not Loam's and is dropped unanswered.
+# Out (`response_out`): the pipelines' Outcome, every field present:
+#   1 cid 2 op 3 key 4 code 5 fence 6 lease_exp 7 exp 8 inst 9 dev 10 vol
+#   11 set 12 grant 13 n 14 r1 15 r2 16 r3, 254 carry
+# Codes: ok held lost refused failed unavailable; `refused` is also every
+# effect's answer while the gate refuses this node's capability, and
+# `unavailable` while the session is down or the module lacks a parameter.
+#
+# A volume is `<root>:/<ns>/volumes/<pvc>` and a snapshot
+# `<root>:/<ns>/snapshots/<pvc>/<snapshot>`: one root for the cluster, so one
+# grant covers every namespace. A lease's holder is the first 16 bytes of
+# sha256(claim), or of `rc:<claim>` for a recovery: the node volume graph's
+# `loam_volume` takes the same holder and so re-acquires the flow's own
+# lease. A create, delete or bind takes its short lease under a holder of
+# its own, so a live writer lease refuses it (`held`). `lease_exp` is on this
+# node's monotonic clock (store_source's `now`), sent plus the lease's ttl.
+# A snapshot is answered without the epochs its root uses (Loam cannot read
+# them without the key); the pipeline keeps its write-ahead pin.
+#
+# One job in flight. An ack whose correlation is not the job's is discarded;
+# a job unanswered for `timeout_ms` is answered `unavailable`.
+timer_class = "wall_clock"
+
+# Loam's capacity profile (loam-common `mechanics/loam_limits.rs`): the admin
+# wire and volume-map codecs this module compiles size themselves from it, so
+# it builds one variant per profile, as Loam's own modules do. `node` — a
+# single host daemon, the profile Loam's Linux service runs — is the default;
+# a graph whose Loam runs another picks it with `variant: <profile>`.
+[[variant]]
+name = "node"
+features = ["node"]
+default = true
+
+[[variant]]
+name = "embedded"
+features = ["embedded"]
+
+[[variant]]
+name = "minimal"
+features = ["minimal"]
+
+[[variant]]
+name = "server"
+features = ["server"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "admin_in"
+direction = "input"
+index = 1
+content_type = "OctetStream"
+buffer_size = 131072
+required = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+[[ports]]
+name = "admin_out"
+direction = "output"
+index = 1
+content_type = "OctetStream"
+buffer_size = 131072
+required = true
+
+# The capability file.
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
+[observability]
+exempt = "connector — each job's outcome is a record in the store; the transport is observed at tls, the session's grants at Loam's admin_gate"

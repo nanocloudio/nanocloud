@@ -1,0 +1,6 @@
+# NBD devices a node publishes encrypted volumes on (volume_host): each
+# request carries at most 128 KiB and at most four are queued. nbd-client
+# attaches with a 30 s I/O timeout, timed from when a request is sent; the
+# kernel's defaults (4 MiB requests, 256 queued) send far more than a remote
+# volume commits in that time, and the requests sent last time out and fail.
+ACTION=="add|change", KERNEL=="nbd[0-9]*", SUBSYSTEM=="block", ATTR{queue/max_sectors_kb}="128", ATTR{queue/nr_requests}="4"

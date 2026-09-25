@@ -8,9 +8,11 @@
 // `list_item`/`list_join` do while walking the children. The per-element
 // transform is a property of the WALK, not a computation over a list.
 //
-// It reads `/endpointslices/<ns>/<svc>/<pod>` — one key per backend, each
-// holding a bare address — rather than the folded `/endpoints/` document, for
-// the same reason the route compiler does: the elements are already separate.
+// `/endpoints/` drives the walk — one record per Service — but the addresses
+// come from its `/endpointslices/<ns>/<svc>/<pod>` children, one key per
+// backend each holding a bare address, for the same reason the route compile
+// reads them: the elements are already separate, so decorating them is a walk
+// rather than a parse of the folded document.
 module nanocloud.servicedns {
 
   message dns.Svc {

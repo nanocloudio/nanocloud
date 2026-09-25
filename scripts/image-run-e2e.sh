@@ -3,10 +3,10 @@
 # spec carrying `image=` drives pull → verify → assemble → run, all fmods:
 #
 #   the pod chain   image= → /image-requests/ (pull trigger) + Pending gate
-#   image_fetcher    manifest + blobs from the registry → verified blob cache
-#   image_puller     the missing-layer plan (drains as blobs land)
-#   image_assembler  drained plan → assembly job → /image-rootfs/ ready
-#   sandbox_runner   runs the assembly job, then the pod itself (pivot_root)
+#   image.uproc      index → manifest → config + layers over http_fetch →
+#                    verified blob cache
+#   image_asm.uproc  every layer cached → assembly job → /image-rootfs/ ready
+#   sandbox chain    runs the assembly job, then the pod itself (pivot_root)
 #
 # The script plays the registry (docker-v2 stub) and authors a REAL runnable
 # image, in the shape a real registry serves it:
@@ -21,7 +21,8 @@
 # with the whiteout applied in the assembled rootfs.
 #
 # Needs passwordless sudo (pivot_root/mknod): the RUNTIME runs under sudo,
-# exactly as the production node service does (root).
+# exactly as the production node service does (root). Without it the suite
+# skips, and NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,13 +30,20 @@ MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
 PORT=5392
 
 . "$ROOT/scripts/fluxor-env.sh"
+# The container runtime, as the packaged sandbox graph states it.
+SANDBOX_MODS="$(python3 "$ROOT/scripts/support/sandbox-block.py" mods)"
+SANDBOX_WIRE="$(python3 "$ROOT/scripts/support/sandbox-block.py" wire)"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-sudo -n true 2>/dev/null || { echo "SKIP: passwordless sudo unavailable (pivot_root needs root)"; exit 0; }
-for m in image_fetcher image_puller image_assembler store_source store_effect decision sandbox_runner; do
+skip() {
+  [ "${NANOCLOUD_REQUIRE_E2E:-}" = "1" ] && { echo "FAIL: $1"; exit 1; }
+  echo "SKIP: $1"; exit 0
+}
+sudo -n true 2>/dev/null || skip "passwordless sudo unavailable (pivot_root needs root)"
+for m in http_fetch store_source store_effect decision workload_effect; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -250,6 +258,11 @@ PY2
 }
 CHAIN_MODS="$(chain_part mods)"
 CHAIN_WIRE="$(chain_part wire)"
+# The packaged pull chain too, pointed at the stub and the temp cache.
+PULL="$(sed -e "s#registry.nanocloud.io:5000#127.0.0.1:$PORT#" -e "s#/var/lib/nanocloud.io/image/blobs#$D/blobcache#" \
+  "$ROOT/packaging/debian/fluxor-imagepull.yaml")"
+PULL_MODS="$(printf '%s\n' "$PULL" | sed -n '/^modules:/,/^wiring:/p' | sed '1d;$d')"
+PULL_WIRE="$(printf '%s\n' "$PULL" | sed -n '/^wiring:/,$p' | sed '1d')"
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -258,38 +271,24 @@ platform:
 scheduler:
   accept_cycles: true
 modules:
-  - name: image_puller
-  - name: image_fetcher
-    authority: "127.0.0.1:$PORT"
-    blob_dir: "$D/blobcache"
-    chunk_bytes: 0
-    boot_delay_ms: 200
-  - name: image_assembler
-    script: "$D/assemble-image.sh"
-    rootfs_base: "$D/rootfs"
-    blob_dir: "$D/blobcache"
-  - name: sandbox_runner
+${PULL_MODS}
+${SANDBOX_MODS}
 ${CHAIN_MODS}
 wiring:
-  - from: linux_net.net_out
-    to: image_fetcher.net_in
-  - from: image_fetcher.net_out
-    to: linux_net.net_in
-  - from: image_puller.status
-    to: image_puller.changes
-  - from: image_fetcher.status
-    to: image_fetcher.changes
-  - from: image_assembler.status
-    to: image_assembler.changes
-  - from: sandbox_runner.status
-    to: sandbox_runner.changes
+${PULL_WIRE}
+${SANDBOX_WIRE}
 ${CHAIN_WIRE}
 YAML
 
 echo "== 4. build config + module table; seed the image-backed pod =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 # No `cmd=`: argv must come from the image config the fetcher pulls.
-wal_put "/pod-specs/pod-img-1" "image=testapp;iso=1;desired=running;restart=never"
+# Where assembly runs, for this test (the packaged paths otherwise).
+wal_put "/config/image" "script=$D/assemble-image.sh;rootfs=$D/rootfs;blobs=$D/blobcache"
+# A volume: a host directory, bound read-only into the container at /data.
+mkdir -p "$D/voldata" && echo "from-the-host" >"$D/voldata/note"
+wal_put "/volumes/data" "path=$D/voldata"
+wal_put "/pod-specs/pod-img-1" "image=testapp;iso=1;desired=running;restart=never;volumes=data:/data:ro"
 
 echo "== 5. run the graph (as root — pivot_root) until the pod terminates =="
 sudo -n env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
@@ -307,7 +306,7 @@ for i in $(seq 1 120); do
 done
 sudo -n kill "$RUNTIME_PID" 2>/dev/null || true
 RUNTIME_PID=""
-[ "$phase" = "Succeeded" ] || fail "pod never Succeeded: status='$(wal_last "/pod-lifecycle-status/pod-img-1")' cfg='$(wal_last "/image-config/testapp")' man='$(wal_last "/image-manifests/testapp")' rootfs='$(wal_last "/image-rootfs/testapp")' plan='$(wal_last "/image-pull-plan/testapp")' sbx='$(wal_last "/sandbox-status/pod-img-1")' asmjob='$(wal_last "/sandboxes/img-asm-testapp")' asmst='$(wal_last "/sandbox-status/img-asm-testapp")' asmlog='$(wal_last "/sandbox-logs/img-asm-testapp")'"
+[ "$phase" = "Succeeded" ] || fail "pod never Succeeded: status='$(wal_last "/pod-lifecycle-status/pod-img-1")' cfg='$(wal_last "/image-config/testapp")' man='$(wal_last "/image-manifests/testapp")' rootfs='$(wal_last "/image-rootfs/testapp")' sbx='$(wal_last "/sandbox-status/pod-img-1")' asmjob='$(wal_last "/sandboxes/img-asm-testapp")' asmst='$(wal_last "/sandbox-status/img-asm-testapp")' asmlog='$(wal_last "/sandbox-logs/img-asm-testapp")'"
 
 echo "== 6. verify every stage of the chain =="
 req="$(wal_last "/image-requests/testapp")"
@@ -327,8 +326,8 @@ case "$sbx" in
   "cmd=/bin/hello-static --ignored;"*) echo "   argv came from the image (Entrypoint ++ Cmd), not the pod spec" ;;
   *) fail "sandbox argv not config-derived: '$sbx'" ;;
 esac
-plan="$(wal_last "/image-pull-plan/testapp")"
-[ "$plan" = "pull=" ] || fail "plan not drained: '$plan'"
+[ -n "$(wal_last "/image-layer-ok/testapp-0")" ] && [ -n "$(wal_last "/image-layer-ok/testapp-1")" ] \
+  || fail "layers not all marked cached"
 # Blob files + rootfs are root-owned (the runtime runs as root) — check via sudo.
 for dg in "$D1" "$D2"; do
   got="$(sudo -n sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
@@ -346,6 +345,8 @@ case "$logs" in
   *hello-from-image*) echo "   container ran: logs carry 'hello-from-image'" ;;
   *) fail "sandbox logs wrong: got '$logs', want 'hello-from-image'" ;;
 esac
+[ "$(wal_last /volume-binds/pod-img-1/0)" = "$D/voldata:/data:ro" ] || fail "volume bind row: '$(wal_last /volume-binds/pod-img-1/0)'"
+echo "   volume: $D/voldata bound read-only at /data (the pod ran with it)"
 asm="$(wal_last "/sandbox-status/img-asm-testapp")"
 case "$asm" in
   *destroyed*|*exited*) echo "   assembly job torn down ($asm)" ;;

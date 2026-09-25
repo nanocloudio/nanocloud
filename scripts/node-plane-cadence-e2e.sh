@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Node-plane cadence E2E — proves the payoff of converting
-# pod_lifecycle + probe_runner from timer_class="tick_counted" to "wall_clock":
+# pod_lifecycle + the probe chain from timer_class="tick_counted" to "wall_clock":
 # the kubelet-side liveness plane is now admissible on a variable-cadence domain
 # and relaxes when idle, just like the reconciler plane.
 #
 # Two proofs (both independent of the 0x1B EXEC/READ seam, so this does not
-# depend on the sandbox_runner workload path):
-#   1. ADMISSIBILITY — fluxor-node-adaptive.yaml (the pod-lifecycle chain + probe_runner on
+# depend on the sandbox runtime workload path):
+#   1. ADMISSIBILITY — fluxor-node-adaptive.yaml (the pod-lifecycle chain + the probe chain on
 #      a mechanism-(b) domain) builds. Before the wall_clock conversion the gate
 #      rejected these tick_counted modules outright; now they pass.
 #   2. RELAXATION — booted idle on an empty store, the plane parks far below the
@@ -27,7 +27,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -36,13 +36,13 @@ WINDOW="${NC_CADENCE_WINDOW:-4}"
 
 vctx() { awk '/^voluntary_ctxt_switches:/{print $2}' "/proc/$1/status" 2>/dev/null; }
 
-echo "== 1. admissibility: build pod_lifecycle + probe_runner on a variable-cadence domain =="
+echo "== 1. admissibility: build the pod-lifecycle and probe chains on a variable-cadence domain =="
 D="$(mktemp -d /tmp/nc-node-cad-XXXXXX)"
 if ! nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin" >"$D/build.log" 2>&1; then
-  echo "FAIL: the node/liveness plane did not build on an adaptive domain — is every module (store_source/store_effect/decision/probe_runner) still attesting a timer_class?"; tail -20 "$D/build.log"; rm -rf "$D"; exit 1
+  echo "FAIL: the node/liveness plane did not build on an adaptive domain — is every module (store_source/store_effect/decision) still attesting a timer_class?"; tail -20 "$D/build.log"; rm -rf "$D"; exit 1
 fi
 echo "   ok: the whole node plane admitted on domain main (adaptive_flags=3) — the"
-echo "       pod-lifecycle CHAIN and probe_runner, every engine attesting its timer_class"
+echo "       pod-lifecycle and probe CHAINS, every engine attesting its timer_class"
 
 echo "== 2. relaxation: boot idle (empty store), measure voluntary context switches =="
 : > "$D/store.log"

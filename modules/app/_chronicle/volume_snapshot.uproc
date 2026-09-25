@@ -1,0 +1,211 @@
+// Snapshots of an encrypted volume, and restore into a clone — as params over
+// ONE record per snapshot:
+//
+//   /volume-snapshots/<ns>/<pvc>/<snap>   (flat; written by an operator or the
+//                                          VolumeSnapshot controller)
+//     desired     retained | deleted
+//     retain      a monotonic ms deadline: the snapshot is deleted then (0: never)
+//     restore     a claim `<ns>/<pvc>` to restore into, as a new clone
+//     restored    the claim it last restored into
+//     root        the snapshot's manifest; elo ehi  the lowest and highest key
+//                 epoch its pinned root needs; kvol the key resource
+//     clone       the clone's Loam volume
+//     phase out at tries wake reason note   as every lifecycle record
+//   related (the key's parent, `<ns>/<pvc>`): /volume-attachments/ vol phase
+//     inst device, /volume-keys/ kvol epoch next,
+//     /volume-deletions/ phase
+//
+//   (open)     —              the PIN, write-ahead: elo..ehi = the epochs the
+//                             volume's key record names now (both during a
+//                             rotation) — before anything is captured, so a
+//                             rotation's retirement scan or a deletion's pin
+//                             scan that runs from here on sees it
+//   s_flush    FLUSH          if attached: crypt_block and the Loam commit, so
+//                             the committed root holds what was acknowledged
+//   s_capture  LOAM_SNAPSHOT  one bind of the committed root under the
+//                             snapshot root; answers the exact epochs that
+//                             root's units use, which replace the pin
+//   retained   —              held until `desired=deleted` or `retain` passes
+//   s_clone    LOAM_RESTORE   `restore`: the manifest bound into a fresh root
+//                             (a clone; no bytes move)
+//   s_identity CLONE_PERSIST  the clone's attachment identity (the source's fs,
+//                             access mode, grant and recovery set, read from
+//                             the source attachment and carried to the
+//                             effect) and key record: the source's key
+//                             resource, epoch=elo, next=ehi —
+//                             the attach pipeline then attaches it under
+//                             exactly the epochs it needs
+//   s_drop     LOAM_SNAP_DELETE  the snapshot's binds; only when Loam answers
+//                             is the pin released (elo, ehi cleared)
+//   dropped
+//
+// A retained snapshot keeps every epoch in elo..ehi from being retired
+// (volume_rotate.uproc) and its volume's keys from being erased
+// (volume_delete.uproc): deleting a key a snapshot still needs is data loss,
+// not crypto-erasure. A clone shares its source's key resource, so it pins
+// the same way until it is deleted. A volume being deleted takes no new
+// snapshot (`deleting`). The snapshot is crash-consistent: the filesystem is
+// not frozen, and a restore replays its journal.
+module nanocloud.volume_snapshot {
+
+  // The shared carry (volume_data_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    fs: string = 35;
+    device: string = 36;
+    grant: string = 37;
+    set: string = 43;
+    access: string = 44;
+    kvol: string = 49;
+    root: string = 57;
+    target: string = 58;
+    elo: string = 59;
+    ehi: string = 60;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum MAX_TRIES = 5;
+
+  message Snap {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    desired: string = 4;
+    restore: string = 5;
+    restored: string = 6;
+    phase: string = 7;
+    out: string = 8;
+    reason: string = 9;
+    note: string = 10;
+    root: string = 11;
+    elo: string = 12;
+    ehi: string = 13;
+    kvol: string = 14;
+    clone: string = 15;
+    retain: int = 50;
+    at: int = 51;
+    tries: int = 52;
+    wake: int = 53;
+    now: int = 58;
+    vol: string = 70;      // /volume-attachments/^1 (related, flat)
+    aphase: string = 71;
+    inst: string = 72;
+    afs: string = 73;
+    aaccess: string = 74;
+    agrant: string = 75;
+    aset: string = 76;
+    adevice: string = 77;  // the node it is attached on
+    kkvol: string = 80;    // /volume-keys/^1
+    kepoch: string = 81;
+    knext: string = 82;
+    dphase: string = 90;   // /volume-deletions/^1
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    w1: string = 12; w2: string = 13; w3: string = 14; w4: string = 15;
+    ctx: Ctx = 254;
+  }
+
+  decision sstep(s: Snap) -> Step {
+    when s.phase == "dropped" || s.phase == "failed" ->
+      Step { cid: s.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // ── a failure before the snapshot was retained ──
+    // A capture that may have happened is undone: the pin is held until then.
+    when s.reason != "" && s.phase == "s_capture" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_drop;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_drop" } };
+    when s.reason != "" && s.phase != "s_drop" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=failed;out=;elo=;ehi=", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── validate, and pin write-ahead ──
+    when s.phase == "" && s.vol == "" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "reason=no_volume", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now, ctx: Ctx { claim: "", ph: "" } };
+    when s.phase == "" && s.dphase != "" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "reason=deleting", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now, ctx: Ctx { claim: "", ph: "" } };
+    when s.phase == "" && s.knext != "" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_pin;out=;tries=0;kvol=", v2: s.kkvol,
+             v3: ";at=", n1: s.now, v4: ";wake=", n2: s.now, w1: ";elo=", w2: s.kepoch, w3: ";ehi=", w4: s.knext, ctx: Ctx { claim: "", ph: "" } };
+    when s.phase == "" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_pin;out=;tries=0;kvol=", v2: s.kkvol,
+             v3: ";at=", n1: s.now, v4: ";wake=", n2: s.now, w1: ";elo=", w2: s.kepoch, w3: ";ehi=", w4: s.kepoch, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── capture ──
+    when s.phase == "s_pin" && s.aphase == "attached" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_flush;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_flush", vol: s.vol, inst: s.inst, device: s.adevice } };
+    when s.phase == "s_pin" || (s.phase == "s_flush" && s.out == "s_flush:ok") ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_capture;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_capture", vol: s.vol } };
+    when s.phase == "s_capture" && s.out == "s_capture:ok" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=retained;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.retain, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── retained: deletion, retention expiry, restore ──
+    when s.phase == "retained" && (s.desired == "deleted" || (s.retain > 0 && s.now >= s.retain)) ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_drop;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_drop" } };
+    when s.phase == "retained" && s.restore != "" && s.restore != s.restored ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_clone;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_clone", root: s.root, target: s.restore } };
+    when s.phase == "s_clone" && s.out == "s_clone:ok" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=s_identity;out=;tries=0", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now + TIMEOUT_MS,
+             ctx: Ctx { claim: s.key, ph: "s_identity", vol: s.clone, kvol: s.kvol, elo: s.elo, ehi: s.ehi, target: s.restore,
+                        fs: s.afs, access: s.aaccess, grant: s.agrant, set: s.aset } };
+    when s.phase == "s_identity" && s.out == "s_identity:ok" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=retained;out=;tries=0;note=;restored=", v2: s.restore,
+             v3: ";at=", n1: s.now, v4: ";wake=", n2: s.retain, ctx: Ctx { claim: "", ph: "" } };
+    // A restore that fails leaves the snapshot as it was.
+    when (s.phase == "s_clone" || s.phase == "s_identity")
+         && ((s.out != "" && s.out != "s_clone:ok" && s.out != "s_identity:ok") || (s.now >= s.at + TIMEOUT_MS && s.tries >= MAX_TRIES)) ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=retained;out=;tries=0;note=restore_failed;restored=", v2: s.restore,
+             v3: ";at=", n1: s.now, v4: ";wake=", n2: s.retain, ctx: Ctx { claim: "", ph: "" } };
+    when s.phase == "s_drop" && s.out == "s_drop:ok" && s.reason != "" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=failed;out=", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+    when s.phase == "s_drop" && s.out == "s_drop:ok" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "phase=dropped;out=", v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── failure and retry ──
+    when (s.phase == "s_flush" || s.phase == "s_capture") && s.out != "" && s.out != "s_flush:ok" && s.out != "s_capture:ok" ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "reason=", v2: s.out, v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now, ctx: Ctx { claim: "", ph: "" } };
+    // The pin is released only by Loam's answer: s_drop is asked until it gives one.
+    when s.phase == "s_drop" && ((s.out != "" && s.now >= s.at + RETRY_MS) || s.now >= s.at + TIMEOUT_MS) ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "out=;note=", v2: s.out, v3: ";tries=", n1: s.tries + 1,
+             v4: ";at=", n2: s.now, v5: ";wake=", n3: s.now + TIMEOUT_MS, ctx: Ctx { claim: s.key, ph: "s_drop" } };
+    when (s.phase == "s_flush" || s.phase == "s_capture") && s.now >= s.at + TIMEOUT_MS && s.tries < MAX_TRIES ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "out=", v3: ";tries=", n1: s.tries + 1,
+             v4: ";at=", n2: s.now, v5: ";wake=", n3: s.now + TIMEOUT_MS,
+             ctx: Ctx { claim: s.key, ph: s.phase, vol: s.vol, inst: s.inst, device: s.adevice } };
+    when (s.phase == "s_clone" || s.phase == "s_identity") && s.now >= s.at + TIMEOUT_MS ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "out=", v3: ";tries=", n1: s.tries + 1,
+             v4: ";at=", n2: s.now, v5: ";wake=", n3: s.now + TIMEOUT_MS,
+             ctx: Ctx { claim: s.key, ph: s.phase, vol: s.clone, root: s.root, target: s.restore, kvol: s.kvol, elo: s.elo, ehi: s.ehi,
+                        fs: s.afs, access: s.aaccess, grant: s.agrant, set: s.aset } };
+    when (s.phase == "s_flush" || s.phase == "s_capture") && s.now >= s.at + TIMEOUT_MS ->
+      Step { cid: s.seq, op: MERGE, key: s.key, v1: "reason=exhausted:", v2: s.phase, v3: ";at=", n1: s.now,
+             v4: ";wake=", n2: s.now, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: s.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline vs_step(s: Snap) -> Step { call y = sstep(s); return y; }
+  entry vs_step = vs_step;
+  provenance revision "volume-snapshot" toolchain "chronicle-authoring";
+}

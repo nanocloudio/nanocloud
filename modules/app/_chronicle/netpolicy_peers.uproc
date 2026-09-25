@@ -1,0 +1,278 @@
+// NetworkPolicy PEERS given by selector, as params — what netpolicy.uproc's
+// rule rows could not name ("a peer given by selector allows nothing").
+//
+// Three levels of cardinality (a policy's rules, a rule's peers, a peer's
+// namespaces, a namespace's pods) are three store round trips: each level is
+// materialised as rows keyed so that a row's parent is its key less ONE
+// segment, and every row carries its parent's digest, so a stale row is found
+// by the same fence the rule rows use (`^1:.!hash`).
+//
+//   rule     /networkpolicies/ expand each rule ->
+//            /np-rule/<ns>/<pol>/<dir>-<i> = {"dir","peers":[…],"ports":[…],"g"}
+//   peer     /np-rule/ expand peers; a peer WITH a selector ->
+//            /np-rule/…/<j> becomes /np-peer/<ns>/<pol>/<dir>-<i>/<j> =
+//            {"dir","pod"?,"ns"?,"ports","protos","g"}   (ipBlock peers stay in
+//            the rule rows, where they always were)
+//   peerns   /np-peer/ JOIN /namespaces/: the namespaceSelector — absent means
+//            the policy's OWN namespace, `{}` every namespace — on map stages ->
+//            /np-peerns/<ns>/<pol>/<dir>-<i>/<j>/<tns> = {"dir","pod"?,…,"g"}
+//   peerip   /np-peerns/ JOIN that namespace's /pods/: the podSelector — absent
+//            means every pod of the namespace — on map stages ->
+//            /np-peerip/<…>/<tns>/<pod> = {"ip","dir","ports","protos","pk","sl","g"}
+//   allow    netpolicy_allow.uproc: /np-sel/ JOIN its policy's /np-peerip/ ->
+//            /np-rows/netpolicy/<ns>/<pol>/<subj>/peer~<sl>
+//
+// Selector semantics are upstream `LabelSelector`, exactly as the subject
+// selection's: matchLabels AND matchExpressions; NotIn / DoesNotExist hold for
+// an object lacking the key. The prunes are netpolicy_allow.uproc's.
+module nanocloud.netpolicy_peers {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  message Req {
+    key: string = 1;
+    op: string = 2;
+    values: string = 3;
+    lv: string = 4;        // the labelled object's value for `key` — absent when it has none
+  }
+  message Label {
+    key: string = 1;
+    value: string = 2;
+    lv: string = 3;        // the labelled object's value for `key` — absent when it has none
+  }
+  // A put whose value is up to ten literal parts; the key is key + k2 + k3.
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+  // A conditional delete: only the row at the revision the verdict read.
+  message Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
+  }
+
+  // ---- rule: one row per rule, peers and ports kept whole ----
+  message RuleSrc {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>
+    peers: string = 4;     // spec.ingress.#.from  /  spec.egress.#.to  (JSON)
+    ports: string = 5;     // spec.<dir>.#.ports (JSON)
+    at: string = 21;
+    g: string = 27;        // the policy's digest
+  }
+  decision rule_in(r: RuleSrc) -> Put {
+    when r.peers == "" && r.ports == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/in-", k3: r.at,
+            v1: "{\"dir\":\"in\",\"peers\":[],\"ports\":[],\"g\":\"", v2: r.g, v3: "\"}",
+            v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.peers == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/in-", k3: r.at,
+            v1: "{\"dir\":\"in\",\"peers\":[],\"ports\":", v2: r.ports, v3: ",\"g\":\"", v4: r.g, v5: "\"}",
+            v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.ports == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/in-", k3: r.at,
+            v1: "{\"dir\":\"in\",\"peers\":", v2: r.peers, v3: ",\"ports\":[],\"g\":\"", v4: r.g, v5: "\"}",
+            v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/in-", k3: r.at,
+            v1: "{\"dir\":\"in\",\"peers\":", v2: r.peers, v3: ",\"ports\":", v4: r.ports,
+            v5: ",\"g\":\"", v6: r.g, v7: "\"}", v8: "", v9: "", v10: "" };
+  }
+  decision rule_out(r: RuleSrc) -> Put {
+    when r.peers == "" && r.ports == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/out-", k3: r.at,
+            v1: "{\"dir\":\"out\",\"peers\":[],\"ports\":[],\"g\":\"", v2: r.g, v3: "\"}",
+            v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.peers == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/out-", k3: r.at,
+            v1: "{\"dir\":\"out\",\"peers\":[],\"ports\":", v2: r.ports, v3: ",\"g\":\"", v4: r.g, v5: "\"}",
+            v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.ports == "" ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/out-", k3: r.at,
+            v1: "{\"dir\":\"out\",\"peers\":", v2: r.peers, v3: ",\"ports\":[],\"g\":\"", v4: r.g, v5: "\"}",
+            v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      Put { cid: r.seq, op: PUT, key: r.key, k2: "/out-", k3: r.at,
+            v1: "{\"dir\":\"out\",\"peers\":", v2: r.peers, v3: ",\"ports\":", v4: r.ports,
+            v5: ",\"g\":\"", v6: r.g, v7: "\"}", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- peer: one row per selector peer of a rule ----
+  message PeerSrc {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>/<dir>-<i>
+    dir: string = 4;
+    pod: string = 5;       // peers.#.podSelector (JSON), "" when absent
+    ns: string = 6;        // peers.#.namespaceSelector (JSON), "" when absent
+    ports: string = 7;     // ports[].port, comma-joined
+    protos: string = 8;    // ports[].protocol, aligned
+    at: string = 21;
+    g: string = 27;        // the rule row's digest
+  }
+  decision peer(p: PeerSrc) -> Put {
+    when p.pod == "" && p.ns == "" ->
+      Put { cid: p.seq, op: NOOP, key: "", k2: "", k3: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when p.ns == "" ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.at,
+            v1: "{\"dir\":\"", v2: p.dir, v3: "\",\"pod\":", v4: p.pod,
+            v5: ",\"ports\":\"", v6: p.ports, v7: "\",\"protos\":\"", v8: p.protos,
+            v9: "\",\"g\":\"", v10: p.g + "\"}" };
+    when p.pod == "" ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.at,
+            v1: "{\"dir\":\"", v2: p.dir, v3: "\",\"ns\":", v4: p.ns,
+            v5: ",\"ports\":\"", v6: p.ports, v7: "\",\"protos\":\"", v8: p.protos,
+            v9: "\",\"g\":\"", v10: p.g + "\"}" };
+    default ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.at,
+            v1: "{\"dir\":\"" + p.dir + "\",\"pod\":", v2: p.pod, v3: ",\"ns\":", v4: p.ns,
+            v5: ",\"ports\":\"", v6: p.ports, v7: "\",\"protos\":\"", v8: p.protos,
+            v9: "\",\"g\":\"", v10: p.g + "\"}" };
+  }
+
+  // ---- peerns: the namespaces a peer selects ----
+  message PeerNs {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>/<dir>-<i>/<j>
+    dir: string = 4;
+    pod: string = 5;       // the peer's podSelector (JSON), "" when absent
+    ns: string = 6;        // the peer's namespaceSelector (JSON), "" when absent
+    ports: string = 7;
+    protos: string = 8;
+    tns: string = 21;      // the joined namespace's name
+    g: string = 27;        // the peer row's digest
+    pns: string = 28;      // the policy's namespace (the key's first segment)
+    exprs: Req = 90;       // REPEATED: namespaceSelector.matchExpressions
+    mlabels: Label = 92;   // REPEATED: namespaceSelector.matchLabels
+    xt: int = 93; xf: int = 94; xu: int = 95;
+    lt: int = 96; lf: int = 97; lu: int = 98;
+  }
+  map ns_expr(p: PeerNs) -> PeerNs {
+    over p.exprs as e: Req max 16;
+    count p.xt, p.xf, p.xu;
+    when (e.op == "In" && has(e.lv) && ("," + e.values + ",").contains("," + e.lv + ","))
+      || (e.op == "NotIn" && (!has(e.lv) || !("," + e.values + ",").contains("," + e.lv + ",")))
+      || (e.op == "Exists" && has(e.lv))
+      || (e.op == "DoesNotExist" && !has(e.lv));
+  }
+  map ns_lab(p: PeerNs) -> PeerNs {
+    over p.mlabels as e: Label max 32;
+    count p.lt, p.lf, p.lu;
+    when has(e.lv) && e.lv == e.value;
+  }
+  decision peerns(p: PeerNs) -> Put {
+    // No namespaceSelector: the policy's own namespace, and only it.
+    when p.ns == "" && p.tns == p.pns && p.pod == "" ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.tns,
+            v1: "{\"dir\":\"", v2: p.dir, v3: "\",\"ports\":\"", v4: p.ports,
+            v5: "\",\"protos\":\"", v6: p.protos, v7: "\",\"g\":\"", v8: p.g, v9: "\"}", v10: "" };
+    when p.ns == "" && p.tns == p.pns ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.tns,
+            v1: "{\"dir\":\"" + p.dir + "\",\"pod\":", v2: p.pod, v3: ",\"ports\":\"", v4: p.ports,
+            v5: "\",\"protos\":\"", v6: p.protos, v7: "\",\"g\":\"", v8: p.g, v9: "\"}", v10: "" };
+    when p.ns != "" && p.xf + p.xu + p.lf + p.lu == 0 && p.pod == "" ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.tns,
+            v1: "{\"dir\":\"", v2: p.dir, v3: "\",\"ports\":\"", v4: p.ports,
+            v5: "\",\"protos\":\"", v6: p.protos, v7: "\",\"g\":\"", v8: p.g, v9: "\"}", v10: "" };
+    when p.ns != "" && p.xf + p.xu + p.lf + p.lu == 0 ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.tns,
+            v1: "{\"dir\":\"" + p.dir + "\",\"pod\":", v2: p.pod, v3: ",\"ports\":\"", v4: p.ports,
+            v5: "\",\"protos\":\"", v6: p.protos, v7: "\",\"g\":\"", v8: p.g, v9: "\"}", v10: "" };
+    default ->
+      Put { cid: p.seq, op: DELETE, key: p.key, k2: "/", k3: p.tns,
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- peerip: the pods a peer selects in a selected namespace ----
+  message PeerPod {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>/<dir>-<i>/<j>/<tns>
+    dir: string = 4;
+    pod: string = 5;       // the peer's podSelector (JSON), "" when absent
+    ports: string = 6;
+    protos: string = 7;
+    pname: string = 21;    // the joined pod's name
+    g: string = 27;        // the peerns row's digest
+    rest: string = 57;     // the key less its first segment
+    ip: string = 60;       // the pod's status.podIP
+    exprs: Req = 90;
+    mlabels: Label = 92;
+    xt: int = 93; xf: int = 94; xu: int = 95;
+    lt: int = 96; lf: int = 97; lu: int = 98;
+    tns: string = 99;      // unused: the namespace is the key's last segment
+  }
+  map pod_expr(p: PeerPod) -> PeerPod {
+    over p.exprs as e: Req max 16;
+    count p.xt, p.xf, p.xu;
+    when (e.op == "In" && has(e.lv) && ("," + e.values + ",").contains("," + e.lv + ","))
+      || (e.op == "NotIn" && (!has(e.lv) || !("," + e.values + ",").contains("," + e.lv + ",")))
+      || (e.op == "Exists" && has(e.lv))
+      || (e.op == "DoesNotExist" && !has(e.lv));
+  }
+  map pod_lab(p: PeerPod) -> PeerPod {
+    over p.mlabels as e: Label max 32;
+    count p.lt, p.lf, p.lu;
+    when has(e.lv) && e.lv == e.value;
+  }
+  // The row's value carries the pod's key (`pk`, for the pod fence) and a
+  // one-segment slug of the whole row key (`sl`, for the allow row's key).
+  decision peerip(p: PeerPod) -> Put {
+    when p.ip != "" && (p.pod == "" || p.xf + p.xu + p.lf + p.lu == 0) ->
+      Put { cid: p.seq, op: PUT, key: p.key, k2: "/", k3: p.pname,
+            v1: "{\"ip\":\"" + p.ip + "\",\"dir\":\"" + p.dir,
+            v2: "\",\"ports\":\"" + p.ports + "\",\"protos\":\"" + p.protos,
+            v3: "\",\"pk\":\"", v4: p.rest.substring(p.rest.lastIndexOf("/") + 1) + "/" + p.pname,
+            v5: "\",\"sl\":\"", v6: p.rest.replace("/", "~") + "~" + p.pname,
+            v7: "\",\"g\":\"", v8: p.g, v9: "\"}", v10: "" };
+    default ->
+      Put { cid: p.seq, op: DELETE, key: p.key, k2: "/", k3: p.pname,
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+  // Scalars and counts only in a pass stage: a path read returns a repeated
+  // field's FIRST element.
+  transformation t_rule(r: RuleSrc) -> RuleSrc {
+    RuleSrc { seq: r.seq, key: r.key, peers: r.peers, ports: r.ports, at: r.at, g: r.g }
+  }
+  transformation t_peer(p: PeerSrc) -> PeerSrc {
+    PeerSrc { seq: p.seq, key: p.key, dir: p.dir, pod: p.pod, ns: p.ns, ports: p.ports,
+              protos: p.protos, at: p.at, g: p.g }
+  }
+  transformation t_ns(p: PeerNs) -> PeerNs {
+    PeerNs { seq: p.seq, key: p.key, dir: p.dir, pod: p.pod, ns: p.ns, ports: p.ports,
+             protos: p.protos, tns: p.tns, g: p.g, pns: p.pns,
+             xf: p.xf, xu: p.xu, lf: p.lf, lu: p.lu }
+  }
+  transformation t_pod(p: PeerPod) -> PeerPod {
+    PeerPod { seq: p.seq, key: p.key, dir: p.dir, pod: p.pod, ports: p.ports, protos: p.protos,
+              pname: p.pname, g: p.g, rest: p.rest, ip: p.ip,
+              xf: p.xf, xu: p.xu, lf: p.lf, lu: p.lu }
+  }
+
+  pipeline np_rule_in(r: RuleSrc) -> Put { call x = t_rule(r); call y = rule_in(x); return y; }
+  pipeline np_rule_out(r: RuleSrc) -> Put { call x = t_rule(r); call y = rule_out(x); return y; }
+  pipeline np_peer(p: PeerSrc) -> Put { call x = t_peer(p); call y = peer(x); return y; }
+  pipeline np_nsmap(p: PeerNs) -> PeerNs { call a = ns_expr(p); call b = ns_lab(a); return b; }
+  pipeline np_peerns(p: PeerNs) -> Put { call x = t_ns(p); call y = peerns(x); return y; }
+  pipeline np_podmap(p: PeerPod) -> PeerPod { call a = pod_expr(p); call b = pod_lab(a); return b; }
+  pipeline np_peerip(p: PeerPod) -> Put { call x = t_pod(p); call y = peerip(x); return y; }
+
+  entry np_rule_in = np_rule_in;
+  entry np_rule_out = np_rule_out;
+  entry np_peer = np_peer;
+  entry np_nsmap = np_nsmap;
+  entry np_peerns = np_peerns;
+  entry np_podmap = np_podmap;
+  entry np_peerip = np_peerip;
+  provenance revision "netpolicy-peers" toolchain "chronicle-authoring";
+}

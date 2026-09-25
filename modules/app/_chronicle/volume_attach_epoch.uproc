@@ -1,0 +1,135 @@
+// The second key epoch of an attachment, and the clone device guard — the part
+// of the attach pipeline a rotation or a restored clone adds. Same record as
+// volume_attach.uproc (`/volume-attachments/<ns>/<pvc>`, related
+// `/volume-keys/<ns>/<pvc>`); this decision owns the `e_*` phases, which
+// volume_attach.uproc never writes, and it is inactive exactly when attach is.
+//
+// A container in the middle of a data-key rotation seals new writes under one
+// epoch while old units still open under the other, so it needs both keys.
+// `/volume-keys/` says so before crypt_block ever sees the next epoch
+// (volume_rotate.uproc records `next` write-ahead), so an attachment made at
+// any point of a rotation — including the re-attach after a node crash —
+// takes both:
+//
+//   unlocking     BUNDLE_DELIVER  the `epoch` bundle (volume_attach.uproc);
+//                                 `ready`, or `stale` when the container has
+//                                 already retired that epoch
+//   e_recipient   CB_RECIPIENT    crypt_block announces a fresh recipient for
+//                                 the `next` epoch
+//   e_releasing   KAGI_RELEASE    Kagi's release of the `next` epoch against it
+//   e_unlocking   CB_BUNDLE       the `next` epoch's FXSB bundle on `bundle`
+//   publishing    —               volume_attach.uproc carries on
+//
+// No key material crosses this record: the recipients and bundles stay inside
+// the effector, like the first epoch's. A refusal ends the attachment and
+// volume_detach.uproc releases what was acquired; an exhausted step is retried
+// after a pause.
+//
+// A clone (its key resource is its source's) never moves the grant: Kagi's
+// grant names one device per key resource, and moving it would revoke the
+// source's attachment. A clone scheduled to another device than the grant
+// names is refused `shared_key_device` before anything is acquired.
+module nanocloud.volume_attach_epoch {
+
+  // The shared carry (volume_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    dev: string = 34;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    epoch: string = 48;
+    kvol: string = 49;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum TIMEOUT_MS = 30000;
+  enum MAX_TRIES = 5;
+
+  message Att {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    desired: string = 4;
+    phase: string = 5;
+    out: string = 6;
+    device: string = 8;
+    grant: string = 9;
+    access: string = 10;
+    vol: string = 11;
+    inst: string = 13;
+    dev: string = 14;
+    reason: string = 15;
+    fence: int = 50;
+    at: int = 53;
+    tries: int = 54;
+    now: int = 58;
+    kvol: string = 80;
+    epoch: string = 81;
+    next: string = 82;
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision epoch_attach(a: Att) -> Step {
+    when a.desired != "attached" || a.reason != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when (a.phase == "" || a.phase == "idle" || a.phase == "detached") && a.device != "" && a.vol != ""
+         && (a.access == "ReadWriteOnce" || a.access == "ReadWriteOncePod")
+         && a.kvol != "" && a.kvol != a.vol && a.grant != a.device ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=shared_key_device", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // The first epoch's bundle is in; the container needs a second.
+    when a.phase == "unlocking" && (a.out == "unlocking:ready" || a.out == "unlocking:stale") && a.next != "" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=e_recipient;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "e_recipient", vol: a.vol, inst: a.inst, device: a.device, fence: a.fence, epoch: a.next, kvol: a.kvol } };
+    when a.phase == "e_recipient" && a.out == "e_recipient:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=e_releasing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "e_releasing", vol: a.vol, inst: a.inst, device: a.device, fence: a.fence, epoch: a.next, kvol: a.kvol } };
+    when a.phase == "e_releasing" && a.out == "e_releasing:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=e_unlocking;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "e_unlocking", vol: a.vol, inst: a.inst, device: a.device, fence: a.fence, epoch: a.next, kvol: a.kvol } };
+    // Both keys held: volume_attach.uproc's `publishing` issues NBD_START.
+    when a.phase == "e_unlocking" && a.out == "e_unlocking:ready" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=publishing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "publishing", vol: a.vol, inst: a.inst, device: a.device, fence: a.fence, epoch: a.epoch, kvol: a.kvol } };
+
+    // A refusal ends the attachment; the teardown releases what was acquired.
+    when (a.phase == "e_recipient" && a.out == "e_recipient:failed")
+         || (a.phase == "e_releasing" && (a.out == "e_releasing:refused" || a.out == "e_releasing:failed"))
+         || (a.phase == "e_unlocking" && (a.out == "e_unlocking:eacces" || a.out == "e_unlocking:stale"
+             || a.out == "e_unlocking:failed")) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=", v2: a.out, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when (a.phase == "e_recipient" || a.phase == "e_releasing" || a.phase == "e_unlocking")
+         && a.now >= a.at + TIMEOUT_MS && a.tries < MAX_TRIES ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: a.phase, vol: a.vol, inst: a.inst, device: a.device, fence: a.fence, epoch: a.next, kvol: a.kvol } };
+    when (a.phase == "e_recipient" || a.phase == "e_releasing" || a.phase == "e_unlocking")
+         && a.now >= a.at + TIMEOUT_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=exhausted:", v2: a.phase, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline va_epoch(a: Att) -> Step { call y = epoch_attach(a); return y; }
+  entry va_epoch = va_epoch;
+  provenance revision "volume-attach-epoch" toolchain "chronicle-authoring";
+}

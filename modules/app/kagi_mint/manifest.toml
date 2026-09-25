@@ -1,0 +1,113 @@
+name = "kagi_mint"
+version = "0.1.0"
+description = "Chronicle connector for kagi's token_mint — record in, signed token out"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The kagi seam for ISSUING, as a connector — `kagi_verify`'s mirror.
+#
+# A ServiceAccount token is a JWS signed under a key the control plane must
+# never hold. kagi's `token_mint` already is that: it opens its signing key in
+# the fluxor key vault BY LABEL (generated inside the vault on first open,
+# persisted there, never exported), builds the claims, and signs by handle.
+# What it lacks is a way to be asked by a Chronicle chain, and that is all this
+# module is: a record comes in, a `MSG_MINT_REQ` goes out as one exchange,
+# the token comes back as a record. It decides nothing — who gets a token, for
+# which subject, for how long, is params upstream.
+#
+# In:  a Chronicle record frame on `request_in` (a byte stream, self-framed, or
+#      a mailbox):
+#        1      = correlation (i64), echoed
+#        40..43 = subject, in PARTS joined in field order. The VM cannot
+#                 concatenate, and a ServiceAccount subject is four of them:
+#                 "system:serviceaccount:" ns ":" name
+#        44     = audience        45 = scope
+#        46     = ttl seconds (i64; absent or 0 = the `ttl` param)
+#        47     = one extra claim's key
+#        48..55 = that claim's value, JSON, in parts joined in field order
+#                 (`{"namespace":"` ns `"}` …). The joined value must be one
+#                 well-formed JSON value or the request is refused here:
+#                 kagi embeds a raw claim verbatim, so this is where a part
+#                 that closed a string early would be caught.
+#        30..39 = carry, echoed with number and type
+# Out: one exchange per record to kagi's `token_mint` (a REQUESTER:
+#      `request_out` -> `token_mint.request_in`, `token_mint.response_out` ->
+#      `response_in`), and a Chronicle record on `response_out`:
+#        1 = correlation (i64)  2 = status (i64, kagi `mint_err`, 0 = OK;
+#            255 = no typed answer)
+#        3 = token (bytes, empty on a refusal)   30..39 = carry
+#
+# THE CALL is kagi's typed-operation shape, as in `kagi_verify`: POST, empty
+# target, the body one `MSG_MINT_REQ` envelope, the answer a 200 whose body is
+# one `MSG_MINT_RESP` envelope (a refusal verdict included). The exchange id
+# is the correlation. An exchange that ends any other way gives status 255 —
+# answered, never dropped — and a call lost to `LINK DOWN` is sent again after
+# `LINK UP`.
+#
+# KEY. At start this sends `token_mint` ONE signing `MSG_KEY_ADD` naming the
+# vault label (`key_label`) — a label, never key material: the control plane
+# can ask that the key exist and can never supply or read it. `token_mint`
+# opens it (OPEN_OR_GENERATE) and announces the public half as a VERIFY
+# `MSG_KEY_ADD` on its `key_announce`; that arrives here on `announce_in` and
+# is stored VERBATIM at `announce_path`, which is where `kagi_verify` loads the
+# key it verifies with. One key, one wire, and the frame is never parsed here.
+#
+# One request in flight at a time, as in `kagi_verify` and for its reason.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# NOT `framed`: a byte stream is self-framed (the record header gives its
+# length), and a mailbox is read whole — see store_effect's request_in.
+
+[[ports]]
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "announce_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+# token_mint's `key_announce` max_record.
+max_record = 4096
+framed = true
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "key_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+max_record = 1024
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+# Writes exactly one object: the verification key the mint announced.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+metrics = ["mint_sent", "mint_ok", "mint_refused", "mint_dropped", "key_announced"]

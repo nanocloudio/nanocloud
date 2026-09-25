@@ -1,0 +1,60 @@
+// The admission chain's STORE seam: /admit-req/<id> (JSON: verb, resource,
+// ns, obj) -> admission.uproc -> /admit-resp/<id> = "<status>;<object or
+// reason>". A client with no request chain of its own asks admission this way.
+module nanocloud.admission_seam {
+  enum NOOP = 0;
+  enum PUT = 3;
+  message Req {
+    seq: int = 1;
+    key: string = 3;       // the request id
+    verb: string = 4;
+    res: string = 5;
+    ns: string = 6;
+    obj: string = 7;
+  }
+  message Call {           // admission.uproc Call
+    verb: string = 3;
+    res: string = 4;
+    ns: string = 5;
+    obj: string = 6;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+  decision take(r: Req) -> Call {
+    when r.ns == "" ->
+      Call { verb: r.verb, res: r.res, ns: "default", obj: r.obj, c_cid: r.seq, c_method: 0,
+             c_key: r.key, c_verdict: 0, c_name: "", c_reason: "", c_verb: "" };
+    default ->
+      Call { verb: r.verb, res: r.res, ns: r.ns, obj: r.obj, c_cid: r.seq, c_method: 0,
+             c_key: r.key, c_verdict: 0, c_name: "", c_reason: "", c_verb: "" };
+  }
+  message Admitted {
+    status: int = 2;
+    object: string = 3;
+    c_cid: int = 30;
+    c_key: string = 32;
+  }
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: int = 4;
+    v2: string = 5;
+    v3: string = 6;
+  }
+  decision answer(a: Admitted) -> Put {
+    default -> Put { cid: a.c_cid, op: PUT, key: a.c_key, v1: a.status, v2: ";", v3: a.object };
+  }
+  transformation tr(r: Req) -> Req { Req { seq: r.seq, key: r.key, verb: r.verb, res: r.res, ns: r.ns, obj: r.obj } }
+  transformation ta(a: Admitted) -> Admitted { Admitted { status: a.status, object: a.object, c_cid: a.c_cid, c_key: a.c_key } }
+  pipeline seam_in(r: Req) -> Call { call x = tr(r); call y = take(x); return y; }
+  pipeline seam_out(a: Admitted) -> Put { call x = ta(a); call y = answer(x); return y; }
+  entry seam_in = seam_in;
+  entry seam_out = seam_out;
+  provenance revision "admission-seam" toolchain "chronicle-authoring";
+}

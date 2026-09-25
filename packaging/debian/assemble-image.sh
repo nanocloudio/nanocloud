@@ -2,7 +2,7 @@
 # assemble-image.sh <rootfs-dir> <blob-dir> <layer-hex64>...
 #
 # The rootfs-assembly EFFECT (container backend), run as a host workload projected by the image_assembler fmod through
-# sandbox_runner. Extracts the digest-verified layer blobs (tar.gz, manifest
+# the sandbox runtime. Extracts the digest-verified layer blobs (tar.gz, manifest
 # order) into the rootfs, applies OCI whiteouts, and populates the /dev nodes
 # a container entrypoint expects (best-effort — mknod needs root; a rootless
 # assembly still yields a usable rootfs for payloads that skip /dev).

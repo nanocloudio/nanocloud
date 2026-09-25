@@ -1,0 +1,315 @@
+// Address allocation as params: Service ClusterIPs.
+// (The two pools share this design; ipam_svc.uproc and ipam_pod.uproc are
+// split only because one module holds at most 16 decisions and 8 entries.)
+//
+// One shape for both pools. An address is CLAIMED by creating the key
+// `/ipam/<pool>/<address as u32>` under the store's ABSENT precondition, so two
+// allocators that pick the same candidate cannot both win: the store answers
+// the loser 409 at one linearization point. A per-pool cursor
+// (`/ipam-cursor/<pool>` = `n=…[;net=…;span=…]`) makes the pick next-fit —
+// candidate = net + 1 + (n mod span) — and every attempt, won or lost,
+// advances it. There is no "lowest free" search and nothing seeded per
+// address: a taken candidate costs one 409 and one bump.
+//
+//   allocate  the FIRST owner still waiting (count index 0) -> GET cursor ->
+//             CREATE claim -> bump cursor -> commit the address to the owner
+//             (or, when the claim was lost, touch /ipam-retry/<pool>)
+//   backfill  every address already in use is claimed, and the LAST record of
+//             that scan (or the one record `empty` sends for an empty set)
+//             creates the cursor. Allocation reads the cursor first, so it
+//             cannot start until every existing address holds its claim.
+//   release   a claim whose owner is gone, or whose owner now holds a
+//             different address, is deleted.
+//
+// Services commit by PATCHing spec.clusterIP (the Service is its own lease).
+// Pods commit by CREATING /ipam-lease/<id> — create-only, so a lease is never
+// reassigned, and a request is "waiting" while it has none (`unless`).
+module nanocloud.ipam_svc {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: CurGet, Cur, ClaimCall, Claimed, BumpCall, Bumped
+  message Ctx {
+    key: string = 30;
+    n: int = 31;
+    ip: int = 32;
+    st: int = 34;
+  }
+  // carried by: BackfillCall, BackfillReply, ReadyCall
+  message Ctx2 {
+    last: int = 30;
+    pool: string = 31;
+  }
+  // carried by: OwnerGet, OwnerReply
+  message Ctx3 {
+    claim: string = 30;
+    ip: int = 31;
+    owner: string = 32;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum PATCH = 5;
+  enum MERGE = 6;
+  enum CREATE = 8;
+
+  // 10.96.0.0/16, hosts .0.1 .. .255.254.
+  enum SVC_NET = 174063616;
+  enum SVC_SPAN = 65534;
+
+  // ---- records ----
+
+  message Waiting {        // an owner with no address yet (count mode)
+    seq: int = 1;
+    key: string = 3;
+    idx: int = 20;
+  }
+  message CurGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message Cur {            // the cursor, read back (flat ints n,net,span)
+    cid: int = 1;
+    status: int = 2;
+    n: int = 50;
+    net: int = 51;
+    span: int = 52;
+    ctx: Ctx = 254;
+  }
+  message ClaimCall {
+    cid: int = 1;
+    op: int = 2;
+    key: int = 3;          // the candidate address, as a number
+    v1: string = 4;        // owner=<key>;ip=<address>
+    v2: string = 5;
+    v3: string = 6;
+    v4: int = 7;
+    ctx: Ctx = 254;
+  }
+  message Claimed {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message BumpCall {       // advance the cursor, carrying the claim's outcome
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    ctx: Ctx = 254;
+  }
+  message Bumped {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message CommitCall {     // the address to its owner, or a retry wake
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    path: string = 19;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    v5: string = 8;
+    v6: int = 9;
+    v7: string = 10;
+    v8: int = 11;
+    v9: string = 12;
+  }
+
+  message InUse {          // backfill: every owner, its address as a number
+    seq: int = 1;
+    key: string = 3;
+    idx: int = 20;
+    count: int = 22;
+    ip: int = 50;
+  }
+  message BackfillCall {
+    cid: int = 1;
+    op: int = 2;
+    key: int = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: int = 7;
+    ctx: Ctx2 = 254;
+  }
+  message BackfillReply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx2 = 254;
+  }
+  message ReadyCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    ctx: Ctx2 = 254;
+  }
+
+  message ClaimRec {       // release: one claim, flat owner=…;ip=…
+    seq: int = 1;
+    key: string = 3;
+    owner: string = 4;
+    ip: int = 50;
+  }
+  message OwnerGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx3 = 254;
+  }
+  message OwnerReply {     // the owner's address, read back as a number at 50
+    cid: int = 1;
+    status: int = 2;
+    ip: int = 50;
+    ctx: Ctx3 = 254;
+  }
+  message DelCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+
+  // ---- allocate (both pools) ----
+
+  // Only index 0 acts: one allocation per pass, and the write it makes (a
+  // cursor bump, a claim, a commit) is itself the change that starts the next.
+  decision svc_cur(w: Waiting) -> CurGet {
+    when w.idx == 0 -> CurGet { cid: w.seq, op: GET, key: "svc", ctx: Ctx { key: w.key } };
+    default -> CurGet { cid: w.seq, op: NOOP, key: "", ctx: Ctx { key: w.key } };
+  }
+
+  // No cursor (404) = the backfill has not finished: every address already in
+  // use must hold its claim before a new one is handed out, or an allocation
+  // could win a candidate an existing owner still uses.
+  decision svc_claim(c: Cur) -> ClaimCall {
+    when c.status == 200 ->
+      ClaimCall { cid: c.cid, op: CREATE,
+                  key: SVC_NET + 1 + (c.n - (c.n / SVC_SPAN) * SVC_SPAN),
+                  v1: "owner=", v2: c.ctx.key, v3: ";ip=",
+                  v4: SVC_NET + 1 + (c.n - (c.n / SVC_SPAN) * SVC_SPAN), ctx: Ctx { key: c.ctx.key, n: c.n, ip: SVC_NET + 1 + (c.n - (c.n / SVC_SPAN) * SVC_SPAN) } };
+    default ->
+      ClaimCall { cid: c.cid, op: NOOP, key: 0, v1: "", v2: "", v3: "", v4: 0, ctx: Ctx { key: c.ctx.key, n: c.n, ip: 0 } };
+  }
+
+  // The cursor moves BEFORE the commit, whether the claim was won or lost, so
+  // the rescan the commit causes already sees the next candidate. Nothing this
+  // chain writes before the commit is watched by its source: a rescan in the
+  // middle of an allocation would pick the same owner again and race it.
+  decision svc_bump(c: Claimed) -> BumpCall {
+    when c.status == 200 || c.status == 409 ->
+      BumpCall { cid: c.cid, op: MERGE, key: "svc", v1: "n=", v2: c.ctx.n + 1, ctx: Ctx { key: c.ctx.key, n: c.ctx.n, ip: c.ctx.ip, st: c.status } };
+    default ->
+      BumpCall { cid: c.cid, op: NOOP, key: "", v1: "", v2: 0, ctx: Ctx { key: c.ctx.key, n: c.ctx.n, ip: c.ctx.ip, st: c.status } };
+  }
+  // A won claim commits the address to its Service; that PATCH is also the
+  // change that starts the next pass. A lost one (409: the candidate is taken)
+  // commits nothing, so it writes the pool's retry key instead — the only
+  // other thing the source watches — and the next pass takes the next one.
+  decision svc_bind(b: Bumped) -> CommitCall {
+    when b.ctx.st == 200 ->
+      CommitCall { cid: b.cid, op: PATCH, key: "/services/", key2: b.ctx.key,
+                   path: "spec.clusterIP",
+                   v1: "\"", v2: math.bitAnd(math.bitShiftRight(b.ctx.ip, 24), 255),
+                   v3: ".", v4: math.bitAnd(math.bitShiftRight(b.ctx.ip, 16), 255),
+                   v5: ".", v6: math.bitAnd(math.bitShiftRight(b.ctx.ip, 8), 255),
+                   v7: ".", v8: math.bitAnd(b.ctx.ip, 255), v9: "\"" };
+    when b.ctx.st == 409 ->
+      CommitCall { cid: b.cid, op: PUT, key: "/ipam-retry/", key2: "svc", path: "",
+                   v1: "n=", v2: b.ctx.n + 1 };
+    default -> CommitCall { cid: b.cid, op: NOOP, key: "", key2: "", path: "" };
+  }
+
+  // ---- backfill (both pools) ----
+
+  // Claim every address in use. `idx + 1 >= count` is the LAST record of the
+  // scan — and also the single record `empty` sends when there is nothing in
+  // use (idx 0, count 0) — which is where the cursor gets created.
+  decision backfill(r: InUse) -> BackfillCall {
+    when r.ip != 0 && r.idx + 1 >= r.count ->
+      BackfillCall { cid: r.seq, op: CREATE, key: r.ip,
+                     v1: "owner=", v2: r.key, v3: ";ip=", v4: r.ip, ctx: Ctx2 { last: 1 } };
+    when r.ip != 0 ->
+      BackfillCall { cid: r.seq, op: CREATE, key: r.ip,
+                     v1: "owner=", v2: r.key, v3: ";ip=", v4: r.ip, ctx: Ctx2 { last: 0 } };
+    when r.idx + 1 >= r.count ->
+      BackfillCall { cid: r.seq, op: NOOP, key: 0, v1: "", v2: "", v3: "", v4: 0, ctx: Ctx2 { last: 1 } };
+    default ->
+      BackfillCall { cid: r.seq, op: NOOP, key: 0, v1: "", v2: "", v3: "", v4: 0, ctx: Ctx2 { last: 0 } };
+  }
+
+  // CREATE, so an existing cursor is never reset to 0 by a later scan.
+  decision svc_ready(r: BackfillReply) -> ReadyCall {
+    when r.ctx.last == 1 -> ReadyCall { cid: r.cid, op: CREATE, key: "svc", v1: "n=0", ctx: Ctx2 { last: 1, pool: "svc" } };
+    default -> ReadyCall { cid: r.cid, op: NOOP, key: "", v1: "", ctx: Ctx2 { last: 0, pool: "svc" } };
+  }
+
+  // ---- release ----
+
+  decision svc_owner(r: ClaimRec) -> OwnerGet {
+    default -> OwnerGet { cid: r.seq, op: GET, key: r.owner, ctx: Ctx3 { claim: r.key, ip: r.ip, owner: r.owner } };
+  }
+  // Gone, or now holding a different address. An owner with NO address yet
+  // (0) is mid-allocation — its claim was just won and the commit is in
+  // flight — and is left alone.
+  decision svc_free(o: OwnerReply) -> DelCall {
+    when o.status == 404 -> DelCall { cid: o.cid, op: DELETE, key: o.ctx.claim };
+    when o.status == 200 && o.ip != 0 && o.ip != o.ctx.ip ->
+      DelCall { cid: o.cid, op: DELETE, key: o.ctx.claim };
+    default -> DelCall { cid: o.cid, op: NOOP, key: "" };
+  }
+
+  // ---- stage wrappers ----
+  transformation pw(w: Waiting) -> Waiting { Waiting { seq: w.seq, key: w.key, idx: w.idx } }
+  transformation pc(c: Cur) -> Cur {
+    Cur { cid: c.cid, status: c.status, n: c.n, net: c.net, span: c.span, ctx: Ctx { key: c.ctx.key } }
+  }
+  transformation pcl(c: Claimed) -> Claimed {
+    Claimed { cid: c.cid, status: c.status, ctx: Ctx { key: c.ctx.key, n: c.ctx.n, ip: c.ctx.ip } }
+  }
+  transformation pbm(b: Bumped) -> Bumped {
+    Bumped { cid: b.cid, status: b.status, ctx: b.ctx }
+  }
+  transformation pu(r: InUse) -> InUse {
+    InUse { seq: r.seq, key: r.key, idx: r.idx, count: r.count, ip: r.ip }
+  }
+  transformation pb(r: BackfillReply) -> BackfillReply {
+    BackfillReply { cid: r.cid, status: r.status, ctx: Ctx2 { last: r.ctx.last } }
+  }
+  transformation pr(r: ClaimRec) -> ClaimRec { ClaimRec { seq: r.seq, key: r.key, owner: r.owner, ip: r.ip } }
+  transformation po(o: OwnerReply) -> OwnerReply {
+    OwnerReply { cid: o.cid, status: o.status, ip: o.ip, ctx: o.ctx }
+  }
+
+  pipeline sa_cur(w: Waiting) -> CurGet { call x = pw(w); call y = svc_cur(x); return y; }
+  pipeline sa_claim(c: Cur) -> ClaimCall { call x = pc(c); call y = svc_claim(x); return y; }
+  pipeline sa_bind(b: Bumped) -> CommitCall { call x = pbm(b); call y = svc_bind(x); return y; }
+  pipeline sa_bump(c: Claimed) -> BumpCall { call x = pcl(c); call y = svc_bump(x); return y; }
+  pipeline sb_claim(r: InUse) -> BackfillCall { call x = pu(r); call y = backfill(x); return y; }
+  pipeline sb_ready(r: BackfillReply) -> ReadyCall { call x = pb(r); call y = svc_ready(x); return y; }
+  pipeline sr_owner(r: ClaimRec) -> OwnerGet { call x = pr(r); call y = svc_owner(x); return y; }
+  pipeline sr_free(o: OwnerReply) -> DelCall { call x = po(o); call y = svc_free(x); return y; }
+
+  entry sa_cur = sa_cur;
+  entry sa_claim = sa_claim;
+  entry sa_bind = sa_bind;
+  entry sa_bump = sa_bump;
+  entry sb_claim = sb_claim;
+  entry sb_ready = sb_ready;
+  entry sr_owner = sr_owner;
+  entry sr_free = sr_free;
+  provenance revision "ipam-claims" toolchain "chronicle-authoring";
+}

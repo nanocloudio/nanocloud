@@ -1,0 +1,59 @@
+// Staged request bodies, collected. The HTTP server stages a body past a
+// record at /blobs/sha256/<hex> and its expiry at /blobs/at/<hex>
+// ({"deadline":<ms>}); nothing references a staged body once the write it
+// carried is done (the object holds its own copy), so each goes at its
+// deadline — the body first, then its expiry, so a crash between the two
+// leaves an expiry that collects nothing rather than a body nothing collects.
+//
+//   gc_src   store_source /blobs/at/ (ints/due deadline): the source stamps
+//            `now` (58) and the kernel timer steps it at the earliest deadline
+//   gc_blob  DELETE /blobs/sha256/<hex> when due; the hex rides on (30)
+//   gc_at    DELETE /blobs/at/<hex>
+module nanocloud.blob_gc {
+  enum NOOP = 0;
+  enum DELETE = 4;
+
+  message Rec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    deadline: int = 50;
+    now: int = 58;
+  }
+  message Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_hex: string = 30;
+  }
+  decision blob(r: Rec) -> Act {
+    when r.deadline > 0 && r.now >= r.deadline ->
+      Act { cid: r.seq, op: DELETE, key: r.key, c_hex: r.key };
+    default ->
+      Act { cid: r.seq, op: NOOP, key: "", c_hex: "" };
+  }
+
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    c_hex: string = 30;
+  }
+  decision at(d: Done) -> Act {
+    when d.c_hex != "" ->
+      Act { cid: d.cid, op: DELETE, key: d.c_hex, c_hex: "" };
+    default ->
+      Act { cid: d.cid, op: NOOP, key: "", c_hex: "" };
+  }
+
+  transformation t_rec(r: Rec) -> Rec {
+    Rec { seq: r.seq, rev: r.rev, key: r.key, deadline: r.deadline, now: r.now }
+  }
+  transformation t_done(d: Done) -> Done {
+    Done { cid: d.cid, status: d.status, c_hex: d.c_hex }
+  }
+  pipeline gc_blob(r: Rec) -> Act { call x = t_rec(r); call y = blob(x); return y; }
+  pipeline gc_at(d: Done) -> Act { call x = t_done(d); call y = at(x); return y; }
+  entry gc_blob = gc_blob;
+  entry gc_at = gc_at;
+  provenance revision "blob-gc" toolchain "chronicle-authoring";
+}

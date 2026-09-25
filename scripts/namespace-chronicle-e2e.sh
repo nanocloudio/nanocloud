@@ -85,12 +85,9 @@ modules:
     paths: "status.phase"
     join: "${PREFIXES}"
     join_scoped: 1
-  - name: sweep
-    type: decision
-    params:
-      decision: "${DEC_SW}"
   - name: collect
     type: store_effect
+    decision: "${DEC_SW}"
   - name: namespaces
     type: store_source
     prefix: "/namespaces/"
@@ -98,28 +95,19 @@ modules:
     count_children: "${PREFIXES}"
     child_sep: "/"
     watch: "${PREFIXES}"
-  - name: finalize
-    type: decision
-    params:
-      decision: "${DEC_FIN}"
   - name: remove
     type: store_effect
+    decision: "${DEC_FIN}"
     key_prefix: "/namespaces/"
 wiring:
   - from: objects.status
     to: objects.changes
   - from: objects.record_out
-    to: sweep.record_in
-  - from: sweep.result_out
     to: collect.request_in
-    buffer_group: 1
   - from: namespaces.status
     to: namespaces.changes
   - from: namespaces.record_out
-    to: finalize.record_in
-  - from: finalize.result_out
     to: remove.request_in
-    buffer_group: 2
 YAML
 
 run() { # run <seconds>

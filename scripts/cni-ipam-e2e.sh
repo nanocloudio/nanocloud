@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's cni_ipam module (modules/app/cni_ipam) — pod IP
-# allocation over the fluxor-native control-plane store, consumed through the
-# standard storage contracts (storage.object 0x14 + storage.namespace 0x13). The
-# store lives inside the
-# runtime and is seeded from its durable append-log ($D/store.log) at boot.
+# Live E2E for pod IP allocation as Chronicle params (ipam_pod.uproc,
+# ipam_pod_release.uproc; graph EXTRACTED from fluxor-controlplane.yaml into
+# packaging/debian/fluxor-ipam.yaml) over the fluxor-native control-plane
+# store, seeded from its durable append-log ($D/store.log) at boot.
 #
-# This script (playing the CNI plugin's request side) seeds the pool + a
-# pre-existing lease + three requests into the store log; the cni_ipam fmod,
-# inside the fluxor-linux runtime, allocates the lowest free host for each and
-# writes the lease. Proves deterministic lowest-free allocation, the free-scan
-# (skipping the pre-existing lease), and lease stability.
+# Proves: an address in use before the allocator starts (a lease with no
+# claim) is CLAIMED before any allocation runs, so it is never handed out
+# again; a taken candidate is refused by the store (create-only claim, 409)
+# and skipped; allocation is next-fit and a lease is never reassigned; and a
+# request whose sandbox is gone releases its lease, its request and its claim.
 #
 # Compact format:
 #   /ipam-pool          = "cidr=<a.b.c.0>/<prefix>"
-#   /ipam-request/<uid> = ""
-#   /ipam-lease/<uid>   = "<ip>"
+#   /ipam-request/<id>  = ""                      (the sandbox runtime, net=own)
+#   /ipam-lease/<id>    = "<ip>"                  (create-only)
+#   /ipam/pod/<u32>     = "owner=<id>;ip=<u32>"   (the claim)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +27,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/cni_ipam.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/store_source.fmod" "$MODULES_DIR/store_effect.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -77,26 +77,80 @@ PY
 echo "== 1. build the config + module table from the graph =="
 nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
-echo "== 2. seed pool + a pre-existing lease (.1) + three requests =="
+ip_u32() { python3 -c "import sys;a=[int(x) for x in sys.argv[1].split('.')];print((a[0]<<24)|(a[1]<<16)|(a[2]<<8)|a[3])" "$1"; }
+
+RUNTIME_PID=""
+trap 'kill $RUNTIME_PID 2>/dev/null || true; rm -rf "$D"' EXIT
+start() {
+  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  RUNTIME_PID=$!
+}
+stop() { kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""; }
+# await <key> <want> — poll the store log until the key's latest value is <want>.
+await() {
+  for _ in $(seq 300); do
+    [ "$(store_last "$1")" = "$2" ] && return 0
+    kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited while waiting for $1"
+    sleep 0.1
+  done
+  fail "$1: got '$(store_last "$1")', want '$2' after 30s"
+}
+
+echo "== 2. seed: pool, a lease in use at .1 (pre), a LEGACY lease at .5 with no claim, four requests =="
 store_put "/ipam-pool" "cidr=10.244.0.0/24"
-store_put "/ipam-lease/pre" "10.244.0.1"       # already allocated — must be skipped + kept
-store_put "/ipam-request/pod1" ""
-store_put "/ipam-request/pod2" ""
-store_put "/ipam-request/pod3" ""
+for id in pre legacy pod1 pod2 pod3 pod4; do
+  store_put "/sandboxes/$id" "net=own"
+  store_put "/ipam-request/$id" ""
+done
+store_put "/ipam-lease/pre" "10.244.0.1"
+store_put "/ipam-lease/legacy" "10.244.0.5"
 
-echo "== 3. run the allocator =="
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
-
-echo "== 4. verify deterministic lowest-free allocation (skipping .1) =="
-expect() { # expect <uid> <want>
+echo "== 3. run the allocator: existing addresses claimed first, then next-fit =="
+start
+await /ipam-lease/pod4 "10.244.0.6"
+stop
+expect() { # expect <id> <want>
   local got; got="$(store_last "/ipam-lease/$1")"
   [ "$got" = "$2" ] || fail "lease for $1 wrong: got '$got', want '$2'"
   echo "   $1: $got"
 }
-expect pre  "10.244.0.1"   # untouched
-expect pod1 "10.244.0.2"   # .1 skipped
-expect pod2 "10.244.0.3"
-expect pod3 "10.244.0.4"
+expect pre    "10.244.0.1"   # in use before the allocator ran: kept, never reissued
+expect legacy "10.244.0.5"   # ditto — claimed by the backfill before allocation began
+expect pod1   "10.244.0.2"   # .1 refused by the store (409), skipped
+expect pod2   "10.244.0.3"
+expect pod3   "10.244.0.4"
+expect pod4   "10.244.0.6"   # .5 refused (the backfilled claim), skipped
+for pair in pre:10.244.0.1 legacy:10.244.0.5 pod1:10.244.0.2 pod4:10.244.0.6; do
+  id="${pair%%:*}"; ip="${pair#*:}"; n="$(ip_u32 "$ip")"
+  got="$(store_last "/ipam/pod/$n")"
+  [ "$got" = "owner=$id;ip=$n" ] || fail "claim /ipam/pod/$n: got '$got', want 'owner=$id;ip=$n'"
+done
+echo "   every address in use holds exactly one create-only claim"
 
-echo "== E2E green: deterministic pod IP allocation over the shared store =="
+echo "== 4. release: pod2's sandbox is gone -> its lease, request and claim go; the next pod gets .7 =="
+store_put "/sandboxes/pod5" "net=own"
+store_put "/ipam-request/pod5" ""
+python3 - "$D/store.log" "/sandboxes/pod2" <<'PY'
+import struct, sys, os
+path, key = sys.argv[1], sys.argv[2].encode()
+with open(path, "r+b") as f:
+    data = f.read(); p, last = 0, 0
+    while p + 15 <= len(data):
+        rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    f.write(struct.pack("<QBHI", last + 1, 2, len(key), 0) + key)
+    f.flush(); os.fsync(f.fileno())
+PY
+start
+await /ipam-lease/pod5 "10.244.0.7"
+await /ipam-lease/pod2 ""
+await /ipam-request/pod2 ""
+await "/ipam/pod/$(ip_u32 10.244.0.3)" ""
+stop
+expect pod1 "10.244.0.2"     # untouched by another pod's release
+echo "   pod2 released (lease, request, claim for .3); pod5 -> 10.244.0.7 (next-fit)"
+
+echo "== E2E green: pod IPs allocated as params — claims make every address unique =="

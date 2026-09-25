@@ -49,7 +49,12 @@ hardware_targets = ["bcm2712"]
 #     20..22  reserved for store_source's expansion trailer
 #     30..39  carry-through (echoed with their TYPE)
 #     40..49  `paths` projected from a GET, as bytes
-#     50..54  `ints` projected from a GET, as i64 (absent -> 0)
+#     50..58  `ints` projected from a GET, as i64 (absent -> 0) — at most
+#             nine; a tenth path is not projected, and a decision reading
+#             its field would silently produce nothing
+#     28      expected revision (i64) for REPLACE / a conditional DELETE
+#     59      reply: the key's store revision (i64, 0 = absent), every reply,
+#             when `revision = 1`
 # Ops: 0 NOOP, 1 GET, 2 EXISTS, 3 PUT (204 when unchanged), 4 DELETE,
 # 7 LIST (the key is a PREFIX; answers 200 with the children's last segments
 # joined by `list_sep`, default ","). LIST is the request-driven counterpart to
@@ -66,11 +71,44 @@ hardware_targets = ["bcm2712"]
 # VM that can concatenate. The literals are PARAMS because which envelope a
 # listing wears is the graph's choice, not this module's.
 # 5 PATCH (set the scalar at dotted path field 19 to field 4 — an i64 is
-# rendered as digits — inside the object at the key; 404 when absent),
+# rendered as digits — inside the object at the key; 404 when absent, 413 when
+# it exists but is past a record),
 # 6 MERGE (upsert the joined `k=v;…` value parts into the flat record at the
-# key, leaving every other key alone; an empty value removes a key).
+# key, leaving every other key alone; an empty value removes a key). With an
+# expected revision in field 28 the merge is into THAT record: 409 when it
+# moved or is gone, so a merge never recreates a record another writer
+# removed.
+# 12 COUNT (the key is a PREFIX; answers 200 with the number of keys under it
+# at field 45). `count_where = <hex>` counts only the children a decision
+# keeps: each child is handed to it as a reply would answer it — field 3 the
+# key's tail past the prefix, the request's carry (30..39, 254), this node's
+# `paths` / `ints` projected out of the child — and counts when the decision
+# constructs a message. A walk that fails, a child present but unreadable, or
+# a decision that does not decide answers 500: a short count reads as a
+# complete one. The container is small (CW_CONT); one past it is refused at
+# load, and every COUNT answers 500.
+# `wall = 1` hands the fused decision the wall clock (Unix ms) at field 60.
 # `flat = 1` reads `k=v;k=v` records for `paths`/`ints`.
+# 8 CREATE (PUT under the store's ABSENT precondition: 200 created, 409 the key
+# already existed), 9 REPLACE (PUT under ETAG: conditional on field 28, or on
+# the body's `rv_path` when 28 is absent; 409 when the key moved; an ordinary
+# PUT when no revision is stated). The precondition is evaluated by the store
+# at ONE linearization point — a probe followed by a write is the race these
+# exist to close. DELETE with field 28 set is conditional the same way.
+# `rv_path = <a.b>` stamps the key's store revision into GET and LIST-values
+# answers at that two-segment path (`metadata.resourceVersion`), as a string.
+# Key parts (3, 17, 18, 25..27) may be INTEGERS and render as decimal, like
+# value parts: an allocator keys its claim by the address it computed. `ints`
+# paths take `.` (the whole value) and `!<mod>` (`.!ip4`), as in store_source.
 timer_class = "agnostic"
+
+# The fused decision (`decision` param) runs Chronicle's engine with the whole
+# pinned CEL extension surface — the same `full` feature set Chronicle's own
+# `decision` module builds with, so a param that runs there runs here.
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
 
 [[ports]]
 name = "request_in"
@@ -79,14 +117,20 @@ content_type = "OctetStream"
 buffer_size = 16384
 max_record = 8192
 required = true
-# This module reads a whole record per step, so it needs the boundary kept.
-framed = true
+# NOT declared `framed`: either edge shape works. On a byte stream the module
+# self-frames (peeks the record header and consumes exactly one record); on a
+# mailbox (`buffer_group`) it reads the record whole. Wire a stream from a
+# producer that emits a page of records per step (store_source), so a page is
+# not stalled a record at a time.
 
 [[ports]]
 name = "response_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 65536
+# Four records of reply ahead of the next stage. A control plane wires this
+# port some fifty times, and every ring comes out of the runtime's one 8 MiB
+# channel arena: a wider ring here is what leaves no room for the rest.
+buffer_size = 32768
 max_record = 8192
 # Optional: a TERMINAL writer has nobody to answer, and requiring a sink would
 # put a `debug` node in a production graph purely to swallow replies. Wire it

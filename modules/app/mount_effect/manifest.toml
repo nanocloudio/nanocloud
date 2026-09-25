@@ -1,0 +1,64 @@
+name = "mount_effect"
+version = "0.1.0"
+description = "The encrypted-volume claim chain's mount actuator — a Mnt record in, the raw facts of what ran back"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The privileged mount actuator of `volume_claim.uproc` (docs/design/
+# encrypted-volumes.md, "The mount effect"). It decides nothing: the chain's
+# `done` decision maps what it answers to a typed outcome.
+#
+# MOUNT (50): dev, fs, mkfs ("1" or "").
+#   1. Without the mount privilege, nothing runs: priv = 0.
+#   2. mkfs "1" on a device with no filesystem signature (`blkid -p` exits
+#      2): `mkfs -t <fs>` without discarding the device (ext*: -E nodiscard,
+#      xfs: -K), its exit status in mkfs. Otherwise
+#      `fsck -p <dev>`, its exit status in fsck.
+#   3. A make or check that failed ends it there; otherwise the platform
+#      mounts dev under `<mount root>/<claim>`, `nodev,nosuid`; code is 0 or
+#      the kernel's errno, dir the mount point.
+# UNMOUNT (51): the claim's directory. was = 1 when something was mounted
+#   there, code 0 or the errno that kept it mounted.
+# Every other op is dropped unanswered.
+#
+# In (`request_in`, a Chronicle record): 1 cid 2 op 3 key (the claim)
+#   4 dev 5 fs 6 dir 7 mkfs, 254 carry.
+# Out (`response_out`): 1 cid 2 op 3 key 4 priv 5 fsck 6 code 7 dir 8 was
+#   9 mkfs (each -1 when it did not run), 254 carry.
+#
+# The mount surface is the platform's (`host_mount`): the root, the block
+# device check and the nodev,nosuid flags are its policy. The tools run
+# through the process executor, so the node's grant must allow `blkid`,
+# `mkfs` and `fsck` (`SECTOR_PROC_ALLOW`). One request at a time; a tool,
+# and the platform's mount or unmount, runs across steps and is polled,
+# never waited on.
+timer_class = "agnostic"
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+[[resources]]
+requires_contract = "host_mount"
+access = "write"
+
+[[resources]]
+requires_contract = "proc"
+access = "write"
+
+[observability]
+exempt = "actuator — every mount and unmount it performs is answered as a record the claim chain stores"

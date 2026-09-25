@@ -27,3 +27,15 @@ nc_stages() { # nc_stages <uproc-path> <entry>
   fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null \
     | grep -oP '(?<=ir_stages: ")[0-9a-f]+' | head -1 | tr -d '\n'
 }
+
+# The stage kinds that go with `nc_stages`' container, when the pipeline holds
+# a map stage (empty otherwise: a container alone is all compute). A node that
+# carries map stages is wrong without them — the container would run each
+# map's header as bytecode — so they are baked beside `ir_stages`, from the
+# same compile.
+nc_stage_kinds() { # nc_stage_kinds <uproc-path> <entry>
+  local hex
+  hex="$(python3 -c "import sys;print(open(sys.argv[1],'rb').read().hex())" "$1")"
+  fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null \
+    | { grep -oP '(?<=stage_kinds: ")[0-9a-f]+' || true; } | head -1 | tr -d '\n'
+}

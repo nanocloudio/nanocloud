@@ -1,0 +1,278 @@
+// Provisioning an encrypted volume for a PersistentVolumeClaim — the provision
+// pipeline of the encrypted-storage design, as params.
+//
+//   ask   a PVC naming a StorageClass, not yet bound and not yet being
+//         provisioned -> GET `/storageclasses/<class>`, carrying the claim
+//   open  the class's answer -> CREATE `/volume-provisions/<ns>/<pvc>` with the
+//         class's encryption policy, when its provisioner is this one
+//         (`encrypted.loam.nanocloud.io`); any other class is not ours. CREATE
+//         is the store's absent-precondition PUT, so a claim opens once.
+//   step  the provision record -> the next step (write-ahead MERGE; the shared
+//         `act`/`record` in volume_effect.uproc issue each step's effect and
+//         write its outcome back), in this order:
+//
+//     (validate) the class policy: custody possession | hardware, fs ext4 |
+//                xfs, a lifetime of 1 s … 24 h, a size, a single-writer access
+//                mode — anything else fails with `policy_invalid`
+//     p_create     LOAM_CREATE     the Loam volume -> vol
+//     p_authorise  KAGI_CREATE     Kagi authorises the key policy (epoch 1)
+//     p_split      VAULT_SPLIT     the provisioning vault generates the volume
+//                                  key and seals three recovery shares, one to
+//                                  each custodian (the key never leaves it)
+//     p_recordset  KAGI_RECORD_SET Kagi records the recovery set -> set
+//     p_vekdrop    VAULT_DESTROY   the provisioning vault destroys its handle:
+//                                  from here only two custodians together can
+//                                  rebuild the key, and only into a vault
+//     p_grant      KAGI_GRANT      the grant to the device of the node the
+//                                  claim's first consumer was scheduled to
+//                                  (WaitForFirstConsumer: it waits for `device`)
+//     p_persist    VOLUME_PERSIST  the volume's identity — vol, fs, the grant's
+//                                  device, access mode, recovery set — opens
+//                                  `/volume-attachments/<ns>/<pvc>`
+//     p_bind       PV_BIND         the PersistentVolume, bound to the claim
+//     provisioned
+//
+// No durable recipient envelope is created for any device: an attachment's
+// key reaches a node only as a fresh two-share bundle, per attach
+// (volume_attach.uproc). No key material, share or envelope crosses this
+// record — it holds identifiers and policy only.
+//
+// A failure after p_split destroys the provisioning vault's key handle first
+// (p_vekdrop, retried until it answers) and then records `failed` with the
+// reason. Every step is idempotent for (claim, phase): Loam answers an existing
+// volume of the same name, Kagi an existing creation for the same resource.
+module nanocloud.volume_provision {
+
+  // The shared carry (volume_effect.uproc), the numbers provision writes.
+  // carried by: Get, Got, Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    fs: string = 35;
+    device: string = 36;
+    grant: string = 37;
+    tenant: string = 40;
+    pvc: string = 41;
+    custody: string = 42;
+    set: string = 43;
+    access: string = 44;
+    size: string = 45;
+    tier: int = 46;
+    lifetime: int = 47;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum TIMEOUT_MS = 30000;
+  enum MAX_TRIES = 5;
+  enum MAX_LIFETIME_S = 86400;
+
+  // ── ask / open: the claim and its StorageClass ──
+  message Pvc {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    class: string = 4;     // spec.storageClassName
+    size: string = 5;      // spec.resources.requests.storage
+    access: string = 6;    // spec.accessModes.0
+    bound: string = 7;     // spec.volumeName
+    ns: string = 28;
+    name: string = 29;
+    prov: string = 70;     // /volume-provisions/<ns>/<pvc> phase (related, flat)
+  }
+  message Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  decision ask(p: Pvc) -> Get {
+    when p.class != "" && p.bound == "" && p.prov == "" ->
+      Get { cid: p.seq, op: GET, key: p.class,
+            ctx: Ctx { claim: p.key, ph: "", tenant: p.ns, pvc: p.name, size: p.size, access: p.access } };
+    default ->
+      Get { cid: p.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  // store_effect GET of the class: paths `provisioner,parameters.custody,
+  // parameters.fsType` (40..42), ints `parameters.minTier,
+  // parameters.lifetimeSeconds` (50, 51).
+  message Got {
+    cid: int = 1;
+    status: int = 2;
+    provisioner: string = 40;
+    custody: string = 41;
+    fs: string = 42;
+    tier: int = 50;
+    lifetime: int = 51;
+    ctx: Ctx = 254;
+  }
+  message Open {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    v7: string = 10; v8: string = 11; v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+  }
+  decision open(g: Got) -> Open {
+    when g.status == 200 && g.provisioner == "encrypted.loam.nanocloud.io" ->
+      Open { cid: g.cid, op: CREATE, key: g.ctx.tenant, k2: "/", k3: g.ctx.pvc,
+             v1: "custody=", v2: g.custody, v3: ";fs=", v4: g.fs, v5: ";size=", v6: g.ctx.size,
+             v7: ";access=", v8: g.ctx.access, v9: ";tier=", v10: g.tier, v11: ";lifetime=", v12: g.lifetime };
+    default ->
+      Open { cid: g.cid, op: NOOP, key: "" };
+  }
+
+  // ── step: the provision record ──
+  message Prov {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    phase: string = 4;
+    out: string = 5;
+    custody: string = 6;
+    fs: string = 7;
+    device: string = 8;
+    vol: string = 9;
+    set: string = 10;
+    grant: string = 11;
+    reason: string = 12;
+    size: string = 13;
+    access: string = 14;
+    tier: int = 50;
+    lifetime: int = 51;
+    at: int = 52;
+    tries: int = 53;
+    vek: int = 54;         // 1 while the provisioning vault holds the key
+    wake: int = 55;
+    now: int = 58;
+    tenant: string = 28;
+    pvc: string = 29;
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision step(p: Prov) -> Step {
+    when p.phase == "provisioned" || p.phase == "failed" ->
+      Step { cid: p.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // ── a failure: the provisioning vault's key handle goes first ──
+    when p.reason != "" && p.vek == 1 && p.phase != "p_vekdrop" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_vekdrop;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_vekdrop", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.reason != "" && p.vek == 1 && p.now >= p.at + TIMEOUT_MS ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "out=", v3: ";tries=", n1: p.tries + 1,
+             v4: ";at=", n2: p.now, v5: ";wake=", n3: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_vekdrop", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.reason != "" && p.vek == 1 ->
+      Step { cid: p.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when p.reason != "" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=failed;out=", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── validate the class policy ──
+    when p.phase == "" && ((p.custody != "possession" && p.custody != "hardware")
+         || (p.fs != "ext4" && p.fs != "xfs") || p.tier < 0 || p.lifetime <= 0 || p.lifetime > MAX_LIFETIME_S
+         || p.size == "" || (p.access != "ReadWriteOnce" && p.access != "ReadWriteOncePod")) ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "reason=policy_invalid", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now, ctx: Ctx { claim: "", ph: "" } };
+    when p.phase == "" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_create;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_create", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+
+    // ── forward ──
+    when p.phase == "p_create" && p.out == "p_create:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_authorise;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_authorise", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_authorise" && p.out == "p_authorise:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_split;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_split", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_split" && p.out == "p_split:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_recordset;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_recordset", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_recordset" && p.out == "p_recordset:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_vekdrop;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_vekdrop", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    // WaitForFirstConsumer: the grant names the node a consumer was scheduled to.
+    when p.phase == "p_vekdrop" && p.out == "p_vekdrop:ok" && p.device == "" ->
+      Step { cid: p.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when p.phase == "p_vekdrop" && p.out == "p_vekdrop:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_grant;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_grant", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_grant" && p.out == "p_grant:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_persist;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_persist", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_persist" && p.out == "p_persist:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=p_bind;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: "p_bind", vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when p.phase == "p_bind" && p.out == "p_bind:ok" ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "phase=provisioned;out=;tries=0", v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // A refusal or failure ends it (the handle cleanup above runs first). The
+    // key-destroy step is never failed this way: it is retried until it
+    // answers, because a live key handle is not left behind.
+    when (p.phase == "p_create" && p.out == "p_create:failed")
+         || (p.phase == "p_authorise" && (p.out == "p_authorise:refused" || p.out == "p_authorise:failed"))
+         || (p.phase == "p_split" && p.out == "p_split:failed")
+         || (p.phase == "p_recordset" && (p.out == "p_recordset:refused" || p.out == "p_recordset:failed")) ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "reason=", v2: p.out, v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now, ctx: Ctx { claim: "", ph: "" } };
+    when (p.phase == "p_grant" && (p.out == "p_grant:refused" || p.out == "p_grant:failed"))
+         || (p.phase == "p_persist" && p.out == "p_persist:failed")
+         || (p.phase == "p_bind" && p.out == "p_bind:failed") ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "reason=", v2: p.out, v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now, ctx: Ctx { claim: "", ph: "" } };
+    // Unanswered or unavailable: ask again, then give up.
+    when (p.phase == "p_create" || p.phase == "p_authorise" || p.phase == "p_split" || p.phase == "p_recordset"
+          || p.phase == "p_vekdrop" || p.phase == "p_grant" || p.phase == "p_persist" || p.phase == "p_bind")
+         && p.now >= p.at + TIMEOUT_MS && p.tries < MAX_TRIES ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "out=", v3: ";tries=", n1: p.tries + 1,
+             v4: ";at=", n2: p.now, v5: ";wake=", n3: p.now + TIMEOUT_MS,
+             ctx: Ctx { claim: p.key, ph: p.phase, vol: p.vol, fs: p.fs, device: p.device, grant: p.grant, tenant: p.tenant, pvc: p.pvc,
+                        custody: p.custody, set: p.set, access: p.access, size: p.size, tier: p.tier, lifetime: p.lifetime } };
+    when (p.phase == "p_create" || p.phase == "p_authorise" || p.phase == "p_split" || p.phase == "p_recordset"
+          || p.phase == "p_vekdrop" || p.phase == "p_grant" || p.phase == "p_persist" || p.phase == "p_bind")
+         && p.now >= p.at + TIMEOUT_MS ->
+      Step { cid: p.seq, op: MERGE, key: p.key, v1: "reason=exhausted:", v2: p.phase, v3: ";at=", n1: p.now,
+             v4: ";wake=", n2: p.now, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: p.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline vp_ask(p: Pvc) -> Get { call y = ask(p); return y; }
+  pipeline vp_open(g: Got) -> Open { call y = open(g); return y; }
+  pipeline vp_step(p: Prov) -> Step { call y = step(p); return y; }
+  entry vp_ask = vp_ask;
+  entry vp_open = vp_open;
+  entry vp_step = vp_step;
+  provenance revision "volume-provision" toolchain "chronicle-authoring";
+}

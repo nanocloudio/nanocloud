@@ -90,8 +90,8 @@ const PVCS_PREFIX: &[u8] = b"/persistentvolumeclaims/";
 const DEVICES_PREFIX: &[u8] = b"/devices.nanocloud.io/";
 const NETWORKPOLICIES_PREFIX: &[u8] = b"/networkpolicies/";
 const BOUND_VOLUMES_PREFIX: &[u8] = b"/volumes/";
-const DATAPLANE_NETPOLICY_KEY: &[u8] = b"/dataplane/netpolicy";
-// Pod logs (published by sandbox_runner draining the workload READ op) + the
+const NETPOLICY_STATUS_KEY: &[u8] = b"/np-status/netpolicy";
+// Pod logs (published by the sandbox runtime draining the workload READ op) + the
 // sandbox lifecycle status (`state=<label>;code=<n>`) keyed by the same id.
 const LOGS_PREFIX: &[u8] = b"/sandbox-logs/";
 const SANDBOX_STATUS_PREFIX: &[u8] = b"/sandbox-status/";
@@ -99,7 +99,7 @@ const SANDBOX_STATUS_PREFIX: &[u8] = b"/sandbox-status/";
 /// applet forever (each step is a cheap store read).
 const STREAM_MAX: u32 = 600_000;
 
-// The exec request/response seam (serviced by sandbox_runner running on the
+// The exec request/response seam (serviced by the sandbox runtime running on the
 // node): the CLI writes `/sandbox-exec/<id>/cli = <cmd>`, then polls
 // `/sandbox-exec-result/<id>/cli` (exit code) + `/sandbox-exec-output/<id>/cli`
 // (captured stdout/stderr), and deletes the trio when done.
@@ -118,7 +118,7 @@ const TTY_PREFIX: &[u8] = b"/tty/";
 const TTY_SID: &[u8] = b"cli";
 const PORT_INPUT: u8 = 0;
 
-// CA cert (published by cert_manager) + SA-token seam (serviced by sa_token).
+// CA cert (published by the device chain) + SA-token seam (the sa_token chain).
 const CA_CERT_KEY: &[u8] = b"/ca-cert";
 const TOKEN_REQ_KEY: &[u8] = b"/token-req/cli";
 const TOKEN_RESP_KEY: &[u8] = b"/token-resp/cli";
@@ -189,6 +189,10 @@ struct State {
     /// exit-code channel (output port 1 → cli_out.exit_in).
     exit_chan: i32,
     waited: u32,
+    /// The store answers: its replica serves (1), or since when (ms) this
+    /// command has waited for it (0: not yet asked).
+    store_ready: u8,
+    store_wait_from: u64,
     done: u8,
     /// `logs -f` streaming: 1 = active. `stream_off` = bytes already emitted;
     /// `stream_steps` = backstop counter; `stream_id` = the sandbox/pod id.
@@ -207,7 +211,26 @@ struct State {
     /// `bundle apply`: stdin bundle accumulated until EOF, then applied.
     bundle_len: u16,
     bundle_buf: [u8; BUNDLE_BUF],
+    /// The store calls of the command being served ([`Journal`]): a
+    /// command waiting on a write the store has not decided is served again,
+    /// from its argv here, until its writes are decided.
+    journal: Journal,
+    waiting: u8,
+    argv: [u8; ARGV_BUF],
+    argv_len: u16,
+    /// `exec -it`: the stdin chunk written to the runner, owed until the
+    /// store decides it; nothing more is drained into it meanwhile.
+    tty_in_owed: u8,
+    /// A command that has answered and is finishing: the keys it removes,
+    /// each asked again until the store decides it, then its exit code.
+    finish: [[u8; MAX_KEY]; FINISH_KEYS],
+    finish_len: [u8; FINISH_KEYS],
+    finish_code: i32,
+    finishing: u8,
 }
+
+/// Keys a finishing command removes.
+const FINISH_KEYS: usize = 3;
 
 // ---- store ----
 
@@ -316,7 +339,7 @@ fn append_u32(dst: &mut [u8], at: usize, mut n: u32) -> usize {
 
 // ---- commands ----
 
-unsafe fn cmd_status(sys: &SyscallTable, out: &mut [u8]) -> usize {
+unsafe fn cmd_status(sys: &Store, out: &mut [u8]) -> usize {
     let mut p = append(out, 0, b"nanocloud status\n");
     p = append(out, p, b"  nodes:        ");
     p = append_u32(out, p, count_prefix(sys, NODES_PREFIX));
@@ -331,7 +354,7 @@ unsafe fn cmd_status(sys: &SyscallTable, out: &mut [u8]) -> usize {
 }
 
 /// `diagnostics` — object counts across every resource type + a health line.
-unsafe fn cmd_diagnostics(sys: &SyscallTable, out: &mut [u8]) -> usize {
+unsafe fn cmd_diagnostics(sys: &Store, out: &mut [u8]) -> usize {
     let rows: [(&[u8], &[u8]); 16] = [
         (b"nodes", NODES_PREFIX),
         (b"namespaces", NAMESPACES_PREFIX),
@@ -371,27 +394,24 @@ unsafe fn cmd_diagnostics(sys: &SyscallTable, out: &mut [u8]) -> usize {
     p
 }
 
-/// `policy` — list NetworkPolicies + print the compiled dataplane ruleset.
-unsafe fn cmd_policy(sys: &SyscallTable, out: &mut [u8]) -> usize {
+/// `policy` — list NetworkPolicies + whether the node enforces them (the
+/// `netpolicy` table's status: `enforced=0|1;rules=…;generation=…`).
+unsafe fn cmd_policy(sys: &Store, out: &mut [u8]) -> usize {
     let (np, _) = cmd_get(sys, b"networkpolicies", out);
     let mut p = np;
-    p = append(
-        out,
-        p,
-        b"---- compiled dataplane (/dataplane/netpolicy) ----\n",
-    );
+    p = append(out, p, b"---- enforcement (/np-status/netpolicy) ----\n");
     let mut val = [0u8; MAX_VALUE];
-    match get_value(sys, DATAPLANE_NETPOLICY_KEY, &mut val) {
+    match get_value(sys, NETPOLICY_STATUS_KEY, &mut val) {
         Some(n) if n > 0 => {
             p = append(out, p, &val[..n]);
             append(out, p, b"\n")
         }
-        _ => append(out, p, b"(not compiled yet)\n"),
+        _ => append(out, p, b"(not applied yet)\n"),
     }
 }
 
 /// `volume` — list PersistentVolumeClaims and bound volumes.
-unsafe fn cmd_volume(sys: &SyscallTable, out: &mut [u8]) -> usize {
+unsafe fn cmd_volume(sys: &Store, out: &mut [u8]) -> usize {
     let mut p = append(out, 0, b"persistentvolumeclaims:\n");
     p = list_names_into(sys, PVCS_PREFIX, out, p);
     p = append(out, p, b"bound volumes:\n");
@@ -435,7 +455,7 @@ fn cmd_config(out: &mut [u8]) -> usize {
 
 /// `rollout status <ns/name>` — how many pods have rolled to the current
 /// pod-template-hash of the Deployment's ReplicaSet.
-unsafe fn cmd_rollout_status(sys: &SyscallTable, subpath: &[u8], out: &mut [u8]) -> (usize, i32) {
+unsafe fn cmd_rollout_status(sys: &Store, subpath: &[u8], out: &mut [u8]) -> (usize, i32) {
     let mut rskey = [0u8; MAX_KEY];
     let rl = build_key(REPLICASETS_PREFIX, subpath, &mut rskey);
     if rl == 0 {
@@ -503,7 +523,7 @@ unsafe fn cmd_rollout_status(sys: &SyscallTable, subpath: &[u8], out: &mut [u8])
 
 /// `rollout undo <ns/name>` — restore the Deployment's previous template
 /// (archived by deployment_reconciler at .../previous on the last rollout).
-unsafe fn cmd_rollout_undo(sys: &SyscallTable, subpath: &[u8], out: &mut [u8]) -> (usize, i32) {
+unsafe fn cmd_rollout_undo(sys: &Store, subpath: &[u8], out: &mut [u8]) -> (usize, i32) {
     let (ns, name) = split_ns_name(subpath);
     let mut ck = [0u8; MAX_KEY];
     let mut cl = append(&mut ck, 0, b"/controllerrevisions.apps/");
@@ -532,7 +552,7 @@ unsafe fn cmd_rollout_undo(sys: &SyscallTable, subpath: &[u8], out: &mut [u8]) -
     if ndl == 0 {
         return (append(out, 0, b"error: rollback failed\n"), 1);
     }
-    if put_value(sys, &dk[..dl], &nd[..ndl]) {
+    if done(put_value(sys, &dk[..dl], &nd[..ndl])) {
         let mut p = append(out, 0, b"deployment ");
         p = append(out, p, name);
         (
@@ -546,7 +566,7 @@ unsafe fn cmd_rollout_undo(sys: &SyscallTable, subpath: &[u8], out: &mut [u8]) -
 
 /// Emit `key\tvalue\n` for every object under `prefix`, written directly to the
 /// stdout channel (a full-cluster dump exceeds the fixed out buffer).
-unsafe fn export_prefix(sys: &SyscallTable, out_chan: i32, prefix: &[u8]) {
+unsafe fn export_prefix(sys: &Store, out_chan: i32, prefix: &[u8]) {
     let mut raw = [0u8; LIST_BUF];
     let n = ns_list(sys, prefix, &mut raw);
     let mut rp = 0usize;
@@ -566,7 +586,7 @@ unsafe fn export_prefix(sys: &SyscallTable, out_chan: i32, prefix: &[u8]) {
 
 /// `bundle export` — dump every object across all resource types as
 /// `<store-key>\t<json>` lines, streamed to stdout (a restorable snapshot).
-unsafe fn cmd_export(s: &State, sys: &SyscallTable) {
+unsafe fn cmd_export(s: &State, sys: &Store) {
     let prefixes: [&[u8]; 17] = [
         NAMESPACES_PREFIX,
         NODES_PREFIX,
@@ -654,7 +674,7 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
 unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
     // Drain stdin into the bundle buffer.
     let mut got = false;
-    if s.stdin_chan >= 0 {
+    if s.stdin_chan >= 0 && s.waiting == 0 {
         let mut buf = [0u8; 512];
         let n = (sys.channel_read)(s.stdin_chan, buf.as_mut_ptr(), buf.len());
         if n > 0 {
@@ -669,10 +689,18 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
     if got {
         return 0;
     }
-    s.stream_steps += 1;
-    if s.stream_steps < BUNDLE_IDLE_EOF {
-        return 0; // wait for more stdin
+    if s.waiting == 0 {
+        s.stream_steps += 1;
+        if s.stream_steps < BUNDLE_IDLE_EOF {
+            return 0; // wait for more stdin
+        }
+        s.journal.reset();
+    } else {
+        s.journal.begin();
     }
+    // The apply's writes go through the journal: one the store has not
+    // decided holds the bundle, applied again next step as it was.
+    let store = Store::serving(sys, &mut s.journal);
 
     // EOF: apply each `<key>\t<json>` line.
     let blen = s.bundle_len as usize;
@@ -709,10 +737,15 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
         let vsrc = tab + 1;
         let vlen = (line_end - vsrc).min(MAX_VALUE);
         val[..vlen].copy_from_slice(&s.bundle_buf[vsrc..vsrc + vlen]);
-        if put_value(sys, &key[..klen], &val[..vlen]) {
+        if done(put_value(&store, &key[..klen], &val[..vlen])) {
             applied += 1;
         }
     }
+    if s.journal.held() {
+        s.waiting = 1;
+        return 0;
+    }
+    s.waiting = 0;
 
     let mut out = [0u8; 64];
     let mut p = append(&mut out, 0, b"applied ");
@@ -730,7 +763,7 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
 }
 
 /// `get <resource>` — one object name per line (the final key segment).
-unsafe fn cmd_get(sys: &SyscallTable, resource: &[u8], out: &mut [u8]) -> (usize, i32) {
+unsafe fn cmd_get(sys: &Store, resource: &[u8], out: &mut [u8]) -> (usize, i32) {
     let Some(prefix) = resource_prefix(resource) else {
         let mut p = append(out, 0, b"error: unknown resource '");
         p = append(out, p, resource);
@@ -757,7 +790,7 @@ unsafe fn cmd_get(sys: &SyscallTable, resource: &[u8], out: &mut [u8]) -> (usize
 
 /// `get <resource> <subpath>` — show one object's stored value (its fields).
 unsafe fn cmd_get_one(
-    sys: &SyscallTable,
+    sys: &Store,
     resource: &[u8],
     subpath: &[u8],
     out: &mut [u8],
@@ -789,12 +822,7 @@ unsafe fn cmd_get_one(
 }
 
 /// `delete <resource> <subpath>` — remove one object from the store (a mutation).
-unsafe fn cmd_delete(
-    sys: &SyscallTable,
-    resource: &[u8],
-    subpath: &[u8],
-    out: &mut [u8],
-) -> (usize, i32) {
+unsafe fn cmd_delete(sys: &Store, resource: &[u8], subpath: &[u8], out: &mut [u8]) -> (usize, i32) {
     let Some(prefix) = resource_prefix(resource) else {
         let mut p = append(out, 0, b"error: unknown resource '");
         p = append(out, p, resource);
@@ -805,7 +833,7 @@ unsafe fn cmd_delete(
     if klen == 0 {
         return (append(out, 0, b"error: name too long\n"), 1);
     }
-    if delete_value(sys, &key[..klen]) {
+    if done(delete_value(sys, &key[..klen])) {
         let mut p = append(out, 0, resource);
         p = append(out, p, b" \"");
         p = append(out, p, subpath);
@@ -821,7 +849,7 @@ unsafe fn cmd_delete(
 /// GET the object, rewrite `replicas=`, PUT it back. The reconciler cascade
 /// (deployment → replicaset → pods) then converges on the new count.
 unsafe fn cmd_scale(
-    sys: &SyscallTable,
+    sys: &Store,
     resource: &[u8],
     subpath: &[u8],
     replicas: &[u8],
@@ -849,7 +877,7 @@ unsafe fn cmd_scale(
     if nlen == 0 {
         return (append(out, 0, b"error: object has no spec\n"), 1);
     }
-    if put_value(sys, &key[..klen], &newdoc[..nlen]) {
+    if done(put_value(sys, &key[..klen], &newdoc[..nlen])) {
         let mut p = append(out, 0, resource);
         p = append(out, p, b" \"");
         p = append(out, p, subpath);
@@ -862,8 +890,8 @@ unsafe fn cmd_scale(
 }
 
 /// `logs <id>` — print the sandbox's captured stdout/stderr (published by
-/// sandbox_runner at `/sandbox-logs/<id>`). One-shot; `logs -f` streams instead.
-unsafe fn cmd_logs(sys: &SyscallTable, id: &[u8], out: &mut [u8]) -> (usize, i32) {
+/// the sandbox runtime at `/sandbox-logs/<id>`). One-shot; `logs -f` streams instead.
+unsafe fn cmd_logs(sys: &Store, id: &[u8], out: &mut [u8]) -> (usize, i32) {
     let mut key = [0u8; MAX_KEY];
     let klen = build_key(LOGS_PREFIX, id, &mut key);
     if klen == 0 {
@@ -895,6 +923,7 @@ fn status_is_terminal(doc: &[u8]) -> bool {
 /// the sandbox status is terminal (or the step backstop trips). Returns the
 /// module_step result (0 = keep streaming, STEP_DONE = finished).
 unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
+    let st = Store::plain(sys);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
@@ -908,7 +937,7 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let vlen = if klen == 0 {
         0
     } else {
-        get_value(sys, &key[..klen], &mut val).unwrap_or(0)
+        get_value(&st, &key[..klen], &mut val).unwrap_or(0)
     };
     let off = (s.stream_off as usize).min(vlen);
     if vlen > off && s.out_chan >= 0 {
@@ -921,7 +950,7 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let sklen = build_key(SANDBOX_STATUS_PREFIX, id, &mut skey);
     let mut sval = [0u8; MAX_VALUE];
     let terminal = sklen != 0
-        && match get_value(sys, &skey[..sklen], &mut sval) {
+        && match get_value(&st, &skey[..sklen], &mut sval) {
             Some(sl) => status_is_terminal(&sval[..sl]),
             None => false,
         };
@@ -977,8 +1006,9 @@ fn parse_int(b: &[u8]) -> i32 {
 /// One step of `exec`: poll for the runner's result. When it appears, emit the
 /// captured output, delete the request/result/output trio, latch the command's
 /// exit code, and finish. Times out (exit 1) if no runner answers — the node
-/// graph (with sandbox_runner) probably isn't running.
+/// graph (with the sandbox runtime) probably isn't running.
 unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
+    let st = Store::plain(sys);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
@@ -989,35 +1019,31 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let rl = build_exec_key(EXEC_RESULT_PREFIX, id, &mut rkey);
     let mut rval = [0u8; 32];
     if rl != 0 {
-        if let Some(vlen) = get_value(sys, &rkey[..rl], &mut rval) {
+        if let Some(vlen) = get_value(&st, &rkey[..rl], &mut rval) {
             // Emit the captured output.
             let mut okey = [0u8; MAX_KEY];
             let ol = build_exec_key(EXEC_OUTPUT_PREFIX, id, &mut okey);
             let mut oval = [0u8; MAX_VALUE];
             if ol != 0 {
-                if let Some(olen) = get_value(sys, &okey[..ol], &mut oval) {
+                if let Some(olen) = get_value(&st, &okey[..ol], &mut oval) {
                     if olen > 0 && s.out_chan >= 0 {
                         let _ = (sys.channel_write)(s.out_chan, oval.as_ptr(), olen);
                     }
                 }
             }
-            let code = parse_int(&rval[..vlen]);
-            // Clean up the seam so requests don't accumulate.
+            // Clean up the seam so requests don't accumulate: the command
+            // exits once the store has decided each removal.
+            s.finish_code = parse_int(&rval[..vlen]);
             let mut qkey = [0u8; MAX_KEY];
             let ql = build_exec_key(EXEC_REQ_PREFIX, id, &mut qkey);
             if ql != 0 {
-                delete_value(sys, &qkey[..ql]);
+                owe_removal(s, &qkey[..ql]);
             }
-            delete_value(sys, &rkey[..rl]);
+            owe_removal(s, &rkey[..rl]);
             if ol != 0 {
-                delete_value(sys, &okey[..ol]);
+                owe_removal(s, &okey[..ol]);
             }
-            if s.exit_chan >= 0 {
-                let c = code.to_le_bytes();
-                let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
-            }
-            s.done = 1;
-            return STEP_DONE;
+            return finish_step(s, sys);
         }
     }
     if s.stream_steps >= EXEC_POLL_MAX {
@@ -1033,6 +1059,56 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
         return STEP_DONE;
     }
     0
+}
+
+/// How long a command waits for the store to answer.
+const STORE_READY_WAIT_MS: u64 = 30_000;
+
+/// Whether the store answers a read: anything but ask-again (a GET of the
+/// root, absent or not, or no store in this directory at all).
+unsafe fn store_answers(sys: &SyscallTable) -> bool {
+    let mut key = *b"/";
+    let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), key.len());
+    if h >= 0 {
+        let mut carg = [0u8; 4];
+        (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    }
+    h != ERR_EAGAIN
+}
+
+/// Owe the removal of `key` before the command exits.
+fn owe_removal(s: &mut State, key: &[u8]) {
+    for i in 0..FINISH_KEYS {
+        if s.finishing & (1 << i) == 0 && key.len() <= MAX_KEY {
+            s.finish[i][..key.len()].copy_from_slice(key);
+            s.finish_len[i] = key.len() as u8;
+            s.finishing |= 1 << i;
+            return;
+        }
+    }
+}
+
+/// A command that has answered: its owed removals asked again until the
+/// store decides each, then its exit code.
+unsafe fn finish_step(s: &mut State, sys: &SyscallTable) -> i32 {
+    let store = Store::plain(sys);
+    for i in 0..FINISH_KEYS {
+        if s.finishing & (1 << i) != 0 {
+            let k = &s.finish[i][..s.finish_len[i] as usize];
+            if delete_value(&store, k) != WriteAnswer::Pending {
+                s.finishing &= !(1 << i);
+            }
+        }
+    }
+    if s.finishing != 0 {
+        return 0;
+    }
+    if s.exit_chan >= 0 {
+        let c = s.finish_code.to_le_bytes();
+        let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
+    }
+    s.done = 1;
+    STEP_DONE
 }
 
 /// Build a PTY session key `/tty/<id>/cli/<leaf>` into `buf`; length or 0.
@@ -1070,14 +1146,16 @@ fn status_code(v: &[u8]) -> i32 {
 /// `/tty/<id>/cli/in`, emits new PTY output from `/tty/<id>/cli/out`, and finishes
 /// when the session status is terminal (exiting with the shell's code).
 unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
+    let st = Store::plain(sys);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
     idbuf[..idlen].copy_from_slice(&s.stream_id[..idlen]);
     let id = &idbuf[..idlen];
 
-    // 1. Drain the stdin port into the local pending buffer.
-    if s.stdin_chan >= 0 {
+    // 1. Drain the stdin port into the local pending buffer — not while a
+    //    chunk written from it is undecided: asked again, it must be the same.
+    if s.stdin_chan >= 0 && s.tty_in_owed == 0 {
         let mut buf = [0u8; 512];
         let n = (sys.channel_read)(s.stdin_chan, buf.as_mut_ptr(), buf.len());
         if n > 0 {
@@ -1091,10 +1169,15 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     if s.tty_pending_len > 0 {
         let mut inkey = [0u8; MAX_KEY];
         let ik = build_tty_key(id, b"in", &mut inkey);
-        if ik != 0 && !exists(sys, &inkey[..ik]) {
+        if ik != 0 && (s.tty_in_owed != 0 || !exists(&st, &inkey[..ik])) {
             let pl = s.tty_pending_len as usize;
-            put_value(sys, &inkey[..ik], &s.tty_pending[..pl]);
-            s.tty_pending_len = 0;
+            match put_value(&st, &inkey[..ik], &s.tty_pending[..pl]) {
+                WriteAnswer::Pending => s.tty_in_owed = 1,
+                WriteAnswer::Decided(_) => {
+                    s.tty_in_owed = 0;
+                    s.tty_pending_len = 0;
+                }
+            }
         }
     }
     // 3. Emit new PTY output.
@@ -1102,7 +1185,7 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let ok = build_tty_key(id, b"out", &mut okey);
     let mut oval = [0u8; MAX_VALUE];
     let olen = if ok != 0 {
-        get_value(sys, &okey[..ok], &mut oval).unwrap_or(0)
+        get_value(&st, &okey[..ok], &mut oval).unwrap_or(0)
     } else {
         0
     };
@@ -1116,7 +1199,7 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let sk = build_tty_key(id, b"status", &mut skey);
     let mut sval = [0u8; 32];
     let (terminal, code) = if sk != 0 {
-        match get_value(sys, &skey[..sk], &mut sval) {
+        match get_value(&st, &skey[..sk], &mut sval) {
             Some(n) if sval[..n].starts_with(b"exited") || sval[..n].starts_with(b"failed") => {
                 (true, status_code(&sval[..n]))
             }
@@ -1138,25 +1221,22 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
 
 /// One step of `token`: poll `/token-resp/cli` for the minted JWT. When it
 /// appears, emit the token, delete the request/response, and exit. Times out
-/// (exit 1) if no sa_token runner answers.
+/// (exit 1) if no mint answers.
 unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
+    let st = Store::plain(sys);
     s.stream_steps += 1;
     let mut rval = [0u8; MAX_VALUE];
-    if let Some(n) = get_value(sys, TOKEN_RESP_KEY, &mut rval) {
+    if let Some(n) = get_value(&st, TOKEN_RESP_KEY, &mut rval) {
         let v = &rval[..n];
         let tok = if v.starts_with(b"token=") { &v[6..] } else { v };
         if s.out_chan >= 0 {
             let _ = (sys.channel_write)(s.out_chan, tok.as_ptr(), tok.len());
             let _ = (sys.channel_write)(s.out_chan, b"\n".as_ptr(), 1);
         }
-        delete_value(sys, TOKEN_REQ_KEY);
-        delete_value(sys, TOKEN_RESP_KEY);
-        if s.exit_chan >= 0 {
-            let c = 0i32.to_le_bytes();
-            let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
-        }
-        s.done = 1;
-        return STEP_DONE;
+        s.finish_code = 0;
+        owe_removal(s, TOKEN_REQ_KEY);
+        owe_removal(s, TOKEN_RESP_KEY);
+        return finish_step(s, sys);
     }
     if s.stream_steps >= EXEC_POLL_MAX {
         let msg = b"error: token mint timed out (is the control-plane graph running?)\n";
@@ -1173,8 +1253,9 @@ unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
     0
 }
 
-/// `ca` — print the cluster CA certificate (DER hex, published by cert_manager).
-unsafe fn cmd_ca(sys: &SyscallTable, out: &mut [u8]) -> (usize, i32) {
+/// `ca` — print the cluster CA certificate (base64url DER, published by the
+/// device chain from the authority's answer).
+unsafe fn cmd_ca(sys: &Store, out: &mut [u8]) -> (usize, i32) {
     let mut val = [0u8; MAX_VALUE];
     match get_value(sys, CA_CERT_KEY, &mut val) {
         Some(n) if n > 0 => {
@@ -1182,7 +1263,11 @@ unsafe fn cmd_ca(sys: &SyscallTable, out: &mut [u8]) -> (usize, i32) {
             (append(out, p, b"\n"), 0)
         }
         _ => (
-            append(out, 0, b"(no CA certificate; is cert_manager running?)\n"),
+            append(
+                out,
+                0,
+                b"(no CA certificate yet; one is published with the first device identity)\n",
+            ),
             1,
         ),
     }
@@ -1200,7 +1285,7 @@ fn split_ns_name(subpath: &[u8]) -> (&[u8], &[u8]) {
 /// `describe <resource> <ns/name>` — a labelled read: Name / Namespace headers
 /// followed by the object's stored JSON body. A friendlier `get <r> <ns/name>`.
 unsafe fn cmd_describe(
-    sys: &SyscallTable,
+    sys: &Store,
     resource: &[u8],
     subpath: &[u8],
     out: &mut [u8],
@@ -1244,7 +1329,7 @@ fn is_json_object(body: &[u8]) -> bool {
 /// already exists (like `kubectl create`). A direct store write, same model as
 /// `delete`/`scale`; the reconcilers then act on it.
 unsafe fn cmd_create(
-    sys: &SyscallTable,
+    sys: &Store,
     resource: &[u8],
     subpath: &[u8],
     body: &[u8],
@@ -1263,26 +1348,29 @@ unsafe fn cmd_create(
     if klen == 0 {
         return (append(out, 0, b"error: name too long\n"), 1);
     }
-    if exists(sys, &key[..klen]) {
-        let mut p = append(out, 0, resource);
-        p = append(out, p, b" \"");
-        p = append(out, p, subpath);
-        return (append(out, p, b"\" already exists\n"), 1);
-    }
-    if put_value(sys, &key[..klen], body) {
-        let mut p = append(out, 0, resource);
-        p = append(out, p, b" \"");
-        p = append(out, p, subpath);
-        (append(out, p, b"\" created\n"), 0)
-    } else {
-        (append(out, 0, b"error: create write failed\n"), 1)
+    // One conditional write: the store decides create-vs-exists at a single
+    // linearization point, so two creators cannot both succeed.
+    match code(put_cond(sys, &key[..klen], body, PRE_ABSENT, 0)) {
+        0 => {
+            let mut p = append(out, 0, resource);
+            p = append(out, p, b" \"");
+            p = append(out, p, subpath);
+            (append(out, p, b"\" created\n"), 0)
+        }
+        ERR_EEXIST => {
+            let mut p = append(out, 0, resource);
+            p = append(out, p, b" \"");
+            p = append(out, p, subpath);
+            (append(out, p, b"\" already exists\n"), 1)
+        }
+        _ => (append(out, 0, b"error: create write failed\n"), 1),
     }
 }
 
 /// `apply <resource> <ns/name> <json>` — upsert the object (create or replace),
 /// like `kubectl apply`. Reports created vs configured by probing first.
 unsafe fn cmd_apply(
-    sys: &SyscallTable,
+    sys: &Store,
     resource: &[u8],
     subpath: &[u8],
     body: &[u8],
@@ -1302,7 +1390,7 @@ unsafe fn cmd_apply(
         return (append(out, 0, b"error: name too long\n"), 1);
     }
     let existed = exists(sys, &key[..klen]);
-    if put_value(sys, &key[..klen], body) {
+    if done(put_value(sys, &key[..klen], body)) {
         let mut p = append(out, 0, resource);
         p = append(out, p, b" \"");
         p = append(out, p, subpath);
@@ -1406,6 +1494,8 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan; // output port 0 → cli_out.bytes_in
         s.exit_chan = -1; // output port 1 → cli_out.exit_in (resolved lazily)
         s.waited = 0;
+        s.store_ready = 0;
+        s.store_wait_from = 0;
         s.done = 0;
         s.stream_mode = 0;
         s.stream_idlen = 0;
@@ -1445,6 +1535,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.stdin_chan = dev_channel_port(sys, PORT_INPUT, 1);
         }
 
+        if s.finishing != 0 {
+            return finish_step(s, sys);
+        }
+
         // Persistent (multi-step) commands: once armed, each step advances the
         // stream — `logs -f` emits log bytes; `exec` polls; `exec -it` pumps a pty.
         if s.stream_mode != 0 {
@@ -1458,22 +1552,62 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             };
         }
 
+        // The store is this node's replica of the group's: until it serves
+        // (what it imports imported, its view caught up with the log) a
+        // read answers ask-again, which a one-shot command would take for
+        // absent. A command runs once it answers, or says it never did.
+        if s.store_ready == 0 {
+            if !store_answers(sys) {
+                let now = dev_millis(sys);
+                if s.store_wait_from == 0 {
+                    s.store_wait_from = now.max(1);
+                }
+                if now.wrapping_sub(s.store_wait_from) < STORE_READY_WAIT_MS {
+                    return 0;
+                }
+                let m = b"error: the store did not come up (run in its state directory, the service stopped)\n";
+                if s.out_chan >= 0 {
+                    let _ = (sys.channel_write)(s.out_chan, m.as_ptr(), m.len());
+                }
+                if s.exit_chan >= 0 {
+                    let c = 1i32.to_le_bytes();
+                    let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
+                }
+                s.done = 1;
+                return STEP_DONE;
+            }
+            s.store_ready = 1;
+        }
+
         // Read the argv record (one NUL-separated record from cli_in). Retry a
         // bounded number of steps; an empty argv (no `--`) never arrives, so we
         // fall through to `help`.
-        let mut arec = [0u8; ARGV_BUF];
-        let an = if s.args_chan >= 0 {
-            (sys.channel_read)(s.args_chan, arec.as_mut_ptr(), arec.len())
+        let alen = if s.waiting != 0 {
+            s.journal.begin();
+            s.argv_len as usize
         } else {
-            0
-        };
-        if an <= 0 {
-            s.waited += 1;
-            if s.waited < ARGV_WAIT {
-                return 0; // keep waiting for argv
+            let an = if s.args_chan >= 0 {
+                (sys.channel_read)(s.args_chan, s.argv.as_mut_ptr(), s.argv.len())
+            } else {
+                0
+            };
+            if an <= 0 {
+                s.waited += 1;
+                if s.waited < ARGV_WAIT {
+                    return 0; // keep waiting for argv
+                }
             }
-        }
-        let alen = if an > 0 { an as usize } else { 0 };
+            let alen = if an > 0 { an as usize } else { 0 };
+            s.argv_len = alen as u16;
+            s.journal.reset();
+            alen
+        };
+        let mut arec = [0u8; ARGV_BUF];
+        arec[..alen].copy_from_slice(&s.argv[..alen]);
+        // The command's store calls go through its journal: one that waits on
+        // a write the store has not decided is served again from its argv.
+        let store = Store::serving(sys, &mut s.journal);
+        let st = &store;
 
         let mut argv = [(0usize, 0usize); 16];
         let argc = split_argv(&arec[..alen], &mut argv);
@@ -1485,15 +1619,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let (s0, e0) = argv[0];
             let sub = &arec[s0..e0];
             if sub == b"status" {
-                (cmd_status(sys, &mut out), 0)
+                (cmd_status(st, &mut out), 0)
             } else if sub == b"get" {
                 if argc >= 3 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
-                    cmd_get_one(sys, &arec[s1..e1], &arec[s2..e2], &mut out)
+                    cmd_get_one(st, &arec[s1..e1], &arec[s2..e2], &mut out)
                 } else if argc >= 2 {
                     let (s1, e1) = argv[1];
-                    cmd_get(sys, &arec[s1..e1], &mut out)
+                    cmd_get(st, &arec[s1..e1], &mut out)
                 } else {
                     (append(&mut out, 0, b"error: get needs a resource\n"), 1)
                 }
@@ -1501,7 +1635,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if argc >= 3 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
-                    cmd_describe(sys, &arec[s1..e1], &arec[s2..e2], &mut out)
+                    cmd_describe(st, &arec[s1..e1], &arec[s2..e2], &mut out)
                 } else {
                     (
                         append(&mut out, 0, b"error: describe needs <resource> <ns/name>\n"),
@@ -1513,7 +1647,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
                     let (s3, e3) = argv[3];
-                    cmd_create(sys, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
+                    cmd_create(st, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
                 } else {
                     (
                         append(
@@ -1529,7 +1663,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
                     let (s3, e3) = argv[3];
-                    cmd_apply(sys, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
+                    cmd_apply(st, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
                 } else {
                     (
                         append(
@@ -1544,7 +1678,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if argc >= 3 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
-                    cmd_delete(sys, &arec[s1..e1], &arec[s2..e2], &mut out)
+                    cmd_delete(st, &arec[s1..e1], &arec[s2..e2], &mut out)
                 } else {
                     (
                         append(&mut out, 0, b"error: delete needs <resource> <ns/name>\n"),
@@ -1556,7 +1690,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let (s1, e1) = argv[1];
                     let (s2, e2) = argv[2];
                     let (s3, e3) = argv[3];
-                    cmd_scale(sys, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
+                    cmd_scale(st, &arec[s1..e1], &arec[s2..e2], &arec[s3..e3], &mut out)
                 } else {
                     (
                         append(
@@ -1584,7 +1718,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.stream_mode = STREAM_LOGS_FOLLOW;
                         (0usize, 0i32)
                     } else {
-                        cmd_logs(sys, id, &mut out)
+                        cmd_logs(st, id, &mut out)
                     }
                 } else {
                     (append(&mut out, 0, b"error: logs needs [-f] <id>\n"), 1)
@@ -1641,7 +1775,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let ckl = build_tty_key(id, b"ctl", &mut ckey);
                             if ckl == 0 {
                                 (append(&mut out, 0, b"error: name too long\n"), 1)
-                            } else if put_value(sys, &ckey[..ckl], &ctl[..cp]) {
+                            } else if done(put_value(st, &ckey[..ckl], &ctl[..cp])) {
                                 let n = id.len().min(s.stream_id.len());
                                 s.stream_id[..n].copy_from_slice(&id[..n]);
                                 s.stream_idlen = n as u8;
@@ -1658,7 +1792,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let rl = build_exec_key(EXEC_REQ_PREFIX, id, &mut rkey);
                             if rl == 0 {
                                 (append(&mut out, 0, b"error: name too long\n"), 1)
-                            } else if put_value(sys, &rkey[..rl], &cbuf[..cl]) {
+                            } else if done(put_value(st, &rkey[..rl], &cbuf[..cl])) {
                                 // Arm exec-poll mode; exec_poll_step drives the rest.
                                 let n = id.len().min(s.stream_id.len());
                                 s.stream_id[..n].copy_from_slice(&id[..n]);
@@ -1683,7 +1817,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     b"".as_slice()
                 };
                 if action == b"export" {
-                    cmd_export(s, sys);
+                    cmd_export(s, st);
                     (0usize, 0i32)
                 } else if action == b"apply" {
                     s.stream_steps = 0;
@@ -1721,9 +1855,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let (s2, e2) = argv[2];
                     let subpath = &arec[s2..e2];
                     if action == b"status" {
-                        cmd_rollout_status(sys, subpath, &mut out)
+                        cmd_rollout_status(st, subpath, &mut out)
                     } else if action == b"undo" {
-                        cmd_rollout_undo(sys, subpath, &mut out)
+                        cmd_rollout_undo(st, subpath, &mut out)
                     } else {
                         (
                             append(&mut out, 0, b"usage: rollout status|undo <ns/name>\n"),
@@ -1737,11 +1871,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     )
                 }
             } else if sub == b"diagnostics" {
-                (cmd_diagnostics(sys, &mut out), 0)
+                (cmd_diagnostics(st, &mut out), 0)
             } else if sub == b"policy" {
-                (cmd_policy(sys, &mut out), 0)
+                (cmd_policy(st, &mut out), 0)
             } else if sub == b"volume" {
-                (cmd_volume(sys, &mut out), 0)
+                (cmd_volume(st, &mut out), 0)
             } else if sub == b"config" {
                 (cmd_config(&mut out), 0)
             } else if sub == b"install" || sub == b"uninstall" {
@@ -1757,7 +1891,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     0,
                 )
             } else if sub == b"ca" {
-                cmd_ca(sys, &mut out)
+                cmd_ca(st, &mut out)
             } else if sub == b"token" {
                 // token <serviceaccount> [<namespace>]
                 if argc >= 2 {
@@ -1774,7 +1908,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     rp = append(&mut req, rp, ns);
                     rp = append(&mut req, rp, b";sa=");
                     rp = append(&mut req, rp, sa);
-                    if put_value(sys, TOKEN_REQ_KEY, &req[..rp]) {
+                    if done(put_value(st, TOKEN_REQ_KEY, &req[..rp])) {
                         s.stream_steps = 0;
                         s.stream_mode = STREAM_TOKEN_POLL;
                         (0usize, 0i32)
@@ -1803,6 +1937,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 (p, 1)
             }
         };
+
+        if s.journal.held() {
+            // A write of this command is undecided: nothing is answered, and
+            // the command is served again next step.
+            s.waiting = 1;
+            s.stream_mode = 0;
+            return 0;
+        }
+        s.waiting = 0;
 
         // `logs -f` armed streaming instead of a one-shot answer: don't finalize
         // (no exit latch / Done yet) — subsequent steps stream via stream_step.

@@ -1,0 +1,116 @@
+// Assembling a pulled image into a rootfs as params, over the sandbox seam.
+//
+//   as1  every layer of /image-manifests/<n> present (/image-layer-ok/<n>-*
+//        counted against n) and no /image-rootfs/<n> yet -> the assembly job
+//        at /sandboxes/img-asm-<n> (`/bin/sh <script> <rootfs>/<n> <blobs>
+//        <layer hex…>`); the job's terminal status -> /image-rootfs/<n>
+//        state=ready|failed
+//   as2  after the job is written -> /image-rootfs/<n> state=assembling;
+//        after the verdict -> the job rewritten phase=delete
+// The script and the two directories come from /config/image
+// (`script=;rootfs=;blobs=`) when it exists, else the packaged paths. A
+// `failed` record is terminal-visible; deleting it re-triggers.
+module nanocloud.image_asm {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: Job, Did
+  message Ctx {
+    next: string = 30;
+    name: string = 31;
+    root: string = 32;
+    script: string = 33;
+    blobs: string = 34;
+    layers: string = 35;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+
+  // ---- assembly ----
+  message As {
+    seq: int = 1;
+    key: string = 3;
+    layers: string = 4;    // layers!argv — space-separated
+    have: int = 22;        // /image-layer-ok/<n>-* present
+    n: int = 50;
+    st: string = 70;       // /image-rootfs/<n> state
+    js: string = 80;       // the job's state
+    jc: string = 81;       // and exit code
+    script: string = 90;   // /config/image
+    root: string = 91;
+    blobs: string = 92;
+  }
+  message Job {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+    v11: string = 14;
+    ctx: Ctx = 254;
+  }
+  decision as1(a: As) -> Job {
+    when a.st == "" && a.n > 0 && a.have >= a.n && a.script != "" ->
+      Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
+            v1: "cmd=/bin/sh ", v2: a.script, v3: " ", v4: a.root, v5: "/", v6: a.key,
+            v7: " ", v8: a.blobs, v9: " ", v10: a.layers, v11: ";phase=start", ctx: Ctx { next: "mark", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
+    when a.st == "" && a.n > 0 && a.have >= a.n ->
+      Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
+            v1: "cmd=/bin/sh ", v2: "/usr/lib/nanocloud/assemble-image.sh", v3: " ",
+            v4: "/var/lib/nanocloud.io/image/rootfs", v5: "/", v6: a.key,
+            v7: " ", v8: "/var/lib/nanocloud.io/image/blobs", v9: " ", v10: a.layers, v11: ";phase=start", ctx: Ctx { next: "mark", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+    when a.st == "assembling" && a.js == "exited" && a.jc == "0" && a.script != "" ->
+      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=ready",
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
+    when a.st == "assembling" && a.js == "exited" && a.jc == "0" ->
+      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+            v1: "path=", v2: "/var/lib/nanocloud.io/image/rootfs", v3: "/", v4: a.key,
+            v5: ";state=ready", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") && a.script != "" ->
+      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=failed",
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") ->
+      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+            v1: "path=", v2: "/var/lib/nanocloud.io/image/rootfs", v3: "/", v4: a.key,
+            v5: ";state=failed", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+    default ->
+      Job { cid: a.seq, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+  }
+  message Did {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision as2(d: Did) -> Job {
+    when d.status >= 200 && d.status < 300 && d.ctx.next == "mark" ->
+      Job { cid: d.cid, op: PUT, key: "/image-rootfs/", k2: d.ctx.name,
+            v1: "path=", v2: d.ctx.root, v3: "/", v4: d.ctx.name, v5: ";state=assembling",
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+    when d.status >= 200 && d.status < 300 && d.ctx.next == "del" ->
+      Job { cid: d.cid, op: PUT, key: "/sandboxes/img-asm-", k2: d.ctx.name,
+            v1: "cmd=/bin/sh ", v2: d.ctx.script, v3: " ", v4: d.ctx.root, v5: "/", v6: d.ctx.name,
+            v7: " ", v8: d.ctx.blobs, v9: " ", v10: d.ctx.layers, v11: ";phase=delete", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+    default ->
+      Job { cid: d.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+  }
+
+  transformation t_as(a: As) -> As {
+    As { seq: a.seq, key: a.key, layers: a.layers, have: a.have, n: a.n, st: a.st, js: a.js,
+         jc: a.jc, script: a.script, root: a.root, blobs: a.blobs }
+  }
+  transformation t_did(d: Did) -> Did {
+    Did { cid: d.cid, status: d.status, ctx: d.ctx }
+  }
+  pipeline im_as1(a: As) -> Job { call x = t_as(a); call y = as1(x); return y; }
+  pipeline im_as2(d: Did) -> Job { call x = t_did(d); call y = as2(x); return y; }
+  entry im_as1 = im_as1;
+  entry im_as2 = im_as2;
+  provenance revision "image-assemble" toolchain "chronicle-authoring";
+}

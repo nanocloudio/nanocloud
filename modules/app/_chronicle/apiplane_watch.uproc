@@ -2,73 +2,176 @@
 //
 // A watch is not a longer request; it is a chain driven by STORE CHANGES rather
 // than by the client, writing into the same reply stage the request chain uses.
-// The request chain (apiplane.uproc) authorizes the watch, registers the
-// watcher at `/watch-reg` + the collection key = "cid=<n>", and answers the
-// current listing with MORE_BODY set so wave holds the connection open. This
-// file turns each subsequent change into one event on that connection.
+// The request chain (apiplane.uproc) authorizes a LIST or a WATCH and
+// registers it at /watch-reg/<cid> with its facts (kube_sel.rd,
+// kube_facts.rd): the prefix, the resume revision, timeoutSeconds, bookmarks,
+// limit/continue, the List head, the field selector's name and namespace, and
+// the label selector's requirements. The watch connector (store_source
+// `events`) then streams: a LIST as its items (the typed envelope's head, the
+// items that pass, the tail with the revision it was read at and `continue`);
+// a WATCH as one event per change, read from the store's change feed strictly
+// after the registration's cursor. The wire line is built by the connector:
 //
-//   store_source(prefix, watch) -> event -> store_effect  the object, wrapped
-//                              -> reg   -> store_effect  who is watching
-//                              -> emit  -> apiplane.uproc's reply stage
+//   ws_evt   (store_source events)  change x registration, or the next item
+//                                   of a LIST — each passed through the filter
+//                                   below (label and field selectors) first
+//   ws_emit  (store_effect)         the event or item, and at the end (a List's
+//                                   tail, timeout, 410) the registration removed
+//   -> apiplane.uproc's reply stage
 //
 // A SEPARATE MODULE, not more of apiplane.uproc: chronicle caps declarations
 // per module and that file reached the cap. The split is the right shape
 // anyway — a different trigger and a different lifetime.
 module nanocloud.apiplane_watch {
 
-  enum OP_GET = 1;
-  enum OP_LIST = 7;
+  enum NOOP = 0;
+  enum DELETE = 4;
+  // Reply envelope flags (`http_chain`): MORE (the response continues) | HOLD
+  // (a stream held open on purpose, under the long idle deadline).
+  enum STREAM = 5;
 
-  // What `store_source` emits for each object under the watched prefix.
-  message Changed {
+  message Req {
+    key: string = 1;
+    op: string = 2;
+    values: string = 3;
+    lv: string = 4;        // the labelled object's value for `key` — absent when it has none
+  }
+  message Label {
+    key: string = 1;
+    value: string = 2;
+    lv: string = 3;        // the labelled object's value for `key` — absent when it has none
+  }
+
+  // What the watch connector emits: the changed object's projections, the
+  // registration's (60.., 90), and the event.
+  message Ev {
     seq: int = 1;
     key: string = 3;
-    ns: string = 28;
+    name: string = 4;
+    ns: string = 5;
+    fsn: string = 60;
+    fsns: string = 61;
+    sel: Req = 90;
+    type: string = 70;
+    rev: int = 71;
+    line: string = 72;
+    cid: int = 73;
+    st: int = 74;
+    xt: int = 93; xf: int = 94; xu: int = 95;
   }
 
-  // Fetch the object AS AN EVENT. The connector reads it during the same prefix
-  // walk and wraps it in the envelope literals (`list_open`/`list_close` on the
-  // node), so composing `{"type":…,"object":…}` needs no concatenation the VM
-  // does not have. The object's own key is the LIST prefix — a degenerate
-  // listing of exactly one object.
-  message EventCall {
+  // labelSelector: every requirement must hold (upstream semantics — NotIn
+  // and DoesNotExist hold for an object without the label).
+  map sel_expr(e: Ev) -> Ev {
+    over e.sel as r: Req max 4;
+    count e.xt, e.xf, e.xu;
+    when (r.op == "In" && has(r.lv) && ("," + r.values + ",").contains("," + r.lv + ","))
+      || (r.op == "NotIn" && (!has(r.lv) || !("," + r.values + ",").contains("," + r.lv + ",")))
+      || (r.op == "Exists" && has(r.lv))
+      || (r.op == "DoesNotExist" && !has(r.lv));
+  }
+
+  // The FILTER the watch connector runs on every candidate (its `ir_stages`):
+  // the label selector's verdict counts, then `keep` — every requirement
+  // held, and the field selector's name and namespace, when named, match.
+  message Kept {
+    keep: bool = 99;
+  }
+  transformation t_keep(e: Ev) -> Kept {
+    Kept { keep: e.xf + e.xu == 0 && (e.fsn == "" || e.name == e.fsn) && (e.fsns == "" || e.ns == e.fsns) }
+  }
+
+  // The store call (the registration removed when the list or watch ends)
+  // and the reply fields apiplane.uproc's reply stage reads, field for field.
+  message WAct {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_seq: int = 30;
-    c_ns: string = 31;
+    kcid: int = 18;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    // The status a WRITE came back with, for the reply stage's conflict
+    // handling (apiplane.uproc ActReply): none here.
+    c_wstatus: int = 36;
   }
 
-  message EventReply {
-    cid: int = 1;
+  decision emit(e: Ev) -> WAct {
+    // The List's tail (with its head, when nothing passed): the response ends
+    // and the registration goes.
+    when e.type == "END" ->
+      WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
+             c_cid: e.cid, c_status: 200, c_answer: e.line, c_stream: 0, c_wstatus: 0 };
+    // timeoutSeconds: the response ends; the registration goes.
+    when e.type == "CLOSE" ->
+      WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
+             c_cid: e.cid, c_status: 200, c_answer: "", c_stream: 0, c_wstatus: 0 };
+    // 410 Expired (or a burst past the connector): the last event, then the end.
+    when e.type == "ERROR" ->
+      WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
+             c_cid: e.cid, c_status: 200, c_answer: e.line, c_stream: 0, c_wstatus: 0 };
+    // A GET of an object that is not there.
+    when e.type == "NOTFOUND" ->
+      WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
+             c_cid: e.cid, c_status: 404, c_answer: e.line, c_stream: 0, c_wstatus: 0 };
+    // An item of a List (or a GET's object — opening with the registration's
+    // status, 201 when it answers a create), a watch event, or the next part
+    // of one too long for a record: the response continues.
+    default ->
+      WAct { cid: e.seq, op: NOOP, key: "", kcid: 0,
+             c_cid: e.cid, c_status: e.st, c_answer: e.line, c_stream: STREAM, c_wstatus: 0 };
+  }
+
+  // ---- body: a STAGED request body, read for what the router could not ----
+  //
+  // Admission's answer (admission.uproc Admitted), and se_body's store call:
+  // for a body the HTTP server staged (`sha256:<hex>`), a GET of the blob
+  // projecting metadata.name (field 40, `paths` on the node); otherwise
+  // nothing. The verdict and object move to 60/61, clear of the store reply's
+  // own fields, and are echoed through.
+  message Admitted {
     status: int = 2;
-    value: string = 3;
-    c_seq: int = 30;
-    c_ns: string = 31;
+    object: string = 3;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
   }
-
-  // Look up which connection is watching this collection. The registration's
-  // value is read as an INTEGER (`ints` on the node) because the envelope wants
-  // the connection id as a number and the VM cannot parse digits.
-  message RegCall {
+  message BodyCall {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    key2: string = 17;
-    c_seq: int = 30;
-    c_event: string = 31;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
   }
-
-  message RegReply {
-    cid: int = 1;
-    status: int = 2;
-    c_seq: int = 30;
-    c_event: string = 31;
-    reg_cid: int = 50;
+  enum GET = 1;
+  decision body(a: Admitted) -> BodyCall {
+    when a.object.startsWith("sha256:") ->
+      BodyCall { cid: a.c_cid, op: GET, key: a.object.substring(7), status: a.status, object: a.object,
+                 c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                 c_name: a.c_name, c_reason: a.c_reason, c_verb: a.c_verb };
+    default ->
+      BodyCall { cid: a.c_cid, op: NOOP, key: "", status: a.status, object: a.object,
+                 c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                 c_name: a.c_name, c_reason: a.c_reason, c_verb: a.c_verb };
   }
+  transformation t_body(a: Admitted) -> Admitted {
+    Admitted { status: a.status, object: a.object, c_cid: a.c_cid, c_method: a.c_method,
+               c_key: a.c_key, c_verdict: a.c_verdict, c_name: a.c_name, c_reason: a.c_reason,
+               c_verb: a.c_verb }
+  }
+  pipeline w_body(a: Admitted) -> BodyCall { call x = t_body(a); call y = body(x); return y; }
+  entry w_body = w_body;
 
-  // apiplane.uproc's ActReply, field for field — a separate module cannot share
-  // the declaration, and the FIELD NUMBERS are the contract between them.
+  // ---- ans: a WRITE of a staged body answers with the object it stored ----
+  //
+  // apiplane.uproc's act wrote a body the HTTP server staged (its answer is
+  // the reference, `sha256:<hex>`, not the object). Upstream answers a create
+  // or update with the object; so, on success, this registers a GET of the
+  // key — the watch chain answers it, of any size, with the write's status —
+  // and the reply stage sends nothing. Any other answer passes through, with
+  // the write's status kept (c_wstatus) for the reply stage's conflicts.
   message ActReply {
     cid: int = 1;
     status: int = 2;
@@ -77,64 +180,73 @@ module nanocloud.apiplane_watch {
     c_status: int = 31;
     c_answer: string = 32;
     c_stream: int = 33;
+    c_key: string = 34;
   }
-
-  decision d_event(c: Changed) -> EventCall {
+  message AnsCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    kcid: int = 18;
+    value: string = 4;
+    value2: int = 5;
+    value3: string = 6;
+    value4: string = 7;
+    value5: string = 8;
+    value6: int = 9;
+    value7: string = 10;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    c_wstatus: int = 36;
+  }
+  enum PUT = 3;
+  decision ans(a: ActReply) -> AnsCall {
+    // The store answered with the object as stored (it fit a record): that
+    // is the answer, and the carry never held it.
+    when (a.c_answer.startsWith("sha256:") || a.c_answer == "@stored")
+         && (a.status == 200 || a.status == 204) && a.value != "" ->
+      AnsCall { cid: a.cid, op: NOOP, key: "", kcid: 0,
+                value: "", value2: 0, value3: "", value4: "", value5: "", value6: 0, value7: "",
+                c_cid: a.c_cid, c_status: a.c_status, c_answer: a.value, c_stream: a.c_stream,
+                c_wstatus: a.status };
+    // An apply refused on its conflicts: the store's Status names them.
+    when a.c_answer == "@stored" && a.status == 409 && a.value != "" ->
+      AnsCall { cid: a.cid, op: NOOP, key: "", kcid: 0,
+                value: "", value2: 0, value3: "", value4: "", value5: "", value6: 0, value7: "",
+                c_cid: a.c_cid, c_status: 409, c_answer: a.value, c_stream: a.c_stream,
+                c_wstatus: 0 };
+    // Too large for a record: a GET registration the watch chain answers.
+    when (a.c_answer.startsWith("sha256:") || a.c_answer == "@stored")
+         && (a.status == 200 || a.status == 204) ->
+      AnsCall { cid: a.cid, op: PUT, key: "", kcid: a.c_cid,
+                value: "{\"cid\":", value2: a.c_cid, value3: ",\"p\":\"", value4: a.c_key,
+                value5: "\",\"g\":\"1\",\"st\":", value6: a.c_status, value7: "}",
+                c_cid: a.c_cid, c_status: 0, c_answer: "", c_stream: 0, c_wstatus: a.status };
     default ->
-      EventCall { cid: c.seq, op: OP_LIST, key: c.key,
-                  c_seq: c.seq, c_ns: c.ns };
+      AnsCall { cid: a.cid, op: NOOP, key: "", kcid: 0,
+                value: "", value2: 0, value3: "", value4: "", value5: "", value6: 0, value7: "",
+                c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer, c_stream: a.c_stream,
+                c_wstatus: a.status };
+  }
+  transformation t_ans(a: ActReply) -> ActReply {
+    ActReply { cid: a.cid, status: a.status, value: a.value, c_cid: a.c_cid, c_status: a.c_status,
+               c_answer: a.c_answer, c_stream: a.c_stream, c_key: a.c_key }
+  }
+  pipeline w_ans(a: ActReply) -> AnsCall { call x = t_ans(a); call y = ans(x); return y; }
+  entry w_ans = w_ans;
+
+  // Scalars and counts only in a pass stage: a path read returns a repeated
+  // field's FIRST element.
+  transformation t_ev(e: Ev) -> Ev {
+    Ev { seq: e.seq, key: e.key, name: e.name, ns: e.ns, fsn: e.fsn, fsns: e.fsns,
+         type: e.type, rev: e.rev, line: e.line, cid: e.cid, st: e.st, xt: e.xt, xf: e.xf, xu: e.xu }
   }
 
-  decision d_reg(e: EventReply) -> RegCall {
-    default ->
-      RegCall { cid: e.c_seq, op: OP_GET, key: e.c_ns, key2: "/",
-                c_seq: e.c_seq, c_event: e.value };
-  }
-
-  // No registration means nobody is watching. `c_status: 0` is the reply
-  // stage's "there is nothing to send": guessing a connection id would send
-  // this object to whoever holds that id now.
-  decision d_emit(r: RegReply) -> ActReply {
-    when r.status != 200 ->
-      ActReply { cid: r.c_seq, status: 0, value: "",
-                 c_cid: 0, c_status: 0, c_answer: "", c_stream: 0 };
-    default ->
-      ActReply { cid: r.c_seq, status: 200, value: r.c_event,
-                 c_cid: r.reg_cid, c_status: 200, c_answer: r.c_event,
-                 c_stream: 1 };
-  }
-
-  transformation pass_changed(c: Changed) -> Changed {
-    Changed { seq: c.seq, key: c.key, ns: c.ns }
-  }
-  transformation pass_event(e: EventReply) -> EventReply {
-    EventReply { cid: e.cid, status: e.status, value: e.value,
-                 c_seq: e.c_seq, c_ns: e.c_ns }
-  }
-  transformation pass_reg(r: RegReply) -> RegReply {
-    RegReply { cid: r.cid, status: r.status, c_seq: r.c_seq,
-               c_event: r.c_event, reg_cid: r.reg_cid }
-  }
-
-  pipeline event(c: Changed) -> EventCall {
-    call x = pass_changed(c);
-    call y = d_event(x);
-    return y;
-  }
-  pipeline reg(e: EventReply) -> RegCall {
-    call x = pass_event(e);
-    call y = d_reg(x);
-    return y;
-  }
-  pipeline emit(r: RegReply) -> ActReply {
-    call x = pass_reg(r);
-    call y = d_emit(x);
-    return y;
-  }
-
-  entry event = event;
-  entry reg = reg;
-  entry emit = emit;
+  pipeline w_filter(e: Ev) -> Kept { call a = sel_expr(e); call b = t_keep(a); return b; }
+  pipeline w_emit(e: Ev) -> WAct { call x = t_ev(e); call y = emit(x); return y; }
+  entry w_filter = w_filter;
+  entry w_emit = w_emit;
 
   provenance revision "apiplane-watch" toolchain "chronicle-authoring";
 }

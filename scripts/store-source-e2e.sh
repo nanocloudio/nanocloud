@@ -213,7 +213,7 @@ print("   ok  all %d objects delivered whole — across LIST pages and backpress
 PY
 [ $? -eq 0 ] || fail "pagination assertion failed"
 
-echo "== 6. `.` projects a raw value, and list_values drops the child names =="
+echo '== 6. "." projects a raw value, and list_values drops the child names =='
 # Two byte-moving options that exist because the VM cannot do either job: read a
 # record that is NOT JSON with paths in it, and strip a label off every element
 # of a list.
@@ -245,7 +245,7 @@ tick_us: 1000
 scheduler:
   accept_cycles: true
 modules:
-  # `join` and `list_children` are alternative branches of the same projection,
+  # join and list_children are alternative branches of the same projection,
   # never both on one node — so the two options are exercised by two nodes over
   # the same data.
   - name: store_source
@@ -300,5 +300,111 @@ if b"pod-a=10.0.0.1" in log:
 print("   ok  join_paths '.' -> the bare address; list_values -> 10.0.0.1,10.0.0.2")
 PY
 rm -rf "$D2"
+
+echo "== 7. unless / empty / .!ip4: the three projections an allocator is built from =="
+# `unless` keeps only objects with NO record at the same key under another
+# prefix (a request with no lease); `empty` says "nothing qualified" with one
+# record (20 = 0, 22 = 0) that no per-object record could carry; `.!ip4` reads
+# a bare address as the number it spells.
+D3="$(mktemp -d /tmp/nc-ss3-XXXXXX)"
+store_put3() {
+  python3 - "$D3/store.log" "$1" "$2" <<'PY'
+import struct, sys, os
+path, key, val = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode()
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+with os.fdopen(fd, "r+b") as f:
+    data = f.read(); p = last = 0
+    while p + 15 <= len(data):
+        rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    f.write(struct.pack("<QBHI", last + 1, 1, len(key), len(val)) + key + val)
+    f.flush(); os.fsync(f.fileno())
+PY
+}
+store_put3 "/req/waiting-1" ""
+store_put3 "/req/leased-1" ""
+# 65.66.67.68 = 0x41424344: its u32 bytes are printable. The debug sink logs
+# frames as text, and a line holding invalid UTF-8 (10.244.x.x has 0xF4) is
+# dropped by the log writer — which would read as the projection failing.
+store_put3 "/lease/leased-1" "10.244.0.2"
+store_put3 "/addr/one" "65.66.67.68"
+store_put3 "/unrelated/x" "1"
+cat >"$D3/graph.yaml" <<YAML
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true
+modules:
+  - name: waiting
+    type: store_source
+    prefix: "/req/"
+    unless: "/lease/"
+    count: 1
+  - name: nothing
+    type: store_source
+    prefix: "/none/"
+    count: 1
+    empty: 1
+  - name: leases
+    type: store_source
+    prefix: "/addr/"
+    ints: ".!ip4"
+  # One sink per source: a fan-in merge clears the mailbox on the shared edge,
+  # and a debug node reading whole records then sees only one producer's.
+  - name: dbg_w
+    type: debug
+    mode: 1
+  - name: dbg_n
+    type: debug
+    mode: 1
+  - name: dbg_l
+    type: debug
+    mode: 1
+wiring:
+  - from: waiting.status
+    to: waiting.changes
+  - from: nothing.status
+    to: nothing.changes
+  - from: leases.status
+    to: leases.changes
+  - from: waiting.record_out
+    to: dbg_w.data
+    buffer_group: 1
+  - from: nothing.record_out
+    to: dbg_n.data
+    buffer_group: 2
+  - from: leases.record_out
+    to: dbg_l.data
+    buffer_group: 3
+YAML
+nc_build_workload "$ROOT" "$D3/graph.yaml" "$D3/config.bin" "$D3/modules.bin"
+FLUXOR_STORE_DIR="$D3" RUST_LOG=info "$FLUXOR_RUNTIME" \
+  --config "$D3/config.bin" --modules "$D3/modules.bin" >"$D3/run.log" 2>&1 &
+RUNTIME_PID=$!
+sleep 2
+kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""
+python3 - "$D3/run.log" <<'PY' || { echo "FAIL: unless/empty/ip4 projection"; rm -rf "$D3"; exit 1; }
+import struct, sys
+log = open(sys.argv[1], "rb").read()
+def f(num, ty, payload):
+    return bytes([num, ty]) + struct.pack("<H", len(payload)) + payload
+I = lambda n, v: f(n, 1, struct.pack("<q", v))
+fails = []
+# unless: the waiting request is emitted, as index 0 of a count of ONE — the
+# leased one is filtered from the count as well as from the records.
+if f(3, 0, b"waiting-1") not in log: fails.append("unless dropped the waiting request")
+if f(3, 0, b"leased-1") in log: fails.append("unless emitted a request that has a lease")
+if I(22, 1) not in log: fails.append("count did not exclude the filtered request")
+# empty: one record, empty tail, index 0 of 0.
+if not (f(3, 0, b"") in log and I(22, 0) in log): fails.append("empty sent no record for an empty prefix")
+# .!ip4: 65.66.67.68 = 0x41424344 = 1094861636.
+if I(50, 1094861636) not in log: fails.append(".!ip4 did not render 65.66.67.68 as 1094861636")
+for x in fails: print("   FAIL " + x)
+if fails: sys.exit(1)
+print("   ok  unless -> only waiting-1 (count 1); empty -> one record, 0 of 0; .!ip4 -> 1094861636")
+PY
+rm -rf "$D3"
 
 echo "== E2E green: store_source projects nested Kubernetes objects into byte-exact Chronicle v1 frames, driven by a store subscription, surviving backpressure without loss =="

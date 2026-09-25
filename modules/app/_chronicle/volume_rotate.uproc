@@ -1,0 +1,307 @@
+// Data-key rotation for an encrypted volume — the encrypted-storage design's
+// PREPARED → ACTIVE → MIGRATING → RETIRING → RETIRED state machine, as params
+// over ONE record per claim, persisted and retry-safe at every step:
+//
+//   /volume-rotations/<ns>/<pvc>   (flat; CREATEd by an operator, or by
+//                                   volume_grant.uproc's eviction)
+//     why actor            why, and who asked (carried into Kagi's audit)
+//     from to              the epoch being retired and the one replacing it
+//     set vek              the new epoch's recovery set; 1 while the
+//                          provisioning vault still holds the new key
+//     cstate cursor        crypt_block's progress: its rotation state toward
+//                          `to` and its migration cursor, as last probed
+//     pins                 retained snapshots and live clones needing `from`
+//     phase out at tries wake reason note   as every lifecycle record
+//   related: /volume-attachments/<ns>/<pvc> vol phase inst device fence,
+//            /volume-keys/<ns>/<pvc> kvol epoch next
+//
+// vt_prepare — the new epoch, before any data uses it:
+//   r_kagi      KAGI_ROTATE_KEY  Kagi moves the grant to epoch `to` and keeps
+//                                admitting `from` (op 9)
+//   r_split     VAULT_SPLIT      the provisioning vault generates the `to` key
+//                                and seals a share to each of three custodians
+//   r_recordset KAGI_RECORD_SET  Kagi records the new recovery set
+//   r_vekdrop   VAULT_DESTROY    the provisioning vault's handle is destroyed.
+//                                PREPARED: only two custodians together can
+//                                rebuild the new key, and nothing uses it.
+// vt_migrate — the container moves to it:
+//   r_mark      KEY_EPOCHS       `/volume-keys/` next=`to`, BEFORE crypt_block
+//                                sees it: any attach from here on, including
+//                                the re-attach after a crash, takes both keys
+//                                (volume_attach_epoch.uproc)
+//   r_wait      —                until the volume is attached: the migration
+//                                runs in the attached crypt_block
+//   r_probe     CB_STATUS        crypt_block's state toward `to` and cursor;
+//                                probed every PROGRESS_MS and recorded
+//   r_recipient CB_RECIPIENT     (state `none`) a fresh recipient for `to` …
+//   r_release   KAGI_RELEASE     … Kagi's release of `to` against it …
+//   r_deliver   CB_BUNDLE        … and the bundle: crypt_block goes prepared,
+//                                active (new writes under `to`), migrating
+//                                (old units re-sealed, cursor committed),
+//                                retiring (a scan proves no unit needs `from`)
+//                                and steady, on its own and resumably
+//   r_steady    KEY_EPOCHS       epoch=`to`, next cleared: attachments now
+//                                need only the new key, and renew under it
+//   r_pins      EPOCH_PINS       retained snapshots and clones needing `from`;
+//   r_pinned    —                while there are any, retirement waits
+//   r_retire    KAGI_RETIRE_EPOCH  Kagi stops admitting `from` and destroys its
+//                                custody set, audited (op 10). RETIRED.
+//
+// Retirement needs both proofs: crypt_block's that no live unit needs `from`
+// (steady), and this chain's that no retained snapshot or clone does.
+// Destroying a key a snapshot still needs is data loss, not crypto-erasure.
+//
+// Failure. Before Kagi rotates, a refusal ends the record (`failed`, nothing
+// held). After it the old epoch is still admitted and the new one is not yet
+// used, so a failure is retried, never abandoned: a lost answer is re-driven,
+// a split that fails is split again, and a recovery set Kagi would not
+// record costs the new key (r_vekdrop) and a fresh split. A key the
+// provisioning vault holds when the record fails is destroyed first. From
+// r_mark on every step is idempotent for (claim, phase) and resumes from the
+// record after any crash, of this chain or of the node. A volume whose
+// identity is deleted ends its rotation (`volume_deleted`).
+//
+// A clone shares its source's key resource and cannot rotate it (`shared_key`);
+// Kagi admits one previous epoch, so a rotation waits for the last one to
+// retire (`rotation_in_progress`).
+module nanocloud.volume_rotate {
+
+  // The shared carry (volume_key_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    device: string = 36;
+    fence: int = 38;
+    epoch: string = 48;
+    kvol: string = 49;
+    from: string = 50;
+    to: string = 51;
+    actor: string = 54;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum PROGRESS_MS = 5000;
+  enum PIN_POLL_MS = 30000;
+  enum MAX_TRIES = 5;
+
+  message Rot {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    why: string = 4;
+    actor: string = 5;
+    phase: string = 6;
+    out: string = 7;
+    reason: string = 8;
+    note: string = 9;
+    from: string = 10;
+    to: string = 11;
+    set: string = 12;
+    cstate: string = 13;
+    vek: int = 50;
+    cursor: int = 51;
+    pins: int = 52;
+    at: int = 53;
+    tries: int = 54;
+    wake: int = 55;
+    now: int = 58;
+    vol: string = 70;      // /volume-attachments/<claim> (related, flat)
+    aphase: string = 71;
+    inst: string = 72;
+    device: string = 73;
+    fence: int = 74;       // `fence#`
+    kvol: string = 80;     // /volume-keys/<claim> (related, flat)
+    kepoch: string = 81;
+    knext: string = 82;
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision prepare(r: Rot) -> Step {
+    when r.phase != "" && r.phase != "r_kagi" && r.phase != "r_split" && r.phase != "r_recordset" && r.phase != "r_vekdrop" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // ── a failure: the provisioning vault's new key goes first ──
+    when r.reason != "" && r.vek == 1 && r.phase != "r_vekdrop" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_vekdrop;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_vekdrop", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when r.reason != "" && r.vek == 1 && r.now >= r.at + TIMEOUT_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_vekdrop", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when r.reason != "" && r.vek == 1 ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when r.reason != "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=failed;out=", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── validate ──
+    when r.vol == "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=volume_deleted", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && r.kvol != r.vol ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=shared_key", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "" && (r.knext != "" || r.kepoch == "") ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=rotation_in_progress", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── forward ──
+    when r.phase == "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_kagi;out=;tries=0;from=", v2: r.kepoch, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_kagi", vol: r.vol, from: r.kepoch, actor: r.actor } };
+    when r.phase == "r_kagi" && r.out == "r_kagi:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_split;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_split", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when r.phase == "r_split" && r.out == "r_split:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_recordset;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_recordset", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when r.phase == "r_recordset" && r.out == "r_recordset:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_vekdrop;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_vekdrop", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    // PREPARED. The epochs are marked before crypt_block hears of `to`.
+    when r.phase == "r_vekdrop" && r.out == "r_vekdrop:ok" && r.set != "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_mark;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_mark", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    // The set was never recorded: the dropped key is replaced by a new split.
+    when r.phase == "r_vekdrop" && r.out == "r_vekdrop:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_split;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_split", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+
+    // ── failure ──
+    // Before Kagi rotates: nothing is held, the record ends.
+    when r.phase == "r_kagi" && r.out != "" && r.out != "r_kagi:ok" && r.out != "r_kagi:unavailable" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=", v2: r.out, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    // After it: never abandoned. A set Kagi would not record costs the key.
+    when r.phase == "r_recordset" && r.out != "" && r.out != "r_recordset:ok" && r.now >= r.at + RETRY_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_vekdrop;out=;tries=0;note=", v2: r.out, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_vekdrop", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when (r.phase == "r_split" || r.phase == "r_vekdrop") && r.out != "" && r.out != "r_split:ok" && r.out != "r_vekdrop:ok" && r.now >= r.at + RETRY_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=;note=", v2: r.out, v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: r.phase, vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    // Unanswered or unavailable. Kagi's rotation gives up after MAX_TRIES; the
+    // steps after it are re-driven until they answer.
+    when r.phase == "r_kagi" && (r.out != "" || r.now >= r.at + TIMEOUT_MS) && r.now >= r.at + RETRY_MS && r.tries < MAX_TRIES ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=", v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_kagi", vol: r.vol, from: r.from, actor: r.actor } };
+    when r.phase == "r_kagi" && (r.out != "" || r.now >= r.at + TIMEOUT_MS) && r.now >= r.at + RETRY_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "reason=exhausted:r_kagi", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when r.out == "" && r.now >= r.at + TIMEOUT_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=;note=stalled:", v2: r.phase, v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: r.phase, vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    default ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  decision migrate(r: Rot) -> Step {
+    when r.phase == "" || r.phase == "r_kagi" || r.phase == "r_split" || r.phase == "r_recordset" || r.phase == "r_vekdrop"
+         || r.phase == "retired" || r.phase == "failed" ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when r.vol == "" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=failed;out=;reason=volume_deleted", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── crypt_block takes the new epoch in the attached instance ──
+    when (r.phase == "r_mark" && r.out == "r_mark:ok") || (r.phase == "r_deliver" && (r.out == "r_deliver:ready" || r.out == "r_deliver:stale"))
+         || (r.phase == "r_probe" && r.out == "r_probe:ok" && r.aphase != "attached") ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_wait;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    when (r.phase == "r_wait" && r.aphase == "attached")
+         || (r.phase == "r_probe" && r.out == "r_probe:ok" && r.cstate != "none" && r.cstate != "steady" && r.now >= r.at + PROGRESS_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_probe;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + PROGRESS_MS,
+             ctx: Ctx { claim: r.key, ph: "r_probe", vol: r.vol, inst: r.inst, to: r.to } };
+    when r.phase == "r_probe" && r.out == "r_probe:ok" && r.cstate == "none" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_recipient;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_recipient", vol: r.vol, inst: r.inst, epoch: r.to, to: r.to } };
+    when r.phase == "r_recipient" && r.out == "r_recipient:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_release;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_release", vol: r.vol, inst: r.inst, device: r.device, fence: r.fence,
+                        epoch: r.to, kvol: r.vol, to: r.to } };
+    when r.phase == "r_release" && r.out == "r_release:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_deliver;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_deliver", vol: r.vol, inst: r.inst, epoch: r.to, to: r.to } };
+    // An instance step that failed — the instance died, was replaced, or
+    // refused — is looked at again once the volume is attached.
+    when (r.phase == "r_probe" || r.phase == "r_recipient" || r.phase == "r_release" || r.phase == "r_deliver")
+         && r.out != "" && r.out != "r_probe:ok" && r.out != "r_recipient:ok" && r.out != "r_release:ok"
+         && r.out != "r_deliver:ready" && r.out != "r_deliver:stale"
+         && r.now >= r.at + RETRY_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_wait;out=;tries=0;note=", v2: r.out, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: r.key, ph: "" } };
+
+    // ── steady: RETIRING, then RETIRED ──
+    when r.phase == "r_probe" && r.out == "r_probe:ok" && r.cstate == "steady" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_steady;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_steady", vol: r.vol, from: r.from, to: r.to } };
+    when (r.phase == "r_steady" && r.out == "r_steady:ok") || (r.phase == "r_pinned" && r.now >= r.at + PIN_POLL_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_pins;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_pins", vol: r.vol, from: r.from, to: r.to } };
+    when r.phase == "r_pins" && r.out == "r_pins:ok" && r.pins > 0 ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_pinned;out=;tries=0;note=snapshot_retained", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + PIN_POLL_MS, ctx: Ctx { claim: "", ph: "" } };
+    when r.phase == "r_pins" && r.out == "r_pins:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_retire;out=;tries=0;note=", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: "r_retire", vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when r.phase == "r_retire" && r.out == "r_retire:ok" ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=retired;out=;tries=0", v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── never abandoned: a refused or unanswered step is asked again ──
+    when (r.phase == "r_mark" || r.phase == "r_steady" || r.phase == "r_pins" || r.phase == "r_retire")
+         && ((r.out != "" && r.now >= r.at + RETRY_MS) || r.now >= r.at + TIMEOUT_MS) ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "out=;note=", v2: r.out, v3: ";tries=", n1: r.tries + 1,
+             v4: ";at=", n2: r.now, v5: ";wake=", n3: r.now + TIMEOUT_MS,
+             ctx: Ctx { claim: r.key, ph: r.phase, vol: r.vol, from: r.from, to: r.to, actor: r.actor } };
+    when (r.phase == "r_probe" || r.phase == "r_recipient" || r.phase == "r_release" || r.phase == "r_deliver")
+         && r.out == "" && r.now >= r.at + TIMEOUT_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "phase=r_wait;out=;tries=0;note=stalled:", v2: r.phase, v3: ";at=", n1: r.now,
+             v4: ";wake=", n2: r.now, ctx: Ctx { claim: "", ph: "" } };
+    // A probe not yet answered at its progress wake waits out the timeout.
+    when r.phase == "r_probe" && r.out == "" && r.now >= r.wake && r.wake < r.at + TIMEOUT_MS ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "note=", v2: r.note, v3: ";at=", n1: r.at,
+             v4: ";wake=", n2: r.at + TIMEOUT_MS, ctx: Ctx { claim: "", ph: "" } };
+    // r_wait: not attached — looked at again.
+    when r.phase == "r_wait" && r.now >= r.wake ->
+      Step { cid: r.seq, op: MERGE, key: r.key, v1: "note=awaiting_attachment", v3: ";at=", n1: r.at,
+             v4: ";wake=", n2: r.now + RETRY_MS, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: r.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline vt_prepare(r: Rot) -> Step { call y = prepare(r); return y; }
+  pipeline vt_migrate(r: Rot) -> Step { call y = migrate(r); return y; }
+  entry vt_prepare = vt_prepare;
+  entry vt_migrate = vt_migrate;
+  provenance revision "volume-rotate" toolchain "chronicle-authoring";
+}

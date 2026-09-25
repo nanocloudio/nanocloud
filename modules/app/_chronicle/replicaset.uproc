@@ -10,6 +10,31 @@
 // which moves the loop from one Rust module to another rather than into params.
 module nanocloud.replicaset {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: rs.PrevQ, rs.PrevA, rs.Probe, rs.Answer
+  message Ctx {
+    key: string = 30;
+    tmpl: string = 31;
+    in: string = 32;
+    name: string = 33;
+    ns: string = 34;
+    ord: string = 35;
+    hash: string = 36;
+    prev: string = 37;
+    gate: string = 38;
+    pod: string = 39;
+  }
+  // carried by: rs.Act, rs.Applied
+  message Ctx2 {
+    key: string = 30;
+    evt: string = 33;
+    ns: string = 34;
+    pod: string = 39;
+  }
+
   message rs.Ord {
     seq: int = 1;
     rev: int = 2;
@@ -39,31 +64,15 @@ module nanocloud.replicaset {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_name: string = 33;
-    c_ns: string = 34;
-    c_ord: string = 35;
-    c_hash: string = 36;
-    c_prev: string = 37;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
 
   message rs.PrevA {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_name: string = 33;
-    c_ns: string = 34;
-    c_ord: string = 35;
-    c_hash: string = 36;
-    c_prev: string = 37;
-    c_pod: string = 39;
     phash: string = 40;  // the predecessor's pod-template-hash, projected
+    ctx: Ctx = 254;
   }
 
   // EXISTS probe for this ordinal's pod. Key parts: "<ns>/" + name + "-" + ord,
@@ -75,31 +84,17 @@ module nanocloud.replicaset {
     // Carry-through, echoed untouched: the verdict needs the REQUEST as well as
     // the answer, and without Chronicle's effect call/join the reply is all it
     // would otherwise see.
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_name: string = 33;
-    c_ns: string = 34;
-    c_ord: string = 35;
-    c_hash: string = 36;   // the ReplicaSet's template hash
-    c_gate: string = 38;   // "1" when the predecessor is fresh (or absent)
-    c_pod: string = 39;
+// the ReplicaSet's template hash
+// "1" when the predecessor is fresh (or absent)
+    ctx: Ctx = 254;
   }
 
   message rs.Answer {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_name: string = 33;
-    c_ns: string = 34;
-    c_ord: string = 35;
-    c_hash: string = 36;
-    c_gate: string = 38;
-    c_pod: string = 39;
     myhash: string = 40;   // this pod's pod-template-hash, projected
+    ctx: Ctx = 254;
   }
 
   // The pod document, as VALUE PARTS joined in field order by the connector.
@@ -118,10 +113,11 @@ module nanocloud.replicaset {
     // record that reports what happened rides along with the write that did it
     // — the only way a decision downstream of the effect can know which branch
     // fired, since the reply carries a status and nothing else.
-    c_key: string = 30;   // "<ns>/<pod>" — the event's key, minus its suffix
-    c_evt: string = 33;   // "create" | "roll" | "delete" | "" (nothing happened)
-    c_ns: string = 34;    // the namespace, for the event's own metadata
-    c_pod: string = 39;   // "<name>-<i>", for the event's involvedObject
+// "<ns>/<pod>" — the event's key, minus its suffix
+// "create" | "roll" | "delete" | "" (nothing happened)
+// the namespace, for the event's own metadata
+// "<name>-<i>", for the event's involvedObject
+    ctx: Ctx2 = 254;
   }
 
   // What the event stage writes. `key` is the acted-on object's "<ns>/<pod>"
@@ -145,10 +141,7 @@ module nanocloud.replicaset {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_evt: string = 33;
-    c_ns: string = 34;
-    c_pod: string = 39;
+    ctx: Ctx2 = 254;
   }
 
   enum NOOP = 0;
@@ -164,25 +157,13 @@ module nanocloud.replicaset {
   // and let the answer's 204 stand for "ungated".
   decision ask_prev(o: rs.Ord) -> rs.PrevQ {
     when o.prevstr == "" && o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "",
-                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1", c_name: o.name,
-                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
-                 c_pod: o.pod };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
     when o.prevstr == "" ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "",
-                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "", c_name: o.name,
-                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
-                 c_pod: o.pod };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
     when o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey,
-                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1", c_name: o.name,
-                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
-                 c_pod: o.pod };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
     default ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey,
-                 c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "", c_name: o.name,
-                 c_ns: o.ns, c_ord: o.ordstr, c_hash: o.hash, c_prev: o.prevstr,
-                 c_pod: o.pod };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
   }
 
   // Stage 2: ask about THIS ordinal, carrying the predecessor verdict. The gate
@@ -190,20 +171,11 @@ module nanocloud.replicaset {
   // predecessor at all (status 204 from the NOOP above).
   decision probe(a: rs.PrevA) -> rs.Probe {
     when a.status == 204 ->
-      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
-                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
-                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "1",
-                 c_pod: a.c_pod };
-    when a.phash == a.c_hash ->
-      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
-                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
-                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "1",
-                 c_pod: a.c_pod };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod } };
+    when a.phash == a.ctx.hash ->
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod } };
     default ->
-      rs.Probe { cid: a.cid, op: GET, key: a.c_key,
-                 c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name,
-                 c_ns: a.c_ns, c_ord: a.c_ord, c_hash: a.c_hash, c_gate: "",
-                 c_pod: a.c_pod };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "", pod: a.ctx.pod } };
   }
 
   // Four cases, and only two act:
@@ -215,31 +187,27 @@ module nanocloud.replicaset {
     // ReplicaSet's, and the predecessor is already fresh. Deleted, not
     // overwritten -- it is recreated from the new template next pass, and
     // create-if-absent is what preserves the fields a kubelet adds.
-    when a.c_in == "1" && a.status == 200 && a.c_gate == "1" && a.myhash != a.c_hash ->
-      rs.Act { cid: a.cid, op: DELETE, key: a.c_key,
-               c_key: a.c_key, c_evt: "roll", c_ns: a.c_ns, c_pod: a.c_pod };
-    when a.c_in == "1" && a.status == 404 ->
-      rs.Act { cid: a.cid, op: PUT, key: a.c_key,
+    when a.ctx.in == "1" && a.status == 200 && a.ctx.gate == "1" && a.myhash != a.ctx.hash ->
+      rs.Act { cid: a.cid, op: DELETE, key: a.ctx.key, ctx: Ctx2 { key: a.ctx.key, evt: "roll", ns: a.ctx.ns, pod: a.ctx.pod } };
+    when a.ctx.in == "1" && a.status == 404 ->
+      rs.Act { cid: a.cid, op: PUT, key: a.ctx.key,
                p1: "{\"metadata\":{\"name\":\"",
-               p2: a.c_name,
+               p2: a.ctx.name,
                p3: "-",
-               p4: a.c_ord,
+               p4: a.ctx.ord,
                p5: "\",\"namespace\":\"",
-               p6: a.c_ns,
+               p6: a.ctx.ns,
                p7: "\",\"ownerReferences\":[{\"kind\":\"ReplicaSet\",\"name\":\"",
-               p8: a.c_name,
+               p8: a.ctx.name,
                p9: "\"}],\"labels\":{\"pod-template-hash\":\"",
-               p10: a.c_hash,
+               p10: a.ctx.hash,
                p11: "\"}},\"spec\":",
-               p12: a.c_tmpl,
-               p13: "}",
-               c_key: a.c_key, c_evt: "create", c_ns: a.c_ns, c_pod: a.c_pod };
-    when a.c_in == "" && a.status == 200 ->
-      rs.Act { cid: a.cid, op: DELETE, key: a.c_key,
-               c_key: a.c_key, c_evt: "delete", c_ns: a.c_ns, c_pod: a.c_pod };
+               p12: a.ctx.tmpl,
+               p13: "}", ctx: Ctx2 { key: a.ctx.key, evt: "create", ns: a.ctx.ns, pod: a.ctx.pod } };
+    when a.ctx.in == "" && a.status == 200 ->
+      rs.Act { cid: a.cid, op: DELETE, key: a.ctx.key, ctx: Ctx2 { key: a.ctx.key, evt: "delete", ns: a.ctx.ns, pod: a.ctx.pod } };
     default ->
-      rs.Act { cid: a.cid, op: NOOP, key: "", c_key: "", c_evt: "",
-               c_ns: "", c_pod: "" };
+      rs.Act { cid: a.cid, op: NOOP, key: "", ctx: Ctx2 { key: "", evt: "", ns: "", pod: "" } };
   }
 
   // Stage 4: RECORD what stage 3 did. Gated on status 200 as well as the tag —
@@ -247,44 +215,44 @@ module nanocloud.replicaset {
   // an event for a write that failed would be a lie. A NOOP answers 204 and its
   // empty tag falls to the default, so nothing is written for a quiet pass.
   decision record(a: rs.Applied) -> rs.Evt {
-    when a.c_evt == "create" && a.status == 200 ->
-      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulCreate.0",
+    when a.ctx.evt == "create" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.ctx.key, xk: ".SuccessfulCreate.0",
                v1: "{\"metadata\":{\"name\":\"",
-               v2: a.c_pod,
+               v2: a.ctx.pod,
                v3: ".SuccessfulCreate.0\",\"namespace\":\"",
-               v4: a.c_ns,
+               v4: a.ctx.ns,
                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
-               v6: a.c_ns,
+               v6: a.ctx.ns,
                v7: "\",\"name\":\"",
-               v8: a.c_pod,
+               v8: a.ctx.pod,
                v9: "\"},\"reason\":\"SuccessfulCreate\",\"message\":\"Created pod ",
-               v10: a.c_pod,
+               v10: a.ctx.pod,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
-    when a.c_evt == "roll" && a.status == 200 ->
-      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulDelete.0",
+    when a.ctx.evt == "roll" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.ctx.key, xk: ".SuccessfulDelete.0",
                v1: "{\"metadata\":{\"name\":\"",
-               v2: a.c_pod,
+               v2: a.ctx.pod,
                v3: ".SuccessfulDelete.0\",\"namespace\":\"",
-               v4: a.c_ns,
+               v4: a.ctx.ns,
                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
-               v6: a.c_ns,
+               v6: a.ctx.ns,
                v7: "\",\"name\":\"",
-               v8: a.c_pod,
+               v8: a.ctx.pod,
                v9: "\"},\"reason\":\"SuccessfulDelete\",\"message\":\"Rolled pod ",
-               v10: a.c_pod,
+               v10: a.ctx.pod,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
-    when a.c_evt == "delete" && a.status == 200 ->
-      rs.Evt { cid: a.cid, op: PUT, key: a.c_key, xk: ".SuccessfulDelete.0",
+    when a.ctx.evt == "delete" && a.status == 200 ->
+      rs.Evt { cid: a.cid, op: PUT, key: a.ctx.key, xk: ".SuccessfulDelete.0",
                v1: "{\"metadata\":{\"name\":\"",
-               v2: a.c_pod,
+               v2: a.ctx.pod,
                v3: ".SuccessfulDelete.0\",\"namespace\":\"",
-               v4: a.c_ns,
+               v4: a.ctx.ns,
                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
-               v6: a.c_ns,
+               v6: a.ctx.ns,
                v7: "\",\"name\":\"",
-               v8: a.c_pod,
+               v8: a.ctx.pod,
                v9: "\"},\"reason\":\"SuccessfulDelete\",\"message\":\"Deleted pod ",
-               v10: a.c_pod,
+               v10: a.ctx.pod,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
     default ->
       rs.Evt { cid: a.cid, op: NOOP, key: "", xk: "" };
@@ -297,22 +265,15 @@ module nanocloud.replicaset {
              selfkey: o.selfkey, prevkey: o.prevkey }
   }
   transformation pass_prev(a: rs.PrevA) -> rs.PrevA {
-    rs.PrevA { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
-               c_tmpl: a.c_tmpl, c_in: a.c_in, c_name: a.c_name, c_ns: a.c_ns,
-               c_ord: a.c_ord, c_hash: a.c_hash, c_prev: a.c_prev,
-               c_pod: a.c_pod, phash: a.phash }
+    rs.PrevA { cid: a.cid, status: a.status, value: a.value, phash: a.phash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, prev: a.ctx.prev, pod: a.ctx.pod } }
   }
   transformation pass_ans(a: rs.Answer) -> rs.Answer {
     rs.Answer { cid: a.cid, status: a.status, value: a.value,
-                c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in,
-                c_name: a.c_name, c_ns: a.c_ns, c_ord: a.c_ord,
-                c_hash: a.c_hash, c_gate: a.c_gate, c_pod: a.c_pod,
-                myhash: a.myhash }
+                myhash: a.myhash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: a.ctx.gate, pod: a.ctx.pod } }
   }
 
   transformation pass_applied(a: rs.Applied) -> rs.Applied {
-    rs.Applied { cid: a.cid, status: a.status, value: a.value,
-                 c_key: a.c_key, c_evt: a.c_evt, c_ns: a.c_ns, c_pod: a.c_pod }
+    rs.Applied { cid: a.cid, status: a.status, value: a.value, ctx: Ctx2 { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, pod: a.ctx.pod } }
   }
 
   pipeline prev(o: rs.Ord) -> rs.PrevQ {

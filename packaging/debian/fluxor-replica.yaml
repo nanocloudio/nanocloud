@@ -1,0 +1,241 @@
+# The store's replica: lattice's store as one replica of a replicated group
+# under clustor's consensus and durability, every peer link under mutual
+# TLS. One fragment for every graph a node runs — the control plane
+# (fluxor-controlplane.yaml, a voter), a worker (fluxor-worker.yaml, a
+# learner) and the CLI (packaging/cli/linux.yaml, this node's replica run
+# offline): `nanocloud-graph.sh` splices its modules at a template's
+# `__REPLICA_MODULES__` and its wiring at `__REPLICA_WIRING__`, then renders
+# this node's values (cluster.env, its PKI).
+#
+# A graph carrying it needs `platform: net` (the peer links ride
+# linux_net). Not a graph on its own.
+modules:
+  # ── The store: lattice's storage engine, serving fluxor's storage.object /
+  # storage.namespace contracts every connector in this graph reads and writes
+  # through, as one replica of a replicated group. The control plane's nodes
+  # are its voters (ids 0..__VOTERS__-1); each worker is a learner
+  # (fluxor-worker.yaml). A write is proposed to the group's log and
+  # answered once it has applied here; reads are this replica's.
+  # Paths are the working directory's (the service runs in its state
+  # directory): `lattice/` holds the store; `store.log` is the host store's
+  # log, imported through the group's log once and then resumed (a node
+  # upgraded from the host store keeps its objects; a seed seam).
+  - name: kv_state_worker_store
+    params:
+      state_store: 1
+      store_dir: lattice
+      import_log: store.log
+      # The history a watch or a change read can resume from: the host
+      # store's window (older answers 410, and the store stays bounded).
+      history_revisions: 65536
+      sweep_wrap: 1
+      replica_id: __REPLICA_ID__
+      group_epoch: 1
+      group_quorum: __QUORUM__
+      # A commit is on a quorum's disks (durability's `fsync_mode: 1`).
+      group_durable: 1
+      # A worker's private records: the kubelet's, its sandboxes', its probes'
+      # and its image cache, under `scoped`. Its graph names them plainly; the
+      # store keeps them under /~node/<scope>, apart from every other node's
+      # (the control plane writes each node's asks there:
+      # /~node/<node>/pod-specs/). Empty on the control plane.
+      scope: "__SCOPE__"
+      scoped: "__SCOPED__"
+  - name: lattice_apply_bridge
+  # The store's clock (a TTL tick through the group's log) and its chunk
+  # sweeps (large values' chunks reclaimed), as lattice composes one.
+  - name: ttl_scheduler
+    params:
+      propose_wrap: 1
+
+  # ── The group: clustor's consensus and durability, every peer link under
+  # mutual TLS. `nanocloud-graph.sh` renders this node's values from
+  # /etc/nanocloud.io/cluster.env and its PKI (/etc/nanocloud.io/pki):
+  # a server-mode `tls` carries the links this replica accepts, a
+  # client-mode one the links it dials; both accept only the anchors in
+  # trust.pem, and peer_router binds a replica only under its pinned key.
+  - name: peer_tls_server
+    type: tls
+    mode: 1
+    verify_peer: 1
+    peer_auth: pinned
+    trust: "${file:__PKI__/trust.pem}"
+    cert_file: "__PKI__/peer.der"
+    key_file: "__PKI__/peer.key.der"
+  - name: peer_tls_client
+    type: tls
+    mode: 0
+    peer_auth: pinned
+    trust: "${file:__PKI__/trust.pem}"
+    cert_file: "__PKI__/peer.der"
+    key_file: "__PKI__/peer.key.der"
+  - name: peer_router
+    params:
+      self_id: __REPLICA_ID__
+      listen_port: __PEER_PORT__
+      __PEERS__
+      require_identity: pinned
+      partitions: 1
+  - name: gateway
+    params:
+      self_id: __REPLICA_ID__
+      # Whether the graph reads the replies to its store's own proposals
+      # (1 where a router answers on gateway.client_responses). Without
+      # one, the clock and sweeps read none: they see their effect in the
+      # committed log.
+      client_replies: __CLIENT_REPLIES__
+  - name: consensus
+    params:
+      self_id: __REPLICA_ID__
+      voter_count: __VOTERS__
+      # The group as it starts: its voters. A worker's slot is
+      # peer_router's (its address and key) until an operator adds it.
+      peer_count: __VOTERS__
+      heartbeat_interval_ms: 150
+      proposal_batch_timeout_ms: 1
+      # A follower's (and a learner's) store writes are relayed to the
+      # leader.
+      forward_proposals: 1
+  - name: durability
+    params:
+      self_id: __REPLICA_ID__
+      voter_count: __VOTERS__
+      partition_id: 0
+      fsync_mode: 1
+      group_window_ms: 0
+  - name: control_plane
+  - name: admission
+  # Wire admin (adding and removing a worker) is judged by the commanding
+  # connection's key.
+  - name: operations
+    params:
+      __ADMIN_KEYS__
+
+wiring:
+  # ── The store's own loops, through the group's log ─────────────────
+  - from: ttl_scheduler.propose_out
+    to: gateway.client_requests
+  - from: lattice_apply_bridge.records_out
+    to: ttl_scheduler.tick_in
+  - from: kv_state_worker_store.expiry_out
+    to: ttl_scheduler.kv_expiry
+  - from: kv_state_worker_store.sweep_out
+    to: gateway.client_requests
+  - from: ttl_scheduler.expire_out
+    to: kv_state_worker_store.expire
+  # ── The group: peer links, consensus, durability, admin ────────────
+  - from: linux_net.net_out
+    to: peer_tls_server.cipher_in
+  - from: peer_tls_server.cipher_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: peer_tls_client.cipher_in
+  - from: peer_tls_client.cipher_out
+    to: linux_net.net_in
+  - from: peer_tls_server.clear_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: peer_tls_server.clear_in
+  - from: peer_tls_client.clear_out
+    to: peer_router.dial_in
+  - from: peer_router.dial_out
+    to: peer_tls_client.clear_in
+  - from: peer_tls_server.peer_identity
+    to: peer_router.tls_identity
+  - from: peer_tls_client.peer_identity
+    to: peer_router.tls_identity
+  - from: peer_router.client_identity
+    to: operations.identity
+  - from: peer_router.peer_rx
+    to: consensus.ack
+    buffer_bytes: 16384
+  - from: peer_router.raft_rpc
+    to: consensus.rpc
+    buffer_bytes: 16384
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+    buffer_bytes: 16384
+  - from: consensus.net_out
+    to: peer_router.repl_tx
+    buffer_bytes: 16384
+  - from: peer_router.cleartext
+    to: gateway.requests
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
+    to: peer_router.client_resp
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.log_append
+    to: durability.entries
+    rate: transaction
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+    buffer_bytes: 16384
+  - from: consensus.log_maintenance
+    to: durability.compact_before
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.quorum_durable
+    to: consensus.durable
+  - from: gateway.reads
+    to: consensus.read
+  - from: consensus.applied
+    to: gateway.applied
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peer_router.peer_tx
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: consensus.admin_applied
+    to: operations.admin_applied
+  - from: operations.responses
+    to: gateway.admin_responses
+  - from: operations.raft_proposal
+    to: consensus.proposals
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker_store.commands
+  - from: kv_state_worker_store.prov_out
+    to: consensus.proposals
+  - from: durability.app_snapshot_ctl
+    to: kv_state_worker_store.snapshot_import
+    rate: transaction
+  - from: kv_state_worker_store.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction

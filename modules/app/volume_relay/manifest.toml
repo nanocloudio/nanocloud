@@ -1,0 +1,118 @@
+name = "volume_relay"
+version = "0.1.0"
+description = "The encrypted-volume pipelines' relay between the control plane and a node, carried by the replicated store"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# Multi-node placement of the encrypted-volume pipelines (docs/design/
+# encrypted-volumes.md). A chain issues an effect on its graph's effect bus;
+# the effects only the other side can answer are relayed through the store:
+#
+#   control plane -> node   the node-only effects (volume_host's: the
+#                           instance's lifecycle, recipient and bundle, NBD,
+#                           flush, crypt_block control, Kagi release, renew
+#                           and recover under the node's device key) that
+#                           the control plane's chains issue — grant
+#                           rotation, data-key rotation, snapshot, recovery,
+#                           secure deletion — go to the node holding the
+#                           claim: /~node/<node>/volume-ops/<id>, which that
+#                           node's store names /volume-ops/<id>.
+#   node -> control plane   the Kagi policy effects (kagi_storage_effect's:
+#                           grants, keys, epochs, the vault's split and
+#                           destroy) that a node's chains issue — attach,
+#                           its second epoch, detach — go to
+#                           /volume-asks/<id>.
+#
+# Each request is `req=<the effect record, hex>`; the side it is addressed
+# to runs it through its own effectors and writes its outcome back,
+# `;out=<the outcome record, hex>`, only while the request stands; the
+# issuing relay answers its chain with that outcome and withdraws the
+# request. A request unanswered for `timeout_ms` is withdrawn unanswered:
+# the chain's own phase timeout redrives it, and an effect is idempotent per
+# (claim, phase), as the pipelines require of every effector.
+#
+# The node a request goes to: the effect's own device argument (GRAPH_START,
+# KAGI_RELEASE, KAGI_RENEW, KAGI_RECOVER: a3), else the device its carry
+# names (a recovery's, a snapshot's flush), else the claim's attachment
+# (/volume-attachments/<claim> device=). One that names no node is
+# dropped, for the chain's timeout to answer.
+#
+# Params:
+#   relay_ops   the ops to relay, comma-separated (the other side's
+#               effectors' op set)
+#   side        plane (0): relay to the node holding a claim, serve
+#               /volume-asks/; node (1): relay to the control plane, serve
+#               /volume-ops/ (this node's, in its replica's scope)
+#   poll_ms     how often waiting requests are read again (a change wakes
+#               them sooner)
+#   timeout_ms  an issued request unanswered this long is withdrawn
+#
+# In:
+#   request_in  the chains' effects (a Chronicle record: 1 cid 2 op 3 key
+#               4..8 a1..a5 9 n1 10 n2 254 carry); any op not in relay_ops
+#               is left to the graph's other effectors
+#   answer_in   the graph's effectors' outcomes: those to served requests
+#               are written back, the rest pass by
+#   changes     the store's push sink (wired from `status`)
+# Out:
+#   response_out  the outcomes of relayed effects, as the effector would
+#                 have answered (cid and carry the chain's)
+#   effect_out    served requests, to the graph's effectors (cid the
+#                 relay's own, restored on the answer)
+#   status        the self-edge that gives `changes` its channel
+timer_class = "wall_clock"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4096
+required = true
+
+[[ports]]
+name = "answer_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4096
+
+[[ports]]
+name = "changes"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+[[ports]]
+name = "effect_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "status"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[observability]
+exempt = "connector — every request and answer it carries is a store record"

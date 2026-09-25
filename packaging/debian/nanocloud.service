@@ -1,20 +1,47 @@
 [Unit]
-Description=Nanocloud control plane (fluxor graph)
+Description=Nanocloud node: the control plane or a worker (fluxor graph)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/nanocloud
+# FLUXOR_SEAL_KEY, generated once by postinst: the key the vault seals its keys
+# (the `nanocloud.ca` signing root among them) under, so they survive a restart.
+EnvironmentFile=-/etc/nanocloud.io/seal.env
 # The control plane is a fluxor graph of PIC fmods — the apiserver (api_ingress),
 # the API pipeline (authn/rbac/admission/core_api/…), and every reconciler. There
 # is no host binary. `fluxor run` resolves the graph's modules from the project
-# root (WorkingDirectory), and the graph is the store's single writer via
-# FLUXOR_STORE_DIR.
-WorkingDirectory=/usr/lib/nanocloud/fluxor
-Environment=FLUXOR_STORE_DIR=/var/lib/nanocloud.io/control-plane/store
-ExecStartPre=/bin/mkdir -p /var/lib/nanocloud.io/control-plane/store
-ExecStart=/usr/bin/fluxor run /etc/nanocloud.io/fluxor/controlplane.yaml
+# root (FLUXOR_PROJECT_ROOT).
+#
+# The graph is this node's, rendered at each start from its template by role
+# (/etc/nanocloud.io/cluster.env: the control plane, a voter of the
+# replicated store, or a worker, a learner of it) with this node's values and
+# peer PKI (/etc/nanocloud.io/pki). See nanocloud-graph.sh.
+#
+# The store is lattice's (the graph's `kv_state_worker_store`), and it lives in
+# the state directory the graph runs in: `lattice/` holds it, and `store.log` —
+# the host store's log, which a node upgraded from it still has — is imported
+# into it once, through the group's log, then kept as the record of what was
+# imported. FLUXOR_STORE_DIR
+# is NOT set: with it, fluxor would bring up its own host store beside the
+# graph's, and a lattice store that could not start would be replaced by it
+# silently. The vault keeps its sealed keys where they always were.
+WorkingDirectory=/var/lib/nanocloud.io/control-plane/store
+Environment=FLUXOR_PROJECT_ROOT=/usr/lib/nanocloud/fluxor
+Environment=FLUXOR_VAULT_DIR=/var/lib/nanocloud.io/control-plane/store/vault
+# The store holds Secrets, minted tokens and (under vault/) the sealed keys,
+# and the store writes its files 0644: the DIRECTORY is what keeps them from
+# every other local user, so it is 0700 on every start — an upgrade from a
+# 0755 store is closed too. Not a service-wide UMask: pod processes inherit
+# the service's umask, and a container's files are not ours to restrict.
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/store
+ExecStartPre=/bin/chmod 0700 /var/lib/nanocloud.io/control-plane/store
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/store/lattice
+RuntimeDirectory=nanocloud
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/lib/nanocloud/nanocloud-graph.sh /etc/nanocloud.io/fluxor /run/nanocloud/graph.yaml
+ExecStart=/usr/bin/fluxor run /run/nanocloud/graph.yaml
 StandardOutput=append:/var/log/nanocloud.log
 StandardError=append:/var/log/nanocloud.log
 Restart=on-failure

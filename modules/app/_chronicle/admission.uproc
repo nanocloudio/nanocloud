@@ -1,0 +1,166 @@
+// Admission as params — what api_admission did, over store_effect.
+//
+//   /admission-policy/<resource> = "required=<a.b>,…;defaults=<a.b>=<json>,…;quota=<n>"
+//
+//   ap   read the resource's policy (always a GET, so its projections are
+//        always there; a read with no verb asks after no policy)
+//   ac   COUNT the objects under /<resource>/<ns>/ when a create is quota'd
+//        (else an empty prefix, counted as 0)
+//   ad   the verdict, over what admission.rd decoded — the object with the
+//        policy's defaults applied, and each required path looked up in it
+//        (mutate, then validate: upstream's order). In order: not a mutating
+//        request (no verb) → the object unchanged; no policy → unchanged; the
+//        first required field the defaulted object lacks → 403 "missing
+//        <path>"; a create at or past its quota → 403 "quota exceeded"; else
+//        200 and the defaulted object.
+// JSON is read and written by the decode program, not by the decision.
+module nanocloud.admission {
+  enum GET = 1;
+  enum COUNT = 12;
+
+  // What the request chain hands admission (apiplane.uproc AdmitCall).
+  message Call {
+    verb: string = 3;
+    res: string = 4;
+    ns: string = 5;
+    obj: string = 6;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_reason: string = 36;
+    c_verb: string = 37;
+  }
+  message PolGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    verb: string = 60; res: string = 61; ns: string = 62; obj: string = 63;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  decision ap(c: Call) -> PolGet {
+    when c.verb == "" ->
+      PolGet { cid: c.c_cid, op: GET, key: "-",
+               verb: c.verb, res: c.res, ns: c.ns, obj: c.obj,
+               c_cid: c.c_cid, c_method: c.c_method, c_key: c.c_key, c_verdict: c.c_verdict,
+               c_name: c.c_name, c_reason: c.c_reason, c_verb: c.c_verb };
+    default ->
+      PolGet { cid: c.c_cid, op: GET, key: c.res,
+               verb: c.verb, res: c.res, ns: c.ns, obj: c.obj,
+               c_cid: c.c_cid, c_method: c.c_method, c_key: c.c_key, c_verdict: c.c_verdict,
+               c_name: c.c_name, c_reason: c.c_reason, c_verb: c.c_verb };
+  }
+
+  message Pol {
+    cid: int = 1;
+    status: int = 2;
+    req: string = 40;
+    defs: string = 41;
+    quota: string = 42;
+    q: int = 50;
+    verb: string = 60; res: string = 61; ns: string = 62; obj: string = 63;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  message CntCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    k4: string = 25;
+    req: string = 40; defs: string = 41; quota: string = 42; q: int = 50;
+    verb: string = 60; res: string = 61; ns: string = 62; obj: string = 63;
+    pstatus: int = 64;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  decision ac(p: Pol) -> CntCall {
+    when p.verb == "create" && p.status == 200 && p.quota != "" ->
+      CntCall { cid: p.cid, op: COUNT, key: p.res, k2: "/", k3: p.ns, k4: "/",
+                req: p.req, defs: p.defs, quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
+    default ->
+      CntCall { cid: p.cid, op: COUNT, key: "-/", k2: "", k3: "", k4: "",
+                req: p.req, defs: p.defs, quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
+  }
+
+  // As admission.rd decodes ad_cnt's answer: the object defaulted, and the
+  // required paths (70..73) with their values in it (74..77; ABSENT where the
+  // object lacks the path).
+  message Cnt {
+    count: int = 45;
+    quota: string = 42; q: int = 50;
+    verb: string = 60; obj: string = 63; pstatus: int = 64;
+    p0: string = 70; p1: string = 71; p2: string = 72; p3: string = 73;
+    h0: string = 74; h1: string = 75; h2: string = 76; h3: string = 77;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  // What the request chain reads back (apiplane.uproc Admitted).
+  message Admitted {
+    status: int = 2;
+    object: string = 3;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  decision ad(n: Cnt) -> Admitted {
+    when n.verb == "" || n.pstatus != 200 ->
+      Admitted { status: 200, object: n.obj, c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    when n.p0 != "" && !has(n.h0) ->
+      Admitted { status: 403, object: "missing " + n.p0,
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    when n.p1 != "" && !has(n.h1) ->
+      Admitted { status: 403, object: "missing " + n.p1,
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    when n.p2 != "" && !has(n.h2) ->
+      Admitted { status: 403, object: "missing " + n.p2,
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    when n.p3 != "" && !has(n.h3) ->
+      Admitted { status: 403, object: "missing " + n.p3,
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    when n.verb == "create" && n.quota != "" && n.count >= n.q ->
+      Admitted { status: 403, object: "quota exceeded",
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+    default ->
+      Admitted { status: 200, object: n.obj,
+                 c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+                 c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb };
+  }
+
+  transformation tc(c: Call) -> Call {
+    Call { verb: c.verb, res: c.res, ns: c.ns, obj: c.obj, c_cid: c.c_cid, c_method: c.c_method,
+           c_key: c.c_key, c_verdict: c.c_verdict, c_name: c.c_name, c_reason: c.c_reason, c_verb: c.c_verb }
+  }
+  transformation tp(p: Pol) -> Pol {
+    Pol { cid: p.cid, status: p.status, req: p.req, defs: p.defs, quota: p.quota, q: p.q,
+          verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, c_cid: p.c_cid, c_method: p.c_method,
+          c_key: p.c_key, c_verdict: p.c_verdict, c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb }
+  }
+  transformation tn(n: Cnt) -> Cnt {
+    Cnt { count: n.count, quota: n.quota, q: n.q, verb: n.verb, obj: n.obj, pstatus: n.pstatus,
+          p0: n.p0, p1: n.p1, p2: n.p2, p3: n.p3, h0: n.h0, h1: n.h1, h2: n.h2, h3: n.h3,
+          c_cid: n.c_cid, c_method: n.c_method, c_key: n.c_key,
+          c_verdict: n.c_verdict, c_name: n.c_name, c_reason: n.c_reason, c_verb: n.c_verb }
+  }
+  pipeline ad_pol(c: Call) -> PolGet { call x = tc(c); call y = ap(x); return y; }
+  pipeline ad_cnt(p: Pol) -> CntCall { call x = tp(p); call y = ac(x); return y; }
+  pipeline ad_dec(n: Cnt) -> Admitted { call x = tn(n); call y = ad(x); return y; }
+  entry ad_pol = ad_pol;
+  entry ad_cnt = ad_cnt;
+  entry ad_dec = ad_dec;
+  provenance revision "admission" toolchain "chronicle-authoring";
+}

@@ -6,13 +6,14 @@
 # holding routing or storage MEANING.
 #
 #   curl -> linux_net -> http (wave)      terminates HTTP, HANDLER_APP fan-out
+#        -> http_chain                    the exchange -> one request envelope
 #        -> kube_decode                   envelope -> Request record + store key
 #        -> route      (decision)         apiserver.uproc's `to_store`, as params
 #        -> store_effect                  GET, answering with the STORE's status
-#        -> enc_http   (pipeline)         ser bytecode: StoreReply -> HttpResponse
-#        -> http -> curl
+#        -> enc_http   (pipeline)         ser bytecode: StoreReply -> reply envelope
+#        -> http_chain -> http -> curl
 #
-# Only `kube_decode` and `store_effect` are nanocloud code, and both only
+# Only `http_chain` and `store_effect` are nanocloud code, and both only
 # reshape bytes: the routing decision is a param compiled from
 # modules/app/_chronicle/apiserver.uproc, and the response framing is a `ser`
 # program. Nothing about /api/v1 is baked into an .fmod.
@@ -28,7 +29,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in kube_decode store_effect decision pipeline http; do
+for m in store_effect decision pipeline http http_chain; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -62,6 +63,13 @@ store_put "/pods/default/web-0" "$POD"
 echo "== 2. write the graph — engines + params, two nanocloud providers =="
 DEC_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/apiserver.uproc" serve)"
 [ -n "$DEC_ROUTE" ] || { echo "FAIL: could not compile apiserver.uproc serve"; exit 1; }
+# The request decoder, as the apiplane graph carries it (kube.rd, kube.uproc).
+. "$ROOT/scripts/chronicle-params.sh"
+KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
+# kd_facts: the stage program the apiplane graph runs before its router
+# (the PATCH type folded into the method, a write's marks after the key).
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_facts)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -73,58 +81,68 @@ modules:
   - name: http
     port: $PORT
     host_tcp: 1
-    max_body_kib: 64
     routes:
       - path: "/api/"
         app: true
       - path: "/apis/"
         app: true
+  # The provider behind the http application routes: each exchange one
+  # request envelope for kube_decode.
+  - name: http_chain
   - name: kube_decode
-  - name: route
+    type: pipeline
+    params:
+      decode: "${KD_DECODE}"
+      ir_stages: "${KD_PASS}"
+  - name: kube_route
     type: decision
     params:
-      # apiserver.uproc 'to_store': method -> store op, cid and key through.
-      decision: "${DEC_ROUTE}"
+      decision: "${KD_ROUTE}"
   - name: store_effect
+    # apiserver.uproc 'to_store': method -> store op, cid and key through.
+    decision: "${DEC_ROUTE}"
   - name: enc_http
     type: pipeline
     params:
       # apiserver.uproc 'pass_reply' — a codec-only node fails CLOSED.
       ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
-      # StoreReply -> HttpResponse. The cid is emitted as ONE 4-byte LE int, so
-      # conn_id and stream_id land whole — a codec that hardcodes stream_id=0
-      # does not satisfy wave's app contract.
+      # StoreReply -> http_chain's reply envelope. The cid is emitted as ONE
+      # 4-byte LE int, so the reply reaches the exchange it answers.
       encode: "01000201000000620401010002020000006202016001000060010010600200000001000203000000646202016010006170706c69636174696f6e2f6a736f6e01000203000000616a"
 wiring:
   - from: linux_net.net_out
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  - from: http.req_out
-    to: kube_decode.req_in
+  - from: http.request_out
+    to: http_chain.request_in
+  - from: http_chain.response_out
+    to: http.response_in
+  # A decode-mode pipeline reads one envelope per read: mailbox.
+  - from: http_chain.record_out
+    to: kube_decode.record_in
     buffer_group: 1
   # NO buffer_group on the engine edges. A Chronicle engine self-frames over a
   # byte stream (io_core::admit_frame: peek, read the length from the header,
   # consume exactly that), so mailbox mode breaks it — the registry example
   # mailboxes only its http edges for the same reason.
-  - from: kube_decode.record_out
-    to: route.record_in
+  - from: kube_decode.result_out
+    to: kube_route.record_in
+  - from: kube_route.result_out
+    to: store_effect.request_in
   # store_effect reads a whole record per step and DECLARES its input framed,
   # so this edge is mailboxed — the build enforces it.
-  - from: route.result_out
-    to: store_effect.request_in
-    buffer_group: 3
   - from: store_effect.response_out
     to: enc_http.record_in
   - from: enc_http.result_out
-    to: http.resp_in
+    to: http_chain.reply_in
     buffer_group: 4
 YAML
 
 echo "== 3. build =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 
-# One request per boot. Even with `resp_in` wired, an `app: true` route services
+# One request per boot. Even with the reply path wired, an `app: true` route services
 # exactly one request per run here; a fresh instance per case keeps each
 # assertion unambiguous rather than depending on request ordering. Worth chasing
 # separately — it is a property of the fan-out, not of this chain, and both

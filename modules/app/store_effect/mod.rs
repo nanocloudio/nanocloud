@@ -28,6 +28,40 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/store.rs");
 include!("../_shared/json.rs");
 include!("../_shared/pathmod.rs");
+include!("../_shared/jsonpatch.rs");
+include!("../_shared/views.rs");
+include!("../_shared/fieldset.rs");
+include!("../_shared/docschema.rs");
+
+// Chronicle's decision engine, from its published cores — not restated. With a
+// `decision` param the connector DECIDES its own request: the record that
+// arrives is the decision's input, and the outcome it constructs is the store
+// request. A chain step is then one node instead of a decision node feeding a
+// connector node — the same semantics, one channel hop fewer, and half the
+// module slots, which is what a control plane made of params runs out of
+// first. The engine is Chronicle's exactly: same container, same load scan,
+// same first-hit driver, same frame codec.
+mod dec {
+    include!("../../../target/fluxor/chronicle-common/vm_core.rs");
+    include!("../../../target/fluxor/chronicle-common/pipeline_core.rs");
+    include!("../../../target/fluxor/chronicle-common/decision_core.rs");
+    include!("../../../target/fluxor/chronicle-common/hex_core.rs");
+}
+
+/// The decision container, decoded, and the hex it arrives as — sized as
+/// Chronicle's own `decision` engine sizes them on a full-arena target.
+const DEC_CONT: usize = dec::MAX_CONTAINER_BIN_FULL;
+const DEC_HEX: usize = 2 * DEC_CONT;
+/// `count_where`'s container, decoded as its hex arrives: a predicate over
+/// one child, a few comparisons. Small because some fifty instances carry it;
+/// a larger one is refused at load, never truncated.
+const CW_CONT: usize = 2048;
+/// The field a `wall = 1` node's fused decision reads the wall clock from
+/// (Unix ms): outside the projections (40..59) and the carry (30..39).
+const WALL_FIELD: u8 = 60;
+
+/// `channel_peek` on a mailbox channel, which has no byte stream to peek.
+const CHAN_EINVAL: i32 = -22;
 
 const OBJ_PUT: u32 = 0x1420;
 const OBJ_DELETE: u32 = 0x1424;
@@ -70,6 +104,49 @@ const OP_NOOP: i64 = 0;
 /// and is empty, and answering 404 tells a client the resource kind is
 /// unknown.
 const OP_LIST: i64 = 7;
+/// Create-only: PUT under the store's `ABSENT` precondition. 200 when this
+/// request created the key, 409 when it already existed. The check and the
+/// write are ONE store operation — a probe followed by a PUT is the race where
+/// two creators both see absence and both win.
+const OP_CREATE: i64 = 8;
+/// Replace under optimistic concurrency: PUT only if the key is still at the
+/// expected revision (field 28, or the body's `rv_path` when field 28 is
+/// absent), 409 when it moved. With no expected revision it is PUT. The
+/// store's `ETAG` precondition, evaluated at one linearization point.
+const OP_REPLACE: i64 = 9;
+/// Does ANY of a family of keys exist? The key is built as usual, and every
+/// key part whose field is named in the `wild` param may ALSO be `*`: each
+/// combination is probed (2^n, n <= 6), and the answer is 200 on the first
+/// that exists, 404 when none does. An authorizer asks "is (ns, verb,
+/// resource) granted, or (ns, *, resource), or (*, verb, *)…" — a bounded set
+/// probe, which is a connector's job, in one store step instead of eight.
+/// A part whose value is `~` is a LITERAL that is never widened: a
+/// non-resource URL grant (`~|verb|~|/metrics|~`) must not be reached by a
+/// resource wildcard, and `*` there would.
+const OP_EXISTS_ANY: i64 = 10;
+/// Append the joined value parts to the object at `key`, keeping only its last
+/// `append_cap` bytes — a bounded tail ring (a workload's output, a pty's). An
+/// unbounded append would grow an object without limit.
+const OP_APPEND: i64 = 11;
+/// Count the keys under the prefix `key` (a bounded walk); the number comes
+/// back at field 45 (i64) — a quota's "how many are there".
+const OP_COUNT: i64 = 12;
+/// A Kubernetes PATCH of the object at the key, value = the patch: RFC 7386
+/// merge (13), RFC 6902 JSON Patch (14), strategic merge (15, merging lists on
+/// the `patch_keys` schema). Read, patched and written back conditional on the
+/// revision read — a lost race reads again, as upstream's GuaranteedUpdate
+/// does. 200 patched; 404 no object; 409 the patch's own resourceVersion is
+/// stale (or the race never settled); 400 a malformed patch; 422 a JSON Patch
+/// `test` that failed, a path that names nothing, or a result that is not the
+/// same object; 413 a result past `DOC_MAX`. Needs the heap (store_big).
+const OP_PATCH_MERGE: i64 = 13;
+const OP_PATCH_JSON: i64 = 14;
+const OP_PATCH_SMP: i64 = 15;
+/// Server-side apply (with `stamp`): an absent object is CREATED (stamped,
+/// answered 201), a present one merged strategically (200).
+const OP_APPLY: i64 = 16;
+/// Request fields `echo` may carry through (see the param).
+const ECHO_MAX: usize = 8;
 
 const MAX_KEY: usize = 256;
 // Contracts the shared store fragment dispatches on; it takes its opcodes from
@@ -81,6 +158,15 @@ const MAX_PREFIX: usize = 64;
 const MAX_PATHS_SPEC: usize = 192;
 const MAX_VALUE: usize = 4096;
 const BUF: usize = 8192;
+/// The largest object read whole onto the heap (store_big): a staged request
+/// body is at most 3 MiB.
+const DOC_MAX: usize = 3 << 20;
+/// The strategic-merge schema a graph may state.
+const PATCH_KEYS_MAX: usize = 768;
+/// The document schema (`schema`, _shared/docschema.rs).
+const DOC_SCHEMA_MAX: usize = 2560;
+/// Reads of a patched object before a lost race is answered 409.
+const PATCH_TRIES: u32 = 4;
 
 #[repr(C)]
 struct State {
@@ -121,8 +207,101 @@ struct State {
     /// a projected string cannot be converted in the VM.
     ints: [u8; MAX_PATHS_SPEC],
     ints_len: u16,
+    /// `rv_path = <a.b>`: the dotted path (two segments) where an object
+    /// states its revision — `metadata.resourceVersion`. A GET or a LIST of
+    /// values stamps the key's CURRENT store revision there, and a REPLACE
+    /// with no explicit revision reads the expected one back from it: the
+    /// optimistic-concurrency token a Kubernetes client round-trips.
+    rv_path: [u8; 48],
+    rv_path_len: u8,
+    /// `tomb = <prefix>`: a DELETE first leaves the object's last state at
+    /// `<prefix><key>` as `{"deadline":<ms>,"obj":<object>}` for `TOMB_MS` —
+    /// what a watch's DELETED event carries (the store's change feed has no
+    /// value for a delete). A `ttl` chain expires it.
+    tomb: [u8; 48],
+    tomb_len: u8,
+    /// `blob = <prefix>`: a PUT/CREATE/REPLACE whose value is `sha256:<hex>`
+    /// writes the STAGED body at `<prefix><hex>` instead (a request body the
+    /// HTTP server staged because it outgrew a record). Needs a heap: the
+    /// store_big build.
+    blob: [u8; 48],
+    blob_len: u8,
+    /// `patch_keys`: the strategic-merge schema — `list=key`,
+    /// `list@parent=key`, `+list` (see `_shared/jsonpatch.rs`).
+    patch_keys: [u8; PATCH_KEYS_MAX],
+    patch_keys_len: u16,
+    patch_keys_bad: u8,
+    /// `schema`: what a create stamps, a replace keeps, a patch may not
+    /// change and a delete is held by (_shared/docschema.rs). With `stamp`.
+    schema: [u8; DOC_SCHEMA_MAX],
+    schema_len: u16,
+    schema_bad: u8,
+    /// `wild = "18,26"`: the key-part fields OP_EXISTS_ANY may replace by `*`.
+    wild: [u8; 6],
+    wild_len: u8,
+    /// `hash = <path>` (or `.`, the whole value): field 27 on every reply is
+    /// the 8-hex-digit FNV-1a of those bytes — the digest `store_source`
+    /// stamps with the same param, so a row derived from an object can carry
+    /// the object's digest and a later read can tell whether it is stale.
+    hash: [u8; 48],
+    hash_len: u8,
+    /// `revision = 1`: every reply carries field 59, the key's store revision
+    /// (0 when absent), so a chain can make a conditional write of its own.
+    revision: u32,
+    /// `stamp = 1`: writes follow the document `schema` the graph states
+    /// (_shared/docschema.rs): a CREATE stamps its `create` paths (and its
+    /// `generate` name when the key names no object), a REPLACE carries the
+    /// stored object's `keep` paths across, a DELETE is held by a non-empty
+    /// `guard` list and marked with `deleting`, and every write answers with
+    /// the object as stored when it fits a record. Which paths those are is
+    /// the schema's vocabulary, never this module's.
+    stamp: u32,
+    /// OP_APPEND's ring size (bytes kept).
+    append_cap: u32,
+    /// `echo = "a,b,…"`: request fields carried into the reply under their own
+    /// numbers, like 30..39 — for a chain whose carry range is spent and whose
+    /// next stage still needs the request's own fields.
+    echo: [u8; ECHO_MAX],
+    echo_len: u8,
+    /// The fused decision (see `mod dec`): hex as received, the container it
+    /// decodes to, and the outcome frame it constructs. `dec_len == 0` = no
+    /// decision; the connector serves the request as it arrives.
+    dec_hex: [u8; DEC_HEX],
+    dec_hex_len: u16,
+    dec_cont: [u8; DEC_CONT],
+    dec_len: u16,
+    dec_buf: [u8; BUF],
+    /// A decision param that was given but unusable: the node refuses input
+    /// rather than serving requests a broken policy did not make.
+    dec_fault: u8,
+    /// Records the decision dropped (an empty outcome) or failed on.
+    dec_dropped: u32,
+    dec_failed: u32,
+    /// `count_where`: the decision OP_COUNT runs over each child (see
+    /// [`count_child`]); `cw_nib` holds a hex digit split across chunks
+    /// (0x10 | nibble). A container that does not decode, does not fit, or
+    /// does not scan is `cw_fault`, and every filtered COUNT answers 500.
+    cw_cont: [u8; CW_CONT],
+    cw_len: u16,
+    cw_nib: u8,
+    cw_fault: u8,
+    /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`].
+    wall: u32,
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
+    /// A reply the output channel has not taken yet: `out_buf[out_at..out_len]`.
+    /// Owed before the next request is read — a reply written once and
+    /// dropped when the channel was full lost the middle of a 1 MiB watch
+    /// stream (two 2 KiB chunks, silently); a partial write cut a frame.
+    out_at: u32,
+    out_len: u32,
+    /// The store calls of the record in `in_buf` ([`Journal`]). While it
+    /// holds the record for a write the store has not decided, the record is
+    /// served again each step — the decided request in `dec_buf`, its
+    /// lengths here — and answered once its writes are decided.
+    journal: Journal,
+    held_n: u32,
+    held_req: u32,
 }
 
 /// Read one field out of a Chronicle v1 record frame:
@@ -330,6 +509,7 @@ struct Projection<'a> {
     paths: &'a [u8],
     ints: &'a [u8],
     flat: bool,
+    hash: &'a [u8],
 }
 
 /// `[cid][status][value]` plus any CARRY-THROUGH the request supplied, echoed
@@ -350,10 +530,59 @@ fn reply_projected(
     carry: &[(u8, u8, &[u8])],
     proj: &Projection,
 ) -> usize {
-    let Projection { paths, ints, flat } = *proj;
-    let n0 = reply(out, cid, status, value, carry);
-    if n0 == 0 || (paths.is_empty() && ints.is_empty()) {
+    reply_projected_from(out, cid, status, value, value, carry, proj)
+}
+
+/// [`reply_projected`] whose projections are read from `value` while the
+/// reply answers `body` — an object past a record is answered with no value
+/// and still projected, from a copy the reply could never carry.
+fn reply_projected_from(
+    out: &mut [u8],
+    cid: i64,
+    status: i64,
+    body: &[u8],
+    value: &[u8],
+    carry: &[(u8, u8, &[u8])],
+    proj: &Projection,
+) -> usize {
+    let Projection {
+        paths,
+        ints,
+        flat,
+        hash,
+    } = *proj;
+    let n0 = reply(out, cid, status, body, carry);
+    if n0 == 0 || (paths.is_empty() && ints.is_empty() && hash.is_empty()) {
         return n0;
+    }
+    let mut n0 = n0;
+    if !hash.is_empty() {
+        // Field 27, on a miss too (the digest of nothing): a decision comparing
+        // digests must never find the field missing.
+        let bytes: &[u8] = if hash == b"." {
+            value
+        } else {
+            let mut segs: [&[u8]; 6] = [&[]; 6];
+            let ns = split_dots(hash, &mut segs);
+            j_sub(value, &segs[..ns])
+                .or_else(|| j_path(value, &segs[..ns]))
+                .unwrap_or(&[])
+        };
+        let v = fnv1a(bytes);
+        let hexd = b"0123456789abcdef";
+        let mut h = [0u8; 8];
+        let mut x = v;
+        for i in (0..8).rev() {
+            h[i] = hexd[(x & 0xf) as usize];
+            x >>= 4;
+        }
+        match put_field(out, n0, 27, TY_BYTES, &h) {
+            Some(q) => {
+                out[0] += 1;
+                n0 = q;
+            }
+            None => return 0,
+        }
     }
     // `value` may be empty (a miss); `j_path` then yields nothing and every
     // projected field is emitted empty, which is exactly what keeps the layout
@@ -406,11 +635,11 @@ fn reply_projected(
         }
         start = end + 1;
     }
-    // Integer projections, 45..49: the same lookup, parsed. Absent → 0, and
+    // Integer projections, 50..58: the same lookup, parsed. Absent → 0, and
     // still emitted, for the same reason the byte projections are.
     let mut fno = 50u8;
     let mut start = 0usize;
-    while start <= ints.len() && fno < 55 {
+    while start <= ints.len() && fno < 59 {
         let end = ints[start..]
             .iter()
             .position(|&b| b == b',')
@@ -418,12 +647,28 @@ fn reply_projected(
             .unwrap_or(ints.len());
         let one = &ints[start..end];
         if !one.is_empty() {
+            // `.` is the whole value and `<path>!<mod>` decodes first, as in
+            // store_source: `.!ip4` reads a raw lease address as a number.
+            let (one, modifier) = split_mod(one);
             let mut segs: [&[u8]; 6] = [&[]; 6];
             let ns = split_dots(one, &mut segs);
-            let raw = if flat {
+            let raw = if one == b"." {
+                value
+            } else if flat {
                 flat_field(value, one).unwrap_or(&[])
+            } else if modifier == Some(b"size") {
+                // `!size` measures an object, so it reads the subtree.
+                j_sub(value, &segs[..ns]).unwrap_or(&[])
             } else {
                 j_path(value, &segs[..ns]).unwrap_or(&[])
+            };
+            let mut modbuf = [0u8; 64];
+            let raw = match modifier {
+                Some(m) => {
+                    let n = apply_mod(m, raw, &mut modbuf);
+                    &modbuf[..n]
+                }
+                None => raw,
             };
             let v = parse_dec_bytes(raw) as i64;
             let Some(q) = put_field(out, p, fno, TY_I64, &v.to_le_bytes()) else {
@@ -472,14 +717,932 @@ fn reply(out: &mut [u8], cid: i64, status: i64, value: &[u8], carry: &[(u8, u8, 
 /// watches does not wake itself forever. Every nanocloud reconciler holds this
 /// invariant and a generic connector must not quietly drop it.
 /// Returns (ok, wrote).
-unsafe fn put_guarded(sys: &SyscallTable, key: &[u8], value: &[u8]) -> (bool, bool) {
+unsafe fn put_guarded(sys: &Store, key: &[u8], value: &[u8]) -> (bool, bool) {
     let mut cur = [0u8; MAX_VALUE];
     if let Some(n) = get_value(sys, key, &mut cur) {
         if &cur[..n] == value {
             return (true, false);
         }
     }
-    (put_value(sys, key, value), true)
+    (done(put_value(sys, key, value)), true)
+}
+
+/// `wild = "18,26,24"` → up to six key-part field numbers.
+fn parse_wild(s: &mut State, d: *const u8, len: usize) {
+    let src = unsafe { core::slice::from_raw_parts(d, len) };
+    s.wild_len = 0;
+    let mut v: u32 = 0;
+    let mut have = false;
+    for &c in src.iter().chain(core::iter::once(&b',')) {
+        if c.is_ascii_digit() {
+            v = v * 10 + u32::from(c - b'0');
+            have = true;
+        } else if c == b',' {
+            if have && (s.wild_len as usize) < s.wild.len() && v < 256 {
+                s.wild[s.wild_len as usize] = v as u8;
+                s.wild_len += 1;
+            }
+            v = 0;
+            have = false;
+        }
+    }
+}
+
+/// Run the fused decision over the `n`-byte record in `in_buf`, encoding the
+/// outcome into `dec_buf`. None when the policy constructed nothing (a
+/// deliberate drop) or failed (counted); the record is then not served.
+unsafe fn decide(s: &mut State, n: usize) -> Option<usize> {
+    let mut fields = [dec::Field {
+        number: 0,
+        value: dec::Value::Null,
+    }; dec::MAX_PIPE_FIELDS];
+    let raw = core::slice::from_raw_parts(s.in_buf.as_ptr(), n);
+    let mut nf = match dec::decode_frame(raw, &mut fields) {
+        Ok(nf) => nf,
+        Err(_) => {
+            s.dec_failed = s.dec_failed.wrapping_add(1);
+            return None;
+        }
+    };
+    if s.wall != 0 {
+        if nf == fields.len() {
+            s.dec_failed = s.dec_failed.wrapping_add(1);
+            return None;
+        }
+        fields[nf] = dec::Field {
+            number: u32::from(WALL_FIELD),
+            value: dec::Value::Int(dev_unix_millis(&*s.syscalls) as i64),
+        };
+        nf += 1;
+    }
+    let params = [dec::Message {
+        fields: &fields[..nf],
+    }];
+    let mut builder = dec::Builder::new();
+    let mut sbuf = [0u8; dec::STAGE_SCRATCH_CAP];
+    let mut scratch = dec::Scratch::new(&mut sbuf);
+    let mut spent = 0u64;
+    let cont = core::slice::from_raw_parts(s.dec_cont.as_ptr(), s.dec_len as usize);
+    if dec::run_decision_metered(cont, &params, &mut builder, &mut scratch, &mut spent).is_err() {
+        s.dec_failed = s.dec_failed.wrapping_add(1);
+        failed_closed_log(
+            &*s.syscalls,
+            &s.key_prefix[..s.key_prefix_len as usize],
+            s.dec_failed,
+        );
+        return None;
+    }
+    if builder.message().fields.is_empty() {
+        s.dec_dropped = s.dec_dropped.wrapping_add(1);
+        return None;
+    }
+    match dec::encode_frame_scratch(&builder.message(), &scratch, &mut s.dec_buf) {
+        Ok(m) => Some(m),
+        Err(_) => {
+            s.dec_failed = s.dec_failed.wrapping_add(1);
+            None
+        }
+    }
+}
+
+/// Whether `count_where` keeps one child of an OP_COUNT walk. Its input is
+/// the child as a reply would answer it: field 3 the key's tail past the
+/// walked prefix, 30..39 and 254 the request's carry (what the predicate
+/// compares against), and this node's `paths` / `ints` projected out of the
+/// child's value. Kept when the decision constructs a message; None when it
+/// does not decide, which the walk takes as a failure, never as "no".
+unsafe fn count_child(
+    s: &State,
+    cid: i64,
+    tail: &[u8],
+    value: &[u8],
+    carry: &[(u8, u8, &[u8])],
+    proj: &Projection,
+) -> Option<bool> {
+    let mut frame = [0u8; BUF];
+    let n = reply_projected_from(&mut frame, cid, 200, tail, value, carry, proj);
+    if n == 0 {
+        return None;
+    }
+    let mut fields = [dec::Field {
+        number: 0,
+        value: dec::Value::Null,
+    }; dec::MAX_PIPE_FIELDS];
+    let nf = dec::decode_frame(&frame[..n], &mut fields).ok()?;
+    let params = [dec::Message {
+        fields: &fields[..nf],
+    }];
+    let mut builder = dec::Builder::new();
+    let mut sbuf = [0u8; dec::STAGE_SCRATCH_CAP];
+    let mut scratch = dec::Scratch::new(&mut sbuf);
+    let mut spent = 0u64;
+    let cont = &s.cw_cont[..s.cw_len as usize];
+    dec::run_decision_metered(cont, &params, &mut builder, &mut scratch, &mut spent).ok()?;
+    Some(!builder.message().fields.is_empty())
+}
+
+/// The fused decision decided nothing for a record: it read a field the
+/// record lacks, or did not evaluate, and the record is not served. Logged
+/// at the 1st, 2nd, 4th, … time, so the first is always seen and a steady
+/// failure cannot flood the log.
+unsafe fn failed_closed_log(sys: &SyscallTable, prefix: &[u8], count: u32) {
+    if !count.is_power_of_two() {
+        return;
+    }
+    let mut m = [0u8; 200];
+    let mut n = 0usize;
+    let mut digits = [0u8; 20];
+    let dn = dec(u64::from(count), &mut digits);
+    let mut put = |part: &[u8]| {
+        let k = part.len().min(m.len() - n);
+        m[n..n + k].copy_from_slice(&part[..k]);
+        n += k;
+    };
+    put(b"[store_effect] ");
+    put(prefix);
+    put(b": the fused decision failed closed (");
+    put(&digits[..dn]);
+    put(b" so far): a rule read a field the record does not carry, or did not evaluate");
+    dev_log(sys, 1, m.as_ptr(), n);
+}
+
+/// Render `v` as decimal digits into `out`; returns the length.
+fn dec(v: u64, out: &mut [u8; 20]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    let mut u = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 || i == 0 {
+            break;
+        }
+    }
+    let n = tmp.len() - i;
+    out[..n].copy_from_slice(&tmp[i..]);
+    n
+}
+
+/// Stamp `rev` at the two-segment `rv_path` of a JSON object, as a string —
+/// Kubernetes' `resourceVersion` is opaque text, and a client that reads it as
+/// a number is wrong. Returns the stamped length, or None when the path is not
+/// two segments or the object has no such parent (the value is then answered
+/// unstamped, as it is stored).
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+fn stamp_rv(value: &[u8], rv_path: &[u8], rev: u64, out: &mut [u8]) -> Option<usize> {
+    let dot = rv_path.iter().position(|&b| b == b'.')?;
+    let (k1, k2) = (&rv_path[..dot], &rv_path[dot + 1..]);
+    if k1.is_empty() || k2.is_empty() || k2.iter().any(|&b| b == b'.') {
+        return None;
+    }
+    let mut digits = [0u8; 20];
+    let dl = dec(rev, &mut digits);
+    let mut tok = [0u8; 24];
+    tok[0] = b'"';
+    tok[1..1 + dl].copy_from_slice(&digits[..dl]);
+    tok[1 + dl] = b'"';
+    let n = j_set2(value, k1, k2, &tok[..dl + 2], out);
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// The expected revision a REPLACE is conditional on: field 28 when the
+/// request states one, else the body's own `rv_path` — the token a client
+/// read on its GET and sends back unchanged. 0 = none stated.
+fn expected_rev(req: &[u8], value: &[u8], rv_path: &[u8]) -> u64 {
+    if let Some(r) = frame_i64(req, 28) {
+        if r > 0 {
+            return r as u64;
+        }
+    }
+    if rv_path.is_empty() {
+        return 0;
+    }
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let ns = split_dots(rv_path, &mut segs);
+    match j_path(value, &segs[..ns]) {
+        Some(raw) => u64::from(parse_dec_bytes(raw)),
+        None => 0,
+    }
+}
+
+/// Apply a PATCH (`OP_PATCH_*`) to the object at `key`; the status to answer.
+/// The object and the result are on the heap, so an object of any size a
+/// record could never carry is patched where it lies. With a writer (`fw`)
+/// the write is recorded under the schema's `owners` path; `apply` makes
+/// `patch` an applied
+/// configuration, whose conflicts are refused (409) with their Status in
+/// `note`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a patch, where it goes, who writes it, and where a refusal is said"
+)]
+unsafe fn patch_object(
+    sys: &Store,
+    key: &[u8],
+    op: i64,
+    patch: &[u8],
+    keys: &[u8],
+    rv_path: &[u8],
+    dry: Option<&mut [u8; MAX_VALUE]>,
+    fw: Option<&FsWriter>,
+    apply: bool,
+    note: &mut [u8; MAX_VALUE],
+    note_n: &mut usize,
+    sch: &[u8],
+) -> i64 {
+    let mut dry = dry;
+    let patch = jp_trim(patch);
+    let want = expected_rev(&[], patch, rv_path);
+    for _ in 0..PATCH_TRIES {
+        let Some(rev) = head(sys, key) else {
+            return 404;
+        };
+        // A patch that states a resourceVersion is conditional on it.
+        if want != 0 && want != rev {
+            return 409;
+        }
+        let Some((cur_p, cur_n)) = read_whole(sys, key, DOC_MAX) else {
+            return if exists(sys, key) { 500 } else { 404 };
+        };
+        let cur = core::slice::from_raw_parts(cur_p, cur_n);
+        // Room for the result: the object and the patch, each written at most
+        // once by a merge; JSON Patch ping-pongs in thirds, with a `copy`'s
+        // growth. Past DOC_MAX it is not an object this store keeps.
+        let room = (cur_n + patch.len())
+            .saturating_mul(2)
+            .saturating_add(4096)
+            .min(DOC_MAX);
+        let work_n = if op == OP_PATCH_JSON { room * 3 } else { room };
+        let work_p = heap_alloc(sys, work_n as u32);
+        if work_p.is_null() {
+            heap_free(sys, cur_p);
+            return 500;
+        }
+        let work = core::slice::from_raw_parts_mut(work_p, work_n);
+        let result = if op == OP_PATCH_JSON {
+            jp_json(cur, patch, work)
+        } else {
+            let smp = jp_smp(keys, sch);
+            let mut o = JpOut::new(work);
+            let r = jp_merge(
+                Some(cur),
+                patch,
+                &mut o,
+                if op == OP_PATCH_SMP { Some(&smp) } else { None },
+                b"",
+                0,
+            );
+            r.map(|()| (0usize, o.n))
+        };
+        let status = match result {
+            Ok((off, n)) => {
+                let doc = &core::slice::from_raw_parts(work_p, work_n)[off..off + n];
+                let tracked = match fw {
+                    Some(w) if jp_kind(doc) == b'{' => {
+                        track(sys, Some(cur), doc, apply.then_some(patch), w)
+                    }
+                    _ => Tracked::Same,
+                };
+                let status = if let Tracked::Refused(..) = tracked {
+                    let t = tracked.doc(&[]);
+                    *note_n = if t.len() <= note.len() {
+                        note[..t.len()].copy_from_slice(t);
+                        t.len()
+                    } else {
+                        0
+                    };
+                    409
+                } else {
+                    let doc = tracked.doc(doc);
+                    if jp_kind(doc) != b'{' || !same_identity(cur, doc, sch) {
+                        422
+                    } else if let Some(d) = dry.as_deref_mut() {
+                        // A dry run: the result, answered, never written.
+                        dry_answer(doc, rev, rv_path, d)
+                    } else {
+                        match code(put_cond(sys, key, doc, PRE_ETAG, rev)) {
+                            0 => 200,
+                            ERR_EAGAIN => 0,
+                            _ => 500,
+                        }
+                    }
+                };
+                tracked.free(sys);
+                status
+            }
+            Err(JpErr::Malformed) => 400,
+            Err(JpErr::Full) => 413,
+            Err(JpErr::Test | JpErr::Path | JpErr::Deep) => 422,
+        };
+        heap_free(sys, work_p);
+        heap_free(sys, cur_p);
+        if status != 0 {
+            return status;
+        }
+    }
+    409
+}
+
+/// The object at `key` as a client is answered with: the stored value with
+/// its revision stamped, when the write succeeded and it fits a record;
+/// empty otherwise (the chain then answers it by a GET registration).
+unsafe fn stored_answer<'a>(
+    sys: &Store,
+    key: &[u8],
+    view: &[u8],
+    status: i64,
+    rv_path: &[u8],
+    buf: &'a mut [u8; MAX_VALUE],
+    sch: &[u8],
+) -> &'a [u8] {
+    if !(status == 200 || status == 204) {
+        return &[];
+    }
+    let mut raw = [0u8; MAX_VALUE];
+    let Some(mut n) = get_value(sys, key, &mut raw) else {
+        return &[];
+    };
+    if let SchView::Template(t) = sch_view(sch, view) {
+        let mut sc = [0u8; 1024];
+        let Some(l) = sch_render(t, &raw[..n], &mut sc) else {
+            return &[];
+        };
+        raw[..l].copy_from_slice(&sc[..l]);
+        n = l;
+    }
+    let rev = head(sys, key).unwrap_or(0);
+    match stamp_rv(&raw[..n], rv_path, rev, &mut buf[..]) {
+        Some(l) => &buf[..l],
+        None => {
+            buf[..n].copy_from_slice(&raw[..n]);
+            &buf[..n]
+        }
+    }
+}
+
+/// Whether the object's delete is held: the schema's `guard` list is
+/// non-empty.
+fn is_guarded(obj: &[u8], sch: &[u8]) -> bool {
+    sch_nonempty(obj, sch_get(sch, b"guard"))
+}
+
+/// A held DELETE: stamp the schema's `deleting` fields (once, conditional on
+/// the revision read) and keep the object. The status to answer.
+unsafe fn mark_deleting(sys: &Store, key: &[u8], obj: &[u8], sch: &[u8]) -> i64 {
+    let list = sch_get(sch, b"deleting");
+    if sch_set(obj, sch_first_path(list)) {
+        return 200;
+    }
+    let Some(rev) = head(sys, key) else {
+        return 404;
+    };
+    let mut ts = [0u8; 20];
+    rfc3339(now_millis(sys), &mut ts);
+    let g = SchGen {
+        uuid: &[],
+        now: &ts,
+        name: &[],
+    };
+    let mut patch = [0u8; 512];
+    let Ok(pl) = sch_empty(&mut patch).and_then(|n| sch_stamps(list, &g, &mut patch, n)) else {
+        return 500;
+    };
+    let cap = obj.len() + pl + 64;
+    let wp = heap_alloc(sys, cap as u32);
+    if wp.is_null() {
+        return 500;
+    }
+    let mut o = JpOut::new(core::slice::from_raw_parts_mut(wp, cap));
+    let status = match jp_merge(Some(obj), &patch[..pl], &mut o, None, b"", 0) {
+        Ok(()) => match code(put_cond(
+            sys,
+            key,
+            &core::slice::from_raw_parts(wp, cap)[..o.n],
+            PRE_ETAG,
+            rev,
+        )) {
+            0 => 200,
+            ERR_EAGAIN => 409,
+            _ => 500,
+        },
+        Err(_) => 500,
+    };
+    heap_free(sys, wp);
+    status
+}
+
+/// After a write: an object marked for deletion whose guard list is now
+/// empty is deleted (its tomb left for a watch's DELETED).
+unsafe fn finish_deletion(s: &State, sys: &Store, key: &[u8], obj: &[u8]) {
+    let sch = &s.schema[..s.schema_len as usize];
+    let mark = sch_first_path(sch_get(sch, b"deleting"));
+    if mark.is_empty() || !sch_set(obj, mark) || is_guarded(obj, sch) {
+        return;
+    }
+    if s.tomb_len > 0 {
+        leave_tomb(s, sys, key, obj);
+    }
+    let _ = delete_value(sys, key);
+}
+
+/// A dry run's answer: `doc` with the revision it was computed against
+/// stamped, copied into `out` NUL-terminated (a JSON document holds no NUL).
+/// The status: 200, or 413 when it does not fit a record.
+fn dry_answer(doc: &[u8], rev: u64, rv_path: &[u8], out: &mut [u8; MAX_VALUE]) -> i64 {
+    let mut tmp = [0u8; MAX_VALUE];
+    let n = match stamp_rv(doc, rv_path, rev, &mut tmp) {
+        Some(l) => l,
+        None if doc.len() < MAX_VALUE => {
+            tmp[..doc.len()].copy_from_slice(doc);
+            doc.len()
+        }
+        None => return 413,
+    };
+    if n >= MAX_VALUE {
+        return 413;
+    }
+    out[..n].copy_from_slice(&tmp[..n]);
+    out[n] = 0;
+    200
+}
+
+/// The dry-run answer held in `d` (NUL-terminated), through `view`.
+fn dry_body<'a>(d: &'a mut [u8; MAX_VALUE], view: &[u8], sch: &[u8]) -> &'a [u8] {
+    let n = d.iter().position(|&b| b == 0).unwrap_or(0);
+    if let SchView::Template(t) = sch_view(sch, view) {
+        let mut sc = [0u8; 1024];
+        if let Some(l) = sch_render(t, &d[..n], &mut sc) {
+            d[..l].copy_from_slice(&sc[..l]);
+            return &d[..l];
+        }
+    }
+    &d[..n]
+}
+
+/// Whether `b` holds a `/`.
+#[allow(
+    clippy::manual_contains,
+    reason = "`<[u8]>::contains` lowers to memchr, which a PIC module cannot link"
+)]
+fn has_slash(b: &[u8]) -> bool {
+    b.iter().any(|&c| c == b'/')
+}
+
+/// Lower-case hex of `b` into `out`.
+fn hex_into(b: &[u8], out: &mut [u8]) {
+    let h = b"0123456789abcdef";
+    for (i, &x) in b.iter().enumerate() {
+        out[2 * i] = h[(x >> 4) as usize];
+        out[2 * i + 1] = h[(x & 15) as usize];
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for Unix milliseconds (civil-from-days).
+fn rfc3339(ms: u64, out: &mut [u8; 20]) {
+    let secs = ms / 1000;
+    let days = (secs / 86400) as i64;
+    let sod = secs % 86400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let put = |o: &mut [u8; 20], at: usize, v: i64, w: usize| {
+        let mut v = v;
+        for k in (0..w).rev() {
+            o[at + k] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    };
+    put(out, 0, y, 4);
+    out[4] = b'-';
+    put(out, 5, m, 2);
+    out[7] = b'-';
+    put(out, 8, d, 2);
+    out[10] = b'T';
+    put(out, 11, (sod / 3600) as i64, 2);
+    out[13] = b':';
+    put(out, 14, (sod / 60 % 60) as i64, 2);
+    out[16] = b':';
+    put(out, 17, (sod % 60) as i64, 2);
+    out[19] = b'Z';
+}
+
+/// Create the object `value` at `key`, its schema's `create` paths stamped.
+/// A `key` ending `/` names no object: the name is the schema's `generate`
+/// path plus five random characters (422 without one), retried on a
+/// collision. Writes the final key into `fk`; returns the status and its
+/// length. With a writer (`fw`) the create is recorded under the schema's
+/// `owners` path — as an apply when `apply` (the body is the applied
+/// configuration).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a create, where it goes, and who makes it"
+)]
+unsafe fn create_stamped(
+    sys: &Store,
+    key: &[u8],
+    value: &[u8],
+    fk: &mut [u8; MAX_KEY],
+    dry: Option<&mut [u8; MAX_VALUE]>,
+    rv_path: &[u8],
+    fw: Option<&FsWriter>,
+    apply: bool,
+    sch: &[u8],
+) -> (i64, usize) {
+    let mut dry = dry;
+    if jp_kind(value) != b'{' {
+        return (400, 0);
+    }
+    let generate = key.last() == Some(&b'/');
+    let gen = if generate {
+        let g = sch_at(value, sch_get(sch, b"generate")).unwrap_or(&[]);
+        let g = g
+            .strip_prefix(b"\"")
+            .and_then(|g| g.strip_suffix(b"\""))
+            .unwrap_or(&[]);
+        if g.is_empty() || g.len() > 58 {
+            return (422, 0);
+        }
+        g
+    } else {
+        &[][..]
+    };
+    for _ in 0..4 {
+        // The name: the key's last segment, or generated.
+        let mut name = [0u8; 64];
+        let nl = if generate {
+            let alphabet = b"bcdfghjklmnpqrstvwxz2456789";
+            let mut r = [0u8; 5];
+            dev_csprng_fill(sys, r.as_mut_ptr(), r.len());
+            name[..gen.len()].copy_from_slice(gen);
+            for (i, &x) in r.iter().enumerate() {
+                name[gen.len() + i] = alphabet[x as usize % alphabet.len()];
+            }
+            gen.len() + 5
+        } else {
+            let last = key.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+            let n = last.len().min(name.len());
+            name[..n].copy_from_slice(&last[..n]);
+            n
+        };
+        let name = &name[..nl];
+        let kl = if generate { key.len() + nl } else { key.len() };
+        if kl > fk.len() {
+            return (422, 0);
+        }
+        fk[..key.len()].copy_from_slice(key);
+        if generate {
+            fk[key.len()..kl].copy_from_slice(name);
+        }
+        // The stamps, as a merge patch over what the client sent: the
+        // schema's `create` fields, and a `named` one for a key it names.
+        let mut u = [0u8; 16];
+        dev_csprng_fill(sys, u.as_mut_ptr(), u.len());
+        u[6] = (u[6] & 0x0f) | 0x40;
+        u[8] = (u[8] & 0x3f) | 0x80;
+        let mut uh = [0u8; 32];
+        hex_into(&u, &mut uh);
+        let mut uuid = [b'-'; 36];
+        uuid[..8].copy_from_slice(&uh[..8]);
+        uuid[9..13].copy_from_slice(&uh[8..12]);
+        uuid[14..18].copy_from_slice(&uh[12..16]);
+        uuid[19..23].copy_from_slice(&uh[16..20]);
+        uuid[24..].copy_from_slice(&uh[20..32]);
+        let mut ts = [0u8; 20];
+        rfc3339(now_millis(sys), &mut ts);
+        let g = SchGen {
+            uuid: &uuid,
+            now: &ts,
+            name,
+        };
+        let mut patch = [0u8; 1024];
+        let stamped = sch_empty(&mut patch)
+            .and_then(|n| sch_stamps(sch_get(sch, b"create"), &g, &mut patch, n))
+            .and_then(|n| match sch_named(sch_get(sch, b"named"), key) {
+                Some((path, gen)) => {
+                    let mut one = [0u8; 256];
+                    let mut o = JpOut::new(&mut one);
+                    o.put(path)?;
+                    o.c(b':')?;
+                    o.put(gen)?;
+                    let l = o.n;
+                    sch_stamps(&one[..l], &g, &mut patch, n)
+                }
+                None => Ok(n),
+            });
+        let Ok(pl) = stamped else {
+            return (422, 0);
+        };
+        let cap = value.len() + pl + 64;
+        let wp = heap_alloc(sys, cap as u32);
+        if wp.is_null() {
+            return (500, 0);
+        }
+        let work = core::slice::from_raw_parts_mut(wp, cap);
+        let mut o = JpOut::new(work);
+        let status = match jp_merge(Some(value), &patch[..pl], &mut o, None, b"", 0) {
+            Ok(()) => {
+                let stamped = &core::slice::from_raw_parts(wp, cap)[..o.n];
+                let tracked = match fw {
+                    Some(w) => track(sys, None, stamped, apply.then_some(value), w),
+                    None => Tracked::Same,
+                };
+                let doc = tracked.doc(stamped);
+                let status = if let Some(d) = dry.as_deref_mut() {
+                    // A dry run: the create as it would be stored, not stored.
+                    if exists(sys, &fk[..kl]) {
+                        if generate {
+                            0
+                        } else {
+                            409
+                        }
+                    } else {
+                        dry_answer(doc, 0, rv_path, d)
+                    }
+                } else {
+                    match code(put_cond(sys, &fk[..kl], doc, PRE_ABSENT, 0)) {
+                        0 => 200,
+                        ERR_EEXIST if generate => 0,
+                        ERR_EEXIST => 409,
+                        _ => 500,
+                    }
+                };
+                tracked.free(sys);
+                status
+            }
+            Err(_) => 400,
+        };
+        heap_free(sys, wp);
+        if status != 0 {
+            return (status, kl);
+        }
+    }
+    (409, 0)
+}
+
+/// A write's object with the write recorded under the schema's `owners`
+/// path.
+enum Tracked {
+    /// Store this: `(heap, offset, length)`; the caller frees the heap.
+    Doc(*mut u8, usize, usize),
+    /// An apply refused on conflicts: the Status, as `Doc`.
+    Refused(*mut u8, usize, usize),
+    /// Store the object as it is.
+    Same,
+}
+
+impl Tracked {
+    unsafe fn doc<'a>(&self, same: &'a [u8]) -> &'a [u8] {
+        match *self {
+            Tracked::Doc(p, off, n) | Tracked::Refused(p, off, n) => {
+                core::slice::from_raw_parts(p.add(off), n)
+            }
+            Tracked::Same => same,
+        }
+    }
+    unsafe fn free(&self, sys: &SyscallTable) {
+        if let Tracked::Doc(p, _, _) | Tracked::Refused(p, _, _) = *self {
+            heap_free(sys, p);
+        }
+    }
+}
+
+/// Record the write of `new` over `old` (`None`: a create) by `w` —
+/// fieldset.rs; `cfg` is the applied configuration of an apply. An object too
+/// large to track keeps the owners it had.
+unsafe fn track(
+    sys: &Store,
+    old: Option<&[u8]>,
+    new: &[u8],
+    cfg: Option<&[u8]>,
+    w: &FsWriter,
+) -> Tracked {
+    let third = new.len() + 2 * FS_ARENA + 16384;
+    let total = third * 3 + FS_ARENA;
+    let wp = heap_alloc(sys, total as u32);
+    if wp.is_null() {
+        return Tracked::Same;
+    }
+    let Some((work, arena)) =
+        core::slice::from_raw_parts_mut(wp, total).split_at_mut_checked(third * 3)
+    else {
+        heap_free(sys, wp);
+        return Tracked::Same;
+    };
+    match fs_record(old, new, cfg, w, arena, work) {
+        FsOutcome::Doc(off, n) => return Tracked::Doc(wp, off, n),
+        FsOutcome::Conflict(off, n) => return Tracked::Refused(wp, off, n),
+        FsOutcome::Untracked => {}
+    }
+    // Untracked: what was recorded stays, whatever the write sent.
+    let owners = sch_get(w.sch, b"owners");
+    let kept = old
+        .and_then(|o| sch_at(o, owners))
+        .filter(|_| !owners.is_empty());
+    let Some(mf) = kept else {
+        heap_free(sys, wp);
+        return Tracked::Same;
+    };
+    let need = new.len() + 2 * mf.len() + 2 * owners.len() + 128;
+    if need > total {
+        heap_free(sys, wp);
+        return Tracked::Same;
+    }
+    let split = mf.len() + 2 * owners.len() + 64;
+    let Some((patch, out)) = core::slice::from_raw_parts_mut(wp, total).split_at_mut_checked(split)
+    else {
+        heap_free(sys, wp);
+        return Tracked::Same;
+    };
+    // What was recorded, patched back in at the schema's `owners` path.
+    let mut po = JpOut::new(patch);
+    let Ok(pl) = sch_one(owners, mf, &mut po).map(|()| po.n) else {
+        heap_free(sys, wp);
+        return Tracked::Same;
+    };
+    let mut o = JpOut::new(out);
+    match jp_merge(Some(new), &patch[..pl], &mut o, None, b"", 0) {
+        Ok(()) => Tracked::Doc(wp, split, o.n),
+        Err(_) => {
+            heap_free(sys, wp);
+            Tracked::Same
+        }
+    }
+}
+
+/// For a REPLACE: `value` with the STORED object's `keep` paths (and its
+/// `named` stamp) carried across, the write recorded under the schema's
+/// `owners` path when `fw` names the writer. `(heap to free, object,
+/// length)`; `None`: store `value` as it is.
+unsafe fn keep_identity(
+    sys: &Store,
+    key: &[u8],
+    value: &[u8],
+    fw: Option<&FsWriter>,
+    sch: &[u8],
+) -> Option<(*mut u8, *const u8, usize)> {
+    if jp_kind(value) != b'{' {
+        return None;
+    }
+    let mut cur = [0u8; MAX_VALUE];
+    let (cp, cn, heap) = match get_value(sys, key, &mut cur) {
+        Some(n) => (cur.as_ptr(), n, core::ptr::null_mut()),
+        None => {
+            let (p, n) = read_whole(sys, key, DOC_MAX)?;
+            (p as *const u8, n, p)
+        }
+    };
+    let stored = core::slice::from_raw_parts(cp, cn);
+    let kept = keep_identity_of(sys, key, stored, value, sch);
+    let merged: &[u8] = match kept {
+        Some((p, n)) => core::slice::from_raw_parts(p, n),
+        None => value,
+    };
+    let tracked = match fw {
+        Some(w) => track(sys, Some(stored), merged, None, w),
+        None => Tracked::Same,
+    };
+    if !heap.is_null() {
+        heap_free(sys, heap);
+    }
+    match tracked {
+        Tracked::Doc(p, off, n) => {
+            if let Some((kp, _)) = kept {
+                heap_free(sys, kp);
+            }
+            Some((p, p.add(off) as *const u8, n))
+        }
+        Tracked::Refused(..) => {
+            tracked.free(sys);
+            kept.map(|(p, n)| (p, p as *const u8, n))
+        }
+        Tracked::Same => kept.map(|(p, n)| (p, p as *const u8, n)),
+    }
+}
+
+/// `value` with `stored`'s identity merged in — the schema's `keep` paths,
+/// and a `named` key's field — on the heap; `None` when there is nothing to
+/// keep or no room.
+unsafe fn keep_identity_of(
+    sys: &Store,
+    key: &[u8],
+    stored: &[u8],
+    value: &[u8],
+    sch: &[u8],
+) -> Option<(*mut u8, usize)> {
+    let mut patch = [0u8; 1024];
+    let mut pl = sch_empty(&mut patch).ok()?;
+    pl = sch_keeps(sch_get(sch, b"keep"), stored, &mut patch, pl).ok()?;
+    if let Some((path, gen)) = sch_named(sch_get(sch, b"named"), key) {
+        let name = key.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+        let g = SchGen {
+            uuid: &[],
+            now: &[],
+            name: &name[..name.len().min(63)],
+        };
+        let mut one = [0u8; 256];
+        let mut o = JpOut::new(&mut one);
+        o.put(path).ok()?;
+        o.c(b':').ok()?;
+        o.put(gen).ok()?;
+        let l = o.n;
+        pl = sch_stamps(&one[..l], &g, &mut patch, pl).ok()?;
+    }
+    if pl <= 2 {
+        return None;
+    }
+    let cap = value.len() + pl + 64;
+    let wp = heap_alloc(sys, cap as u32);
+    if wp.is_null() {
+        return None;
+    }
+    let mut o = JpOut::new(core::slice::from_raw_parts_mut(wp, cap));
+    if jp_merge(Some(value), &patch[..pl], &mut o, None, b"", 0).is_err() {
+        heap_free(sys, wp);
+        return None;
+    }
+    Some((wp, o.n))
+}
+
+/// A patch edits an object; it does not turn it into another one: the
+/// schema's `identity` paths are unchanged, or the patch is refused.
+fn same_identity(a: &[u8], b: &[u8], sch: &[u8]) -> bool {
+    sch_same(sch_get(sch, b"identity"), a, b)
+}
+
+/// store_big — this source built with `big` — takes a heap arena: a staged
+/// request body read whole to be written, or an object past a record read
+/// whole to be projected. store_effect takes none.
+#[allow(
+    unexpected_cfgs,
+    reason = "`big` is store_big's feature; this file is also store_effect, whose build does not declare it"
+)]
+mod arena {
+    #[cfg(feature = "big")]
+    #[no_mangle]
+    #[link_section = ".text.module_arena_size"]
+    pub extern "C" fn module_arena_size() -> u32 {
+        16 << 20
+    }
+}
+
+/// How long a deleted object's last state stays for a watch to carry.
+const TOMB_MS: u64 = 300_000;
+
+/// Leave `value` as `key`'s tombstone (see `tomb`). A tombstone that would
+/// not fit the store's value ceiling is not written: the DELETED event then
+/// carries the object's identity only, which is what a client needs to drop it.
+unsafe fn leave_tomb(s: &State, sys: &Store, key: &[u8], value: &[u8]) {
+    let mut tk = [0u8; MAX_KEY];
+    let tl = s.tomb_len as usize;
+    if tl + key.len() > tk.len() {
+        return;
+    }
+    tk[..tl].copy_from_slice(&s.tomb[..tl]);
+    tk[tl..tl + key.len()].copy_from_slice(key);
+    let mut digits = [0u8; 20];
+    let dl = dec(dev_millis(sys).saturating_add(TOMB_MS), &mut digits);
+    // Sequential appends, never an array of byte-string literals: such an
+    // array's pointers are not relocated in a PIC module.
+    let mut v = [0u8; MAX_VALUE];
+    let mut l = 0usize;
+    let fits = value.len() + dl + 20 <= v.len();
+    if !fits {
+        return;
+    }
+    l = append(&mut v, l, b"{\"deadline\":");
+    l = append(&mut v, l, &digits[..dl]);
+    l = append(&mut v, l, b",\"obj\":");
+    l = append(&mut v, l, value);
+    l = append(&mut v, l, b"}");
+    let _ = put_value(sys, &tk[..tl + key.len()], &v[..l]);
+}
+
+/// Append field 59 (the store revision, i64) to a finished reply frame.
+fn append_rev(out: &mut [u8], flen: usize, rev: u64) -> usize {
+    if flen == 0 {
+        return 0;
+    }
+    match put_field(out, flen, 59, TY_I64, &(rev as i64).to_le_bytes()) {
+        Some(q) => {
+            out[0] += 1;
+            q
+        }
+        None => 0,
+    }
 }
 
 mod params_def {
@@ -539,6 +1702,148 @@ mod params_def {
                 s.ints_len = n as u16;
                 if n > 0 { ptr_copy(s.ints.as_mut_ptr(), d, n); }
             };
+
+        11, rv_path, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 48 } else { len };
+                s.rv_path_len = n as u8;
+                if n > 0 { ptr_copy(s.rv_path.as_mut_ptr(), d, n); }
+            };
+
+        41, stamp, u32, 0
+            => |s, d, len| { s.stamp = super::p_u32(d, len, 0, 0); };
+
+        12, revision, u32, 0
+            => |s, d, len| { s.revision = super::p_u32(d, len, 0, 0); };
+
+        // Chunked, as `decision` is: a schema is longer than one TLV entry.
+        // Past PATCH_KEYS_MAX the whole schema is dropped (every list atomic)
+        // rather than cut — a cut entry names a different key.
+        20, patch_keys, str_chunked, 0
+            => |s, d, len| {
+                let at = s.patch_keys_len as usize;
+                if at + len > super::PATCH_KEYS_MAX {
+                    s.patch_keys_len = 0;
+                    s.patch_keys_bad = 1;
+                } else if s.patch_keys_bad == 0 {
+                    ptr_copy(s.patch_keys.as_mut_ptr().add(at), d, len);
+                    s.patch_keys_len = (at + len) as u16;
+                }
+            };
+
+        // Chunked: a schema is longer than one TLV entry. Past DOC_SCHEMA_MAX it
+        // is refused whole — a cut directive names a different path.
+        43, schema, str_chunked, 0
+            => |s, d, len| {
+                let at = s.schema_len as usize;
+                if at + len > super::DOC_SCHEMA_MAX {
+                    s.schema_len = 0;
+                    s.schema_bad = 1;
+                } else if s.schema_bad == 0 {
+                    ptr_copy(s.schema.as_mut_ptr().add(at), d, len);
+                    s.schema_len = (at + len) as u16;
+                }
+            };
+
+        19, blob, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 48 } else { len };
+                s.blob_len = n as u8;
+                if n > 0 { ptr_copy(s.blob.as_mut_ptr(), d, n); }
+            };
+
+        18, tomb, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 48 } else { len };
+                s.tomb_len = n as u8;
+                if n > 0 { ptr_copy(s.tomb.as_mut_ptr(), d, n); }
+            };
+
+        16, append_cap, u32, 1024
+            => |s, d, len| { s.append_cap = super::p_u32(d, len, 0, 1024); };
+
+        17, echo, str, 0
+            => |s, d, len| {
+                s.echo_len = 0;
+                let mut v: u32 = 0;
+                let mut any = false;
+                let mut i = 0usize;
+                while i <= len {
+                    let c = if i < len { *d.add(i) } else { b',' };
+                    if c.is_ascii_digit() {
+                        v = v * 10 + (c - b'0') as u32;
+                        any = true;
+                    } else if c == b',' {
+                        if any && v <= 255 && (s.echo_len as usize) < super::ECHO_MAX {
+                            s.echo[s.echo_len as usize] = v as u8;
+                            s.echo_len += 1;
+                        }
+                        v = 0;
+                        any = false;
+                    }
+                    i += 1;
+                }
+            };
+
+        13, wild, str, 0
+            => |s, d, len| { super::parse_wild(s, d, len); };
+
+        14, hash, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 48 } else { len };
+                s.hash_len = n as u8;
+                if n > 0 { ptr_copy(s.hash.as_mut_ptr(), d, n); }
+            };
+
+        // `str_chunked`: a decision container is longer than one TLV entry,
+        // so each chunk APPENDS. An overflow is a fault, never a truncation —
+        // a truncated container decodes to a different policy.
+        15, decision, str_chunked, 0
+            => |s, d, len| {
+                let at = s.dec_hex_len as usize;
+                if at + len > super::DEC_HEX {
+                    s.dec_fault = 1;
+                } else {
+                    ptr_copy(s.dec_hex.as_mut_ptr().add(at), d, len);
+                    s.dec_hex_len = (at + len) as u16;
+                }
+            };
+
+        // The per-child decision OP_COUNT counts by: hex, chunked like
+        // `decision`, decoded as it arrives.
+        21, count_where, str_chunked, 0
+            => |s, d, len| { super::cw_append(s, core::slice::from_raw_parts(d, len)); };
+
+        22, wall, u32, 0
+            => |s, d, len| { s.wall = super::p_u32(d, len, 0, 0); };
+    }
+}
+
+/// Decode one chunk of `count_where`'s hex into `cw_cont`, a digit split
+/// across chunks held in `cw_nib`.
+fn cw_append(s: &mut State, hex: &[u8]) {
+    for &c in hex {
+        let v = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => {
+                s.cw_fault = 1;
+                return;
+            }
+        };
+        if s.cw_nib == 0 {
+            s.cw_nib = 0x10 | v;
+            continue;
+        }
+        let at = s.cw_len as usize;
+        if at >= CW_CONT {
+            s.cw_fault = 1;
+            return;
+        }
+        s.cw_cont[at] = ((s.cw_nib & 0x0f) << 4) | v;
+        s.cw_len += 1;
+        s.cw_nib = 0;
     }
 }
 
@@ -586,12 +1891,123 @@ pub unsafe extern "C" fn module_new(
         s.request_in = in_chan;
         s.response_out = out_chan;
         s.served = 0;
+        s.out_at = 0;
+        s.out_len = 0;
         s.malformed = 0;
         s.unchanged = 0;
         s.paths_len = 0;
+        s.dec_hex_len = 0;
+        s.dec_len = 0;
+        s.dec_fault = 0;
+        s.dec_dropped = 0;
+        s.dec_failed = 0;
+        s.cw_len = 0;
+        s.cw_nib = 0;
+        s.cw_fault = 0;
+        s.wall = 0;
+        s.tomb_len = 0;
+        s.blob_len = 0;
+        s.patch_keys_len = 0;
+        s.patch_keys_bad = 0;
+        s.schema_len = 0;
+        s.schema_bad = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
+        if s.dec_hex_len > 0 && s.dec_fault == 0 {
+            match dec::hex_decode(&s.dec_hex[..s.dec_hex_len as usize], &mut s.dec_cont) {
+                Some(n) if dec::scan_decision_container(&s.dec_cont[..n]).is_ok() => {
+                    s.dec_len = n as u16;
+                }
+                _ => s.dec_fault = 1,
+            }
+        }
+        if s.cw_nib != 0
+            || (s.cw_len > 0
+                && dec::scan_decision_container(&s.cw_cont[..s.cw_len as usize]).is_err())
+        {
+            s.cw_fault = 1;
+        }
+        if s.cw_fault != 0 {
+            let sys = &*(syscalls as *const SyscallTable);
+            let m = b"[store_effect] FAULT: count_where invalid, past its cap, or needs a builtin not in this build; every COUNT answers 500";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+        if s.schema_bad != 0 {
+            let sys = &*(syscalls as *const SyscallTable);
+            let m = b"[store_effect] schema past its cap - DROPPED, writes are not stamped";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+        if s.patch_keys_bad != 0 {
+            let sys = &*(syscalls as *const SyscallTable);
+            let m = b"[store_effect] patch_keys past PATCH_KEYS_MAX - DROPPED, every list merges atomically";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+        if s.dec_fault != 0 {
+            let sys = &*(syscalls as *const SyscallTable);
+            let m = b"[store_effect] FAULT: decision param invalid, truncated, or needs a builtin not in this build";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
         0
+    }
+}
+
+/// Take ONE whole record off `request_in` into `in_buf`: its length.
+///
+/// Either edge shape delivers ONE whole record. A mailbox hands over a
+/// record per write and cannot be peeked (EINVAL). A byte stream is
+/// self-framed, as a Chronicle engine frames it: peek, read the length out
+/// of the frame header, consume exactly that. The stream is what a producer
+/// that emits a page of records per step needs — a scan stalled a record at
+/// a time behind a mailbox re-lists between records, and a consumer that
+/// deletes what it is handed shifts everything the scan resumes by.
+unsafe fn take_request(s: &mut State, sys: &SyscallTable) -> Option<i32> {
+    let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return None;
+    }
+    let pk = (sys.channel_peek)(s.request_in, s.in_buf.as_mut_ptr(), BUF);
+    let n = if pk == CHAN_EINVAL {
+        (sys.channel_read)(s.request_in, s.in_buf.as_mut_ptr(), BUF)
+    } else if pk <= 0 {
+        return None;
+    } else {
+        match dec::frame_len(&s.in_buf[..pk as usize]) {
+            Some(fl) => (sys.channel_read)(s.request_in, s.in_buf.as_mut_ptr(), fl),
+            // Still arriving.
+            None if (pk as usize) < BUF => return None,
+            // A buffer's worth and no frame boundary: not a record frame,
+            // or one past max_record. Drop what is there and resync.
+            None => {
+                (sys.channel_read)(s.request_in, s.in_buf.as_mut_ptr(), BUF);
+                s.dec_failed = s.dec_failed.wrapping_add(1);
+                return None;
+            }
+        }
+    };
+    if n <= 0 || s.dec_fault != 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Write what is owed of the last reply. True when nothing is owed.
+unsafe fn flush_reply(s: &mut State) -> bool {
+    if s.out_len == 0 || s.response_out < 0 {
+        return true;
+    }
+    let sys = &*s.syscalls;
+    let (at, len) = (s.out_at as usize, s.out_len as usize);
+    let w = (sys.channel_write)(s.response_out, s.out_buf.as_ptr().add(at), len - at);
+    if w > 0 {
+        s.out_at += w as u32;
+    }
+    if s.out_at >= s.out_len {
+        s.out_at = 0;
+        s.out_len = 0;
+        s.served = s.served.wrapping_add(1);
+        true
+    } else {
+        false
     }
 }
 
@@ -608,20 +2024,59 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*s.syscalls;
 
-        let poll = (sys.channel_poll)(s.request_in, POLL_IN);
-        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        // What is owed goes first; nothing new is read until it has.
+        if !flush_reply(s) {
             return 0;
         }
-        let n = (sys.channel_read)(s.request_in, s.in_buf.as_mut_ptr(), BUF);
-        if n <= 0 {
-            return 0;
+        let waiting = s.journal.held();
+        let n = if waiting {
+            s.journal.begin();
+            s.held_n as i32
+        } else {
+            match take_request(s, sys) {
+                Some(n) => n,
+                None => return 0,
+            }
+        };
+        // The fused decision: the arriving record is ITS input, and the
+        // outcome it constructs is the request served below. An empty outcome
+        // is the decision's filter — nothing is served and nothing answers.
+        // A held record serves the request decided when it arrived.
+        let req: &[u8] = if s.dec_len > 0 {
+            if waiting {
+                core::slice::from_raw_parts(s.dec_buf.as_ptr(), s.held_req as usize)
+            } else {
+                match decide(s, n as usize) {
+                    Some(len) => {
+                        s.held_req = len as u32;
+                        core::slice::from_raw_parts(s.dec_buf.as_ptr(), len)
+                    }
+                    None => return 0,
+                }
+            }
+        } else {
+            core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize)
+        };
+        if !waiting {
+            s.held_n = n as u32;
+            s.journal.reset();
         }
-        let req = core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize);
+        // Every store call of the serve goes through the record's journal.
+        let store = Store::serving(sys, &mut s.journal);
+        let sys = &store;
 
         let cid = frame_i64(req, 1).unwrap_or(0);
         let op = frame_i64(req, 2).unwrap_or(OP_GET);
+        // Field 3 may be an INTEGER too (a claim keyed by the address it
+        // claims), rendered as decimal like every other key part.
+        let mut key3 = [0u8; 20];
         let key = match frame_field(req, 3) {
             Some((TY_BYTES, k)) => k,
+            Some((TY_I64, b)) if b.len() == 8 => {
+                let v = i64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+                let n = dec(v.unsigned_abs(), &mut key3);
+                &key3[..n]
+            }
             _ => &[],
         };
 
@@ -673,6 +2128,44 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         let value = &vbuf[..vlen];
+        // A write of a STAGED body: the value named by its digest.
+        let mut staged: *mut u8 = core::ptr::null_mut();
+        let mut staged_bad = false;
+        let value: &[u8] = if s.blob_len > 0
+            && matches!(
+                op,
+                OP_PUT
+                    | OP_CREATE
+                    | OP_REPLACE
+                    | OP_PATCH_MERGE
+                    | OP_PATCH_JSON
+                    | OP_PATCH_SMP
+                    | OP_APPLY
+            )
+            && value.starts_with(b"sha256:")
+        {
+            let mut bk = [0u8; MAX_KEY];
+            let bl = s.blob_len as usize;
+            let hex = &value[7..];
+            if bl + hex.len() <= bk.len() {
+                bk[..bl].copy_from_slice(&s.blob[..bl]);
+                bk[bl..bl + hex.len()].copy_from_slice(hex);
+            }
+            match read_whole(sys, &bk[..(bl + hex.len()).min(MAX_KEY)], DOC_MAX) {
+                Some((p, n)) => {
+                    staged = p;
+                    core::slice::from_raw_parts(p, n)
+                }
+                None => {
+                    staged_bad = true;
+                    let m = b"[store_effect] a staged body is gone or past the heap - REFUSED";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                    value
+                }
+            }
+        } else {
+            value
+        };
         // The graph configures WHERE this connector writes; a record carries the
         // key TAIL (what `store_source` emits), so the convention stays in the
         // deployment rather than in a decision that would have to concatenate.
@@ -692,19 +2185,85 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             full[*klen..*klen + n].copy_from_slice(&part[..n]);
             *klen += n;
         };
+        // Where each key part lands, by field — OP_EXISTS_ANY rebuilds the key
+        // with some of them swapped for `*`.
+        let mut bounds: [(u8, usize, usize); 12] = [(0, 0, 0); 12];
+        let mut nb = 0usize;
+        let k0 = klen;
         append_part(key, &mut klen);
+        bounds[nb] = (3, k0, klen);
+        nb += 1;
         // 25, 26 and 27 extend the same idea: a projection key like
         // `/authz/<subject>/<verb>/<resource>` is five parts and two literal
         // separators, and two extra parts could not build it. They are the
         // WIDEST the key ranges go — the carry range starts at 30 and the gap
         // is deliberate.
-        for f in [17u8, 18, 25, 26, 27] {
-            if let Some((TY_BYTES, part)) = frame_field(req, f) {
-                append_part(part, &mut klen);
+        // An INTEGER key part renders as decimal, as a value part does: an
+        // allocator computes a candidate address as a number and keys its
+        // claim by it, and the VM can compute a number but not render one.
+        // 20..24 extend it again, appended AFTER 27 so every key built before
+        // them is unchanged: a grant key `/rbac-g/<id>/<ns>|<verb>|<res>` plus
+        // its source is more parts than six.
+        for f in [17u8, 18, 25, 26, 27, 20, 21, 22, 23, 24] {
+            let start = klen;
+            match frame_field(req, f) {
+                Some((TY_BYTES, part)) => append_part(part, &mut klen),
+                Some((TY_I64, b)) if b.len() == 8 => {
+                    let v = i64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+                    let mut digits = [0u8; 20];
+                    let n = dec(v.unsigned_abs(), &mut digits);
+                    append_part(&digits[..n], &mut klen);
+                }
+                _ => {}
+            }
+            if nb < bounds.len() {
+                bounds[nb] = (f, start, klen);
+                nb += 1;
             }
         }
         let key = &full[..klen];
         let key = if klen == pl { &full[..0] } else { key };
+        // A subresource is the object through a view (`<key>#scale`): stored
+        // under the key, answered and written as the view says.
+        let (key, view) = view_split(key);
+        // The writer's marks after the view (views.rs `view_args`): its field
+        // manager, and `!` — a DRY RUN: every write computed as it would be
+        // (stamps, patches, identity) and answered, none stored.
+        let (view, fmgr, force, dry) = view_args(view);
+        let mut dry_doc = [0u8; MAX_VALUE];
+        dry_doc[0] = 0;
+        // Who writes, for the schema's `owners` (fieldset.rs): the API's
+        // writes only.
+        let mut now = [0u8; 20];
+        rfc3339(now_millis(sys), &mut now);
+        // Read in place: nothing below writes the schema.
+        let sch = core::slice::from_raw_parts(s.schema.as_ptr(), s.schema_len as usize);
+        let mut pk = [0u8; PATCH_KEYS_MAX];
+        let pkl = s.patch_keys_len as usize;
+        pk[..pkl].copy_from_slice(&s.patch_keys[..pkl]);
+        let writer = FsWriter {
+            mgr: if fmgr.is_empty() {
+                &b"unknown"[..]
+            } else {
+                fmgr
+            },
+            sub: view,
+            force,
+            now: &now,
+            keys: &pk[..pkl],
+            sch,
+        };
+        let fw = (s.stamp != 0).then_some(&writer);
+        let mut note = [0u8; MAX_VALUE];
+        let mut note_n = 0usize;
+        // Server-side apply is a create or a strategic merge, by what exists.
+        let applying = op == OP_APPLY;
+        let applied_create = applying && !exists(sys, key);
+        let op = match op {
+            OP_APPLY if applied_create => OP_CREATE,
+            OP_APPLY => OP_PATCH_SMP,
+            o => o,
+        };
 
         // Opaque carry-through: fields 30..=39 come back untouched. Kept clear
         // of the value parts (4..16) and the key parts (3, 17, 18, 25..27) so widening
@@ -715,9 +2274,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // whose inputs are empty rather than as an error.
         // Echoed with their TYPE: a carried integer comes back an integer, so a
         // number computed before the effect is still a number after it.
-        let mut carry_buf: [(u8, u8, &[u8]); 10] = [(0, 0, &[]); 10];
+        // Field 254 is the record's carried context (chronicle `CARRY_FIELD`),
+        // one nested message, echoed with the legacy range.
+        let mut carry_buf: [(u8, u8, &[u8]); 11 + ECHO_MAX] = [(0, 0, &[]); 11 + ECHO_MAX];
         let mut nc = 0usize;
-        for f in 30u8..=39 {
+        for f in (30u8..=39).chain(core::iter::once(254u8)) {
+            if let Some((ty, v)) = frame_field(req, f) {
+                carry_buf[nc] = (f, ty, v);
+                nc += 1;
+            }
+        }
+        for k in 0..s.echo_len as usize {
+            let f = s.echo[k];
             if let Some((ty, v)) = frame_field(req, f) {
                 carry_buf[nc] = (f, ty, v);
                 nc += 1;
@@ -738,9 +2306,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             paths: &s.paths[..s.paths_len as usize],
             ints: &s.ints[..s.ints_len as usize],
             flat: s.flat != 0,
+            hash: &s.hash[..s.hash_len as usize],
         };
+        let rv_path = &s.rv_path[..s.rv_path_len as usize];
+        // The key's store revision, for field 59 when `revision = 1`. Set by
+        // each branch that knows it; 0 = absent or not asked.
+        let mut rev: u64 = 0;
         let flen = if op == OP_NOOP {
             reply_projected(&mut out, cid, 204, &[], carry, &proj)
+        } else if staged_bad {
+            // The body it names is gone (collected) or could not be held:
+            // writing the reference itself as the object would be a lie.
+            reply_projected(&mut out, cid, 500, &[], carry, &proj)
         } else if key.is_empty() {
             // A request that names no key is malformed, not a 404: answering
             // 404 would let a caller mistake a broken frame for an absent
@@ -762,11 +2339,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     };
                     let mut names = [0u8; MAX_VALUE];
                     let mut at = 0usize;
+                    let mut walk = ListWalk::new(key);
                     if s.list_open_len > 0 {
                         at = append(&mut names, at, &s.list_open[..s.list_open_len as usize]);
                     }
                     let opened = at;
-                    let mut walk = ListWalk::new(key);
                     let mut overflow = false;
                     let mut vbuf = [0u8; MAX_VALUE];
                     while let Some(k) = walk.next(sys) {
@@ -779,8 +2356,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let mut kb = [0u8; MAX_KEY];
                             let kl = k.len().min(MAX_KEY);
                             kb[..kl].copy_from_slice(&k[..kl]);
+                            // HEAD before GET: a write landing between the two
+                            // leaves the value NEWER than the stamped revision,
+                            // so a later conditional write fails and retries —
+                            // the safe direction to be wrong in.
+                            let r = if rv_path.is_empty() {
+                                None
+                            } else {
+                                head(sys, &kb[..kl])
+                            };
                             match get_value(sys, &kb[..kl], &mut vbuf) {
-                                Some(vl) => &vbuf[..vl],
+                                Some(vl) => match r
+                                    .and_then(|r| stamp_rv(&vbuf[..vl], rv_path, r, &mut s.out_buf))
+                                {
+                                    Some(sl) => &s.out_buf[..sl],
+                                    None => &vbuf[..vl],
+                                },
                                 // Refused (oversized) or vanished mid-walk. A
                                 // listing that quietly omits an object reads as
                                 // a complete one, so the whole answer fails.
@@ -812,36 +2403,331 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let body: &[u8] = if status == 200 { &names[..at] } else { &[] };
                     reply_projected(&mut out, cid, status, body, carry, &proj)
                 }
+                OP_EXISTS_ANY => {
+                    let wild = &s.wild[..s.wild_len as usize];
+                    let mut found = false;
+                    // Every subset of the wild fields, the exact key first.
+                    let combos = 1u32 << wild.len();
+                    let mut probe = [0u8; MAX_VALUE];
+                    'combo: for mask in 0..combos {
+                        let mut kb = [0u8; MAX_KEY];
+                        let mut kl = 0usize;
+                        let mut at = 0usize;
+                        for &(f, a, b) in bounds.iter().take(nb) {
+                            let starred = wild
+                                .iter()
+                                .position(|&w| w == f)
+                                .map(|bit| mask & (1 << bit) != 0)
+                                .unwrap_or(false);
+                            if starred && &full[a..b] == b"~" {
+                                continue 'combo; // a literal is never widened
+                            }
+                            // The prefix and any literal before this part.
+                            kl = append(&mut kb, kl, &full[at..a]);
+                            kl = if starred {
+                                append(&mut kb, kl, b"*")
+                            } else {
+                                append(&mut kb, kl, &full[a..b])
+                            };
+                            at = b;
+                        }
+                        kl = append(&mut kb, kl, &full[at..klen]);
+                        if get_value(sys, &kb[..kl], &mut probe).is_some() {
+                            found = true;
+                            break;
+                        }
+                    }
+                    reply_projected(
+                        &mut out,
+                        cid,
+                        if found { 200 } else { 404 },
+                        &[],
+                        carry,
+                        &proj,
+                    )
+                }
                 OP_DELETE => {
                     // delete-if-present, so a converged cluster spends no
-                    // revisions and a repeated verdict is a no-op.
-                    let mut probe = [0u8; MAX_VALUE];
-                    let ok = if get_value(sys, key, &mut probe).is_some() {
-                        delete_value(sys, key)
-                    } else {
-                        true // already gone: the verdict has nothing to undo
+                    // revisions and a repeated verdict is a no-op. With an
+                    // expected revision in field 28 the delete is conditional:
+                    // 409 when the object moved since it was read.
+                    let want = match frame_i64(req, 28) {
+                        Some(r) if r > 0 => r as u64,
+                        _ => 0,
                     };
-                    reply_projected(&mut out, cid, if ok { 200 } else { 500 }, &[], carry, &proj)
-                }
-                OP_MERGE => {
-                    let mut cur = [0u8; MAX_VALUE];
-                    let cl = get_value(sys, key, &mut cur).unwrap_or(0);
-                    let mut merged = [0u8; MAX_VALUE];
-                    let ml = flat_merge(&cur[..cl], value, &mut merged);
-                    if ml == 0 && !value.is_empty() {
-                        s.malformed = s.malformed.wrapping_add(1);
-                        reply_projected(&mut out, cid, 400, &[], carry, &proj)
+                    let mut probe = [0u8; MAX_VALUE];
+                    let found = get_value(sys, key, &mut probe);
+                    // An object with finalizers is not deleted: it is marked
+                    // (deletionTimestamp) and stays until the last finalizer
+                    // is removed — which a later write completes.
+                    let held =
+                        s.stamp != 0 && found.is_some_and(|vl| is_guarded(&probe[..vl], sch));
+                    if dry {
+                        // A dry run deletes nothing: whether it would is answered.
+                        let status = if found.is_some() { 200 } else { 404 };
+                        reply_projected(&mut out, cid, status, &[], carry, &proj)
+                    } else if held {
+                        let status = mark_deleting(sys, key, &probe[..found.unwrap_or(0)], sch);
+                        if s.revision != 0 {
+                            rev = head(sys, key).unwrap_or(0);
+                        }
+                        reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else {
-                        let (ok, wrote) = put_guarded(sys, key, &merged[..ml]);
-                        let status = if !ok {
-                            500
-                        } else if wrote {
+                        if let (Some(vl), true) = (found, s.tomb_len > 0) {
+                            leave_tomb(s, sys, key, &probe[..vl]);
+                        }
+                        let status = if found.is_none() && s.stamp != 0 {
+                            404 // the API's delete of nothing: NotFound
+                        } else if found.is_none() {
+                            200 // already gone: the verdict has nothing to undo
+                        } else if want > 0 {
+                            match code(delete_cond(sys, key, PRE_ETAG, want)) {
+                                0 => 200,
+                                ERR_EAGAIN => 409,
+                                _ => 500,
+                            }
+                        } else if done(delete_value(sys, key)) {
                             200
                         } else {
-                            204
+                            500
                         };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
                     }
+                }
+                OP_CREATE if s.stamp != 0 => {
+                    let mut fk = [0u8; MAX_KEY];
+                    let (status, fl) = create_stamped(
+                        sys,
+                        key,
+                        value,
+                        &mut fk,
+                        dry.then_some(&mut dry_doc),
+                        rv_path,
+                        fw,
+                        applied_create,
+                        sch,
+                    );
+                    let fkey = &fk[..fl];
+                    // An apply that created answers 201, as upstream does.
+                    let status = if applied_create && status == 200 {
+                        201
+                    } else {
+                        status
+                    };
+                    if s.revision != 0 {
+                        rev = head(sys, fkey).unwrap_or(0);
+                    }
+                    let mut shown = [0u8; MAX_VALUE];
+                    let body = if dry {
+                        if status == 200 || status == 201 {
+                            dry_body(&mut dry_doc, &[], sch)
+                        } else {
+                            &[]
+                        }
+                    } else {
+                        stored_answer(
+                            sys,
+                            fkey,
+                            &[],
+                            if status == 201 { 200 } else { status },
+                            rv_path,
+                            &mut shown,
+                            sch,
+                        )
+                    };
+                    reply_projected(&mut out, cid, status, body, carry, &proj)
+                }
+                OP_CREATE => {
+                    let status = match code(put_cond(sys, key, value, PRE_ABSENT, 0)) {
+                        0 => 200,
+                        ERR_EEXIST => 409,
+                        _ => 500,
+                    };
+                    if s.revision != 0 {
+                        rev = head(sys, key).unwrap_or(0);
+                    }
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
+                }
+                OP_PATCH_MERGE | OP_PATCH_JSON | OP_PATCH_SMP => {
+                    let keys = &s.patch_keys[..s.patch_keys_len as usize];
+                    let status = patch_object(
+                        sys,
+                        key,
+                        op,
+                        value,
+                        keys,
+                        rv_path,
+                        dry.then_some(&mut dry_doc),
+                        fw,
+                        applying,
+                        &mut note,
+                        &mut note_n,
+                        sch,
+                    );
+                    if s.revision != 0 {
+                        rev = head(sys, key).unwrap_or(0);
+                    }
+                    let mut shown = [0u8; MAX_VALUE];
+                    let body = if status == 409 && note_n > 0 {
+                        // An apply's conflicts: the Status that names them.
+                        &note[..note_n]
+                    } else if dry {
+                        if status == 200 {
+                            dry_body(&mut dry_doc, view, sch)
+                        } else {
+                            &[]
+                        }
+                    } else if s.stamp != 0 {
+                        let b = stored_answer(sys, key, view, status, rv_path, &mut shown, sch);
+                        finish_deletion(s, sys, key, b);
+                        b
+                    } else {
+                        &[]
+                    };
+                    reply_projected(&mut out, cid, status, body, carry, &proj)
+                }
+                OP_REPLACE if !view.is_empty() => {
+                    // A PUT to a subresource changes only what the view owns.
+                    let mut vp = [0u8; MAX_VALUE];
+                    let status = match sch_view_patch(sch, view, rv_path, value, &mut vp) {
+                        Some(l) => patch_object(
+                            sys,
+                            key,
+                            OP_PATCH_MERGE,
+                            &vp[..l],
+                            &[],
+                            rv_path,
+                            dry.then_some(&mut dry_doc),
+                            fw,
+                            false,
+                            &mut note,
+                            &mut note_n,
+                            sch,
+                        ),
+                        None => 422,
+                    };
+                    if s.revision != 0 {
+                        rev = head(sys, key).unwrap_or(0);
+                    }
+                    let mut shown = [0u8; MAX_VALUE];
+                    let body = if dry {
+                        if status == 200 {
+                            dry_body(&mut dry_doc, view, sch)
+                        } else {
+                            &[]
+                        }
+                    } else {
+                        stored_answer(sys, key, view, status, rv_path, &mut shown, sch)
+                    };
+                    reply_projected(&mut out, cid, status, body, carry, &proj)
+                }
+                OP_REPLACE => {
+                    let want = expected_rev(req, value, rv_path);
+                    // What a replace carries across: the stored object's
+                    // `keep` paths, whatever the client sent.
+                    let kept = if s.stamp != 0 {
+                        keep_identity(sys, key, value, fw, sch)
+                    } else {
+                        None
+                    };
+                    let value: &[u8] = match kept {
+                        Some((_, d, n)) => core::slice::from_raw_parts(d, n),
+                        None => value,
+                    };
+                    let status = if s.stamp != 0 && !dry && !exists(sys, key) {
+                        // Upstream replaces what exists; nothing there is 404.
+                        404
+                    } else if dry {
+                        match head(sys, key) {
+                            Some(r) if want == 0 || want == r => {
+                                dry_answer(value, r, rv_path, &mut dry_doc)
+                            }
+                            Some(_) => 409,
+                            None => 404,
+                        }
+                    } else if want == 0 {
+                        // No token stated: a Kubernetes PUT without a
+                        // resourceVersion is an unconditional update.
+                        match put_guarded(sys, key, value) {
+                            (false, _) => 500,
+                            (true, true) => 200,
+                            (true, false) => 204,
+                        }
+                    } else {
+                        match code(put_cond(sys, key, value, PRE_ETAG, want)) {
+                            0 => 200,
+                            // The key moved, or is gone: either way the
+                            // client's copy is stale and it must re-read.
+                            ERR_EAGAIN | ERR_EEXIST => 409,
+                            _ => 500,
+                        }
+                    };
+                    if let Some((p, _, _)) = kept {
+                        heap_free(sys, p);
+                    }
+                    if s.revision != 0 {
+                        rev = head(sys, key).unwrap_or(0);
+                    }
+                    let mut shown = [0u8; MAX_VALUE];
+                    let body = if dry {
+                        if status == 200 {
+                            dry_body(&mut dry_doc, view, sch)
+                        } else {
+                            &[]
+                        }
+                    } else if s.stamp != 0 {
+                        let b = stored_answer(sys, key, view, status, rv_path, &mut shown, sch);
+                        finish_deletion(s, sys, key, b);
+                        b
+                    } else {
+                        &[]
+                    };
+                    reply_projected(&mut out, cid, status, body, carry, &proj)
+                }
+                OP_MERGE => {
+                    // With an expected revision in field 28 the merge is into
+                    // THAT record: 409 when it moved or is gone, so a merge
+                    // never recreates a record another writer removed.
+                    let want = match frame_i64(req, 28) {
+                        Some(r) if r > 0 => r as u64,
+                        _ => 0,
+                    };
+                    let mut cur = [0u8; MAX_VALUE];
+                    let got = get_value(sys, key, &mut cur);
+                    let cl = got.unwrap_or(0);
+                    let mut merged = [0u8; MAX_VALUE];
+                    let ml = flat_merge(&cur[..cl], value, &mut merged);
+                    let status = if ml == 0 && !value.is_empty() {
+                        s.malformed = s.malformed.wrapping_add(1);
+                        400
+                    } else if want == 0 {
+                        match put_guarded(sys, key, &merged[..ml]) {
+                            (false, _) => 500,
+                            (true, true) => 200,
+                            (true, false) => 204,
+                        }
+                    } else if got.is_none() {
+                        if exists(sys, key) {
+                            413
+                        } else {
+                            409
+                        }
+                    } else if merged[..ml] == cur[..cl] {
+                        match head(sys, key) {
+                            Some(r) if r == want => 204,
+                            _ => 409,
+                        }
+                    } else {
+                        match code(put_cond(sys, key, &merged[..ml], PRE_ETAG, want)) {
+                            0 => 200,
+                            ERR_EAGAIN | ERR_EEXIST => 409,
+                            _ => 500,
+                        }
+                    };
+                    if s.revision != 0 {
+                        rev = head(sys, key).unwrap_or(0);
+                    }
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
                 OP_PATCH => {
                     // The path rides in field 19 (the key parts 3/17/18 are
@@ -864,7 +2750,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         _ => 0,
                     };
                     if cl.is_none() {
-                        reply_projected(&mut out, cid, 404, &[], carry, &proj)
+                        // Unreadable is not absent: an object past a record
+                        // exists, and a caller told 404 would take it as gone.
+                        let status = if exists(sys, key) { 413 } else { 404 };
+                        reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else if el == 0 {
                         s.malformed = s.malformed.wrapping_add(1);
                         reply_projected(&mut out, cid, 400, &[], carry, &proj)
@@ -879,6 +2768,79 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
                     }
+                }
+                OP_COUNT => {
+                    // Every child, or with `count_where` those its decision
+                    // keeps. A walk that fails, a child present but
+                    // unreadable, or a predicate that does not decide answers
+                    // 500: a short count reads as a complete one.
+                    let mut walk = ListWalk::new(key);
+                    let mut n = 0i64;
+                    let mut bad = s.cw_fault != 0;
+                    while !bad {
+                        let Some(k) = walk.next(sys) else {
+                            break;
+                        };
+                        if s.cw_len == 0 {
+                            n += 1;
+                            continue;
+                        }
+                        let mut kb = [0u8; MAX_KEY];
+                        let kl = k.len().min(MAX_KEY);
+                        kb[..kl].copy_from_slice(&k[..kl]);
+                        let child = &kb[..kl];
+                        let mut v = [0u8; MAX_VALUE];
+                        match get_value(sys, child, &mut v) {
+                            Some(vl) => {
+                                let tail = child.get(key.len()..).unwrap_or(&[]);
+                                match count_child(s, cid, tail, &v[..vl], carry, &proj) {
+                                    Some(true) => n += 1,
+                                    Some(false) => {}
+                                    None => bad = true,
+                                }
+                            }
+                            // Gone since it was listed: not there to count.
+                            None => bad = exists(sys, child),
+                        }
+                    }
+                    let status = if bad || walk.failed { 500 } else { 200 };
+                    let q = reply(&mut out, cid, status, &[], carry);
+                    if q > 0 {
+                        match put_field(&mut out, q, 45, TY_I64, &n.to_le_bytes()) {
+                            Some(q2) => {
+                                out[0] += 1;
+                                q2
+                            }
+                            None => 0,
+                        }
+                    } else {
+                        0
+                    }
+                }
+                OP_APPEND => {
+                    let cap = (s.append_cap as usize).clamp(1, MAX_VALUE);
+                    let mut cur = [0u8; MAX_VALUE];
+                    let cl = get_value(sys, key, &mut cur).unwrap_or(0);
+                    let mut buf = [0u8; MAX_VALUE];
+                    let total = cl + value.len();
+                    let n = if value.len() >= cap {
+                        buf[..cap].copy_from_slice(&value[value.len() - cap..]);
+                        cap
+                    } else {
+                        let keep = cl.min(cap - value.len());
+                        buf[..keep].copy_from_slice(&cur[cl - keep..cl]);
+                        buf[keep..keep + value.len()].copy_from_slice(value);
+                        keep + value.len()
+                    };
+                    let _ = total;
+                    let status = if value.is_empty() {
+                        204
+                    } else if done(put_value(sys, key, &buf[..n])) {
+                        200
+                    } else {
+                        500
+                    };
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
                 OP_PUT => {
                     let (ok, wrote) = put_guarded(sys, key, value);
@@ -900,13 +2862,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 _ => {
                     let mut val = [0u8; MAX_VALUE];
+                    // HEAD first, for the same reason the LIST stamps that way.
+                    let r = if s.revision != 0 || !rv_path.is_empty() {
+                        head(sys, key)
+                    } else {
+                        None
+                    };
+                    rev = r.unwrap_or(0);
                     match get_value(sys, key, &mut val) {
                         Some(_) if op == OP_EXISTS => {
                             reply_projected(&mut out, cid, 200, &[], carry, &proj)
                         }
                         Some(vlen) => {
-                            reply_projected(&mut out, cid, 200, &val[..vlen], carry, &proj)
+                            let mut stamped = [0u8; MAX_VALUE];
+                            let body = match r
+                                .and_then(|r| stamp_rv(&val[..vlen], rv_path, r, &mut stamped))
+                            {
+                                Some(sl) => &stamped[..sl],
+                                None => &val[..vlen],
+                            };
+                            reply_projected(&mut out, cid, 200, body, carry, &proj)
                         }
+                        // Present, but past a record: it EXISTS (200), its
+                        // value is not answered (no record could carry it),
+                        // and its projections come from a heap copy when this
+                        // build has one (store_big).
+                        None if exists(sys, key) => match read_whole(sys, key, DOC_MAX) {
+                            Some((p, n)) => {
+                                let doc = core::slice::from_raw_parts(p, n);
+                                let f = reply_projected_from(
+                                    &mut out,
+                                    cid,
+                                    200,
+                                    &[],
+                                    doc,
+                                    carry,
+                                    &proj,
+                                );
+                                heap_free(sys, p);
+                                f
+                            }
+                            None => reply_projected(&mut out, cid, 200, &[], carry, &proj),
+                        },
                         // A miss STILL projects, into empty fields. Field
                         // numbers must not depend on the outcome: a decision
                         // indexes by number, and comparing a field that is
@@ -917,6 +2914,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         };
+        if !staged.is_null() {
+            heap_free(sys, staged);
+        }
+        if s.journal.held() {
+            // A write of this record is undecided: nothing is answered, and
+            // the record is served again next step.
+            return 0;
+        }
+        // Field 59 on EVERY reply when asked for, miss or hit: a decision
+        // indexes by number, and a field that exists only on some outcomes
+        // silently kills the decision on the others.
+        let flen = if s.revision != 0 {
+            append_rev(&mut out, flen, rev)
+        } else {
+            flen
+        };
         if flen == 0 {
             return 0;
         }
@@ -925,9 +2938,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // `debug` node in a production graph purely to swallow replies.
         if s.response_out >= 0 {
             s.out_buf[..flen].copy_from_slice(&out[..flen]);
-            if (sys.channel_write)(s.response_out, s.out_buf.as_ptr(), flen) > 0 {
-                s.served = s.served.wrapping_add(1);
-            }
+            s.out_at = 0;
+            s.out_len = flen as u32;
+            flush_reply(s);
         } else {
             s.served = s.served.wrapping_add(1);
         }

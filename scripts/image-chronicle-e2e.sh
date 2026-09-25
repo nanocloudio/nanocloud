@@ -80,7 +80,7 @@ python3 - "$ROOT/packaging/debian/fluxor-podlifecycle.yaml" "$D/graph.yaml" <<'P
 import re, sys
 s = open(sys.argv[1]).read()
 mods = re.search(r'(  # ── image:.*?)\n  # ── lifecycle', s, re.S).group(1)
-wire = re.search(r'(  - from: pi_source\.status.*?buffer_group: 24)\n', s, re.S).group(1)
+wire = re.search(r'(  - from: pi_source\.status.*?  - from: pi_config\.response_out\n    to: \S+)\n', s, re.S).group(1)
 open(sys.argv[2], "w").write(
     "target: linux\ntick_us: 1000\nscheduler:\n  accept_cycles: true\nmodules:\n"
     + mods + "\nwiring:\n" + wire + "\n")
@@ -115,16 +115,16 @@ run 4
 [ -z "$(store_last /pod-resolved/pod-img)" ] || fail "state=pending must not resolve"
 echo "   state=pending: held"
 
-echo "== 3. ready + an OCI config: argv is Entrypoint ++ Cmd, unescaped =="
+echo "== 3. ready + an OCI config: argv is Entrypoint ++ Cmd, every token's bounds kept =="
 # What image_fetcher writes: `,`-joined, with %25/%2C/%3B escaped.
 store_put "/image-rootfs/nanocloud_hello" "state=ready;path=/rootfs/nanocloud_hello"
 store_put "/image-config/nanocloud_hello" "entrypoint=/usr/sbin/nginx;cmd=-g,--pid%2Cfile"
 run 5
 R="$(store_last /pod-resolved/pod-img)"
-[ "$R" = "rootfs=/rootfs/nanocloud_hello;cmd=/usr/sbin/nginx -g --pid,file" ] \
+[ "$R" = "rootfs=/rootfs/nanocloud_hello;cmd=/usr/sbin/nginx -g --pid%2Cfile" ] \
   || fail "resolved wrong: '$R'"
 echo "   $R"
-echo "   (Entrypoint ++ Cmd, ',' tokens split, '%2C' restored to a literal comma)"
+echo "   (Entrypoint ++ Cmd, ',' tokens split; the comma inside one stays escaped until the spawn decodes it)"
 
 echo "== 4. an explicit spec cmd wins outright over the image's config =="
 store_put "/pod-specs/pod-ovr" "image=nanocloud/hello:v2;cmd=/bin/sh -c true;desired=running"

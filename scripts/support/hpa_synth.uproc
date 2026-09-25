@@ -1,0 +1,82 @@
+// A SYNTHETIC metric for hpa-chronicle-e2e (a test fixture, not shipped): one
+// sample every `period` ms of the source's clock, `hi` until `sw`, `lo` after.
+//
+//   /synth/<ns>/<t>        {"next":<due>,"hi":…,"lo":…,"sw":…,"period":…}
+//   /hpa-metrics/<ns>/<t>  cpu=<pct>;ts=<now>   (every sample a change)
+//
+// store_source wakes at `next` (`due`), `put` writes the sample and `adv`
+// moves `next` a period on — so the loop runs on the kernel timer alone.
+module nanocloud.hpa_synth {
+  message Ctx {
+    key: string = 30;
+    now: int = 31;
+    hi: int = 32;
+    lo: int = 33;
+    sw: int = 34;
+    period: int = 35;
+  }
+  message Tick {
+    seq: int = 1;
+    key: string = 3;
+    next: int = 50;
+    hi: int = 51;
+    lo: int = 52;
+    sw: int = 53;
+    period: int = 54;
+    now: int = 58;
+  }
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    ctx: Ctx = 254;
+  }
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Adv {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8;
+    v6: int = 9; v7: string = 10; v8: int = 11; v9: string = 12; v10: int = 13; v11: string = 14;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  decision put(t: Tick) -> Put {
+    when t.now < t.next ->
+      Put { cid: t.seq, op: NOOP, key: "", v1: "", v2: 0, v3: "", v4: 0,
+            ctx: Ctx { key: "", now: t.now, hi: t.hi, lo: t.lo, sw: t.sw, period: t.period } };
+    default ->
+      Put { cid: t.seq, op: PUT, key: t.key, v1: "cpu=",
+            v2: t.hi + (t.lo - t.hi) * math.least(1, math.greatest(0, t.now - t.sw + 1)),
+            v3: ";ts=", v4: t.now,
+            ctx: Ctx { key: t.key, now: t.now, hi: t.hi, lo: t.lo, sw: t.sw, period: t.period } };
+  }
+  decision adv(d: Done) -> Adv {
+    when d.ctx.key == "" ->
+      Adv { cid: d.cid, op: NOOP, key: "", v1: "", v2: 0, v3: "", v4: 0, v5: "", v6: 0, v7: "", v8: 0, v9: "", v10: 0, v11: "" };
+    default ->
+      Adv { cid: d.cid, op: PUT, key: d.ctx.key,
+            v1: "{\"next\":", v2: d.ctx.now + d.ctx.period, v3: ",\"hi\":", v4: d.ctx.hi,
+            v5: ",\"lo\":", v6: d.ctx.lo, v7: ",\"sw\":", v8: d.ctx.sw,
+            v9: ",\"period\":", v10: d.ctx.period, v11: "}" };
+  }
+  transformation tt(t: Tick) -> Tick {
+    Tick { seq: t.seq, key: t.key, next: t.next, hi: t.hi, lo: t.lo, sw: t.sw, period: t.period, now: t.now }
+  }
+  transformation td(d: Done) -> Done {
+    Done { cid: d.cid, status: d.status, ctx: Ctx { key: d.ctx.key, now: d.ctx.now, hi: d.ctx.hi, lo: d.ctx.lo, sw: d.ctx.sw, period: d.ctx.period } }
+  }
+  pipeline sy_put(t: Tick) -> Put { call x = tt(t); call y = put(x); return y; }
+  pipeline sy_adv(d: Done) -> Adv { call x = td(d); call y = adv(x); return y; }
+  entry sy_put = sy_put;
+  entry sy_adv = sy_adv;
+  provenance revision "hpa-synthetic-metric" toolchain "chronicle-authoring";
+}

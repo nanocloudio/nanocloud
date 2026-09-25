@@ -6,13 +6,14 @@
 # with the routing and the refusal ladder as params, not as an .fmod.
 #
 #   curl -> linux_net -> http (wave)      terminates HTTP, HANDLER_APP fan-out
+#        -> http_chain                    the exchange -> one request envelope
 #        -> kube_decode                   envelope -> Request record + credential
 #        -> admit      (decision)         apiplane_auth.uproc `admit`, as params
 #        -> kagi_verify                   the kagi seam: credential out, identity back
 #             <-> token_verify (KAGI)     the signature check, kagi's module
 #        -> decide     (decision)         apiplane_auth.uproc `decide`, as params
 #        -> enc_http   (pipeline)         the READ PATH'S ser program, byte-identical
-#        -> http -> curl
+#        -> http_chain -> http -> curl
 #
 # The stage under test is the FILTER: one that calls out of the graph and
 # correlates back. The only nanocloud code in it is `kagi_verify`, which decides
@@ -31,7 +32,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in kube_decode kagi_verify token_verify decision pipeline http; do
+for m in kagi_verify token_verify decision pipeline http http_chain; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -59,9 +60,9 @@ PY
 }
 
 echo "== 1. mint an ES256 keypair, a kagi MSG_KEY_ADD frame and a real JWT =="
-# Byte-for-byte what `sa_token` publishes and mints (modules/app/sa_token/mod.rs:
-# publish_verification_key and mint_token). Generated here rather than by running
-# sa_token so the test can also produce an EXPIRED token, which a live issuer
+# The shapes kagi's `token_mint` announces (a VERIFY MSG_KEY_ADD, stored at
+# /authn-keys/sa by kagi_mint) and mints (an ES256 JWS). Generated here rather than by running
+# the live mint so the test can also produce an EXPIRED token, which a live issuer
 # will not do.
 python3 - "$D" <<'PY'
 import base64, json, struct, sys, time, binascii
@@ -120,6 +121,11 @@ DEC_ADMIT="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.uproc" admi
 DEC_DECIDE="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.uproc" decide)"
 [ -n "$DEC_ADMIT" ]  || { echo "FAIL: could not compile apiplane_auth.uproc admit"; exit 1; }
 [ -n "$DEC_DECIDE" ] || { echo "FAIL: could not compile apiplane_auth.uproc decide"; exit 1; }
+# The request decoder, as the apiplane graph carries it (kube.rd, kube.uproc).
+. "$ROOT/scripts/chronicle-params.sh"
+KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_pass)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -131,11 +137,21 @@ modules:
   - name: http
     port: $PORT
     host_tcp: 1
-    max_body_kib: 64
     routes:
       - path: "/api/"
         app: true
+  # The provider behind the http application routes: each exchange one
+  # request envelope for kube_decode.
+  - name: http_chain
   - name: kube_decode
+    type: pipeline
+    params:
+      decode: "${KD_DECODE}"
+      ir_stages: "${KD_PASS}"
+  - name: kube_route
+    type: decision
+    params:
+      decision: "${KD_ROUTE}"
   - name: admit
     type: decision
     params:
@@ -164,35 +180,39 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  - from: http.req_out
-    to: kube_decode.req_in
+  - from: http.request_out
+    to: http_chain.request_in
+  - from: http_chain.response_out
+    to: http.response_in
+  # A decode-mode pipeline reads one envelope per read: mailbox.
+  - from: http_chain.record_out
+    to: kube_decode.record_in
     buffer_group: 1
   # No buffer_group on engine edges: a Chronicle engine self-frames over a byte
   # stream, so mailbox mode breaks it. The edges into modules that read a whole
   # record per step and DECLARE their input framed are mailboxed.
-  - from: kube_decode.record_out
+  - from: kube_decode.result_out
+    to: kube_route.record_in
+  - from: kube_route.result_out
     to: admit.record_in
   - from: admit.result_out
     to: kagi_verify.request_in
     buffer_group: 3
-  # The kagi seam, both directions plus the key.
-  # token_verify does NOT declare `framed`: it self-frames over a byte stream
-  # with kagi's own 3-byte envelope, exactly as a Chronicle engine does with
-  # its record header. So these two edges are NOT mailboxed. The return leg is,
-  # because `kagi_verify` reads a whole reply per step and declares it.
+  # The kagi seam, both directions plus the key: one exchange per credential,
+  # kagi_verify the requester and token_verify the provider. Exchange edges
+  # are framed by their content type; the build gives them their mailbox.
   - from: kagi_verify.key_out
     to: token_verify.verify_key
-  - from: kagi_verify.verify_out
-    to: token_verify.verify_requests
-  - from: token_verify.results
-    to: kagi_verify.verify_in
-    buffer_group: 4
+  - from: kagi_verify.request_out
+    to: token_verify.request_in
+  - from: token_verify.response_out
+    to: kagi_verify.response_in
   - from: kagi_verify.response_out
     to: decide.record_in
   - from: decide.result_out
     to: enc_http.record_in
   - from: enc_http.result_out
-    to: http.resp_in
+    to: http_chain.reply_in
     buffer_group: 5
 YAML
 
@@ -254,5 +274,34 @@ R="$(drive "Bearer ${GOOD%?}X")"
 CODE="${R%%|*}"
 [ "$CODE" = "401" ] || fail "tampered token: got '$CODE' want 401"
 echo "   401 — a flipped signature byte does not verify"
+
+echo "== 8. a token the LIVE issuer mints (sa_token chain -> kagi token_mint) is admitted =="
+# The packaged sa-token graph over the same store: it opens the vault root,
+# stores its announced key at /authn-keys/sa (replacing the one seeded above)
+# and answers a /token-req/. The API graph, restarted, loads that key.
+store_put "/token-req/live" "$(printf 'ns=team;sa=deployer' | xxd -p | tr -d '\n')"
+nc_build_workload "$ROOT" "$ROOT/packaging/debian/fluxor-sa-token.yaml" "$D/sat-config.bin" "$D/sat-modules.bin"
+SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+FLUXOR_SEAL_KEY="$SEAL" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 4 "$FLUXOR_RUNTIME" \
+  --config "$D/sat-config.bin" --modules "$D/sat-modules.bin" >>"$D/run.log" 2>&1 || true
+LIVE="$(python3 - "$D/store.log" <<'PY'
+import struct, sys
+data = open(sys.argv[1], "rb").read(); p = 0; out = b""
+while p + 15 <= len(data):
+    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+    if p + 15 + kl + vl > len(data): break
+    if data[p+15:p+15+kl] == b"/token-resp/live" and op == 1: out = data[p+15+kl:p+15+kl+vl]
+    p += 15 + kl + vl
+print(out.decode().removeprefix("token="))
+PY
+)"
+[ -n "$LIVE" ] || fail "the live issuer did not answer /token-req/live"
+R="$(drive "Bearer $LIVE")"
+CODE="${R%%|*}"; BODY="${R#*|}"
+[ "$CODE" = "200" ] || fail "live token: got '$CODE' want 200 ($BODY)"
+[ "$BODY" = "system:serviceaccount:team:deployer" ] || fail "live subject: got '$BODY'"
+R="$(drive "Bearer $(cat "$D/token.good")")"
+[ "${R%%|*}" = "401" ] || fail "a token under the replaced key must no longer verify: got '${R%%|*}'"
+echo "   200 for the minted token; the old key's token now 401 — one issuer, one key"
 
 echo "== E2E green: the API plane's auth stage is a Chronicle filter — one connector, zero decisions in .fmod =="

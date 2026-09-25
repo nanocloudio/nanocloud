@@ -1,0 +1,171 @@
+// Kubernetes RBAC as params: keeping the grant index TRUE (see rbac_rules.uproc
+// for the rows). An index that only grows would keep granting what a deleted
+// binding or an edited role no longer grants, so every derived row is checked
+// against what it was derived from, and removed when that no longer produces
+// it. Revocation is therefore as fast as these chains, which is the property
+// the E2E measures.
+//
+//   rule, bind   GET the source object with its digest; gone, or a different
+//                digest than the row was made from -> the row goes
+//   perm         its rule row is gone -> it goes
+//   src          its perm or its bind row is gone -> it goes
+//   g            no /rbac-src/ row left under it -> it goes (probe: 404)
+module nanocloud.rbac_prune {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: SrcGet, SrcNow, Probe, Probed, Probe3, Probed3
+  message Ctx {
+    row: string = 30;
+    g: string = 31;
+    pst: int = 32;
+  }
+  // carried by: Probe2, Probed2
+  message Ctx2 {
+    row: string = 30;
+    bind: string = 31;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum DELETE = 4;
+
+  // ---- rule and bind rows: digest check ----
+  message Derived {
+    seq: int = 1;
+    key: string = 3;       // the row's key tail
+    src: string = 4;       // the object it came from
+    g: string = 5;         // that object's digest when it did
+  }
+  message SrcGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message SrcNow {
+    cid: int = 1;
+    status: int = 2;
+    now: string = 27;      // the object's digest now (store_effect `hash: "."`)
+    ctx: Ctx = 254;
+  }
+  message Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  decision derived_get(d: Derived) -> SrcGet {
+    when d.src == "" -> SrcGet { cid: d.seq, op: NOOP, key: "", ctx: Ctx { row: d.key, g: d.g } };
+    default -> SrcGet { cid: d.seq, op: GET, key: d.src, ctx: Ctx { row: d.key, g: d.g } };
+  }
+  decision derived_drop(n: SrcNow) -> Drop {
+    when n.status == 404 -> Drop { cid: n.cid, op: DELETE, key: n.ctx.row };
+    when n.status == 200 && n.now != n.ctx.g -> Drop { cid: n.cid, op: DELETE, key: n.ctx.row };
+    default -> Drop { cid: n.cid, op: NOOP, key: "" };
+  }
+
+  // ---- perm rows: parent check ----
+  message Perm {
+    seq: int = 1;
+    key: string = 3;
+    rule: string = 4;
+  }
+  message Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message Probed {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision perm_check(p: Perm) -> Probe {
+    when p.rule == "" -> Probe { cid: p.seq, op: NOOP, key: "", ctx: Ctx { row: p.key } };
+    default -> Probe { cid: p.seq, op: EXISTS, key: p.rule, ctx: Ctx { row: p.key } };
+  }
+  decision perm_drop(r: Probed) -> Drop {
+    when r.status == 404 -> Drop { cid: r.cid, op: DELETE, key: r.ctx.row };
+    default -> Drop { cid: r.cid, op: NOOP, key: "" };
+  }
+
+  // ---- src rows: both parents ----
+  message Src {
+    seq: int = 1;
+    key: string = 3;
+    perm: string = 4;
+    bind: string = 5;
+  }
+  message Probe2 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx2 = 254;
+  }
+  message Probed2 {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx2 = 254;
+  }
+  message Probe3 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message Probed3 {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision src_perm(s: Src) -> Probe2 {
+    default -> Probe2 { cid: s.seq, op: EXISTS, key: s.perm, ctx: Ctx2 { row: s.key, bind: s.bind } };
+  }
+  decision src_bind(p: Probed2) -> Probe3 {
+    default -> Probe3 { cid: p.cid, op: EXISTS, key: p.ctx.bind, ctx: Ctx { row: p.ctx.row, pst: p.status } };
+  }
+  decision src_drop(p: Probed3) -> Drop {
+    when p.ctx.pst == 404 || p.status == 404 -> Drop { cid: p.cid, op: DELETE, key: p.ctx.row };
+    default -> Drop { cid: p.cid, op: NOOP, key: "" };
+  }
+
+  // ---- g rows: refcount ----
+  message Grant {
+    seq: int = 1;
+    key: string = 3;
+    srcs: int = 22;        // count_children under /rbac-src/<same tail>/
+  }
+  decision g_drop(g: Grant) -> Drop {
+    when g.srcs == 0 -> Drop { cid: g.seq, op: DELETE, key: g.key };
+    default -> Drop { cid: g.seq, op: NOOP, key: "" };
+  }
+
+  transformation pd(d: Derived) -> Derived { Derived { seq: d.seq, key: d.key, src: d.src, g: d.g } }
+  transformation pn(n: SrcNow) -> SrcNow { SrcNow { cid: n.cid, status: n.status, now: n.now, ctx: n.ctx } }
+  transformation pp(p: Perm) -> Perm { Perm { seq: p.seq, key: p.key, rule: p.rule } }
+  transformation pr(r: Probed) -> Probed { Probed { cid: r.cid, status: r.status, ctx: r.ctx } }
+  transformation ps(s: Src) -> Src { Src { seq: s.seq, key: s.key, perm: s.perm, bind: s.bind } }
+  transformation pp2(p: Probed2) -> Probed2 { Probed2 { cid: p.cid, status: p.status, ctx: Ctx2 { row: p.ctx.row, bind: p.ctx.bind } } }
+  transformation pp3(p: Probed3) -> Probed3 { Probed3 { cid: p.cid, status: p.status, ctx: Ctx { row: p.ctx.row, pst: p.ctx.pst } } }
+  transformation pg(g: Grant) -> Grant { Grant { seq: g.seq, key: g.key, srcs: g.srcs } }
+  pipeline dv_get(d: Derived) -> SrcGet { call x = pd(d); call y = derived_get(x); return y; }
+  pipeline dv_drop(n: SrcNow) -> Drop { call x = pn(n); call y = derived_drop(x); return y; }
+  pipeline pm_chk(p: Perm) -> Probe { call x = pp(p); call y = perm_check(x); return y; }
+  pipeline pm_drop(r: Probed) -> Drop { call x = pr(r); call y = perm_drop(x); return y; }
+  pipeline sr_perm(s: Src) -> Probe2 { call x = ps(s); call y = src_perm(x); return y; }
+  pipeline sr_bind(p: Probed2) -> Probe3 { call x = pp2(p); call y = src_bind(x); return y; }
+  pipeline sr_drop(p: Probed3) -> Drop { call x = pp3(p); call y = src_drop(x); return y; }
+  pipeline gr_drop(g: Grant) -> Drop { call x = pg(g); call y = g_drop(x); return y; }
+  entry dv_get = dv_get;
+  entry dv_drop = dv_drop;
+  entry pm_chk = pm_chk;
+  entry pm_drop = pm_drop;
+  entry sr_perm = sr_perm;
+  entry sr_bind = sr_bind;
+  entry sr_drop = sr_drop;
+  entry gr_drop = gr_drop;
+  provenance revision "rbac-index" toolchain "chronicle-authoring";
+}

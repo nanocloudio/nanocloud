@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live E2E for `kube_decode` — the typed seam between wave's HTTP fan-out and
-# Chronicle's engines.
+# Live E2E for `kube_decode` — the typed seam between the HTTP fan-out
+# (`http_chain`'s request envelope) and Chronicle's engines.
 #
 # Chronicle's VM cannot split a variable-arity URL path (no iteration, by
 # construction) and its record frame is flat, so a Kubernetes request must be
@@ -15,8 +15,8 @@
 # — and requires those exact bytes to appear in what the sink received. A frame
 # that is merely "close" fails.
 #
-# Chain: curl -> linux_net -> http (wave) -> kube_decode -> debug (the sink,
-# which logs the raw bytes it is handed).
+# Chain: curl -> linux_net -> http (wave) -> http_chain -> kube_decode -> debug
+# (the sink, which logs the raw bytes it is handed).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,7 +29,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in kube_decode http debug; do
+for m in pipeline decision http http_chain debug; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -39,7 +39,14 @@ cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -25 "$D/run.log" 2>/dev/null || true; exit 1; }
 
-echo "== 1. write the decode graph =="
+echo "== 1. write the decode graph (kube.rd + kube.uproc, as the apiplane graph carries them) =="
+. "$ROOT/scripts/chronicle-params.sh"
+KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
+# kd_facts: the stage program the apiplane graph runs before its router
+# (the PATCH type folded into the method, a write's marks after the key).
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_facts)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
+[ -n "$KD_DECODE" ] && [ -n "$KD_PASS" ] && [ -n "$KD_ROUTE" ] || { echo "FAIL: kube.rd / kube.uproc did not build"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -51,20 +58,27 @@ modules:
   - name: http
     port: $PORT
     host_tcp: 1
-    max_body_kib: 64
     routes:
       - path: "/api/"
         app: true
       - path: "/apis/"
         app: true
-      # `/api/` is a PREFIX and does not cover `/version`: a path with no route
+      # \`/api/\` is a PREFIX and does not cover \`/version\`: a path with no route
       # never reaches the app at all, and wave answers its own 404.
       - path: "/version"
         app: true
+  # The provider behind the http application routes: each exchange one
+  # request envelope for kube_decode.
+  - name: http_chain
   - name: kube_decode
-    # Non-resource paths reach the graph only with this on — the case the
-    # apiplane graph relies on for discovery documents.
-    passthrough: 1
+    type: pipeline
+    params:
+      decode: "${KD_DECODE}"
+      ir_stages: "${KD_PASS}"
+  - name: kube_route
+    type: decision
+    params:
+      decision: "${KD_ROUTE}"
   - name: debug
     mode: 1        # plaintext: log the bytes verbatim, not a hash of them
 wiring:
@@ -72,13 +86,19 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  - from: http.req_out
-    to: kube_decode.req_in
+  - from: http.request_out
+    to: http_chain.request_in
+  - from: http_chain.response_out
+    to: http.response_in
+  # A decode-mode pipeline reads one envelope per read: mailbox.
+  - from: http_chain.record_out
+    to: kube_decode.record_in
     buffer_group: 1
-  - from: kube_decode.record_out
+  - from: kube_decode.result_out
+    to: kube_route.record_in
+  - from: kube_route.result_out
     to: debug.data
-    # `record_out` is declared framed, so the graph build requires mailbox mode
-    # here — a byte FIFO would fragment these records under load.
+    # debug reads whole records: mailbox.
     buffer_group: 2
 YAML
 
@@ -86,7 +106,7 @@ echo "== 2. build =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 
 # One request per graph instance, deliberately. An `app: true` route hands the
-# request to the graph and waits for an answer on `resp_in`; nothing here
+# request to the graph and waits for the chain's answer; nothing here
 # answers, so http services exactly ONE request per boot. That is the correct
 # behaviour for a half-wired app route, and running a fresh instance per case
 # keeps each assertion unambiguous rather than depending on request ordering.
@@ -135,10 +155,13 @@ def field(num, ty, payload):
     return bytes([num, ty]) + struct.pack("<H", len(payload)) + payload
 
 def frame(wave_id_known, method, resource, namespace, name, body, key,
-          credential=b"", target=b"", query=b"", watch=0, peer=b""):
+          credential=b"", target=b"", query=b"", watch=0, peer=b"", group=b""):
     """Every field except the correlation, which the graph assigns."""
     return (field(2, TY_I64, struct.pack("<q", method))
             + field(3, TY_BYTES, resource)
+            # The API GROUP RBAC authorizes on: "" for the core /api/v1,
+            # the segment after /apis otherwise.
+            + field(13, TY_BYTES, group)
             + field(4, TY_BYTES, namespace)
             + field(5, TY_BYTES, name)
             + field(6, TY_BYTES, body)
@@ -163,17 +186,19 @@ def frame(wave_id_known, method, resource, namespace, name, body, key,
             # consumer indexes by number and an absent field is not an empty one.
             + field(12, TY_BYTES, peer))
 
-# wave wire/method.rs: GET = 1, POST = 3 (the registry's uproc pins GET = 1).
+# The exchange method byte: GET = 1, POST = 3.
 cases = [
     ("GET  /api/v1/namespaces/default/pods/web-0",
      frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0",
            b"", b"/api/v1/namespaces/default/pods/web-0")),
     # A CREATE names its object in the BODY: the path has no name, so the key
     # is addressed from `metadata.name`. Path name wins when there is one.
+    # A write's key carries its marks after `#`: the field manager, here
+    # curl's User-Agent product (no `fieldManager` in the query).
     ("POST /apis/apps/v1/namespaces/kube-system/deployments",
      frame(None, 3, b"deployments", b"kube-system", b"",
-           b'{"metadata":{"name":"web"}}', b"/deployments/kube-system/web",
-           b"", b"/apis/apps/v1/namespaces/kube-system/deployments")),
+           b'{"metadata":{"name":"web"}}', b"/deployments/kube-system/web#@curl",
+           b"", b"/apis/apps/v1/namespaces/kube-system/deployments", group=b"apps")),
     ("GET  .../pods/web-0 with Authorization: Bearer",
      frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0",
            b"abc.def.ghi", b"/api/v1/namespaces/default/pods/web-0")),
@@ -201,14 +226,14 @@ for (label, tail), log in zip(cases, logs):
     # whole frame, not just the part that was easy to predict.
     corr_at = at - 12          # field 1: [1][TY_I64][8,0] + 8 payload bytes
     count_at = corr_at - 1
-    if count_at < 0 or log[count_at] != 12:
-        fails.append(label + " (field count != 12)")
+    if count_at < 0 or log[count_at] != 13:
+        fails.append(label + " (field count != 13)")
         continue
     if log[corr_at] != 1 or log[corr_at + 1] != TY_I64:
         fails.append(label + " (field 1 is not the i64 correlation)")
         continue
     corr = struct.unpack("<q", log[corr_at + 4:corr_at + 12])[0]
-    print("   ok  %-52s corr=0x%08x, 12 fields, byte-exact" % (label, corr))
+    print("   ok  %-52s corr=0x%08x, 13 fields, byte-exact" % (label, corr))
 
 if fails:
     for f in fails:

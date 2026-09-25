@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live E2E for the pod-lifecycle chain -> sandbox_runner -> workload pipeline —
+# Live E2E for the pod-lifecycle chain -> the sandbox runtime -> workload pipeline —
 # the kubelet's decision half (Chronicle params) driving the effect half (a
 # module) driving the workload capability surface, over the control-plane
 # store, verified UNPRIVILEGED.
@@ -8,7 +8,7 @@
 # from its durable append-log at init: this script (playing the control plane
 # after it materialized the bundle) writes a /pod-specs/<uid> into
 # `$D/store.log`. Inside the runtime: the lifecycle chain (DECISION) projects
-# /sandboxes/<uid>; sandbox_runner (EFFECT) creates+starts the sandbox via the
+# /sandboxes/<uid>; the sandbox runtime (EFFECT) creates+starts the sandbox via the
 # workload contract and writes /sandbox-status/<uid>; the chain maps that back
 # to /pod-lifecycle-status/<uid>. The decision<->effect handshake happens live
 # in the one in-process store during the run. A NULL sandbox (no isolate) keeps
@@ -29,7 +29,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/workload_effect.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -93,7 +93,7 @@ store_put "/pod-specs/pod-al"  "cmd=/bin/echo hello-pod;desired=running;restart=
 # pod-slp: long-running (sleep) — killed in phase 5 via the two-phase kill seam
 store_put "/pod-specs/pod-slp" "cmd=/bin/sleep 30;desired=running"
 
-echo "== 3. run the pipeline (pod_lifecycle -> sandbox_runner -> oci) =="
+echo "== 3. run the pipeline (pod_lifecycle -> the sandbox runtime -> oci) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 4 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
 

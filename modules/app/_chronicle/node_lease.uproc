@@ -1,0 +1,120 @@
+// A node registers itself and keeps its lease; the control plane takes a
+// node that stops renewing out of service.
+//
+//   renew   (node)  /nodes/<self> — absent, or due — -> PUT it ready, its
+//                   heartbeat the node's monotonic clock now. The source's
+//                   `label` is the node's name; `empty` emits when there is
+//                   no record yet, `due` wakes it to renew.
+//   seen    (plane) /nodes/<node> at a revision not yet seen -> /node-seen/
+//                   <node> rev=<rev>;at=<the plane's clock>: when the plane
+//                   last saw it change. Clocks of two machines are never
+//                   compared; each side reads only its own.
+//   stale   (plane) /node-seen/<node> unchanged LEASE_MS -> /nodes/<node>
+//                   status.ready false, which the readiness projection
+//                   (daemonset.uproc `rdy`) carries to /ready-nodes/. A node
+//                   that renews again is ready again.
+module nanocloud.nodelease {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum PATCH = 5;
+
+  // ---- renew: the node's own record ----
+  message nl.Self {
+    seq: int = 1;
+    key: string = 3;
+    ready: string = 4;    // status.ready
+    hb: int = 50;         // status.heartbeat, the node's clock when it wrote
+    total: int = 22;      // 0: no record yet (the source's `empty`)
+    label: string = 48;   // the node's name
+    now: int = 58;
+  }
+  message nl.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;  v2: string = 5;  v3: string = 6;  v4: string = 7;
+    v5: string = 8;
+  }
+  // Renew every 10 s; at once when there is no record, when the plane has
+  // taken the node out of service, or when the clock is behind the heartbeat
+  // (the node restarted, its clock with it).
+  decision renew(n: nl.Self) -> nl.Put {
+    when n.label == "" ->
+      nl.Put { cid: n.seq, op: NOOP, key: "" };
+    when n.total == 0 ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"metadata\":{\"name\":\"", v2: n.label,
+               v3: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v4: n.now,
+               v5: "}}" };
+    when n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000 ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"metadata\":{\"name\":\"", v2: n.label,
+               v3: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v4: n.now,
+               v5: "}}" };
+    default ->
+      nl.Put { cid: n.seq, op: NOOP, key: "" };
+  }
+
+  // ---- seen: when the plane last saw each node change ----
+  message nl.Node {
+    seq: int = 1;
+    rev: int = 2;         // the record's revision (`rev = 1`)
+    key: string = 3;      // "<node>"
+    now: int = 58;
+    seen_rev: int = 70;   // /node-seen/<node> rev
+    seen_at: int = 71;    // /node-seen/<node> at
+  }
+  // A plane whose clock is behind its record restarted, its clock with it:
+  // what it saw is stamped again, so a lease runs from the restart.
+  decision seen(n: nl.Node) -> nl.Put {
+    when n.rev != 0 && n.rev == n.seen_rev && n.now >= n.seen_at ->
+      nl.Put { cid: n.seq, op: NOOP, key: "" };
+    default ->
+      nl.Put { cid: n.seq, op: PUT, key: n.key,
+               v1: "rev=", v2: n.rev, v3: ";at=", v4: n.now };
+  }
+
+  // ---- stale: a node that stopped renewing ----
+  message nl.Seen {
+    seq: int = 1;
+    key: string = 3;      // "<node>"
+    at: int = 50;         // the plane's clock when the record last changed
+    now: int = 58;
+    ready: string = 70;   // /nodes/<node> status.ready
+  }
+  message nl.Patch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    value: string = 4;
+    path: string = 19;
+  }
+  // Three missed renewals.
+  decision stale(n: nl.Seen) -> nl.Patch {
+    when n.ready == "true" && n.at > 0 && n.now >= n.at + 30000 ->
+      nl.Patch { cid: n.seq, op: PATCH, key: n.key, value: "false",
+                 path: "status.ready" };
+    default ->
+      nl.Patch { cid: n.seq, op: NOOP, key: "" };
+  }
+
+  pipeline renew_p(n: nl.Self) -> nl.Put {
+    call x = renew(n);
+    return x;
+  }
+  pipeline seen_p(n: nl.Node) -> nl.Put {
+    call x = seen(n);
+    return x;
+  }
+  pipeline stale_p(n: nl.Seen) -> nl.Patch {
+    call x = stale(n);
+    return x;
+  }
+
+  entry renew = renew_p;
+  entry seen = seen_p;
+  entry stale = stale_p;
+
+  provenance revision "node-lease" toolchain "chronicle-authoring";
+}

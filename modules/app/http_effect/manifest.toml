@@ -1,0 +1,79 @@
+name = "http_effect"
+version = "0.1.0"
+description = "Chronicle connector for an in-graph HTTP module — record in, one exchange out, its answer back as a record"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# `store_effect`'s role for an HTTP-speaking module in the same graph.
+#
+# Some surfaces are HTTP endpoints by design — kagi's `certificate_endpoint`
+# (`POST /pki/certificate`) is one — and a chain that needs one of them should
+# call it as it is, not through a second copy of what it does. This carries a
+# record out as one exchange — a REQUESTER on `request_out` / `response_in`,
+# wired to the endpoint's `request_in` / `response_out`, or to Wave's `http`
+# client for an endpoint across the network — and the answer back as a
+# record. It decides nothing, and it knows no endpoint: the method, the path
+# and the body are the record's, built upstream as params.
+#
+# In:  a Chronicle record frame on `request_in` (a byte stream, self-framed, or
+#      a mailbox):
+#        1      = correlation (i64), echoed
+#        2      = method (i64): the exchange method byte (GET 1, POST 3 …).
+#                 0 = no request: the record is a decision's filter and nothing
+#                 is sent or answered
+#        3..6   = path, in parts joined in field order: the request target
+#        8..19  = body, in parts joined in field order; an INTEGER part is
+#                 rendered as decimal (the VM cannot concatenate, nor render a
+#                 number). Sent inline in the request HEAD, with no headers.
+#        30..39 = carry, echoed with number and type
+# Out: a Chronicle record on `response_out`:
+#        1 = correlation (i64)   2 = HTTP status (i64): the answer's, or the
+#            status the exchange ended with (502 for an ABORT or an answer
+#            past 8192 bytes; 413 for a path past 512 or a body past 4096
+#            bytes, refused here)   3 = body (bytes)
+#        4.. = the `paths` param's top-level JSON members of the body, in
+#              order: a string's content without its quotes, any other scalar
+#              as its text, absent as empty
+#        30..39 = carry
+#
+# One request in flight at a time. The exchange id is the correlation (the
+# call's counter and this module's request port), so a record of any other
+# exchange is never attached to this request's carry. Every request is
+# answered; a call the provider loses to `LINK DOWN` is sent again after its
+# `LINK UP`.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# NOT `framed`: a stream is self-framed, a mailbox read whole (store_effect's).
+
+[[ports]]
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[observability]
+metrics = ["http_sent", "http_answered", "http_dropped"]

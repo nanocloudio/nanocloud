@@ -8,6 +8,21 @@
 // when in range, the successor when not.
 module nanocloud.statefulset {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: st.NbQ, st.NbA, st.Probe, st.Answer
+  message Ctx {
+    key: string = 30;
+    tmpl: string = 31;
+    in: string = 32;
+    ns: string = 34;
+    name: string = 35;
+    gate: string = 38;
+    pod: string = 39;
+  }
+
   message st.Ord {
     seq: int = 1;
     rev: int = 2;
@@ -29,48 +44,28 @@ module nanocloud.statefulset {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;    // "1" in range, "" surplus
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_pod: string = 39;
+// "1" in range, "" surplus
+    ctx: Ctx = 254;
   }
   message st.NbA {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_pod: string = 39;
     ready: string = 40;   // the neighbour's status.ready
+    ctx: Ctx = 254;
   }
   message st.Probe {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_gate: string = 38;  // "1" when the neighbour permits acting
-    c_pod: string = 39;
+// "1" when the neighbour permits acting
+    ctx: Ctx = 254;
   }
   message st.Answer {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_in: string = 32;
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_gate: string = 38;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
   message st.Act {
     cid: int = 1;
@@ -90,55 +85,46 @@ module nanocloud.statefulset {
   // 0, so NOOP and let 204 mean "ungated"). Surplus: the successor.
   decision neighbour(o: st.Ord) -> st.NbQ {
     when o.replicas == "" ->
-      st.NbQ { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_in: "",
-               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      st.NbQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", in: "", ns: o.ns, name: o.name, pod: o.pod } };
     when o.ord < o.want && o.prevstr == "" ->
-      st.NbQ { cid: o.seq, op: NOOP, key: "", c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1",
-               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      st.NbQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", ns: o.ns, name: o.name, pod: o.pod } };
     when o.ord < o.want ->
-      st.NbQ { cid: o.seq, op: GET, key: o.prevkey, c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "1",
-               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      st.NbQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", ns: o.ns, name: o.name, pod: o.pod } };
     default ->
-      st.NbQ { cid: o.seq, op: GET, key: o.succkey, c_key: o.selfkey, c_tmpl: o.tmpl, c_in: "",
-               c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      st.NbQ { cid: o.seq, op: GET, key: o.succkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", ns: o.ns, name: o.name, pod: o.pod } };
   }
 
   // Stage 2: the gate. In range: ungated at 0 (204) or predecessor ready.
   // Surplus: successor absent (404). A missing key (the non-projectable
   // Deployment) probes nothing.
   decision probe(a: st.NbA) -> st.Probe {
-    when a.c_key == "" ->
-      st.Probe { cid: a.cid, op: NOOP, key: "", c_key: "", c_tmpl: "", c_in: "",
-                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "", c_pod: a.c_pod };
-    when a.c_in == "1" && a.status == 204 ->
-      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "1",
-                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
-    when a.c_in == "1" && a.status == 200 && a.ready == "true" ->
-      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "1",
-                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
-    when a.c_in == "" && a.status == 404 ->
-      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: "",
-                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "1", c_pod: a.c_pod };
+    when a.ctx.key == "" ->
+      st.Probe { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", in: "", ns: a.ctx.ns, name: a.ctx.name, gate: "", pod: a.ctx.pod } };
+    when a.ctx.in == "1" && a.status == 204 ->
+      st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "1", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod } };
+    when a.ctx.in == "1" && a.status == 200 && a.ready == "true" ->
+      st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "1", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod } };
+    when a.ctx.in == "" && a.status == 404 ->
+      st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod } };
     default ->
-      st.Probe { cid: a.cid, op: GET, key: a.c_key, c_key: a.c_key, c_tmpl: a.c_tmpl, c_in: a.c_in,
-                 c_ns: a.c_ns, c_name: a.c_name, c_gate: "", c_pod: a.c_pod };
+      st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, ns: a.ctx.ns, name: a.ctx.name, gate: "", pod: a.ctx.pod } };
   }
 
   // Stage 3: act, gated.
   decision converge(a: st.Answer) -> st.Act {
-    when a.c_in == "1" && a.status == 404 && a.c_gate == "1" ->
-      st.Act { cid: a.cid, op: PUT, key: a.c_key,
+    when a.ctx.in == "1" && a.status == 404 && a.ctx.gate == "1" ->
+      st.Act { cid: a.cid, op: PUT, key: a.ctx.key,
                p1: "{\"metadata\":{\"name\":\"",
-               p2: a.c_pod,
+               p2: a.ctx.pod,
                p3: "\",\"namespace\":\"",
-               p4: a.c_ns,
+               p4: a.ctx.ns,
                p5: "\",\"ownerReferences\":[{\"kind\":\"StatefulSet\",\"name\":\"",
-               p6: a.c_name,
+               p6: a.ctx.name,
                p7: "\"}]},\"spec\":",
-               p8: a.c_tmpl,
+               p8: a.ctx.tmpl,
                p9: "}" };
-    when a.c_in == "" && a.status == 200 && a.c_gate == "1" ->
-      st.Act { cid: a.cid, op: DELETE, key: a.c_key };
+    when a.ctx.in == "" && a.status == 200 && a.ctx.gate == "1" ->
+      st.Act { cid: a.cid, op: DELETE, key: a.ctx.key };
     default ->
       st.Act { cid: a.cid, op: NOOP, key: "" };
   }
@@ -150,12 +136,10 @@ module nanocloud.statefulset {
              ns: o.ns, name: o.name }
   }
   transformation pass_nb(a: st.NbA) -> st.NbA {
-    st.NbA { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
-             c_in: a.c_in, c_ns: a.c_ns, c_name: a.c_name, c_pod: a.c_pod, ready: a.ready }
+    st.NbA { cid: a.cid, status: a.status, value: a.value, ready: a.ready, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, ns: a.ctx.ns, name: a.ctx.name, pod: a.ctx.pod } }
   }
   transformation pass_ans(a: st.Answer) -> st.Answer {
-    st.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
-                c_in: a.c_in, c_ns: a.c_ns, c_name: a.c_name, c_gate: a.c_gate, c_pod: a.c_pod }
+    st.Answer { cid: a.cid, status: a.status, value: a.value, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, ns: a.ctx.ns, name: a.ctx.name, gate: a.ctx.gate, pod: a.ctx.pod } }
   }
   pipeline nb(o: st.Ord) -> st.NbQ {
     call x = pass_ord(o);

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's sandbox_runner module (modules/app/sandbox_runner) —
+# Live E2E for nanocloud's container runtime — sandbox.uproc and volume.uproc
+# over the workload_effect connector (packaging/debian/fluxor-sandbox.yaml) —
 # the store -> workload seam over the ONE shared multi-process store.
 #
 # Proves the container-runtime bridge on real binaries WITHOUT root: an EXTERNAL
 # process (this script, playing pod_lifecycle) projects a desired
 # sandbox spec into the shared WAL (a NULL sandbox — no `isolate` marker, so the
-# oci provider skips unshare and needs no CAP_SYS_ADMIN); the sandbox_runner
-# fmod, inside the fluxor-linux runtime, drives the oci contract
+# oci provider skips unshare and needs no CAP_SYS_ADMIN); the runtime, inside
+# the fluxor-linux runtime, drives the workload contract
 # (CREATE -> START -> WAIT), runs the process in its bundle, and writes terminal
 # status back. The isolated (privileged) path is proven separately by the oci
 # provider's #[ignore]d UTS test under sudo.
@@ -31,7 +32,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/workload_effect.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -163,6 +164,24 @@ case "$T1ST"  in *exited*)         : ;; *) fail "pty echo session status wrong: 
 case "$T2OUT" in *ping*)           : ;; *) fail "pty cat stdin->output round-trip failed: got '$T2OUT'" ;; esac
 echo "== E2E green (interactive pty): echo -> '$T1OUT' ($T1ST); cat stdin echoed -> '$T2OUT' =="
 
+echo "== 5d. volumes: an unbound claim holds the start; a bound one reaches the workload as a bind =="
+D6="$(mktemp -d /tmp/nc-sb-vol-XXXXXX)"; trap 'rm -rf "$D" "$D3" "$D4" "$D6"' EXIT
+D="$D6" wal_put "/pod-specs/volbox" "cmd=/bin/true;volumes=data:/data:ro"
+D="$D6" wal_put "/sandboxes/volbox"  "cmd=/bin/true;phase=start"
+FLUXOR_STORE_DIR="$D6" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
+  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-vol.log" 2>&1 || true
+[ -z "$(D="$D6" wal_last /sandbox-status/volbox)" ] || fail "a sandbox with an unbound volume was started: '$(D="$D6" wal_last /sandbox-status/volbox)'"
+echo "   unbound: not created"
+D="$D6" wal_put "/volumes/data" "path=$D6"
+FLUXOR_STORE_DIR="$D6" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
+  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run-vol.log" 2>&1 || true
+[ "$(D="$D6" wal_last /volume-binds/volbox/0)" = "$D6:/data:ro" ] || fail "bind row: '$(D="$D6" wal_last /volume-binds/volbox/0)'"
+# The bind reached the workload: with no isolated rootfs to land in, the
+# backend refuses it (EINVAL) rather than run the sandbox without its volume.
+[ "$(D="$D6" wal_last /sandbox-status/volbox)" = "state=failed;code=-22" ] \
+  || fail "bound volume did not reach the workload: '$(D="$D6" wal_last /sandbox-status/volbox)'"
+echo "   bound: $D6 -> /data (ro) passed as a workload bind; refused without a rootfs, as it must be"
+
 # ── Privileged path: the ISOLATED sandbox through the same module→contract
 # chain. Namespace surgery needs CAP_SYS_ADMIN, so this block runs only as
 # root; unprivileged runs stop after the null-sandbox proof above.
@@ -193,7 +212,7 @@ echo "== E2E green (isolated): module -> oci -> unshare(MOUNT|UTS|IPC), host UTS
 echo "   /sandbox-status/iso1: $IST  (host hostname unchanged: $HOST_HOSTNAME)"
 
 echo "== 8. net=own: leased identity -> own netns + veth carrying the address =="
-# cni_ipam's allocation is proven by its own e2e; here we prove the runner
+# Pod IP allocation is proven by cni-ipam-e2e; here we prove the runner
 # consumes the lease: fills the workload CREATE header's Tier-1 network
 # identity, the backend gives the sandbox its own netns + veth, and the
 # leased address is visible from INSIDE the sandbox. Also: a net=own sandbox

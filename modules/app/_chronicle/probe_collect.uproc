@@ -1,0 +1,204 @@
+// Liveness and readiness probes as params: the COLLECT half (see probe.uproc
+// for the state record and the spec fields).
+//
+//   collect  an exec result at /sandbox-exec-result/<uid>/probe-<l|r> is read
+//            against its state record, the seam keys are cleared (REQUEST
+//            first — the runner re-executes a request that has no result), and
+//            the outcome is folded: exit 0 passes; succ_n consecutive passes
+//            flip the verdict to 1, fail_n consecutive failures to 0
+//   publish  /probe-status/<uid> = live=<0|1>;ready=<0|1> from the two state
+//            records; a kind with no probe counts as passing, and a pod with
+//            neither has no status at all
+//   sweep    a status whose spec is gone is deleted
+module nanocloud.probe_collect {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: RtGet, Rt, Seam, SeamReply
+  message Ctx {
+    uid: string = 30;
+    w: string = 31;
+    exit: string = 32;
+    inf: int = 33;
+    fails: int = 34;
+    oks: int = 35;
+    verdict: int = 36;
+    failn: int = 37;
+    succn: int = 38;
+    st: int = 39;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // ---- collect ----
+  message Result {
+    seq: int = 1;
+    key: string = 3;
+    exit: string = 4;      // the exit code, as the runner wrote it
+    uid: string = 28;      // <uid>/probe-l: first segment
+    which: string = 29;    //               last segment
+  }
+  message RtGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    ctx: Ctx = 254;
+  }
+  // The state record, read back (ints inflight,fails,oks,verdict,fail_n,succ_n).
+  message Rt {
+    cid: int = 1;
+    status: int = 2;
+    inflight: int = 50;
+    fails: int = 51;
+    oks: int = 52;
+    verdict: int = 53;
+    fail_n: int = 54;
+    succ_n: int = 55;
+    ctx: Ctx = 254;
+  }
+  // Carried through the seam clean-up: the whole fold's inputs.
+  message Seam {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    key3: string = 18;
+    key4: string = 25;
+    ctx: Ctx = 254;
+  }
+  message SeamReply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Fold {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    key3: string = 18;
+    key4: string = 25;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    v5: string = 8;
+    v6: int = 9;
+  }
+
+  // Only probe results; an operator's `exec` shares the seam under other ids.
+  decision rt_get(r: Result) -> RtGet {
+    when r.which == "probe-l" ->
+      RtGet { cid: r.seq, op: GET, key: "/probe-rt-l/", key2: r.uid, ctx: Ctx { uid: r.uid, w: "l", exit: r.exit } };
+    when r.which == "probe-r" ->
+      RtGet { cid: r.seq, op: GET, key: "/probe-rt-r/", key2: r.uid, ctx: Ctx { uid: r.uid, w: "r", exit: r.exit } };
+    default ->
+      RtGet { cid: r.seq, op: NOOP, key: "", key2: "", ctx: Ctx { uid: r.uid, w: "", exit: r.exit } };
+  }
+  decision del_request(r: Rt) -> Seam {
+    when r.ctx.w != "" ->
+      Seam { cid: r.cid, op: DELETE, key: "/sandbox-exec/", key2: r.ctx.uid, key3: "/probe-", key4: r.ctx.w, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: r.inflight, fails: r.fails, oks: r.oks, verdict: r.verdict, failn: math.greatest(r.fail_n, 1), succn: math.greatest(r.succ_n, 1), st: r.status } };
+    default ->
+      Seam { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: 0, fails: 0, oks: 0, verdict: 0, failn: 1, succn: 1, st: 0 } };
+  }
+  decision del_result(r: SeamReply) -> Seam {
+    when r.ctx.w != "" ->
+      Seam { cid: r.cid, op: DELETE, key: "/sandbox-exec-result/", key2: r.ctx.uid, key3: "/probe-", key4: r.ctx.w, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: r.ctx.inf, fails: r.ctx.fails, oks: r.ctx.oks, verdict: r.ctx.verdict, failn: r.ctx.failn, succn: r.ctx.succn, st: r.ctx.st } };
+    default ->
+      Seam { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: 0, fails: 0, oks: 0, verdict: 0, failn: 1, succn: 1, st: 0 } };
+  }
+  decision del_output(r: SeamReply) -> Seam {
+    when r.ctx.w != "" ->
+      Seam { cid: r.cid, op: DELETE, key: "/sandbox-exec-output/", key2: r.ctx.uid, key3: "/probe-", key4: r.ctx.w, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: r.ctx.inf, fails: r.ctx.fails, oks: r.ctx.oks, verdict: r.ctx.verdict, failn: r.ctx.failn, succn: r.ctx.succn, st: r.ctx.st } };
+    default ->
+      Seam { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: 0, fails: 0, oks: 0, verdict: 0, failn: 1, succn: 1, st: 0 } };
+  }
+  // A result for an attempt no longer in flight (timed out, reset) is only
+  // cleared, never counted: the tick already recorded that attempt.
+  decision fold(r: SeamReply) -> Fold {
+    when r.ctx.st == 200 && r.ctx.inf == 1 && r.ctx.exit == "0" && r.ctx.verdict != 1 && r.ctx.oks + 1 >= r.ctx.succn ->
+      Fold { cid: r.cid, op: MERGE, key: "/probe-rt-", key2: r.ctx.w, key3: "/", key4: r.ctx.uid,
+             v1: "inflight=0;fails=0;oks=", v2: r.ctx.oks + 1, v3: ";verdict=", v4: 1 };
+    when r.ctx.st == 200 && r.ctx.inf == 1 && r.ctx.exit == "0" ->
+      Fold { cid: r.cid, op: MERGE, key: "/probe-rt-", key2: r.ctx.w, key3: "/", key4: r.ctx.uid,
+             v1: "inflight=0;fails=0;oks=", v2: r.ctx.oks + 1, v3: ";verdict=", v4: r.ctx.verdict };
+    when r.ctx.st == 200 && r.ctx.inf == 1 && r.ctx.verdict != 0 && r.ctx.fails + 1 >= r.ctx.failn ->
+      Fold { cid: r.cid, op: MERGE, key: "/probe-rt-", key2: r.ctx.w, key3: "/", key4: r.ctx.uid,
+             v1: "inflight=0;oks=0;fails=", v2: r.ctx.fails + 1, v3: ";verdict=", v4: 0 };
+    when r.ctx.st == 200 && r.ctx.inf == 1 ->
+      Fold { cid: r.cid, op: MERGE, key: "/probe-rt-", key2: r.ctx.w, key3: "/", key4: r.ctx.uid,
+             v1: "inflight=0;oks=0;fails=", v2: r.ctx.fails + 1, v3: ";verdict=", v4: r.ctx.verdict };
+    default -> Fold { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", v1: "" };
+  }
+
+  // ---- publish + sweep ----
+  message Pod {
+    seq: int = 1;
+    key: string = 3;
+    lseq: string = 70;     // present iff the liveness record exists
+    lverdict: int = 71;
+    rseq: string = 80;     // present iff the readiness record exists
+    rverdict: int = 81;
+  }
+  message StatusCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+  }
+  decision publish(p: Pod) -> StatusCall {
+    when p.lseq == "" && p.rseq == "" ->
+      StatusCall { cid: p.seq, op: DELETE, key: p.key, v1: "" };
+    when p.lseq == "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: 1, v3: ";ready=", v4: p.rverdict };
+    when p.rseq == "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: p.lverdict, v3: ";ready=", v4: 1 };
+    default ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: p.lverdict, v3: ";ready=", v4: p.rverdict };
+  }
+  message Gone {
+    seq: int = 1;
+    key: string = 3;
+  }
+  decision sweep(g: Gone) -> StatusCall {
+    default -> StatusCall { cid: g.seq, op: DELETE, key: g.key, v1: "" };
+  }
+
+  transformation pres(r: Result) -> Result { Result { seq: r.seq, key: r.key, exit: r.exit, uid: r.uid, which: r.which } }
+  transformation prt(r: Rt) -> Rt {
+    Rt { cid: r.cid, status: r.status,
+         inflight: r.inflight, fails: r.fails, oks: r.oks, verdict: r.verdict,
+         fail_n: r.fail_n, succ_n: r.succ_n, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit } }
+  }
+  transformation psr(r: SeamReply) -> SeamReply {
+    SeamReply { cid: r.cid, status: r.status, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: r.ctx.inf, fails: r.ctx.fails, oks: r.ctx.oks, verdict: r.ctx.verdict, failn: r.ctx.failn, succn: r.ctx.succn, st: r.ctx.st } }
+  }
+  transformation ppod(p: Pod) -> Pod {
+    Pod { seq: p.seq, key: p.key, lseq: p.lseq, lverdict: p.lverdict, rseq: p.rseq, rverdict: p.rverdict }
+  }
+  transformation pg(g: Gone) -> Gone { Gone { seq: g.seq, key: g.key } }
+  pipeline cl_get(r: Result) -> RtGet { call x = pres(r); call y = rt_get(x); return y; }
+  pipeline cl_req(r: Rt) -> Seam { call x = prt(r); call y = del_request(x); return y; }
+  pipeline cl_res(r: SeamReply) -> Seam { call x = psr(r); call y = del_result(x); return y; }
+  pipeline cl_out(r: SeamReply) -> Seam { call x = psr(r); call y = del_output(x); return y; }
+  pipeline cl_fold(r: SeamReply) -> Fold { call x = psr(r); call y = fold(x); return y; }
+  pipeline pub(p: Pod) -> StatusCall { call x = ppod(p); call y = publish(x); return y; }
+  pipeline gone(g: Gone) -> StatusCall { call x = pg(g); call y = sweep(x); return y; }
+  entry cl_get = cl_get;
+  entry cl_req = cl_req;
+  entry cl_res = cl_res;
+  entry cl_out = cl_out;
+  entry cl_fold = cl_fold;
+  entry pub = pub;
+  entry gone = gone;
+  provenance revision "probe-params" toolchain "chronicle-authoring";
+}

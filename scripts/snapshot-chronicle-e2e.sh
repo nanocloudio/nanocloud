@@ -78,33 +78,21 @@ modules:
     type: store_source
     prefix: "/volumesnapshots.snapshot.storage.k8s.io/"
     paths: "status.readyToUse,spec.source.persistentVolumeClaimName"
-  - name: content
-    type: decision
-    params:
-      decision: "${DEC_CT}"
   - name: contents
     type: store_effect
+    decision: "${DEC_CT}"
     key_prefix: "/volumesnapshotcontents.snapshot.storage.k8s.io/"
-  - name: bind
-    type: decision
-    params:
-      decision: "${DEC_BD}"
   - name: status
     type: store_effect
+    decision: "${DEC_BD}"
     key_prefix: "/volumesnapshots.snapshot.storage.k8s.io/"
 wiring:
   - from: snaps.status
     to: snaps.changes
   - from: snaps.record_out
-    to: content.record_in
-  - from: content.result_out
     to: contents.request_in
-    buffer_group: 1
   - from: contents.response_out
-    to: bind.record_in
-  - from: bind.result_out
     to: status.request_in
-    buffer_group: 2
 YAML
 run() { # run <seconds>
   nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null

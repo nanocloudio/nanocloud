@@ -8,6 +8,19 @@
 //           "succeeded=<n>;complete=<0|1>" — the fold is the source's
 module nanocloud.job {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: jb.Probe, jb.Answer
+  message Ctx {
+    key: string = 30;
+    tmpl: string = 31;
+    ns: string = 34;
+    name: string = 35;
+    pod: string = 39;
+  }
+
   message jb.Ord {
     seq: int = 1;
     rev: int = 2;
@@ -25,21 +38,13 @@ module nanocloud.job {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
   message jb.Answer {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_tmpl: string = 31;
-    c_ns: string = 34;
-    c_name: string = 35;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
   message jb.Create {
     cid: int = 1;
@@ -87,24 +92,23 @@ module nanocloud.job {
 
   decision probe(o: jb.Ord) -> jb.Probe {
     when o.completions == "" ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod } };
     when o.ord < o.want ->
-      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, c_key: o.selfkey, c_tmpl: o.tmpl,
-                 c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, ns: o.ns, name: o.name, pod: o.pod } };
     default ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", c_key: "", c_tmpl: "", c_ns: o.ns, c_name: o.name, c_pod: o.pod };
+      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod } };
   }
   decision launch(a: jb.Answer) -> jb.Create {
-    when a.status == 404 && a.c_key != "" ->
-      jb.Create { cid: a.cid, op: PUT, key: a.c_key,
+    when a.status == 404 && a.ctx.key != "" ->
+      jb.Create { cid: a.cid, op: PUT, key: a.ctx.key,
                   p1: "{\"metadata\":{\"name\":\"",
-                  p2: a.c_pod,
+                  p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
-                  p4: a.c_ns,
+                  p4: a.ctx.ns,
                   p5: "\",\"ownerReferences\":[{\"kind\":\"Job\",\"name\":\"",
-                  p6: a.c_name,
+                  p6: a.ctx.name,
                   p7: "\"}]},\"spec\":",
-                  p8: a.c_tmpl,
+                  p8: a.ctx.tmpl,
                   p9: "}" };
     default ->
       jb.Create { cid: a.cid, op: NOOP, key: "" };
@@ -133,8 +137,7 @@ module nanocloud.job {
              ord: o.ord, want: o.want, selfkey: o.selfkey, pod: o.pod, ns: o.ns, name: o.name }
   }
   transformation pass_ans(a: jb.Answer) -> jb.Answer {
-    jb.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_tmpl: a.c_tmpl,
-                c_ns: a.c_ns, c_name: a.c_name, c_pod: a.c_pod }
+    jb.Answer { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }
   }
   transformation pass_pod(p: jb.Pod) -> jb.Pod {
     jb.Pod { seq: p.seq, rev: p.rev, key: p.key, kind: p.kind, phase: p.phase }

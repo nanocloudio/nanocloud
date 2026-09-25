@@ -29,13 +29,28 @@ hardware_targets = ["bcm2712"]
 #        Fields 30..=39 are CARRY: echoed onto the reply with their number and
 #        type, untouched. Ten of them, which is the whole correlation budget a
 #        filter stage has.
-# Out: `MSG_VERIFY_REQ` on `verify_out`, `MSG_VERIFY_RESP` back on `verify_in`,
-#      and a Chronicle record on `response_out`:
-#        1 = correlation (i64)   2 = status (i64, `verify_err`, 0 = OK)
+# Out: one exchange per record to kagi's `token_verify` (a REQUESTER:
+#      `request_out` -> `token_verify.request_in`, `token_verify.response_out`
+#      -> `response_in`), and a Chronicle record on `response_out`:
+#        1 = the request's own field 1 (i64), echoed
+#        2 = status (i64, `verify_err`, 0 = OK; 255 = no typed answer)
 #        3 = subject (bytes)     4 = issuer (bytes)
 #        5 = audience (bytes)    6 = scope (bytes)
 #        7 = expires_at (i64)    8 = suite (i64)
 #        30..=39 = carry, echoed
+#
+# THE CALL. kagi's typed-operation shape (`typed_exchange.rs`, compiled from
+# kagi-common): a request HEAD, method POST, empty target, headers and peer,
+# granting a whole answer's response credit, its body exactly one
+# `MSG_VERIFY_REQ` envelope; the answer a 200 whose body is one
+# `MSG_VERIFY_RESP` envelope, a refusal verdict included. The exchange id is
+# the correlation: the call's counter and this module's request port, so two
+# connectors wired to one verifier each take only their own answers. An
+# exchange that ends any other way — a refusal status, an ABORT, a body that
+# is not one `MSG_VERIFY_RESP` — gives status 255, which is not OK, so the
+# chain refuses it as it refuses a credential that did not verify; it is never
+# dropped. A call the verifier loses to `LINK DOWN` is sent again, whole, after
+# its `LINK UP`.
 #
 # `status` is a `verify_err` code, NOT an HTTP status. Mapping a refusal to a
 # response is an authorization decision and belongs in params, which is the
@@ -43,7 +58,7 @@ hardware_targets = ["bcm2712"]
 #
 # KEY DELIVERY. kagi's verifier is PUSHED its keys on `verify_key` and answers
 # ST_NO_KEY until one lands; nanocloud keeps its truth in the store, where
-# `sa_token` already publishes the verification key as a kagi `MSG_KEY_ADD`
+# `kagi_mint` stores the key kagi's `token_mint` announces as a `MSG_KEY_ADD`
 # frame at `/authn-keys/sa`. So this connector reads that key once and forwards
 # the frame VERBATIM on `key_out` — it never parses it, because the frame is
 # kagi's and the moment nanocloud interprets it there are two readings of it.
@@ -62,10 +77,8 @@ hardware_targets = ["bcm2712"]
 # NOT DONE, deliberately: proof-of-possession binding. `VerifyRequest` carries
 # `method`/`uri` so a DPoP-style proof can be bound to the request it was
 # presented with, and kagi's wire says they are "empty when the credential is
-# not presented with a proof". This sends them empty. Filling them needs the
-# method NAME, and all this connector has is wave's method BYTE — inventing a
-# byte->name table here would be nanocloud restating wave's `wire::method`,
-# which is the reinvention this module exists to avoid.
+# not presented with a proof". This sends them empty: the API plane carries a
+# bearer credential and no proof, so there is nothing for them to bind.
 timer_class = "agnostic"
 
 [[ports]]
@@ -76,26 +89,22 @@ buffer_size = 16384
 max_record = 8192
 required = true
 # Whole records: this module reads one frame per step and needs the boundary
-# kept, so it asks for mailbox delivery on its own input (see kube_decode's
-# manifest for why the producer must NOT declare it).
+# kept, so it asks for mailbox delivery on its own input.
 framed = true
 
 [[ports]]
-name = "verify_out"
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 16384
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 8192
 max_record = 8192
 
 [[ports]]
-name = "verify_in"
-direction = "input"
-content_type = "OctetStream"
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
 buffer_size = 8192
-# kagi's `token_verify` sets `max_record = 2048` on its `results` port; this is
-# the matching ceiling on the reading side.
-max_record = 2048
-framed = true
+max_record = 8192
 
 [[ports]]
 name = "key_out"
@@ -112,7 +121,7 @@ buffer_size = 16384
 max_record = 8192
 
 # READ-ONLY on the store. This module fetches exactly one object — the
-# verification key `sa_token` published — and writes nothing: a connector that
+# verification key `kagi_mint` stored — and writes nothing: a connector that
 # could write the keyset is a connector that could install a key it then
 # accepts tokens against.
 [[resources]]

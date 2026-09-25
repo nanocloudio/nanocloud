@@ -10,6 +10,19 @@
 //           unchanged; a materialised view of the slices
 module nanocloud.endpoints {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: ep.Ask, ep.Probe, ep.Exists, ep.Known
+  message Ctx {
+    key: string = 30;
+    pod: string = 31;
+    ready: string = 32;
+    ip: string = 33;
+    hit: string = 34;
+  }
+
   message ep.Pair {
     seq: int = 1;
     rev: int = 2;
@@ -25,22 +38,15 @@ module nanocloud.endpoints {
     cid: int = 1;
     op: int = 2;
     key: string = 3;      // the uid, under /probe-status/
-    c_key: string = 30;   // "<ns>/<svc>"
-    c_pod: string = 31;
-    c_ready: string = 32;
-    c_ip: string = 33;
-    c_hit: string = 34;
+// "<ns>/<svc>"
+    ctx: Ctx = 254;
   }
   message ep.Probe {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_pod: string = 31;
-    c_ready: string = 32;
-    c_ip: string = 33;
-    c_hit: string = 34;
     pready: string = 40;  // ready= from the probe record
+    ctx: Ctx = 254;
   }
   message ep.Slice {
     cid: int = 1;
@@ -64,13 +70,13 @@ module nanocloud.endpoints {
     key: string = 3;      // ns
     sep: string = 17;
     pod: string = 18;
-    c_key: string = 30;
+    ctx: Ctx = 254;
   }
   message ep.Known {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
+    ctx: Ctx = 254;
   }
   message ep.Act {
     cid: int = 1;
@@ -97,30 +103,28 @@ module nanocloud.endpoints {
   // readiness stands (a NOOP answers 204 and carries everything).
   decision ask(p: ep.Pair) -> ep.Ask {
     when p.uid != "" ->
-      ep.Ask { cid: p.seq, op: GET, key: p.uid,
-               c_key: p.key, c_pod: p.pod, c_ready: p.ready, c_ip: p.ip, c_hit: p.hit };
+      ep.Ask { cid: p.seq, op: GET, key: p.uid, ctx: Ctx { key: p.key, pod: p.pod, ready: p.ready, ip: p.ip, hit: p.hit } };
     default ->
-      ep.Ask { cid: p.seq, op: NOOP, key: "",
-               c_key: p.key, c_pod: p.pod, c_ready: p.ready, c_ip: p.ip, c_hit: p.hit };
+      ep.Ask { cid: p.seq, op: NOOP, key: "", ctx: Ctx { key: p.key, pod: p.pod, ready: p.ready, ip: p.ip, hit: p.hit } };
   }
   // Included when matched, addressed, and ready — the probe's verdict when
   // it has one, the static field otherwise. Excluded is a delete-if-present.
   decision slice(a: ep.Probe) -> ep.Slice {
-    when a.c_hit == "1" && a.c_ip != "" && a.status == 200 && a.pready == "1" ->
-      ep.Slice { cid: a.cid, op: PUT, key: a.c_key, sep: "/", pod: a.c_pod, v1: a.c_ip };
-    when a.c_hit == "1" && a.c_ip != "" && a.status != 200 && a.c_ready == "true" ->
-      ep.Slice { cid: a.cid, op: PUT, key: a.c_key, sep: "/", pod: a.c_pod, v1: a.c_ip };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.status == 200 && a.pready == "1" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: a.ctx.ip };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.status != 200 && a.ctx.ready == "true" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: a.ctx.ip };
     default ->
-      ep.Slice { cid: a.cid, op: DELETE, key: a.c_key, sep: "/", pod: a.c_pod, v1: "" };
+      ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: "" };
   }
 
   decision exists(s: ep.Sl) -> ep.Exists {
     default ->
-      ep.Exists { cid: s.seq, op: EXISTS, key: s.ns, sep: "/", pod: s.pod, c_key: s.key };
+      ep.Exists { cid: s.seq, op: EXISTS, key: s.ns, sep: "/", pod: s.pod, ctx: Ctx { key: s.key } };
   }
   decision prune(k: ep.Known) -> ep.Act {
     when k.status == 404 ->
-      ep.Act { cid: k.cid, op: DELETE, key: k.c_key, v1: "" };
+      ep.Act { cid: k.cid, op: DELETE, key: k.ctx.key, v1: "" };
     default ->
       ep.Act { cid: k.cid, op: NOOP, key: "", v1: "" };
   }
@@ -139,14 +143,13 @@ module nanocloud.endpoints {
               ready: p.ready, ip: p.ip, uid: p.uid, hit: p.hit }
   }
   transformation pass_probe(a: ep.Probe) -> ep.Probe {
-    ep.Probe { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key, c_pod: a.c_pod,
-               c_ready: a.c_ready, c_ip: a.c_ip, c_hit: a.c_hit, pready: a.pready }
+    ep.Probe { cid: a.cid, status: a.status, value: a.value, pready: a.pready, ctx: a.ctx }
   }
   transformation pass_sl(s: ep.Sl) -> ep.Sl {
     ep.Sl { seq: s.seq, rev: s.rev, key: s.key, ns: s.ns, pod: s.pod }
   }
   transformation pass_known(k: ep.Known) -> ep.Known {
-    ep.Known { cid: k.cid, status: k.status, value: k.value, c_key: k.c_key }
+    ep.Known { cid: k.cid, status: k.status, value: k.value, ctx: k.ctx }
   }
   transformation pass_svc(v: ep.Svc) -> ep.Svc {
     ep.Svc { seq: v.seq, rev: v.rev, key: v.key, selector: v.selector, list: v.list }

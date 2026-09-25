@@ -74,46 +74,28 @@ modules:
     expand_tail: 2
     expand_over: "/pods/"
     watch: "/pods/"
-  - name: nb
-    type: decision
-    params:
-      decision: "${DEC_NB}"
   - name: nbget
     type: store_effect
+    decision: "${DEC_NB}"
     key_prefix: "/pods/"
     paths: "status.ready"
-  - name: probe
-    type: decision
-    params:
-      decision: "${DEC_ASK}"
   - name: selfget
     type: store_effect
+    decision: "${DEC_ASK}"
     key_prefix: "/pods/"
-  - name: act
-    type: decision
-    params:
-      decision: "${DEC_ACT}"
   - name: apply
     type: store_effect
+    decision: "${DEC_ACT}"
     key_prefix: "/pods/"
 wiring:
   - from: store_source.status
     to: store_source.changes
   - from: store_source.record_out
-    to: nb.record_in
-  - from: nb.result_out
     to: nbget.request_in
-    buffer_group: 1
   - from: nbget.response_out
-    to: probe.record_in
-  - from: probe.result_out
     to: selfget.request_in
-    buffer_group: 2
   - from: selfget.response_out
-    to: act.record_in
-  - from: act.result_out
     to: apply.request_in
-    buffer_group: 3
 YAML
 }
 run() { # run <seconds>

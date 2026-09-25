@@ -1,11 +1,13 @@
 # Nanocloud
 
-Nanocloud is a Kubernetes control plane built entirely from [fluxor](../fluxor/)
-modules. The node runtime and the CLI are `no_std` position-independent modules
-(`.fmod`); the apiserver and every controller are chains of generic engines
-carrying compiled rules. Both run as cooperating nodes of a fluxor graph over
-one shared store. There is no host binary and no separate database: install the
-package, start one systemd unit, and the node serves the Kubernetes API.
+Nanocloud is a Kubernetes control plane that runs as a [fluxor](../fluxor/)
+graph. The apiserver, every controller and the node's own lifecycle are chains
+of generic engines carrying compiled rules. The `no_std` position-independent
+modules (`.fmod`) in the tree hold no Kubernetes meaning: every one but the CLI
+is a connector, moving bytes across one seam — the store, a socket, an HTTP
+route, a container, the packet filter, a volume. There is no host
+binary and no separate database: install the package, start one systemd unit,
+and the node serves the Kubernetes API.
 
 ## Highlights
 
@@ -22,19 +24,24 @@ package, start one systemd unit, and the node serves the Kubernetes API.
   `apps/v1`, `discovery.k8s.io/v1`, `node.k8s.io/v1` and `nanocloud.io/v1`
   discovery documents, list/get/create/update/delete, and `?watch=true`
   watches fenced on the store's own revisions.
-- **One store, single writer.** Control-plane state lives in fluxor's
+- **One store, replicated.** Control-plane state lives in fluxor's
   `storage.object` / `storage.namespace` contracts — versioned keyed bytes with
-  compare-and-swap, prefix listing and change subscriptions. The graph is its
-  only writer, so a watch is a projection of the store's revision stream rather
+  compare-and-swap, prefix listing and change subscriptions — served by
+  lattice's store as one replica of a group: every write is decided through
+  clustor's log (the control-plane nodes are its voters, each worker a
+  learner, every peer link mutually authenticated). Each node's graph is its
+  replica's only writer, so a watch is a projection of the store's revision stream rather
   than a poll.
 - **Host facts stay behind capability surfaces.** A module never calls libc.
   Sockets arrive through `linux_net`/`tls`, containers through the `workload`
   contract, files through `fs`, private keys through the kernel key vault — each
   one a contract admission can gate.
 - **Decision and effect are separate.** Controllers compute; the node's backends
-  act. The network compilers publish an nftables ruleset to the store rather
-  than programming the kernel themselves; the kubelet's decision half projects
-  desired sandboxes, and the runner performs them.
+  act. Service proxying and NetworkPolicy are rows in the store, applied as a
+  `net.policy` table the platform realizes — nftables on Linux, the packet
+  filter on bare metal — and whether it is enforced is written down, never
+  assumed; the pod-lifecycle chain projects the sandboxes a node should be
+  running, and `workload_effect` performs them.
 - **Behaviour is proven on real binaries.** There are no unit tests to mock the
   seams: `make test` boots the built `.fmod` artefacts in a fluxor runtime and
   drives them over real HTTP, the real store, and real mTLS.
@@ -50,16 +57,18 @@ flowchart TD
     Pipe --> Store
     Store --> Ctrl["controller chains (params): deployment, replicaset,<br/>daemonset, statefulset, job, hpa, gc, namespace, scheduler"]
     Ctrl --> Store
-    Store --> Node["pod-lifecycle chain → sandbox_runner → workload contract"]
-    Store --> Net["endpoints chain, service_ipam, service_dns,<br/>proxy/netpolicy/route compilers"]
+    Store --> Node["pod-lifecycle chain → sandbox chain → workload_effect → workload contract"]
+    Store --> Net["endpoints chain, IPAM chains, service_dns,<br/>proxy/netpolicy chains → net.policy,<br/>route compiler"]
 ```
 
 Every arrow into or out of the store is a contract call, and no stage addresses
 another directly — the only direct channels are the net streams at the edge, the
 records a chain hands along, and each module's own change sink. A request is
 admitted at the edge, written once, and every controller that cares wakes on
-the change and writes its own outputs back. [docs/architecture/modules.md](docs/architecture/modules.md) describes
-each module, the keys it owns, and the capability surfaces it holds.
+the change and writes its own outputs back.
+[docs/architecture/modules.md](docs/architecture/modules.md) describes each
+chain, the keys it owns, the connectors it reaches them through, and the
+capability surfaces behind them.
 
 ## Install
 
@@ -73,11 +82,30 @@ tools/install_deb.sh                    # dpkg -i the newest build, restart the 
 ```
 
 The package installs the fluxor CLI and runtime, every nanocloud `.fmod`, the
-control-plane graph (`/etc/nanocloud.io/fluxor/controlplane.yaml`), the node and
-image-plane graphs, and a systemd unit that runs the control-plane graph with
-`FLUXOR_STORE_DIR` pointed at `/var/lib/nanocloud.io/control-plane/store`.
+control-plane and worker graph templates (`/etc/nanocloud.io/fluxor/`), the
+node and image-plane graphs, and a systemd unit that renders this node's graph
+(`nanocloud-graph.sh`, from `/etc/nanocloud.io/cluster.env` and the peer keys
+in `/etc/nanocloud.io/pki`, both provisioned on install) and runs it in
+`/var/lib/nanocloud.io/control-plane/store`. A fresh install is a cluster of
+one: the control plane, replica 0, alone.
 `/usr/bin/nanocloud` is a busybox-style symlink to `fluxor`, so `nanocloud <cmd>`
 dispatches the `nanocloud_cli` applet.
+
+## A cluster
+
+A worker joins the control plane's store as a learner. On the worker, set
+`NANOCLOUD_ROLE=node`, its `NANOCLOUD_REPLICA_ID` and `NANOCLOUD_PEERS`
+(every replica's address) in `/etc/nanocloud.io/cluster.env`, and give it
+each replica's certificate as `/etc/nanocloud.io/pki/peers/<id>.pem`; give
+every control-plane node the worker's (`nanocloud-cluster pin` prints a
+node's). Then, on a control-plane node:
+
+```bash
+sudo nanocloud-cluster add-node 1       # replica 1 joins, by the operator key
+```
+
+The worker registers itself in `/nodes/`, renews its lease, and is scheduled
+onto once ready.
 
 ## Using it
 
@@ -97,7 +125,7 @@ nanocloud watch pods                    # stream a listing as it changes
 nanocloud logs -f <sandbox>             # a sandbox's stdout/stderr
 nanocloud exec -it <sandbox> -- sh      # a command inside a sandbox
 nanocloud diagnostics                   # counts across every resource + health
-nanocloud policy                        # NetworkPolicies + the compiled ruleset
+nanocloud policy                        # NetworkPolicies + enforcement status
 nanocloud volume                        # PVCs and the volumes bound to them
 nanocloud bundle export > cluster.txt   # every object as `<key>\t<json>` lines
 nanocloud bundle apply < cluster.txt    # recreate them from that dump
@@ -124,13 +152,16 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 | nanocloud.io/v1 | bundles, roles, rolebindings, volumesnapshots, certificates |
 
 The request path is a Chronicle chain: wave's `http` terminates HTTP/1.1 behind
-`tls`, `kube_decode` projects the request into a record, and every decision
-after that — which resource a path names, whether the credential is good enough,
+`tls` and hands each request, as an exchange, to `http_chain`, which gives the
+chain one request envelope for it and turns the chain's replies into its
+response; a Chronicle decode program (`kube.rd`) projects the envelope into a
+record, and every decision after that — which resource a path names, whether the credential is good enough,
 what a refusal answers, which store operation the verb implies — is params
-compiled from `modules/app/_chronicle/apiplane.uproc`. Only two nodes in the
-path hold Kubernetes meaning in compiled code, and they hold it because a rules
-VM cannot walk a set: `rbac_gate` resolves bindings to roles to rules, and
-`api_admission` counts live objects for a quota.
+compiled from `modules/app/_chronicle/apiplane.uproc`. Authorization is one
+store probe of a grant index that the RBAC chains keep true from the real
+Role/ClusterRole/RoleBinding/ClusterRoleBinding objects. Admission is params
+too: a policy read and a live-object COUNT through `store_effect`, then a
+decision. No node on the path holds Kubernetes meaning in compiled code.
 
 Discovery documents (`/api`, `/apis`, `/api/v1`, `/apis/<group>/<version>`),
 `/version` and `/openapi/` are literals in a decision — the API surface is data.
@@ -148,23 +179,27 @@ store changes, writing into the same reply stage.
   which reaches the request chain as a field on the decoded record — so a
   certificate that does not chain never opens a connection, and one that does
   is authorized by its SVID.
-- **Signed bearer tokens.** `sa_token` mints ES256 ServiceAccount JWTs, signing
-  by handle against a key held in the kernel key vault, and publishes the
-  verification key as a kagi key frame. Verification is kagi's own, reached
-  through the `kagi_verify` connector. No credential is ever stored: a token is
-  admitted because its signature verifies, not because a record exists.
-- **Deny-by-default authorization.** `rbac_gate` resolves RoleBindings to Roles
-  and admits a request only when a rule matches its verb and resource.
-- **Admission before the store.** Every mutating request crosses
-  `api_admission`, which validates required fields, applies defaults and
-  enforces per-resource quota against live counts.
-- **Certificates in-module.** `cert_manager` mints X.509 leaves with an
-  in-module ASN.1 DER encoder, signing by handle against a CA key in the kernel
-  key vault so the private key never re-enters the module. It is a
-  development-only issuer and refuses to construct without `development: 1` in
-  its graph — it regenerates its CA at every start, returns leaf private keys
-  as plaintext on the store, and lets the caller choose its own SAN. A
-  deployment issues from kagi's certificate endpoint instead.
+- **Two roots, nothing else provisioned.** A node holds one symmetric key —
+  `FLUXOR_SEAL_KEY`, generated once at install — and one signing key,
+  `nanocloud.ca`, generated *inside* the fluxor key vault on first use and only
+  ever stored sealed under the first. Every certificate and every
+  ServiceAccount token is signed under that one vault key, by kagi; no private
+  key is issued, exported or written to the store.
+- **Signed bearer tokens.** ServiceAccount tokens are Chronicle params over
+  kagi's `token_mint` (through the `kagi_mint` connector): ES256 JWS with the
+  `kubernetes.io` claim and a one-hour `iat`/`exp`. Verification is kagi's own,
+  through `kagi_verify`. No credential is ever stored: a token is admitted
+  because its signature verifies, not because a record exists.
+- **Deny-by-default authorization.** Kubernetes RBAC objects are expanded into a
+  grant index (`rbac_*.uproc`); a request is admitted only when a grant covers
+  its namespace, verb and resource, and a deleted binding's grants are pruned.
+- **Admission before the store.** Every mutating request crosses the
+  admission decisions (`admission.uproc`), which validate required fields,
+  apply defaults and enforce per-resource quota against live counts.
+- **Device certificates.** A Device names the public key it holds; the
+  `dv_` chain has kagi's `certificate_endpoint` certify it (through the generic
+  `http_effect` connector) with its SPIFFE id in the SAN, and writes back the
+  leaf and the CA it chains to.
 
 ## Development
 
@@ -201,7 +236,8 @@ scripts/*-e2e.sh                live graph E2Es — the behaviour gate
 
 ## Contributing
 
-Issues and pull requests are welcome. A change to a module lands with the graph
-E2E that proves it: add or extend a `scripts/*-e2e.sh` that boots the module for
-real. Keep decisions in modules and effects behind capability surfaces — if a
-change wants a new host fact, it wants a contract, not a syscall.
+Issues and pull requests are welcome. A change lands with the graph E2E that
+proves it: add or extend a `scripts/*-e2e.sh` that boots the real artefacts.
+Keep decisions in rules and effects behind capability surfaces — if a change
+wants a new host fact, it wants a contract, not a syscall; and if it wants a new
+`.fmod`, it should first be sure a rule cannot say it.

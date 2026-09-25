@@ -128,19 +128,13 @@ modules:
     # The cascade: when a ReplicaSet is collected, its Pods are orphans NOW,
     # and nothing under /pods/ changed to say so. Watch the owners' prefix.
     watch: "/replicasets.apps/"
-  - name: probe
-    type: decision
-    params:
-      decision: "${DEC_PROBE}"
   - name: owner
     type: store_effect
+    decision: "${DEC_PROBE}"
     key_prefix: "/replicasets.apps/"
-  - name: sweep
-    type: decision
-    params:
-      decision: "${DEC_SWEEP}"
   - name: collect
     type: store_effect
+    decision: "${DEC_SWEEP}"
     key_prefix: "/pods/"
   # B — the same two decisions over different prefixes. Nothing recompiled.
   - name: rs_source
@@ -148,31 +142,22 @@ modules:
     prefix: "/replicasets.apps/"
     paths: "metadata.ownerReferences.0.name"
     watch: "/deployments.apps/"
-  - name: rs_probe
-    type: decision
-    params:
-      decision: "${DEC_PROBE}"
   - name: rs_owner
     type: store_effect
+    decision: "${DEC_PROBE}"
     key_prefix: "/deployments.apps/"
-  - name: rs_sweep
-    type: decision
-    params:
-      decision: "${DEC_SWEEP}"
   - name: rs_collect
     type: store_effect
+    decision: "${DEC_SWEEP}"
     key_prefix: "/replicasets.apps/"
   # C — the cap. count: 1 is the whole difference.
   - name: ev_source
     type: store_source
     prefix: "/events/"
     count: 1
-  - name: ev_cap
-    type: decision
-    params:
-      decision: "${DEC_CAP}"
   - name: ev_collect
     type: store_effect
+    decision: "${DEC_CAP}"
     key_prefix: "/events/"
   - name: dbg
     type: debug
@@ -181,37 +166,22 @@ wiring:
   - from: store_source.status
     to: store_source.changes
   - from: store_source.record_out
-    to: probe.record_in
-  - from: probe.result_out
     to: owner.request_in
-    buffer_group: 1
   - from: owner.response_out
-    to: sweep.record_in
-  - from: sweep.result_out
     to: collect.request_in
-    buffer_group: 2
   - from: collect.response_out
     to: dbg.data
     buffer_group: 3
   - from: rs_source.status
     to: rs_source.changes
   - from: rs_source.record_out
-    to: rs_probe.record_in
-  - from: rs_probe.result_out
     to: rs_owner.request_in
-    buffer_group: 4
   - from: rs_owner.response_out
-    to: rs_sweep.record_in
-  - from: rs_sweep.result_out
     to: rs_collect.request_in
-    buffer_group: 5
   - from: ev_source.status
     to: ev_source.changes
   - from: ev_source.record_out
-    to: ev_cap.record_in
-  - from: ev_cap.result_out
     to: ev_collect.request_in
-    buffer_group: 6
 YAML
 
 echo "== 3. run =="

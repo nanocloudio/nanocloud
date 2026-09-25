@@ -17,13 +17,10 @@ modules:
     paths: "status.phase"
     join: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
     join_scoped: 1
-  - name: ns_sweep
-    type: decision
-    params:
-      # chronicle-source: modules/app/_chronicle/namespace.uproc sw
-      decision: "0105000000170001000204000000120b005465726d696e6174696e6720000900000027000100020100000040010000001004000000000000004002000000010002180000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
   - name: ns_collect
     type: store_effect
+    # chronicle-source: modules/app/_chronicle/namespace.uproc sw
+    decision: "0105000000170001000204000000120b005465726d696e6174696e6720000900000027000100020100000040010000001004000000000000004002000000010002180000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
   - name: ns_source
     type: store_source
     prefix: "/namespaces/"
@@ -31,13 +28,10 @@ modules:
     count_children: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
     child_sep: "/"
     watch: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
-  - name: ns_finalize
-    type: decision
-    params:
-      # chronicle-source: modules/app/_chronicle/namespace.uproc fin
-      decision: "010a000000290001000204000000120b005465726d696e6174696e6720010002160000001000000000000000002030000900000027000100020100000040010000001004000000000000004002000000010002030000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
   - name: ns_remove
     type: store_effect
+    # chronicle-source: modules/app/_chronicle/namespace.uproc fin
+    decision: "010a000000290001000204000000120b005465726d696e6174696e6720010002160000001000000000000000002030000900000027000100020100000040010000001004000000000000004002000000010002030000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
     key_prefix: "/namespaces/"
   # The node plane is NOT here. Nothing in the control plane writes
   # /pod-specs/, so the pod-lifecycle chain belongs to the image plane
@@ -56,14 +50,8 @@ wiring:
   - from: ns_objects.status
     to: ns_objects.changes
   - from: ns_objects.record_out
-    to: ns_sweep.record_in
-  - from: ns_sweep.result_out
     to: ns_collect.request_in
-    buffer_group: 81
   - from: ns_source.status
     to: ns_source.changes
   - from: ns_source.record_out
-    to: ns_finalize.record_in
-  - from: ns_finalize.result_out
     to: ns_remove.request_in
-    buffer_group: 82

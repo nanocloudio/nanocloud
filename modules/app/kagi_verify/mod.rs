@@ -2,9 +2,9 @@
 //!
 //! See `manifest.toml` for the wire layouts and the rationale. The short
 //! version: this is `store_effect`'s role for a different outside — a record
-//! comes in, a credential goes out to kagi, a typed identity comes back, and a
-//! record carrying it goes on down the chain. It decides nothing. Whether a
-//! verified subject may perform the request is params.
+//! comes in, a credential goes out to kagi as one exchange, a typed identity
+//! comes back, and a record carrying it goes on down the chain. It decides
+//! nothing. Whether a verified subject may perform the request is params.
 
 #![no_std]
 #![allow(
@@ -24,12 +24,15 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/store.rs");
+include!("../_shared/exchange_call.rs");
 
-// kagi owns the identity protocols, so it owns the wire. Compiled from its
-// published tree rather than restated here, so there is one definition of what
-// a verify request is.
+// kagi owns the identity protocols, so it owns the wire and the way a typed
+// operation is called. Compiled from its published tree rather than restated
+// here, so there is one definition of what a verify request is.
 #[path = "../../../target/fluxor/kagi-common/auth_wire.rs"]
 mod auth_wire;
+#[path = "../../../target/fluxor/kagi-common/typed_exchange.rs"]
+mod typed_exchange;
 use auth_wire::{VerifiedIdentity, VerifyRequest};
 
 /// Chronicle record-frame value types (`pipeline_core.rs`).
@@ -50,6 +53,12 @@ const DEFAULT_KEY_PATH: &[u8] = b"/authn-keys/sa";
 /// Steps between key-fetch attempts while the key is absent.
 const KEY_RETRY_STEPS: u32 = 64;
 
+/// The status a reply carries when the verifier gave no typed answer: its
+/// exchange ended with a refusal status, an ABORT, or an answer that was not
+/// one `MSG_VERIFY_RESP`. Outside kagi's `verify_err` range, and not OK, so
+/// a chain that refuses every non-OK status refuses this too.
+const NO_ANSWER: i64 = 255;
+
 // The control-plane store, via the standard fluxor storage contracts:
 // storage.object (0x14) keyed bytes, storage.namespace (0x13) prefix LIST.
 // Named here because `_shared/store.rs` is an `include!` fragment and takes
@@ -68,6 +77,9 @@ const MAX_KEY: usize = 160;
 /// a chain that changes connectors must not change how much it can remember.
 const CARRY_LO: u8 = 30;
 const CARRY_HI: u8 = 39;
+/// The record's carried context (chronicle `CARRY_FIELD`): one nested
+/// message, echoed unchanged beside the legacy 30..=39 range.
+const CARRY_FIELD: u8 = 254;
 
 /// `TIMER::TRUSTED_UNIX` record offsets (`kernel_abi::trusted_time`).
 const TT_UNIX_SECONDS: usize = 0;
@@ -78,8 +90,8 @@ const TT_FLAGS: usize = 33;
 struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
-    verify_out: i32,
-    verify_in: i32,
+    response_in: i32,
+    request_out: i32,
     key_out: i32,
     response_out: i32,
     /// Ports past the primary pair are resolved on the first step, not in
@@ -91,11 +103,11 @@ struct State {
     key_path: [u8; MAX_KEY_PATH],
     key_path_len: u16,
     /// Whether the verification key has been forwarded. The store may not hold
-    /// it yet when this module starts — `sa_token` publishes it on ITS start —
+    /// it yet when this module starts — the mint announces it on ITS start —
     /// so this is retried every step until it lands rather than resolved once.
     key_published: u32,
     /// Steps until the next key-fetch attempt. The key may legitimately be
-    /// absent for a while (`sa_token` publishes on ITS start), and retrying a
+    /// absent for a while (the mint announces on ITS start), and retrying a
     /// store read every tick turns a normal startup race into a log flood.
     key_backoff: u32,
     audience: [u8; MAX_AUD],
@@ -103,14 +115,16 @@ struct State {
     issuer: [u8; MAX_ISS],
     issuer_len: u16,
 
-    /// The correlation stamped on the request now in flight, and whether one
-    /// is. A single slot: see the manifest on why there is no table.
-    corr: u32,
-    inflight: u32,
+    /// The verify exchange in flight. One at a time: see the manifest on why
+    /// there is no table.
+    call: Call,
     /// The request frame, held while the call is out, so the carry fields can
     /// be re-read at reply time rather than copied into a second layout.
     held: [u8; BUF],
     held_len: u16,
+    /// A built reply record the chain's ring has not taken yet
+    /// (`out_buf[..reply_len]`), placed before anything else is read.
+    reply_len: u16,
 
     sent: u32,
     ok: u32,
@@ -206,14 +220,24 @@ fn put_i64(out: &mut [u8], at: usize, number: u8, v: i64) -> Option<usize> {
     put_field(out, at, number, TY_I64, &v.to_le_bytes())
 }
 
+/// The request record's own correlation (field 1), echoed on its reply.
+fn held_cid(held: &[u8]) -> i64 {
+    match frame_field(held, 1) {
+        Some((TY_I64, b)) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
+        _ => 0,
+    }
+}
+
 /// Build the reply record: the typed identity, then the request's carry echoed
-/// with its own numbers and types.
+/// with its own numbers and types. `id` is `None` when the verifier gave no
+/// typed answer: every field is then empty or zero and the status is
+/// [`NO_ANSWER`].
 ///
 /// Every field is emitted even when empty, so a decision downstream reads a
 /// stable shape. A refusal carries an empty subject and scope — kagi's own
 /// decoder REFUSES a refusal that carried either, so this cannot report a
 /// subject it did not establish.
-fn build_reply(out: &mut [u8], id: &VerifiedIdentity, held: &[u8]) -> usize {
+fn build_reply(out: &mut [u8], id: Option<&VerifiedIdentity>, held: &[u8]) -> usize {
     let mut p = 1usize;
     let mut n = 0u8;
     macro_rules! field {
@@ -227,16 +251,28 @@ fn build_reply(out: &mut [u8], id: &VerifiedIdentity, held: &[u8]) -> usize {
             }
         };
     }
-    field!(put_i64(out, p, 1, id.correlation as i64));
-    field!(put_i64(out, p, 2, id.status as i64));
-    field!(put_field(out, p, 3, TY_BYTES, id.subject));
-    field!(put_field(out, p, 4, TY_BYTES, id.issuer));
-    field!(put_field(out, p, 5, TY_BYTES, id.audience));
-    field!(put_field(out, p, 6, TY_BYTES, id.scope));
-    field!(put_i64(out, p, 7, id.expires_at as i64));
-    field!(put_i64(out, p, 8, id.suite as i64));
+    let (status, subject, issuer, audience, scope, expires_at, suite) = match id {
+        Some(i) => (
+            i.status as i64,
+            i.subject,
+            i.issuer,
+            i.audience,
+            i.scope,
+            i.expires_at as i64,
+            i.suite as i64,
+        ),
+        None => (NO_ANSWER, &b""[..], &b""[..], &b""[..], &b""[..], 0, 0),
+    };
+    field!(put_i64(out, p, 1, held_cid(held)));
+    field!(put_i64(out, p, 2, status));
+    field!(put_field(out, p, 3, TY_BYTES, subject));
+    field!(put_field(out, p, 4, TY_BYTES, issuer));
+    field!(put_field(out, p, 5, TY_BYTES, audience));
+    field!(put_field(out, p, 6, TY_BYTES, scope));
+    field!(put_i64(out, p, 7, expires_at));
+    field!(put_i64(out, p, 8, suite));
 
-    for f in CARRY_LO..=CARRY_HI {
+    for f in (CARRY_LO..=CARRY_HI).chain(core::iter::once(CARRY_FIELD)) {
         if let Some((ty, v)) = frame_field(held, f) {
             field!(put_field(out, p, f, ty, v));
         }
@@ -285,20 +321,20 @@ pub unsafe extern "C" fn module_new(
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         // `module_new` hands over the FIRST input and the FIRST output, which
-        // in manifest order are `request_in` and `verify_out`. The other two
-        // are resolved by direction-index on the first step.
+        // in manifest order are `request_in` and `request_out`. The rest are
+        // resolved by direction-index on the first step.
         s.request_in = in_chan;
-        s.verify_out = out_chan;
-        s.verify_in = -1;
+        s.request_out = out_chan;
+        s.response_in = -1;
         s.key_out = -1;
         s.response_out = -1;
         s.resolved = 0;
         s.key_published = 0;
         s.key_backoff = 0;
         s.key_path_len = 0;
-        s.corr = 0;
-        s.inflight = 0;
+        s.call.reset();
         s.held_len = 0;
+        s.reply_len = 0;
         s.sent = 0;
         s.ok = 0;
         s.refused = 0;
@@ -322,7 +358,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
-            s.verify_in = dev_channel_port(sys, PORT_INPUT, 1);
+            s.response_in = dev_channel_port(sys, PORT_INPUT, 1);
             s.key_out = dev_channel_port(sys, PORT_OUTPUT, 1);
             s.response_out = dev_channel_port(sys, PORT_OUTPUT, 2);
             s.resolved = 1;
@@ -340,20 +376,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.key_backoff -= 1;
             }
         }
-        if s.request_in < 0 || s.response_out < 0 {
+        if s.request_in < 0 || s.response_out < 0 || s.request_out < 0 || s.response_in < 0 {
             return 0;
         }
 
-        // Reply first: draining the verifier before admitting more work is what
-        // keeps the single in-flight slot from deadlocking against a full
-        // downstream ring.
-        if s.inflight != 0 && drain_reply(s, sys) {
+        // A reply the chain has not taken goes first: nothing else is read
+        // until it is away.
+        if s.reply_len != 0 && !flush_reply(s, sys) {
             return 0;
         }
-        if s.inflight != 0 {
-            return 0;
+        flush_call(s, sys);
+        drain_answers(s, sys);
+        if s.reply_len == 0 && s.call.idle() {
+            admit(s, sys);
         }
-        admit(s, sys);
         // Return 0, ALWAYS. A non-zero `module_step` return means DONE: the
         // scheduler stops stepping the module.
         0
@@ -362,7 +398,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 /// Forward the verification key to kagi, verbatim.
 ///
-/// The frame at `key_path` is a kagi `MSG_KEY_ADD` that `sa_token` wrote. It is
+/// The frame at `key_path` is a kagi `MSG_KEY_ADD` that `kagi_mint` stored. It is
 /// copied to `key_out` WITHOUT being parsed: it is kagi's wire, and a second
 /// reading of it here is a second answer to "which key is this".
 unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
@@ -378,7 +414,7 @@ unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
         let mut key = [0u8; KEY_BUF];
         // `get_value` REFUSES an oversized value rather than truncating it — a
         // half key would verify nothing and say nothing about why.
-        let Some(n) = get_value(sys, path, &mut key) else {
+        let Some(n) = get_value(&Store::plain(sys), path, &mut key) else {
             return; // not published yet, or too large; retried next step
         };
         if n == 0 {
@@ -390,70 +426,98 @@ unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
     }
 }
 
-/// Read one reply, emit one record. Returns true when it consumed a reply.
-unsafe fn drain_reply(s: &mut State, sys: &SyscallTable) -> bool {
-    unsafe {
-        if s.verify_in < 0 {
-            return false;
+/// Place what the call owes the verifier: its request (first sent, or asked
+/// again after a `LINK UP`), or the ABORT for an answer it refused.
+unsafe fn flush_call(s: &mut State, sys: &SyscallTable) {
+    let mut abort = [0u8; 32];
+    if let Some(n) = s.call.abort_record(&mut abort) {
+        // Best effort: the call is already over on this side.
+        (sys.channel_write)(s.request_out, abort.as_ptr(), n);
+    }
+    if let Some(req) = s.call.outgoing() {
+        if (sys.channel_write)(s.request_out, req.as_ptr(), req.len()) > 0 {
+            s.call.sent();
         }
-        let poll = (sys.channel_poll)(s.verify_in, POLL_IN);
-        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-            return false;
-        }
-        let n = (sys.channel_read)(s.verify_in, s.in_buf.as_mut_ptr(), BUF);
-        if n <= 0 {
-            return false;
-        }
-        let bytes = core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize);
-        let Ok((ty, payload)) = auth_wire::read_envelope(bytes) else {
-            s.dropped = s.dropped.wrapping_add(1);
-            return true;
-        };
-        if ty != auth_wire::MSG_VERIFY_RESP {
-            s.dropped = s.dropped.wrapping_add(1);
-            return true;
-        }
-        let Ok(id) = VerifiedIdentity::decode(payload) else {
-            s.dropped = s.dropped.wrapping_add(1);
-            return true;
-        };
-        // A reply for a correlation we are not waiting on is not ours to act
-        // on. Dropping it is the fail-closed answer: emitting it would attach
-        // one request's identity to another request's carry.
-        if id.correlation != s.corr {
-            s.dropped = s.dropped.wrapping_add(1);
-            return true;
-        }
-
-        let mut out = [0u8; BUF];
-        let held_len = s.held_len as usize;
-        let flen = {
-            let held = core::slice::from_raw_parts(s.held.as_ptr(), held_len);
-            build_reply(&mut out, &id, held)
-        };
-        if flen > 0 {
-            s.out_buf[..flen].copy_from_slice(&out[..flen]);
-            (sys.channel_write)(s.response_out, s.out_buf.as_ptr(), flen);
-            if id.status == auth_wire::verify_err::OK {
-                s.ok = s.ok.wrapping_add(1);
-            } else {
-                s.refused = s.refused.wrapping_add(1);
-            }
-        } else {
-            s.dropped = s.dropped.wrapping_add(1);
-        }
-        s.inflight = 0;
-        s.held_len = 0;
-        true
     }
 }
 
-/// Take one record and put one verify request on the wire.
-unsafe fn admit(s: &mut State, sys: &SyscallTable) {
-    unsafe {
-        if s.verify_out < 0 {
+/// Place the held reply record. True when nothing is left owed.
+unsafe fn flush_reply(s: &mut State, sys: &SyscallTable) -> bool {
+    let n = s.reply_len as usize;
+    if (sys.channel_write)(s.response_out, s.out_buf.as_ptr(), n) > 0 {
+        s.reply_len = 0;
+        return true;
+    }
+    false
+}
+
+/// Read the verifier's records; a call that ends becomes one reply record.
+unsafe fn drain_answers(s: &mut State, sys: &SyscallTable) {
+    loop {
+        if s.reply_len != 0 {
             return;
         }
+        let poll = (sys.channel_poll)(s.response_in, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(s.response_in, s.in_buf.as_mut_ptr(), BUF);
+        if n <= 0 {
+            return;
+        }
+        let rec = core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize);
+        match s.call.take(rec) {
+            CallEvent::Answered => answered(s, sys),
+            CallEvent::Failed(_) => reply(s, sys, None),
+            CallEvent::Nothing | CallEvent::LinkDown | CallEvent::LinkUp => {}
+        }
+    }
+}
+
+/// The call's whole answer, as the reply record.
+unsafe fn answered(s: &mut State, sys: &SyscallTable) {
+    let (status, body) = s.call.answer();
+    // Read through a raw place: the answer stays in the call, which nothing
+    // below touches, while the reply is built from it.
+    let body = core::slice::from_raw_parts(body.as_ptr(), body.len());
+    // A 200 whose body is one MSG_VERIFY_RESP is kagi's typed answer, a
+    // refusal verdict included. Anything else is no answer at all.
+    let id = if status == exch::status::OK {
+        match typed_exchange::message(body) {
+            Some((auth_wire::MSG_VERIFY_RESP, payload)) => VerifiedIdentity::decode(payload).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    reply(s, sys, id.as_ref());
+}
+
+/// Emit the reply for the held request and free the call.
+unsafe fn reply(s: &mut State, sys: &SyscallTable, id: Option<&VerifiedIdentity>) {
+    let mut out = [0u8; BUF];
+    let held_len = s.held_len as usize;
+    let flen = {
+        let held = core::slice::from_raw_parts(s.held.as_ptr(), held_len);
+        build_reply(&mut out, id, held)
+    };
+    s.held_len = 0;
+    if flen == 0 {
+        s.dropped = s.dropped.wrapping_add(1);
+        return;
+    }
+    match id {
+        Some(i) if i.status == auth_wire::verify_err::OK => s.ok = s.ok.wrapping_add(1),
+        _ => s.refused = s.refused.wrapping_add(1),
+    }
+    s.out_buf[..flen].copy_from_slice(&out[..flen]);
+    s.reply_len = flen as u16;
+    flush_reply(s, sys);
+}
+
+/// Take one record and open one verify call for it.
+unsafe fn admit(s: &mut State, sys: &SyscallTable) {
+    unsafe {
         let poll = (sys.channel_poll)(s.request_in, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return;
@@ -483,9 +547,7 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
         let now_secs =
             u64::from_le_bytes(tt[TT_UNIX_SECONDS..TT_UNIX_SECONDS + 8].try_into().unwrap());
 
-        s.corr = s.corr.wrapping_add(1);
         let req = VerifyRequest {
-            correlation: s.corr,
             credential,
             expected_profile: 0,
             expected_issuer: &s.issuer[..s.issuer_len as usize],
@@ -498,25 +560,23 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
             time_source_class: tt[TT_SOURCE_CLASS],
             time_flags: tt[TT_FLAGS],
         };
-        let mut out = [0u8; BUF];
-        let Ok(wlen) = req.encode(&mut out) else {
-            s.dropped = s.dropped.wrapping_add(1);
-            s.held_len = 0;
+        let mut env = [0u8; BUF];
+        let Ok(elen) = req.encode(&mut env) else {
+            // A credential too long for one request: refused here, as the
+            // verifier would, and answered rather than dropped.
+            reply(s, sys, None);
             return;
         };
-        s.out_buf[..wlen].copy_from_slice(&out[..wlen]);
-        let wrote = (sys.channel_write)(s.verify_out, s.out_buf.as_ptr(), wlen);
-        if wrote > 0 {
-            s.sent = s.sent.wrapping_add(1);
-            s.inflight = 1;
-        } else {
-            // The verifier's ring is full. The record is dropped rather than
-            // retried, and that is a REAL limitation: a request whose verify
-            // never went out gets no response, and the client waits for its own
-            // timeout. Retaining and resuming the way `store_source` does is
-            // the property a request stage needs and a controller does not.
-            s.dropped = s.dropped.wrapping_add(1);
-            s.held_len = 0;
+        let port = s.request_out;
+        let env = &env[..elen];
+        if !s
+            .call
+            .begin(port, |id, out| typed_exchange::write_call(id, env, out))
+        {
+            reply(s, sys, None);
+            return;
         }
+        s.sent = s.sent.wrapping_add(1);
+        flush_call(s, sys);
     }
 }

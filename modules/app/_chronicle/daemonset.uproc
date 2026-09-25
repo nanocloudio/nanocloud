@@ -13,6 +13,20 @@
 // independent create-if-absent.
 module nanocloud.daemonset {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: ds.Probe, ds.Answer, ds.Ask, ds.Known
+  message Ctx {
+    key: string = 30;
+    members: string = 31;
+    node: string = 32;
+    ns: string = 34;
+    ds: string = 35;
+    pod: string = 39;
+  }
+
   // ---- ready: the readiness projection ----
   message ds.Node {
     seq: int = 1;
@@ -50,23 +64,13 @@ module nanocloud.daemonset {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_members: string = 31;
-    c_node: string = 32;
-    c_ns: string = 34;
-    c_ds: string = 35;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
   message ds.Answer {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_members: string = 31;
-    c_node: string = 32;
-    c_ns: string = 34;
-    c_ds: string = 35;
-    c_pod: string = 39;
+    ctx: Ctx = 254;
   }
   message ds.Create {
     cid: int = 1;
@@ -86,40 +90,38 @@ module nanocloud.daemonset {
 
   decision probe(p: ds.Pair) -> ds.Probe {
     default ->
-      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey,
-                 c_key: p.podkey, c_members: p.members, c_node: p.node,
-                 c_ns: p.ns, c_ds: p.ds, c_pod: p.podname };
+      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey, ctx: Ctx { key: p.podkey, members: p.members, node: p.node, ns: p.ns, ds: p.ds, pod: p.podname } };
   }
 
   // Create-if-absent, node-pinned: the template's members with nodeName
   // spliced in first. An empty template takes the comma-less form.
   decision create(a: ds.Answer) -> ds.Create {
-    when a.status == 404 && a.c_members == "" ->
-      ds.Create { cid: a.cid, op: PUT, key: a.c_key,
+    when a.status == 404 && a.ctx.members == "" ->
+      ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
                   p1: "{\"metadata\":{\"name\":\"",
-                  p2: a.c_pod,
+                  p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
-                  p4: a.c_ns,
+                  p4: a.ctx.ns,
                   p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
-                  p6: a.c_ds,
+                  p6: a.ctx.ds,
                   p7: "\"}]},\"spec\":{\"nodeName\":\"",
-                  p8: a.c_node,
+                  p8: a.ctx.node,
                   p9: "\"",
                   p10: "",
                   p11: "",
                   p12: "}}" };
     when a.status == 404 ->
-      ds.Create { cid: a.cid, op: PUT, key: a.c_key,
+      ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
                   p1: "{\"metadata\":{\"name\":\"",
-                  p2: a.c_pod,
+                  p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
-                  p4: a.c_ns,
+                  p4: a.ctx.ns,
                   p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
-                  p6: a.c_ds,
+                  p6: a.ctx.ds,
                   p7: "\"}]},\"spec\":{\"nodeName\":\"",
-                  p8: a.c_node,
+                  p8: a.ctx.node,
                   p9: "\",",
-                  p10: a.c_members,
+                  p10: a.ctx.members,
                   p11: "",
                   p12: "}}" };
     default ->
@@ -138,13 +140,14 @@ module nanocloud.daemonset {
     cid: int = 1;
     op: int = 2;
     key: string = 3;      // the node, under /ready-nodes/
-    c_key: string = 30;   // the pod, to delete
+// the pod, to delete
+    ctx: Ctx = 254;
   }
   message ds.Known {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
+    ctx: Ctx = 254;
   }
   message ds.Act {
     cid: int = 1;
@@ -153,13 +156,13 @@ module nanocloud.daemonset {
   }
   decision ask(p: ds.Pod) -> ds.Ask {
     when p.kind == "DaemonSet" && p.node != "" ->
-      ds.Ask { cid: p.seq, op: EXISTS, key: p.node, c_key: p.key };
+      ds.Ask { cid: p.seq, op: EXISTS, key: p.node, ctx: Ctx { key: p.key } };
     default ->
-      ds.Ask { cid: p.seq, op: NOOP, key: "", c_key: p.key };
+      ds.Ask { cid: p.seq, op: NOOP, key: "", ctx: Ctx { key: p.key } };
   }
   decision prune(k: ds.Known) -> ds.Act {
     when k.status == 404 ->
-      ds.Act { cid: k.cid, op: DELETE, key: k.c_key };
+      ds.Act { cid: k.cid, op: DELETE, key: k.ctx.key };
     default ->
       ds.Act { cid: k.cid, op: NOOP, key: "" };
   }
@@ -172,15 +175,13 @@ module nanocloud.daemonset {
               podkey: p.podkey, podname: p.podname, ns: p.ns, ds: p.ds }
   }
   transformation pass_answer(a: ds.Answer) -> ds.Answer {
-    ds.Answer { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
-                c_members: a.c_members, c_node: a.c_node, c_ns: a.c_ns,
-                c_ds: a.c_ds, c_pod: a.c_pod }
+    ds.Answer { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }
   }
   transformation pass_pod(p: ds.Pod) -> ds.Pod {
     ds.Pod { seq: p.seq, rev: p.rev, key: p.key, kind: p.kind, node: p.node }
   }
   transformation pass_known(k: ds.Known) -> ds.Known {
-    ds.Known { cid: k.cid, status: k.status, value: k.value, c_key: k.c_key }
+    ds.Known { cid: k.cid, status: k.status, value: k.value, ctx: k.ctx }
   }
 
   pipeline rdy(n: ds.Node) -> ds.Mark {
@@ -198,7 +199,9 @@ module nanocloud.daemonset {
     call y = create(x);
     return y;
   }
-  pipeline ask(p: ds.Pod) -> ds.Ask {
+  // Named apart from the `ask` decision it calls: a document's declarations
+  // share one namespace.
+  pipeline ask_p(p: ds.Pod) -> ds.Ask {
     call x = pass_pod(p);
     call y = ask(x);
     return y;
@@ -212,7 +215,7 @@ module nanocloud.daemonset {
   entry rdy = rdy;
   entry prb = prb;
   entry mk = mk;
-  entry ask = ask;
+  entry ask = ask_p;
   entry prn = prn;
 
   provenance revision "daemonset-join" toolchain "chronicle-authoring";

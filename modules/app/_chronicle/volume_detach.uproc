@@ -1,0 +1,245 @@
+// Taking an encrypted volume away from a node — the detach pipeline of the
+// encrypted-storage design, and the cleanup of every failed or expired attach.
+// Same record as volume_attach.uproc (`/volume-attachments/<ns>/<pvc>`, whose
+// header lists the fields); this decision owns it whenever `desired` is not
+// `attached` or a `reason` is set, and volume_attach.uproc's never does, so the
+// two never both write one record.
+//
+// It releases ONLY what the record says is held, in THIS order, one step in
+// flight at a time (write-ahead, like attach; volume_effect.uproc issues each
+// step's effect and records its outcome):
+//
+//   d_unmount   UNMOUNT_REQ    stop filesystem operations: the mount effect
+//                              withdraws the binds (`path=`), then unmounts.
+//                              Never passed while the claim may be mounted.
+//   d_flush     FLUSH          the complete encrypted block path: nbd_serve,
+//                              crypt_block's journal and homes, the Loam commit
+//   d_unclaim   CLAIM_DELETE   withdraw the published claim …
+//   d_unpublish NBD_STOP       … and the device itself
+//   d_erase     CB_ERASE       only when secure deletion set `erase=1`: FXER
+//                              (volume_key_effect.uproc issues it)
+//   d_destroy   GRAPH_DESTROY  the instance, taking crypt_block's recipient and
+//                              volume-key handles with it
+//   d_release   LEASE_RELEASE  the writer lease — only after all of the above
+//   then        detached (asked), idle (a retryable reason: attach again after
+//               a pause) or failed (anything else, left for an operator; a
+//               volume being deleted always ends here, reason kept)
+//
+// Releasing the lease before the device is quiesced would permit two writers;
+// destroying the handles before the flush would make recovery ambiguous. A
+// flush that keeps failing is recorded (`note=flush_failed`) and passed — the
+// committed root is intact and what was staged since is lost. An unmount that
+// keeps failing is NEVER passed: the lease is then not renewed, lapses at its
+// TTL, and loam_volume refuses every write from that moment. A lease Loam
+// cannot be reached to release lapses the same way (`note=lease_lapses`).
+module nanocloud.volume_detach {
+
+  // The shared carry (volume_effect.uproc): ONE nested message in field 254,
+  // echoed unchanged by every connector.
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    dev: string = 34;
+    fs: string = 35;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    fresh: string = 39;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+
+  // A step that has not answered is asked again after TIMEOUT_MS; one that
+  // answered without releasing its resource, after RETRY_MS. The flush and the
+  // lease release give up after MAX_TRIES (recorded in `note`); the unmount,
+  // the device withdrawal and the instance teardown never do.
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum MAX_TRIES = 5;
+
+  message Att {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    desired: string = 4;
+    phase: string = 5;
+    out: string = 6;
+    fresh: string = 7;
+    device: string = 8;
+    grant: string = 9;
+    access: string = 10;
+    vol: string = 11;
+    fs: string = 12;
+    inst: string = 13;
+    dev: string = 14;
+    reason: string = 15;
+    note: string = 16;
+    fence: int = 50;
+    lease_exp: int = 51;
+    exp: int = 52;
+    at: int = 53;
+    tries: int = 54;
+    ready: int = 55;
+    wake: int = 56;
+    now: int = 58;
+    erase: string = 17;    // "1": crypto-erase the instance before it is destroyed
+    mstate: string = 70;   // /volumes/<claim> mount (related, flat)
+    cdev: string = 71;     // /volumes/<claim> device: the claim is published
+    kvol: string = 80;     // /volume-keys/<claim> (related, flat)
+    epoch: string = 81;
+    next: string = 82;
+  }
+  // A MERGE of the fields that change; value parts join in field order.
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision detach(a: Att) -> Step {
+    when a.desired == "attached" && a.reason == "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "failed" || (a.phase == "detached" && a.desired != "attached") ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // An attach effect still in flight answers first: its outcome says what it
+    // acquired, and the teardown releases exactly that.
+    when (a.phase == "granting" || a.phase == "leasing" || a.phase == "instantiating" || a.phase == "recipient"
+          || a.phase == "releasing" || a.phase == "unlocking" || a.phase == "publishing" || a.phase == "claiming"
+          || a.phase == "renew_lease" || a.phase == "renew_grant"
+          || a.phase == "e_recipient" || a.phase == "e_releasing" || a.phase == "e_unlocking")
+         && a.out == "" && a.now < a.at + TIMEOUT_MS ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // So does the mount effect.
+    when a.mstate == "mounting" || a.mstate == "unmount" || a.mstate == "unmounting" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 1. Stop filesystem operations and unmount. A claim the mount effect has
+    // not settled as not-mounted is asked to unmount — never withdrawn under it.
+    when a.cdev != "" && (a.mstate == "" || a.mstate == "mounted" || a.mstate == "busy") && a.phase != "d_unmount" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_unmount;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unmount", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.cdev != "" && (a.mstate == "" || a.mstate == "mounted" || a.mstate == "busy")
+         && ((a.mstate == "busy" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=;note=unmount_blocked", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + RETRY_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unmount", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.cdev != "" && (a.mstate == "" || a.mstate == "mounted" || a.mstate == "busy") ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 2. Flush the complete encrypted block path.
+    when a.ready == 1 && a.phase != "d_flush" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_flush;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_flush", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.ready == 1 && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) && a.tries < MAX_TRIES ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_flush", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.ready == 1 && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "ready=0;note=flush_failed", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.ready == 1 ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 3. Withdraw the published device: the claim, then the export.
+    when a.cdev != "" && a.phase != "d_unclaim" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_unclaim;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unclaim", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.cdev != "" && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unclaim", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.cdev != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when a.dev != "" && a.phase != "d_unpublish" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_unpublish;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unpublish", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.dev != "" && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_unpublish", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.dev != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 3b. Crypto-erase (secure deletion asked for it): with the device
+    // withdrawn and nothing in flight, crypt_block takes an FXER record —
+    // every master it holds destroyed, both superblocks zeroed and flushed —
+    // while the instance still holds the lease its writes need.
+    when a.erase == "1" && a.inst != "" && a.phase != "d_erase" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_erase;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_erase", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.erase == "1" && a.inst != "" && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_erase", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.erase == "1" && a.inst != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 4. Destroy the instance: crypt_block's recipient and volume-key handles.
+    when a.inst != "" && a.phase != "d_destroy" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_destroy;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_destroy", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.inst != "" && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_destroy", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.inst != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 5. Only now, with every lower path quiesced, release the writer lease.
+    when a.fence != 0 && a.phase != "d_release" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=d_release;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_release", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    when a.fence != 0 && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) && a.tries < MAX_TRIES ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "d_release", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh } };
+    // Loam cannot be reached to release it: nothing writes under it any more,
+    // and it lapses at its TTL.
+    when a.fence != 0 && ((a.out != "" && a.now >= a.at + RETRY_MS) || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "fence=0;note=lease_lapses", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.fence != 0 ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // 6. Record the status. A volume being deleted keeps its reason, so
+    // nothing attaches it again.
+    when a.desired != "attached" && a.reason != "deleting" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=detached;out=;tries=0;reason=", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+    // Transient: attach again after a pause.
+    when a.reason == "leasing:held" || a.reason == "attachment_expired" || a.reason == "lease_expiring"
+         || a.reason == "lease_lost" || a.reason == "exhausted:granting" || a.reason == "exhausted:leasing"
+         || a.reason == "exhausted:instantiating" || a.reason == "exhausted:recipient"
+         || a.reason == "exhausted:releasing" || a.reason == "exhausted:unlocking"
+         || a.reason == "exhausted:publishing" || a.reason == "exhausted:claiming" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=idle;out=;tries=0;reason=;note=", v2: a.reason,
+             v3: ";at=", n1: a.now, v4: ";wake=", n2: a.now + RETRY_MS, ctx: Ctx { claim: "", ph: "" } };
+    // Kagi ended the attachment but not the grant; the second-epoch steps ran
+    // out of answers; the grant moved to a replacement device.
+    when a.reason == "renew_grant:fence_changed" || a.reason == "renew_grant:expired" || a.reason == "renew_grant:conflict"
+         || a.reason == "exhausted:e_recipient" || a.reason == "exhausted:e_releasing"
+         || a.reason == "exhausted:e_unlocking" || a.reason == "device_replaced" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=idle;out=;tries=0;reason=;note=", v2: a.reason,
+             v3: ";at=", n1: a.now, v4: ";wake=", n2: a.now + RETRY_MS, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=failed;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline va_detach(a: Att) -> Step { call y = detach(a); return y; }
+  entry va_detach = va_detach;
+  provenance revision "volume-detach" toolchain "chronicle-authoring";
+}

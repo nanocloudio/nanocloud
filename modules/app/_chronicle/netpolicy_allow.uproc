@@ -1,0 +1,156 @@
+// NetworkPolicy ALLOW rows from selector peers, and the prunes that keep every
+// level of netpolicy_peers.uproc honest (see that file for the row layout):
+//
+//   allow    /np-sel/ (a policy's selected pod) JOIN its policy's /np-peerip/
+//            (scoped to <ns>/<pol>) -> /np-rows/netpolicy/<ns>/<pol>/<subj>/peer~<sl>
+//   fence    a level's row whose parent's digest moved is deleted
+//   ip       a peer IP row whose pod is gone, or whose address moved, is deleted
+//   arow     an allow row whose peer IP row is gone or moved is deleted
+// Every delete is conditional on the revision the verdict read.
+module nanocloud.netpolicy_allow {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // A put whose value is up to ten literal parts; the key is key + k2 + k3.
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+  // A conditional delete: only the row at the revision the verdict read.
+  message Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
+  }
+
+  // ---- allow: a policy's selected pod x its peer IPs ----
+  message Allow {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>/<subj>
+    subj: string = 4;      // the subject's podIP
+    g: string = 27;        // the /np-sel/ row's digest
+    pip: string = 60;      // the peer's ip
+    dir: string = 61;
+    ports: string = 62;
+    protos: string = 63;
+    sl: string = 64;       // the peer row's slug
+    pkey: string = 24;     // the peer row's FULL key (scoped join)
+  }
+  decision allow(a: Allow) -> Put {
+    when a.subj != "" && a.pip != "" ->
+      Put { cid: a.seq, op: PUT, key: a.key, k2: "/peer~", k3: a.sl,
+            v1: "kind=allow;dir=" + a.dir + ";subj=" + a.subj, v2: ";peers=", v3: a.pip,
+            v4: ";ports=", v5: a.ports, v6: ";protos=", v7: a.protos,
+            v8: ";g=", v9: a.g, v10: ";pk=" + a.pkey };
+    default ->
+      Put { cid: a.seq, op: NOOP, key: "", k2: "", k3: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- prunes ----
+  // A row whose parent's digest moved (70 = the parent, `^1:.!hash`).
+  message Fenced {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    g: string = 4;
+    now: string = 70;
+  }
+  decision fence(r: Fenced) -> Del {
+    when r.g != r.now -> Del { cid: r.seq, op: DELETE, key: r.key, rev: r.rev };
+    default -> Del { cid: r.seq, op: NOOP, key: "", rev: 0 };
+  }
+  // A peer IP row whose pod is gone, or whose pod's address moved.
+  message IpRow {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    ip: string = 4;
+    pk: string = 5;
+  }
+  // The carried context: the row to judge and the address it recorded.
+  message Ctx {
+    key: string = 30;
+    ip: string = 31;
+    rev: int = 32;
+  }
+  message Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message Got {
+    cid: int = 1;
+    status: int = 2;
+    ip: string = 40;       // store_effect `paths`: status.podIP / ip
+    ctx: Ctx = 254;
+  }
+  decision ip_get(r: IpRow) -> Get {
+    default -> Get { cid: r.seq, op: GET, key: r.pk, ctx: Ctx { key: r.key, ip: r.ip, rev: r.rev } };
+  }
+  decision ip_drop(g: Got) -> Del {
+    when g.status == 200 && g.ip == g.ctx.ip -> Del { cid: g.cid, op: NOOP, key: "", rev: 0 };
+    default -> Del { cid: g.cid, op: DELETE, key: g.ctx.key, rev: g.ctx.rev };
+  }
+  // An allow row whose peer IP row is gone or carries another address.
+  message AllowRow {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    pip: string = 4;       // flat: peers
+    pk: string = 5;        // flat: pk (empty on the rule rows, which are not ours)
+  }
+  decision allow_get(r: AllowRow) -> Get {
+    when r.pk == "" -> Get { cid: r.seq, op: NOOP, key: "", ctx: Ctx { key: "", ip: "", rev: 0 } };
+    default -> Get { cid: r.seq, op: GET, key: r.pk, ctx: Ctx { key: r.key, ip: r.pip, rev: r.rev } };
+  }
+  decision allow_drop(g: Got) -> Del {
+    when g.ctx.key == "" -> Del { cid: g.cid, op: NOOP, key: "", rev: 0 };
+    when g.status == 200 && g.ip == g.ctx.ip -> Del { cid: g.cid, op: NOOP, key: "", rev: 0 };
+    default -> Del { cid: g.cid, op: DELETE, key: g.ctx.key, rev: g.ctx.rev };
+  }
+
+  // Scalars and counts only in a pass stage: a path read returns a repeated
+  // field's FIRST element.
+  transformation t_allow(a: Allow) -> Allow {
+    Allow { seq: a.seq, key: a.key, subj: a.subj, g: a.g, pip: a.pip, dir: a.dir,
+            ports: a.ports, protos: a.protos, sl: a.sl, pkey: a.pkey }
+  }
+  transformation t_fence(r: Fenced) -> Fenced {
+    Fenced { seq: r.seq, rev: r.rev, key: r.key, g: r.g, now: r.now }
+  }
+  transformation t_ip(r: IpRow) -> IpRow {
+    IpRow { seq: r.seq, rev: r.rev, key: r.key, ip: r.ip, pk: r.pk }
+  }
+  transformation t_got(g: Got) -> Got {
+    Got { cid: g.cid, status: g.status, ip: g.ip, ctx: g.ctx }
+  }
+  transformation t_arow(r: AllowRow) -> AllowRow {
+    AllowRow { seq: r.seq, rev: r.rev, key: r.key, pip: r.pip, pk: r.pk }
+  }
+
+  pipeline np_allow(a: Allow) -> Put { call x = t_allow(a); call y = allow(x); return y; }
+  pipeline np_fence(r: Fenced) -> Del { call x = t_fence(r); call y = fence(x); return y; }
+  pipeline np_ipget(r: IpRow) -> Get { call x = t_ip(r); call y = ip_get(x); return y; }
+  pipeline np_ipdrop(g: Got) -> Del { call x = t_got(g); call y = ip_drop(x); return y; }
+  pipeline np_aget(r: AllowRow) -> Get { call x = t_arow(r); call y = allow_get(x); return y; }
+  pipeline np_adrop(g: Got) -> Del { call x = t_got(g); call y = allow_drop(x); return y; }
+
+  entry np_allow = np_allow;
+  entry np_fence = np_fence;
+  entry np_ipget = np_ipget;
+  entry np_ipdrop = np_ipdrop;
+  entry np_aget = np_aget;
+  entry np_adrop = np_adrop;
+  provenance revision "netpolicy-allow" toolchain "chronicle-authoring";
+}

@@ -3,6 +3,16 @@
 // PATCH the VolumeSnapshot's status object to bind it and mark it ready.
 // Idempotent on readyToUse: a ready snapshot is left alone.
 module nanocloud.snapshot {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: sn.Content, sn.Made
+  message Ctx {
+    key: string = 30;
+    name: string = 31;
+  }
   message sn.Vs {
     seq: int = 1;
     rev: int = 2;
@@ -20,15 +30,13 @@ module nanocloud.snapshot {
     p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7; p5: string = 8;
     p6: string = 9; p7: string = 10; p8: string = 11; p9: string = 12;
     p10: string = 13; p11: string = 14;
-    c_key: string = 30;
-    c_name: string = 31;
+    ctx: Ctx = 254;
   }
   message sn.Made {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_name: string = 31;
+    ctx: Ctx = 254;
   }
   message sn.Bind {
     cid: int = 1;
@@ -43,7 +51,7 @@ module nanocloud.snapshot {
 
   decision content(v: sn.Vs) -> sn.Content {
     when v.ready == "true" || v.pvc == "" ->
-      sn.Content { cid: v.seq, op: NOOP, key: "", name: "", p10: "", p11: "", c_key: "", c_name: "" };
+      sn.Content { cid: v.seq, op: NOOP, key: "", name: "", p10: "", p11: "", ctx: Ctx { key: "", name: "" } };
     default ->
       sn.Content { cid: v.seq, op: PUT, key: "snapcontent-", name: v.name,
                    p1: "{\"metadata\":{\"name\":\"snapcontent-",
@@ -56,15 +64,14 @@ module nanocloud.snapshot {
                    p8: v.pvc,
                    p9: "\"}},\"status\":{\"readyToUse\":true,\"snapshotHandle\":\"snap-",
                    p10: v.name,
-                   p11: "\",\"restoreSize\":0}}",
-                   c_key: v.key, c_name: v.name };
+                   p11: "\",\"restoreSize\":0}}", ctx: Ctx { key: v.key, name: v.name } };
   }
   // The content exists (written now, or already there: 200 or 204) -> bind.
   decision bind(m: sn.Made) -> sn.Bind {
-    when m.c_key != "" && (m.status == 200 || m.status == 204) ->
-      sn.Bind { cid: m.cid, op: PATCH, key: m.c_key, path: "status",
+    when m.ctx.key != "" && (m.status == 200 || m.status == 204) ->
+      sn.Bind { cid: m.cid, op: PATCH, key: m.ctx.key, path: "status",
                 p1: "{\"readyToUse\":true,\"boundVolumeSnapshotContentName\":\"snapcontent-",
-                p2: m.c_name,
+                p2: m.ctx.name,
                 p3: "\",\"restoreSize\":\"0\"}" };
     default ->
       sn.Bind { cid: m.cid, op: NOOP, key: "", path: "", p1: "", p2: "", p3: "" };
@@ -73,7 +80,7 @@ module nanocloud.snapshot {
     sn.Vs { seq: v.seq, rev: v.rev, key: v.key, ready: v.ready, pvc: v.pvc, ns: v.ns, name: v.name }
   }
   transformation pass_made(m: sn.Made) -> sn.Made {
-    sn.Made { cid: m.cid, status: m.status, value: m.value, c_key: m.c_key, c_name: m.c_name }
+    sn.Made { cid: m.cid, status: m.status, value: m.value, ctx: m.ctx }
   }
   pipeline ct(v: sn.Vs) -> sn.Content {
     call x = pass_vs(v);

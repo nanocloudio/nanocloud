@@ -2,7 +2,7 @@
 # publishes it into the node's OCI store, so `sandbox-runner:1.0.0` resolves offline.
 # Portless — the runner drives the store and workload capability surfaces via
 # provider_call, not a socket. The graph (linux.yaml, staged beside this file)
-# runs the sandbox_runner module.
+# runs the sandbox runtime (sandbox.uproc over workload_effect).
 [workload]
 name = "sandbox-runner"
 version = "1.0.0"

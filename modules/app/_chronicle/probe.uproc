@@ -1,0 +1,242 @@
+// Liveness and readiness probes as params: the TICK half.
+//
+// A probe's state is a flat record at /probe-rt-<l|r>/<uid>, not module memory:
+//   inflight  0|1       an attempt is out on the exec seam
+//   due       ms        when the next attempt may start   (armed as a timer)
+//   deadline  ms        when the one in flight times out  (armed as a timer)
+//   seq       n         attempts started
+//   fails oks n         consecutive outcomes since the last opposite one
+//   verdict   0|1       liveness starts 1, readiness 0
+//   fail_n succ_n       the thresholds, copied from the spec at each attempt so
+//                       the collector (probe_collect.uproc) folds against them
+//
+// The spec states each probe as flat fields on /pod-specs/<uid>:
+//   lp_cmd lp_period lp_timeout lp_fail lp_succ     (liveness)
+//   rp_cmd rp_period rp_timeout rp_fail rp_succ     (readiness)
+// An exec probe runs its command inside the sandbox; exit 0 passes.
+//
+//   seed     a spec that names a probe gets its state record (create-only)
+//   tick     per kind: start an attempt when due, time one out at its
+//            deadline, reset while the sandbox is not running, drop the
+//            record when the spec stops naming the probe — then clear the
+//            exec seam keys and, when starting, write the request
+//
+// The state record is written FIRST, so it is also the lock: a rescan that
+// arrives mid-attempt sees inflight=1 and does nothing.
+module nanocloud.probe {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: SeedCall, SeedReply
+  message Ctx {
+    uid: string = 30;
+    rcmd: string = 31;
+  }
+  // carried by: RtCall, RtReply, SeamCall
+  message Ctx2 {
+    uid: string = 30;
+    act: int = 31;
+    cmd: string = 32;
+    w: string = 33;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum CREATE = 8;
+
+  // ---- seed ----
+  message SpecRec {
+    seq: int = 1;
+    key: string = 3;
+    lcmd: string = 4;
+    rcmd: string = 5;
+  }
+  message SeedCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    v1: string = 4;
+    ctx: Ctx = 254;
+  }
+  message SeedReply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision seed_l(s: SpecRec) -> SeedCall {
+    when s.lcmd != "" ->
+      SeedCall { cid: s.seq, op: CREATE, key: "/probe-rt-l/", key2: s.key,
+                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=1;fail_n=1;succ_n=1", ctx: Ctx { uid: s.key, rcmd: s.rcmd } };
+    default ->
+      SeedCall { cid: s.seq, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.key, rcmd: s.rcmd } };
+  }
+  decision seed_r(s: SeedReply) -> SeedCall {
+    when s.ctx.rcmd != "" ->
+      SeedCall { cid: s.cid, op: CREATE, key: "/probe-rt-r/", key2: s.ctx.uid,
+                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=0;fail_n=1;succ_n=1", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } };
+    default ->
+      SeedCall { cid: s.cid, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } };
+  }
+
+  // ---- tick ----
+  message Tick {
+    seq: int = 1;
+    key: string = 3;
+    inflight: int = 50;
+    due: int = 51;
+    deadline: int = 52;
+    pseq: int = 53;
+    fails: int = 54;
+    oks: int = 55;
+    verdict: int = 56;
+    now: int = 58;
+    cmd: string = 70;
+    period: int = 71;
+    timeout: int = 72;
+    fail_n: int = 73;
+    succ_n: int = 74;
+    state: string = 80;
+  }
+  // act: 0 nothing, 1 start, 2 timed out, 3 reset, 4 dropped
+  message RtCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    v5: string = 8;
+    v6: int = 9;
+    v7: string = 10;
+    v8: int = 11;
+    v9: string = 12;
+    v10: int = 13;
+    ctx: Ctx2 = 254;
+  }
+  message RtReply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx2 = 254;
+  }
+  message SeamCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    key3: string = 18;
+    key4: string = 25;
+    v1: string = 4;
+    ctx: Ctx2 = 254;
+  }
+
+  // One ladder per kind: only the initial verdict differs (liveness is
+  // assumed live until proven dead; readiness is not ready until proven).
+  decision tick_l(t: Tick) -> RtCall {
+    when t.cmd == "" ->
+      RtCall { cid: t.seq, op: DELETE, key: t.key, v1: "", ctx: Ctx2 { uid: t.key, act: 4, cmd: "", w: "l" } };
+    when t.state != "running" && (t.inflight == 1 || t.fails != 0 || t.oks != 0 || t.verdict != 1) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=1", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "l" } };
+    when t.state != "running" ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
+    when t.inflight == 0 && t.now >= t.due ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=1;deadline=", v2: t.now + math.greatest(t.timeout, 1) * 1000,
+               v3: ";due=", v4: t.now + math.greatest(t.period, 1) * 1000,
+               v5: ";seq=", v6: t.pseq + 1,
+               v7: ";fail_n=", v8: math.greatest(t.fail_n, 1),
+               v9: ";succ_n=", v10: math.greatest(t.succ_n, 1), ctx: Ctx2 { uid: t.key, act: 1, cmd: t.cmd, w: "l" } };
+    when t.inflight == 1 && t.now >= t.deadline && t.verdict == 1 && t.fails + 1 >= math.greatest(t.fail_n, 1) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "l" } };
+    when t.inflight == 1 && t.now >= t.deadline ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=", v4: t.verdict, ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "l" } };
+    default ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
+  }
+  decision tick_r(t: Tick) -> RtCall {
+    when t.cmd == "" ->
+      RtCall { cid: t.seq, op: DELETE, key: t.key, v1: "", ctx: Ctx2 { uid: t.key, act: 4, cmd: "", w: "r" } };
+    when t.state != "running" && (t.inflight == 1 || t.fails != 0 || t.oks != 0 || t.verdict != 0) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "r" } };
+    when t.state != "running" ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
+    when t.inflight == 0 && t.now >= t.due ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=1;deadline=", v2: t.now + math.greatest(t.timeout, 1) * 1000,
+               v3: ";due=", v4: t.now + math.greatest(t.period, 1) * 1000,
+               v5: ";seq=", v6: t.pseq + 1,
+               v7: ";fail_n=", v8: math.greatest(t.fail_n, 1),
+               v9: ";succ_n=", v10: math.greatest(t.succ_n, 1), ctx: Ctx2 { uid: t.key, act: 1, cmd: t.cmd, w: "r" } };
+    when t.inflight == 1 && t.now >= t.deadline && t.verdict == 1 && t.fails + 1 >= math.greatest(t.fail_n, 1) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "r" } };
+    when t.inflight == 1 && t.now >= t.deadline ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=", v4: t.verdict, ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "r" } };
+    default ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
+  }
+
+  // The exec seam, keyed /sandbox-*/<uid>/probe-<l|r>. A stale result must go
+  // before a request is written (the runner skips a request that already has
+  // one); a timed-out, reset or dropped attempt takes its request with it.
+  decision seam_result(r: RtReply) -> SeamCall {
+    when r.ctx.act != 0 ->
+      SeamCall { cid: r.cid, op: DELETE, key: "/sandbox-exec-result/", key2: r.ctx.uid,
+                 key3: "/probe-", key4: r.ctx.w, v1: "", ctx: r.ctx };
+    default ->
+      SeamCall { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", v1: "", ctx: r.ctx };
+  }
+  decision seam_output(r: RtReply) -> SeamCall {
+    when r.ctx.act != 0 ->
+      SeamCall { cid: r.cid, op: DELETE, key: "/sandbox-exec-output/", key2: r.ctx.uid,
+                 key3: "/probe-", key4: r.ctx.w, v1: "", ctx: r.ctx };
+    default ->
+      SeamCall { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", v1: "", ctx: r.ctx };
+  }
+  decision seam_request(r: RtReply) -> SeamCall {
+    when r.ctx.act == 1 ->
+      SeamCall { cid: r.cid, op: PUT, key: "/sandbox-exec/", key2: r.ctx.uid,
+                 key3: "/probe-", key4: r.ctx.w, v1: r.ctx.cmd, ctx: r.ctx };
+    when r.ctx.act != 0 ->
+      SeamCall { cid: r.cid, op: DELETE, key: "/sandbox-exec/", key2: r.ctx.uid,
+                 key3: "/probe-", key4: r.ctx.w, v1: "", ctx: r.ctx };
+    default ->
+      SeamCall { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", v1: "", ctx: r.ctx };
+  }
+
+  transformation ps(s: SpecRec) -> SpecRec { SpecRec { seq: s.seq, key: s.key, lcmd: s.lcmd, rcmd: s.rcmd } }
+  transformation psr(s: SeedReply) -> SeedReply { SeedReply { cid: s.cid, status: s.status, ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } } }
+  transformation pt(t: Tick) -> Tick {
+    Tick { seq: t.seq, key: t.key, inflight: t.inflight, due: t.due, deadline: t.deadline,
+           pseq: t.pseq, fails: t.fails, oks: t.oks, verdict: t.verdict, now: t.now,
+           cmd: t.cmd, period: t.period, timeout: t.timeout, fail_n: t.fail_n,
+           succ_n: t.succ_n, state: t.state }
+  }
+  transformation prt(r: RtReply) -> RtReply {
+    RtReply { cid: r.cid, status: r.status, ctx: r.ctx }
+  }
+  pipeline sd_l(s: SpecRec) -> SeedCall { call x = ps(s); call y = seed_l(x); return y; }
+  pipeline sd_r(s: SeedReply) -> SeedCall { call x = psr(s); call y = seed_r(x); return y; }
+  pipeline tk_l(t: Tick) -> RtCall { call x = pt(t); call y = tick_l(x); return y; }
+  pipeline tk_r(t: Tick) -> RtCall { call x = pt(t); call y = tick_r(x); return y; }
+  pipeline sm_res(r: RtReply) -> SeamCall { call x = prt(r); call y = seam_result(x); return y; }
+  pipeline sm_out(r: RtReply) -> SeamCall { call x = prt(r); call y = seam_output(x); return y; }
+  pipeline sm_req(r: RtReply) -> SeamCall { call x = prt(r); call y = seam_request(x); return y; }
+  entry sd_l = sd_l;
+  entry sd_r = sd_r;
+  entry tk_l = tk_l;
+  entry tk_r = tk_r;
+  entry sm_res = sm_res;
+  entry sm_out = sm_out;
+  entry sm_req = sm_req;
+  provenance revision "probe-params" toolchain "chronicle-authoring";
+}

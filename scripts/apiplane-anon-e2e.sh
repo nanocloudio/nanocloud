@@ -21,11 +21,15 @@ PORT=7446
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
-for m in kube_decode kagi_verify rbac_gate api_admission store_effect decision pipeline http; do
+for m in kagi_verify store_effect store_source decision pipeline http http_chain; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
 D="$(mktemp -d /tmp/nc-apianon-XXXXXX)"
+# The store is lattice's (the graph's `kv_state_worker_store`): the runtime
+# runs in $D, where the store lives (lattice/) and the seeded host log
+# (store.log) is imported from.
+nc_lattice_prepare "$D"
 RUNTIME_PID=""
 cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi; }
 trap cleanup EXIT
@@ -91,12 +95,15 @@ echo "== 1. seed a pod, and bind system:anonymous to a READ-ONLY role =="
 # anything" are different decisions, and conflating them is how an opt-in
 # becomes an open door.
 put_text "/pods/default/web-0" '{"metadata":{"name":"web-0","namespace":"default"}}'
-put_text "/roles/reader" "rules=get:pods,list:pods"
-put_text "/rolebindings/anon" "subjects=system:anonymous;role=reader"
+. "$ROOT/scripts/support/rbac.sh"
+rbac_clusterrole "$D/store.log" reader "get,list" "pods"
+rbac_crb "$D/store.log" anon reader User system:anonymous
 
 run_case() { # run_case <graph> -> "<code>|<body>"
   nc_build_workload "$ROOT" "$1" "$D/config.bin" "$D/modules.bin" >/dev/null
-  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+  rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present \
+    '/rbac-g/system:anonymous/*|get|*|pods|*' >&2
+  env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
     --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
@@ -134,8 +141,8 @@ g = g.replace("""  - name: admit
 
   - name: admit
     type: decision""" % param)
-g = g.replace("""  - from: kube_decode.record_out
-    to: admit.record_in""", """  - from: kube_decode.record_out
+g = g.replace("""  - from: kube_route.result_out
+    to: admit.record_in""", """  - from: kube_route.result_out
     to: anon.record_in
   - from: anon.result_out
     to: admit.record_in""")
@@ -154,7 +161,7 @@ g = open(p).read()
 open(p, "w").write(g)
 PY
 nc_build_workload "$ROOT" "$D/anon.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do

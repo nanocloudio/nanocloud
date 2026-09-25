@@ -41,26 +41,29 @@ with open(os.sys.argv[1],"wb") as f:
     rec(f,5,b"/pods/default/web-0",b"image=nginx;node=node-1")
     rec(f,6,b"/pods/default/web-1",b"image=nginx;node=node-2")
     rec(f,7,b"/pods/default/web-2",b"image=nginx;node=node-1")
-    # a sandbox's captured stdout/stderr + a terminal status (what sandbox_runner
+    # a sandbox's captured stdout/stderr + a terminal status (what the sandbox runtime
     # publishes by draining the workload READ op) — for the `logs` verb.
     rec(f,8,b"/sandbox-logs/pod-uid-1",b"starting nginx\nready\n")
     rec(f,9,b"/sandbox-status/pod-uid-1",b"state=exited;code=0")
-    # a CA cert (what cert_manager publishes) — for the `ca` verb.
+    # a CA cert (what the device chain publishes) — for the `ca` verb.
     rec(f,10,b"/ca-cert",b"3082deadbeefca")
-    # networkpolicy + compiled dataplane, a PVC, a device — for policy/volume/get.
+    # networkpolicy + its enforcement status, a PVC, a device — for policy/volume/get.
     rec(f,11,b"/networkpolicies/default/allow-web",b'{"metadata":{"name":"allow-web"},"spec":{"podSelector":{}}}')
-    rec(f,12,b"/dataplane/netpolicy",b"table inet nc { chain in { } }")
+    rec(f,12,b"/np-status/netpolicy",b"enforced=1;rules=3;generation=7")
     rec(f,13,b"/persistentvolumeclaims/default/data",b'{"metadata":{"name":"data"},"spec":{"resources":{"requests":{"storage":"1Gi"}}}}')
     rec(f,14,b"/devices.nanocloud.io/default/sensor1",b'{"metadata":{"name":"sensor1"},"spec":{"kind":"sensor"}}')
 PY
 
 echo "== 2. build config + module table (cli stack expands cli_in/cli_out) =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+# The applet runs as this node's replica of the store, in its state
+# directory: the seeded host log is imported through the replica's log.
+nc_cli_graph "$D" "$D/cli.yaml" || fail "the CLI did not render"
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/config.bin" "$D/modules.bin"
 
 run() { # run <expected-exit> <args...>
   local want="$1"; shift
   local rc=0
-  FLUXOR_STORE_DIR="$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+  env -C "$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
     -- "$@" >"$D/out.txt" 2>/dev/null || rc=$?
   [ "$rc" = "$want" ] || fail "nanocloud $* — exit $rc, want $want"
 }
@@ -147,7 +150,7 @@ grep -q "ready"          "$D/out.txt" || fail "logs -f missing second line"
 echo "   streamed to end; exited 0 on terminal status"
 
 echo "== 14. nanocloud exec <id> -- <cmd> (arms request + polls; times out sans runner) =="
-# No sandbox_runner runs in this isolated CLI graph, so the exec request is
+# No the sandbox runtime runs in this isolated CLI graph, so the exec request is
 # written to the store but never serviced → the CLI polls to its backstop and
 # reports a timeout (exit 1). The full exec round-trip (real command run inside a
 # sandbox, exit code + output captured) is proven in sandbox-runner-e2e.
@@ -156,36 +159,25 @@ grep -q "timed out" "$D/out.txt" || fail "exec with no runner should report a ti
 echo "   exec armed + polled + timed out (exit 1); round-trip proven in sandbox-runner-e2e"
 
 echo "== 15. nanocloud exec -it <id> -- <cmd> (opens a pty session; live-runner feature) =="
-# No sandbox_runner runs here, so -it opens the session (writes the interactive
+# No the sandbox runtime runs here, so -it opens the session (writes the interactive
 # ctl) then streams; we time-box it and assert the ctl was written. The full pty
 # round-trip (stdin<->pty<->stdout) is proven in sandbox-runner-e2e.
-timeout 2 env FLUXOR_STORE_DIR="$D" "$FLUXOR_RUNTIME" \
+timeout 4 env -C "$D" "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" \
   -- exec -it pod-uid-1 -- /bin/sh </dev/null >/dev/null 2>&1 || true
-CTL="$(python3 - "$D/store.log" /tty/pod-uid-1/cli/ctl <<'PY'
-import struct, sys
-data = open(sys.argv[1], "rb").read(); want = sys.argv[2].encode(); p = 0; out = ""
-while p + 15 <= len(data):
-    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
-    if p + 15 + kl + vl > len(data): break
-    k = data[p+15:p+15+kl]; v = data[p+15+kl:p+15+kl+vl]
-    if k == want: out = v.decode("utf-8", "replace")
-    p += 15 + kl + vl
-print(out)
-PY
-)"
+CTL="$(nc_replica_get "$D" /tty/pod-uid-1/cli/ctl)"
 case "$CTL" in
   open*cmd=/bin/sh*) echo "   -it opened session ctl: '$CTL'" ;;
   *) fail "exec -it did not write the interactive ctl key: got '$CTL'" ;;
 esac
 
-echo "== 16. nanocloud ca (cluster CA certificate, published by cert_manager) =="
+echo "== 16. nanocloud ca (cluster CA certificate, published by the device chain) =="
 run 0 ca
 grep -q "3082deadbeefca" "$D/out.txt" || fail "ca did not print the CA cert: got '$(cat "$D/out.txt")'"
 echo "   ca: $(cat "$D/out.txt")"
 
-echo "== 17. nanocloud token <sa> (mint request + poll; times out sans sa_token) =="
-# No sa_token runs here, so the request is written but never serviced → timeout.
+echo "== 17. nanocloud token <sa> (mint request + poll; times out with no mint running) =="
+# No mint runs here, so the request is written but never serviced → timeout.
 # The real ES256 JWT mint is proven in sa-token-e2e.sh.
 run 1 token builder default
 grep -q "timed out" "$D/out.txt" || fail "token with no runner should report a timeout"
@@ -197,7 +189,7 @@ grep -q "control-plane store: reachable" "$D/out.txt" || fail "diagnostics missi
 grep -qE "pods +2" "$D/out.txt" || fail "diagnostics wrong pod count: $(cat "$D/out.txt")"
 run 0 policy
 grep -q "allow-web" "$D/out.txt" || fail "policy did not list networkpolicies"
-grep -q "table inet nc" "$D/out.txt" || fail "policy did not show the compiled dataplane"
+grep -q "enforced=1;rules=3" "$D/out.txt" || fail "policy did not show the enforcement status"
 run 0 volume
 grep -q "data" "$D/out.txt" || fail "volume did not list the PVC"
 run 0 config
@@ -217,21 +209,24 @@ echo "   exported $(wc -l < "$D/out.txt") objects"
 
 echo "== 20. nanocloud watch <resource> (stream a listing; kubectl get -w semantics) =="
 # watch runs until killed; time-box it and assert it emitted the initial snapshot.
-timeout 2 env FLUXOR_STORE_DIR="$D" "$FLUXOR_RUNTIME" \
+timeout 4 env -C "$D" "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" -- watch pods </dev/null >"$D/watch.txt" 2>/dev/null || true
 grep -q "^---- pods ----" "$D/watch.txt" || fail "watch did not emit a snapshot header: $(cat "$D/watch.txt")"
 grep -qx "web-0" "$D/watch.txt" || fail "watch snapshot missing web-0"
 echo "   watch streamed the pods snapshot"
 
 echo "== 21. nanocloud bundle apply (round-trip: export | apply into a fresh store) =="
-FLUXOR_STORE_DIR="$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+env -C "$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
   -- bundle export </dev/null >"$D/bundle.txt" 2>/dev/null || true
 D2="$(mktemp -d /tmp/nc-cli-restore-XXXXXX)"; trap 'rm -rf "$D" "$D2"' EXIT
-FLUXOR_STORE_DIR="$D2" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+# A fresh node: its own replica, its own store.
+nc_cli_graph "$D2" "$D2/cli.yaml" || fail "the second CLI did not render"
+nc_build_workload "$ROOT" "$D2/cli.yaml" "$D2/config.bin" "$D2/modules.bin"
+env -C "$D2" "$FLUXOR_RUNTIME" --config "$D2/config.bin" --modules "$D2/modules.bin" \
   -- bundle apply <"$D/bundle.txt" >"$D2/apply.txt" 2>/dev/null || true
 grep -q "applied [1-9]" "$D2/apply.txt" || fail "bundle apply did not apply objects: $(cat "$D2/apply.txt")"
 # the restored store now serves the same pods.
-FLUXOR_STORE_DIR="$D2" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+env -C "$D2" "$FLUXOR_RUNTIME" --config "$D2/config.bin" --modules "$D2/modules.bin" \
   -- get pods </dev/null >"$D2/pods.txt" 2>/dev/null || true
 grep -qx "web-0" "$D2/pods.txt" || fail "restored store missing web-0: $(cat "$D2/pods.txt")"
 echo "   $(cat "$D2/apply.txt" | tr -d '\n') → restored store serves web-0"

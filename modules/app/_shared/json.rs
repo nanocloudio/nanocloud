@@ -428,3 +428,34 @@ fn j_idx(b: &[u8], n: usize) -> Option<&[u8]> {
     let e = j_skip(b, s);
     Some(&b[s..e])
 }
+
+/// Number of elements in the JSON array at `path` (0 when absent or not an
+/// array). Bounded by the bytes: each step skips one whole element.
+fn j_arr_len(b: &[u8], path: &[&[u8]]) -> usize {
+    let Some(sub) = j_sub(b, path) else {
+        return 0;
+    };
+    let mut i = j_ws(sub, 0);
+    if i >= sub.len() || sub[i] != b'[' {
+        return 0;
+    }
+    i = j_ws(sub, i + 1);
+    if i < sub.len() && sub[i] == b']' {
+        return 0;
+    }
+    let mut n = 0usize;
+    while i < sub.len() {
+        let e = j_skip(sub, i);
+        if e <= i {
+            break;
+        }
+        n += 1;
+        i = j_ws(sub, e);
+        if i < sub.len() && sub[i] == b',' {
+            i = j_ws(sub, i + 1);
+            continue;
+        }
+        break;
+    }
+    n
+}

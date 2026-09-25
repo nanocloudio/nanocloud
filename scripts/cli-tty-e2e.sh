@@ -30,7 +30,9 @@ D="$(mktemp -d /tmp/nc-tty-e2e-XXXXXX)"
 trap 'rm -rf "$D"' EXIT
 
 echo "== 1. build config + module table =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+# The applet runs as this node's replica of the store, in its state directory.
+nc_cli_graph "$D" "$D/cli.yaml" || { echo "FAIL: the CLI did not render"; exit 1; }
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. run 'nanocloud help' under a pseudo-terminal =="
 RESULT="$(timeout 20 python3 - "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" <<'PY'
@@ -42,7 +44,7 @@ a = termios.tcgetattr(sfd); a[3] |= (termios.ICANON | termios.ECHO); termios.tcs
 pid = os.fork()
 if pid == 0:
     os.setsid(); os.dup2(sfd, 0); os.dup2(sfd, 1); os.dup2(sfd, 2)
-    os.environ["FLUXOR_STORE_DIR"] = os.path.dirname(cfg); os.environ["RUST_LOG"] = "error"
+    os.chdir(os.path.dirname(cfg)); os.environ["RUST_LOG"] = "error"
     os.execv(rt, [rt, "--config", cfg, "--modules", mods, "--", "help"])
 os.close(sfd)
 out = b""

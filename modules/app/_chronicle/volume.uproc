@@ -1,0 +1,95 @@
+// Pod volumes as params: each volume a pod spec names becomes a bind the
+// workload connector mounts (the workload contract's `mount`/`bind` option).
+//
+//   /pod-specs/<uid>  volumes=<claim>:<mountPath>[:ro],…
+//   /volumes/<claim>  path=<host directory>               (a bound claim)
+//
+//   get    each named volume (the flat list, expanded) -> GET its claim
+//   put    bound -> /volume-binds/<uid>/<i> = <host path>:<mountPath>[:ro];
+//          unbound -> no row, so the sandbox waits (its start counts the rows
+//          against the volumes named)
+//   prune  a row whose pod spec is gone
+// A pod's volumes do not change after it is created (Kubernetes: immutable),
+// so a row outlives only its pod.
+module nanocloud.volume {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: Get, Got
+  message Ctx {
+    uid: string = 30;
+    at: string = 31;
+    rest: string = 32;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  message Vol {
+    seq: int = 1;
+    key: string = 3;       // uid
+    v: string = 4;         // volumes.#  — <claim>:<mountPath>[:ro]
+    at: string = 21;       // the index, as digits
+  }
+  message Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  decision get(v: Vol) -> Get {
+    when v.v != "" && v.v.indexOf(":") > 0 ->
+      Get { cid: v.seq, op: GET, key: v.v.substring(0, v.v.indexOf(":")), ctx: Ctx { uid: v.key, at: v.at, rest: v.v.substring(v.v.indexOf(":") + 1) } };
+    default -> Get { cid: v.seq, op: NOOP, key: "", ctx: Ctx { uid: "", at: "", rest: "" } };
+  }
+  message Got {
+    cid: int = 1;
+    status: int = 2;
+    path: string = 40;     // store_effect `paths: "path"` (flat)
+    ctx: Ctx = 254;
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6;
+  }
+  decision put(g: Got) -> Row {
+    when g.status == 200 && g.path != "" ->
+      Row { cid: g.cid, op: PUT, key: g.ctx.uid, k2: "/", k3: g.ctx.at, v1: g.path, v2: ":", v3: g.ctx.rest };
+    when g.ctx.uid != "" ->
+      Row { cid: g.cid, op: DELETE, key: g.ctx.uid, k2: "/", k3: g.ctx.at, v1: "", v2: "", v3: "" };
+    default -> Row { cid: g.cid, op: NOOP, key: "", k2: "", k3: "", v1: "", v2: "", v3: "" };
+  }
+  message Bind {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // <uid>/<i>
+    spec: string = 70;     // /pod-specs/<uid> (related ^1): the whole spec
+  }
+  message Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
+  }
+  decision prune(b: Bind) -> Del {
+    when b.spec == "" -> Del { cid: b.seq, op: DELETE, key: b.key, rev: b.rev };
+    default -> Del { cid: b.seq, op: NOOP, key: "", rev: 0 };
+  }
+  transformation tv(v: Vol) -> Vol { Vol { seq: v.seq, key: v.key, v: v.v, at: v.at } }
+  transformation tg(g: Got) -> Got { Got { cid: g.cid, status: g.status, path: g.path, ctx: g.ctx } }
+  transformation tb(b: Bind) -> Bind { Bind { seq: b.seq, rev: b.rev, key: b.key, spec: b.spec } }
+  pipeline vb_get(v: Vol) -> Get { call x = tv(v); call y = get(x); return y; }
+  pipeline vb_put(g: Got) -> Row { call x = tg(g); call y = put(x); return y; }
+  pipeline vb_prune(b: Bind) -> Del { call x = tb(b); call y = prune(x); return y; }
+  entry vb_get = vb_get;
+  entry vb_put = vb_put;
+  entry vb_prune = vb_prune;
+  provenance revision "pod-volumes" toolchain "chronicle-authoring";
+}

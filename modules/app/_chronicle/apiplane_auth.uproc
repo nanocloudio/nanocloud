@@ -60,7 +60,7 @@ module nanocloud.apiplane {
   }
 
   // The read path's `ns.StoreReply`, field for field, so the SAME `ser`
-  // program encodes the HttpResponse. The response leg needs no module and no
+  // program encodes `http_chain`'s reply envelope. The response leg needs no module and no
   // new bytecode — which is why there is no `kube_reply` here.
   message ap.Reply {
     cid: int = 1;

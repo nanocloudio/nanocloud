@@ -1,0 +1,99 @@
+name = "http_chain"
+version = "0.1.0"
+description = "An HTTP application route as a Chronicle chain — each exchange one request envelope in, the chain's reply envelopes out as its response"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The PROVIDER behind Wave's `http` server for a route served by a Chronicle
+# chain (the API plane: `kube_decode` ... `enc_http`). Wave is the requester
+# (`http.request_out` -> `request_in`, `response_out` -> `http.response_in`);
+# the chain sees one request envelope per exchange on `record_out` and answers
+# with reply envelopes on `reply_in`. The desk is `_shared/http_chain.rs`.
+#
+# Why a module and not the chain: a chain record carries its correlation as an
+# integer through every stage and connector, where an exchange id is 14 opaque
+# bytes; a watch answers one exchange with many records, past the response
+# credit the server grants; and a body larger than one record is staged in
+# the store and handed on by reference. Each holds state across records.
+#
+# REQUEST ENVELOPE (`record_out`, one record, little-endian):
+#   [cid u32][method u8][flags u8][target_len u16][hdr_len u16][body_len u16]
+#   target | headers | body | peer trailer
+#   cid    this module's correlation for the exchange: never 0 or 0xFFFFFFFF
+#   method the exchange method byte (GET 1, POST 3, PUT 5, PATCH 6, DELETE 7)
+#   flags  0x02 the connection's verified mutual-TLS peer follows the body as
+#          `[len u16][peer]`; 0x04 the body was staged and is `sha256:<hex>`
+# REPLY ENVELOPE (`reply_in`, one record, little-endian):
+#   [cid u32][status u16][flags u8][ct_len u8][hdr_len u16][body_len u16]
+#   content type | headers | body
+#   flags  0x01 more envelopes follow for this cid; 0x04 the response is held
+#          open on purpose (a watch: the exchange's HOLD)
+# The first envelope gives the status, content type (at most 128 bytes) and
+# headers (at most 512); each envelope's body continues the response body. An
+# envelope for cid 0xFFFFFFFF, or for an exchange already gone, answers no one.
+#
+# Every request is answered. A whole request goes to the chain inline when its
+# body is at most `body_inline_max` bytes (all bodies when it is 0); past it
+# the body is staged at `<body_ref_prefix>sha256/<hex>`, with its expiry at
+# `<body_ref_prefix>at/<hex>` (`{"deadline":<ms>}`, five minutes on), and the
+# envelope carries `sha256:<hex>`. Refused here: 413 for a body past
+# `max_body_kib`, or an envelope past one record; 503 when every slot is taken
+# or the arena cannot hold the request; 500 when the store refused a staged
+# body. The response goes to the server within the credit it grants; what it
+# has not yet taken is held, up to 4 MiB per exchange, past which the exchange
+# is aborted as too slow rather than holding every other exchange behind it.
+# A server ABORT (the client gone, its deadline passed) frees the exchange,
+# and the chain's later envelopes for it answer no one.
+#
+# Params:
+#   max_body_kib     the largest request body (default 64); at most the arena
+#   body_inline_max  bodies past this many bytes are staged (0: none are)
+#   body_ref_prefix  where staged bodies go (at most 48 bytes; required with
+#                    body_inline_max)
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# From the chain's encoder: one envelope per record. Unwired, the chain never
+# answers here and the server answers each request 504 at its deadline — a
+# half-wired route, which a decoder's own test runs as.
+[[ports]]
+name = "reply_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 8192
+framed = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# To the chain's decoder: one envelope per record.
+[[ports]]
+name = "record_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 8192
+required = true
+
+# Staged bodies and their expiries.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "carrier — every request it takes is answered on the exchange, and the chain it feeds counts its own records"

@@ -24,7 +24,9 @@ hardware_targets = ["bcm2712"]
 #                      subscription entry has instead of a request id
 #   2 = rev   (i64)    store revision the object was read at
 #   3 = key   (bytes)  the object's key tail, below the prefix
-#   4.. = one field per `paths` entry, in order, as bytes ("" when absent).
+#   4.. = one field per `paths` entry, in order, as bytes ("" when absent);
+#         fifteen at most (4..18), and a source naming more is refused at
+#         its first step, since the rest would be missing from every record.
 #         A `paths` (or `join_paths`) entry of `.` is the WHOLE VALUE, unparsed
 #         — for a record that is not JSON with paths in it (an endpoint
 #         address, a kagi key frame) or one a decision only forwards. Without
@@ -52,7 +54,8 @@ hardware_targets = ["bcm2712"]
 # more member in with literals. `join_scoped = 1` scopes each join prefix to
 # the object (`<prefix><tail>/…`) and puts the joined entry's FULL key at 24 —
 # a namespace's contents across every namespaced tree, one record each.
-# `join_scoped = 2` scopes to the namespace segment instead. `join_match =
+# `join_scoped = 2` scopes to the namespace segment instead; `3..=9` to the
+# tail's first (k - 1) segments, `10` to its last segment. `join_match =
 # "<joined path>:<object path>"` puts "1" at 65 when the joined object's path
 # is a superset of the object's (a label selector); `join_paths` projects the
 # joined object's fields at 60..64. `list_children = <prefix>` materialises the
@@ -66,7 +69,8 @@ hardware_targets = ["bcm2712"]
 #
 # `<prefix>!flat` reads that related record as `k=v;k=v` instead of JSON — both
 # shapes live in the control plane (a Route is JSON, its `/route-status/` is
-# flat) and a source only knows its OWN objects' shape. Without it the
+# flat) and a source only knows its OWN objects' shape. `<prefix>!json` is the
+# converse, for a flat source asking after a JSON object. Without it the
 # projection silently reads nothing, and an empty field looks exactly like an
 # absent one.
 # `related = "<prefix>:<path>,…;<prefix>:<path>"` projects the SAME KEY under
@@ -74,12 +78,43 @@ hardware_targets = ["bcm2712"]
 # plane here is keyed by the same id, so "the other facts about this object"
 # is a lookup, not a join, and a chain that would need a read stage each
 # needs none. A path with a trailing `#` projects as an INTEGER.
+# A related path of `.` is the whole related value, and `<path>!<mod>` decodes
+# it first, as `paths` do (`.!ip4#`: a bare address, as the number it spells;
+# `.!hash`: its digest, as `hash = .` stamps it). `<prefix>^<n>` looks up the
+# key's n-th PARENT instead — the tail less its last n segments — so a row
+# keyed `<ns>/<svc>/<pod>` can ask after its Service; `^<n>+<leaf>` is that
+# parent's `<leaf>` child (a session's `status` beside its `ctl`), and a large
+# `n` strips the whole tail — the prefix itself, a fixed record like a config.
+# A `paths` entry `a[].b` collects member `b` of every element of the array
+# `a`, comma-joined, one entry per element (`-` where it has none) — the ports
+# of a rule, the peers of a policy. `expand = a[]+` is one record per element
+# and ONE more past the last (index = count), for the object as a whole.
+#
+# `unless = <prefix>` emits only objects whose SAME KEY under that prefix is
+# ABSENT — a request with no lease, a claim whose owner is gone. A filter like
+# `where`, applied to the count too, so "the first one still waiting" is
+# index 0. `empty = 1` (with `count`) sends ONE record when nothing qualified —
+# tail empty, 20 = 0, 22 = 0 — because "the set is empty" is a fact no
+# per-object record can carry. `ints` paths take `.` and `!<mod>` as well, and
+# land at 50..56 — seven at most, because 57 (the key remainder) and 58 (the
+# clock) are already taken; more is refused at the first step, since a
+# decision reading a missing field fails closed and produces nothing.
+# Modifiers: `!repo` `!tag` `!flat` `!argv` `!lower` (see _shared/pathmod.rs), `!ip4`
+# (dotted quad -> u32 as decimal) and `!prefix` (the `/<n>` of a CIDR).
+#
+# `label = <text>` stamps it at 48 on every record, the `empty` one too: what
+# the graph is to its decisions, which cannot hold a per-deployment literal — a
+# node graph's own name, so it can register and renew itself.
 #
 # `now = 1` stamps the monotonic ms clock at 58 on every record of a scan.
 # `due = <path,…>` names fields holding deadlines in that clock: the earliest
 # one ahead arms a kernel timer, the kernel steps the source when it fires,
 # and the record is emitted with `now` past its deadline. Deadlines live in
-# the store; the timer is the alarm clock; nothing polls.
+# the store; the timer is the alarm clock; nothing polls. An entry
+# `<path>+<ms>` is the deadline that long after the time the path holds: a
+# decision that waits `at + 5000` before acting again names `at+5000`, or
+# nothing would wake it when the pause ends. A zero or absent field is no
+# deadline.
 #
 # `count = 1` walks the listing twice — count, then emit — stamping every record
 # with its listing position (20, i64) and the total (22, i64). A cap over a
@@ -92,6 +127,15 @@ timer_class = "wall_clock"
 
 # The store pushes namespace.change events onto this input. The graph allocates
 # the channel by self-wiring `status` -> `changes`.
+# The watch connector's filter (`ir_stages`) runs Chronicle's stage executor
+# with the whole pinned CEL extension surface — the same `full` feature set
+# Chronicle's own `pipeline` module builds with, so a param that runs there
+# runs here.
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
+
 [[ports]]
 name = "changes"
 direction = "input"

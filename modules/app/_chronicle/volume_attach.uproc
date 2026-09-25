@@ -1,0 +1,284 @@
+// Attaching an encrypted volume to a node and keeping it attached — the attach
+// pipeline of the encrypted-storage design, as params over ONE record per
+// claim, which volume_detach.uproc tears down:
+//
+//   /volume-attachments/<ns>/<pvc>   (flat; opened by the provision pipeline)
+//     desired   attached | detached — the scheduler's ask
+//     device    the Kagi device identity of the node the pod runs on
+//     access    the claim's access mode; grant  the device the Kagi grant names
+//     vol fs fresh  the Loam volume, its filesystem, "1" until first mounted
+//     phase out at tries wake   the step in flight, its typed outcome
+//                                (`<phase>:<code>`), when it was issued, how
+//                                often, and when the source must look again
+//                                (`due = wake`)
+//     fence lease_exp exp  the Loam writer lease's fence token and expiry, and
+//                          the attachment's handle expiry (Kagi's release)
+//     inst dev ready       the node-local graph instance, the published device,
+//                          and "crypt_block reported ready"
+//     reason note          why it is being torn down; what an operator must know
+//
+//   /volume-keys/<ns>/<pvc>  (related, flat): kvol epoch next — the Kagi key
+//     resource (the volume itself, or a clone's source), the key epoch the
+//     container is sealed under, and the epoch a rotation is introducing.
+//     Every Kagi release and renewal names that epoch and resource. With
+//     `next` set the container needs both keys: volume_attach_epoch.uproc
+//     takes the second between `unlocking` and `publishing`. A clone never
+//     moves its source's grant: attach refuses a device the grant does not
+//     name (volume_attach_epoch.uproc).
+//
+// Write-ahead: the step MERGEs the next phase (clearing `out`), and only the
+// store's acceptance of that MERGE lets volume_effect.uproc's `act` issue the
+// effect the phase names; `record` writes the effect's outcome back. Every
+// effect is idempotent for (claim, phase), so a re-emitted record or a re-drive
+// after a timeout never doubles one; an effect that fails holds nothing new.
+//
+//   granting      KAGI_REPLACE   the grant names another device -> this one
+//   leasing       LEASE_ACQUIRE  the Loam writer lease and its fence token
+//   instantiating GRAPH_START    loam_volume + crypt_block (attach mode) in a
+//                                quiesced, unpublished graph, under that fence
+//   recipient     RECIPIENT      crypt_block announced its FXRK recipient
+//   releasing     KAGI_RELEASE   Kagi's attachment release against a device
+//                                proof over recipient, volume and fence; the
+//                                FXSB bundle stays with the effector
+//   unlocking     BUNDLE_DELIVER the bundle on crypt_block's `bundle` port;
+//                                `ready` once it reconstructed its key
+//   publishing    NBD_START      nbd_serve over crypt_block, attached as a device
+//   claiming      CLAIM_PUT      `/volumes/<claim>` device=<dev>;fs=<fs>
+//   mounting      —              the mount effect answers on the claim
+//   renew_lease   LEASE_RENEW    confirm the lease before serving, then keep it
+//   attached      —              renewing: the lease ahead of its expiry, the
+//                                grant ahead of the handle's; past its grace
+//                                either one forces a teardown
+//   renew_grant   KAGI_RENEW     the same device and fence, re-proven. Kagi
+//                                refusing it ends the attachment
+//                                (grant_revoked); fence_changed, expired and
+//                                conflict detach and attach again.
+//
+// Any refusal, exhausted retry, mount failure or lapsed deadline sets `reason`,
+// and volume_detach.uproc releases exactly what was acquired, in order.
+module nanocloud.volume_attach {
+
+  // The shared carry (volume_effect.uproc): ONE nested message in field 254,
+  // echoed unchanged by every connector.
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    dev: string = 34;
+    fs: string = 35;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    fresh: string = 39;
+    epoch: string = 48;
+    kvol: string = 49;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+
+  // An effect that has not answered is asked again after TIMEOUT_MS, at most
+  // MAX_TRIES times. The lease is renewed RENEW_AHEAD_MS before it expires, and
+  // a lease that could not be renewed by GRACE_MS before expiry forces a
+  // teardown: the device is quiesced while the lease is still this node's. The
+  // grant is re-proven GRANT_AHEAD_MS before the handle expires; at expiry the
+  // attachment ends. A failed renewal is retried after RETRY_MS.
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum MAX_TRIES = 5;
+  enum MOUNT_TIMEOUT_MS = 900000;
+  enum RENEW_AHEAD_MS = 20000;
+  enum GRACE_MS = 3000;
+  enum GRANT_AHEAD_MS = 60000;
+
+  message Att {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    desired: string = 4;
+    phase: string = 5;
+    out: string = 6;
+    fresh: string = 7;
+    device: string = 8;
+    grant: string = 9;
+    access: string = 10;
+    vol: string = 11;
+    fs: string = 12;
+    inst: string = 13;
+    dev: string = 14;
+    reason: string = 15;
+    note: string = 16;
+    fence: int = 50;
+    lease_exp: int = 51;
+    exp: int = 52;
+    at: int = 53;
+    tries: int = 54;
+    ready: int = 55;
+    wake: int = 56;
+    now: int = 58;
+    mstate: string = 70;   // /volumes/<claim> mount (related, flat)
+    cdev: string = 71;     // /volumes/<claim> device: the claim is published
+    kvol: string = 80;     // /volume-keys/<claim> kvol: the Kagi key resource
+    epoch: string = 81;    // … epoch: the key epoch the container is sealed under
+    next: string = 82;     // … next: the epoch a rotation is introducing, if any
+  }
+  // A MERGE of the fields that change; value parts join in field order.
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision attach(a: Att) -> Step {
+    when a.desired != "attached" || a.reason != "" ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+
+    // ── start: scheduling and access mode ──
+    // A pause after an attempt (`at`); a fresh attachment has none, and a
+    // runtime's clock starts at boot.
+    when (a.phase == "" || a.phase == "idle" || a.phase == "detached")
+         && ((a.at != 0 && a.now < a.at + RETRY_MS) || a.device == "" || a.vol == "") ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // One writer: a block device carries a filesystem one node mounts.
+    when (a.phase == "" || a.phase == "idle" || a.phase == "detached") && a.access != "ReadWriteOnce" && a.access != "ReadWriteOncePod" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=access_mode", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when (a.phase == "" || a.phase == "idle" || a.phase == "detached") && a.grant != a.device && (a.kvol == "" || a.kvol == a.vol) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=granting;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "granting", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when (a.phase == "" || a.phase == "idle" || a.phase == "detached") && (a.grant == a.device || a.kvol == "" || a.kvol == a.vol) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=leasing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "leasing", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+
+    // ── forward: each step's success issues the next ──
+    when a.phase == "granting" && a.out == "granting:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=leasing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "leasing", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "leasing" && a.out == "leasing:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=instantiating;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "instantiating", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "instantiating" && a.out == "instantiating:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=recipient;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "recipient", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "recipient" && a.out == "recipient:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=releasing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "releasing", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "releasing" && a.out == "releasing:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=unlocking;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "unlocking", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "unlocking" && a.out == "unlocking:ready" && a.next == "" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=publishing;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "publishing", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "publishing" && a.out == "publishing:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=claiming;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "claiming", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "claiming" && a.out == "claiming:ok" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=mounting;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + MOUNT_TIMEOUT_MS, ctx: Ctx { claim: "", ph: "" } };
+
+    // A step's own refusal ends the attachment; the teardown releases what
+    // was acquired before it. The phase is checked too, so a late answer to an
+    // earlier step cannot end a later one.
+    when (a.phase == "granting" && (a.out == "granting:refused" || a.out == "granting:failed"))
+         || (a.phase == "leasing" && (a.out == "leasing:held" || a.out == "leasing:failed"))
+         || (a.phase == "instantiating" && a.out == "instantiating:failed")
+         || (a.phase == "recipient" && a.out == "recipient:failed") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=", v2: a.out, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when (a.phase == "releasing" && (a.out == "releasing:refused" || a.out == "releasing:failed"))
+         || (a.phase == "unlocking" && (a.out == "unlocking:eacces" || a.out == "unlocking:failed"))
+         || (a.phase == "publishing" && a.out == "publishing:failed")
+         || (a.phase == "claiming" && a.out == "claiming:failed") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=", v2: a.out, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    // Unanswered or unavailable: ask again, then give up.
+    when (a.phase == "granting" || a.phase == "leasing" || a.phase == "instantiating" || a.phase == "recipient"
+          || a.phase == "releasing" || a.phase == "unlocking" || a.phase == "publishing" || a.phase == "claiming")
+         && a.now >= a.at + TIMEOUT_MS && a.tries < MAX_TRIES ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "out=", v3: ";tries=", n1: a.tries + 1,
+             v4: ";at=", n2: a.now, v5: ";wake=", n3: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: a.phase, vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when (a.phase == "granting" || a.phase == "leasing" || a.phase == "instantiating" || a.phase == "recipient"
+          || a.phase == "releasing" || a.phase == "unlocking" || a.phase == "publishing" || a.phase == "claiming")
+         && a.now >= a.at + TIMEOUT_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=exhausted:", v2: a.phase, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── mounting: the mount effect answers on the claim ──
+    // Mounted: confirm the lease (loam_volume kept it while the filesystem was
+    // checked) before calling the attachment served.
+    when a.phase == "mounting" && a.mstate == "mounted" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=renew_lease;out=;tries=0;fresh=", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "renew_lease", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "mounting" && (a.mstate == "fsck_failed" || a.mstate == "format_failed" || a.mstate == "mount_failed"
+         || a.mstate == "denied" || a.mstate == "invalid" || a.mstate == "refused") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=mount:", v2: a.mstate, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "mounting" && a.now >= a.at + MOUNT_TIMEOUT_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=mount_timeout", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── attached: a renewable state machine ──
+    when (a.phase == "attached" || a.phase == "renew_lease" || a.phase == "renew_grant") && a.now >= a.exp ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=attachment_expired", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "attached" && a.now >= a.lease_exp - GRACE_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=lease_expiring", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "attached" && a.mstate != "mounted" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=mount_lost", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when (a.phase == "renew_lease" && a.out == "renew_lease:ok") || (a.phase == "renew_grant" && a.out == "renew_grant:ok") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=attached;out=;tries=0", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.lease_exp - RENEW_AHEAD_MS, ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "renew_lease" && a.out == "renew_lease:lost" ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=lease_lost", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    when a.phase == "renew_grant" && (a.out == "renew_grant:refused" || a.out == "renew_grant:failed") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=grant_revoked", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    // Kagi's renewal says this attachment is over but the grant stands: the
+    // lease fence moved on (29), the attachment expired (30) or a newer link
+    // superseded it (19). Detach, then attach again.
+    when a.phase == "renew_grant" && (a.out == "renew_grant:fence_changed" || a.out == "renew_grant:expired"
+         || a.out == "renew_grant:conflict") ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "reason=", v2: a.out, v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now, ctx: Ctx { claim: "", ph: "" } };
+    // Unavailable, or no answer: stay attached on the grace that is left and
+    // try again after a pause — the deadlines above bound it.
+    when (a.phase == "renew_lease" || a.phase == "renew_grant") && (a.out != "" || a.now >= a.at + TIMEOUT_MS) ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=attached;out=", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + RETRY_MS, ctx: Ctx { claim: "", ph: "" } };
+    // The lease first: a grant renewal Kagi keeps refusing to answer must not
+    // starve the renewal that keeps the device writable.
+    when a.phase == "attached" && a.now >= a.lease_exp - RENEW_AHEAD_MS && a.now >= a.at + RETRY_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=renew_lease;out=", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "renew_lease", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    when a.phase == "attached" && a.now >= a.exp - GRANT_AHEAD_MS && a.now >= a.at + RETRY_MS ->
+      Step { cid: a.seq, op: MERGE, key: a.key, v1: "phase=renew_grant;out=", v3: ";at=", n1: a.now,
+             v4: ";wake=", n2: a.now + TIMEOUT_MS,
+             ctx: Ctx { claim: a.key, ph: "renew_grant", vol: a.vol, inst: a.inst, dev: a.dev, fs: a.fs, device: a.device, grant: a.grant, fence: a.fence, fresh: a.fresh, epoch: a.epoch, kvol: a.kvol } };
+    // In flight, or waiting for its deadline.
+    default ->
+      Step { cid: a.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  pipeline va_attach(a: Att) -> Step { call y = attach(a); return y; }
+  entry va_attach = va_attach;
+  provenance revision "volume-attach" toolchain "chronicle-authoring";
+}

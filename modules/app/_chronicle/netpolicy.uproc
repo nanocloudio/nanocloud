@@ -1,0 +1,253 @@
+// NetworkPolicy as params.
+//
+//   selmap   /networkpolicies/ JOIN the namespace's /pods/: every pair carries
+//            the podSelector's matchExpressions and matchLabels and the pod's
+//            labels as REPEATED fields, and two map stages evaluate every
+//            requirement against the labels — upstream `LabelSelector`
+//            semantics: matchLabels AND matchExpressions; In / NotIn / Exists /
+//            DoesNotExist, where NotIn and DoesNotExist hold for a pod LACKING
+//            the key; an empty selector selects every pod.
+//   sel      a selected pod (no requirement FALSE — an unknown one, or a
+//            term list the source cut, selects: selection isolates, so an
+//            evaluation that cannot decide fails closed) with an address
+//            gets /np-sel/<ns>/<pol>/<pod> = the policy's spec with the pod's
+//            address spliced in; a pair that is no longer selected loses it.
+//   in, out  each /np-sel/ row expands over its rules (`spec.ingress[]+`,
+//            `spec.egress[]+`): a rule is one row at
+//            /np-rows/netpolicy/<ns>/<pol>/<pod>/<dir>-<i> =
+//            "kind=allow;dir=…;subj=<pod ip>;peers=…;ports=…;protos=…;g=…",
+//            its ipBlock peers and ports as the aligned lists the source
+//            collects; the record past the last rule isolates the pod in that
+//            direction (`<dir>-iso`). Kubernetes' reading of policyTypes: a
+//            policy governs Ingress when its types name it or name nothing,
+//            and Egress when they name it, or name nothing and it has egress
+//            rules. An ipBlock's `except` rides along (`except=`, each peer's
+//            list `+`-joined) and net_apply subtracts it. A peer given by
+//            SELECTOR is `-` here — it names no address — and its addresses
+//            are materialised by netpolicy_peers.uproc as rows of their own.
+//   psel     an /np-sel/ row whose policy is gone, whose pod is gone, or whose
+//            pod's address changed, is deleted
+//   prow     a rule row whose /np-sel/ row is gone or no longer the one it was
+//            derived from (digest `g`) is deleted
+// `net_apply` turns the rows into the `netpolicy` net.policy table.
+module nanocloud.netpolicy {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: PodGet, PodNow
+  message Ctx {
+    key: string = 30;
+    ip: string = 31;
+    rev: int = 32;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // A selector requirement (`matchExpressions[]`), and a label — one element
+  // each of the repeated fields below, as the source's `each` emits them.
+  message Req {
+    key: string = 1;
+    op: string = 2;
+    values: string = 3;    // comma-joined; a label value holds no comma
+    lv: string = 4;        // the POD's value for `key` — absent when it has none
+  }
+  message Label {
+    key: string = 1;
+    value: string = 2;
+    lv: string = 3;        // the POD's value for `key` — absent when it has none
+  }
+  message Pair {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>
+    spec: string = 4;      // spec's members, braces stripped
+    pod: string = 21;
+    ip: string = 60;       // the pod's status.podIP
+    // The selector's terms, each PAIRED at the source with the pod's value
+    // for its key (store_source `join_terms`): the pod's own labels never
+    // ride in the record, so a pod's label count cannot overflow it.
+    exprs: Req = 90;       // REPEATED: spec.podSelector.matchExpressions
+    mlabels: Label = 92;   // REPEATED: spec.podSelector.matchLabels
+    over: int = 67;        // 1: the source cut a term list at `terms_max`
+    xt: int = 93; xf: int = 94; xu: int = 95;   // matchExpressions verdicts
+    lt: int = 96; lf: int = 97; lu: int = 98;   // matchLabels verdicts
+  }
+
+  map mexpr(p: Pair) -> Pair {
+    over p.exprs as e: Req max 16;
+    count p.xt, p.xf, p.xu;
+    when (e.op == "In" && has(e.lv) && ("," + e.values + ",").contains("," + e.lv + ","))
+      || (e.op == "NotIn" && (!has(e.lv) || !("," + e.values + ",").contains("," + e.lv + ",")))
+      || (e.op == "Exists" && has(e.lv))
+      || (e.op == "DoesNotExist" && !has(e.lv));
+  }
+  map mlab(p: Pair) -> Pair {
+    over p.mlabels as e: Label max 16;
+    count p.lt, p.lf, p.lu;
+    when has(e.lv) && e.lv == e.value;
+  }
+  message SelPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    sep: string = 17;
+    pod: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+  }
+  // FAIL CLOSED. A selected pod is ISOLATED (only its policies' rules admit
+  // traffic), so an evaluation that cannot say "not selected" must select:
+  // a requirement left unknown, or a term list the source cut (`over`),
+  // selects the pod; only a requirement definitively FALSE unselects it.
+  decision sel(p: Pair) -> SelPut {
+    when (p.over == 1 || p.xf + p.lf == 0) && p.ip != "" ->
+      SelPut { cid: p.seq, op: PUT, key: p.key, sep: "/", pod: p.pod,
+               v1: "{\"spec\":{", v2: p.spec, v3: "},\"podIP\":\"", v4: p.ip, v5: "\"}" };
+    default ->
+      SelPut { cid: p.seq, op: DELETE, key: p.key, sep: "/", pod: p.pod,
+               v1: "", v2: "", v3: "", v4: "", v5: "" };
+  }
+
+  message Rule {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pol>/<pod>
+    ip: string = 4;        // podIP
+    types: string = 5;     // spec.policyTypes, raw
+    peers: string = 6;     // …#.from[].ipBlock.cidr  /  …#.to[].ipBlock.cidr
+    ports: string = 7;
+    protos: string = 8;
+    excepts: string = 9;   // …#.from[].ipBlock.except, each peer's list `+`-joined
+    idx: int = 20;
+    at: string = 21;       // the index, as digits
+    n: int = 22;           // the rule count
+    g: string = 27;        // this /np-sel/ row's digest
+  }
+  message RulePut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+  decision rin(r: Rule) -> RulePut {
+    when r.types != "" && !r.types.contains("Ingress") ->
+      RulePut { cid: r.seq, op: NOOP, key: "", k2: "", k3: "",
+                v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.idx == r.n ->
+      RulePut { cid: r.seq, op: PUT, key: r.key, k2: "/in-iso", k3: "",
+                v1: "kind=isolate;dir=in;subj=", v2: r.ip, v3: ";g=", v4: r.g,
+                v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      RulePut { cid: r.seq, op: PUT, key: r.key, k2: "/in-", k3: r.at,
+                v1: "kind=allow;dir=in;subj=", v2: r.ip, v3: ";peers=", v4: r.peers,
+                v5: ";ports=", v6: r.ports, v7: ";protos=", v8: r.protos,
+                v9: ";except=" + r.excepts + ";g=", v10: r.g };
+  }
+  decision rout(r: Rule) -> RulePut {
+    when r.types == "" && r.n == 0 ->
+      RulePut { cid: r.seq, op: NOOP, key: "", k2: "", k3: "",
+                v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.types != "" && !r.types.contains("Egress") ->
+      RulePut { cid: r.seq, op: NOOP, key: "", k2: "", k3: "",
+                v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when r.idx == r.n ->
+      RulePut { cid: r.seq, op: PUT, key: r.key, k2: "/out-iso", k3: "",
+                v1: "kind=isolate;dir=out;subj=", v2: r.ip, v3: ";g=", v4: r.g,
+                v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      RulePut { cid: r.seq, op: PUT, key: r.key, k2: "/out-", k3: r.at,
+                v1: "kind=allow;dir=out;subj=", v2: r.ip, v3: ";peers=", v4: r.peers,
+                v5: ";ports=", v6: r.ports, v7: ";protos=", v8: r.protos,
+                v9: ";except=" + r.excepts + ";g=", v10: r.g };
+  }
+
+  // ---- prune ----
+  message Sel {
+    seq: int = 1;
+    rev: int = 2;          // the row's revision (source `rev = 1`)
+    key: string = 3;       // <ns>/<pol>/<pod>
+    ip: string = 4;
+    ns: string = 28;
+    pod: string = 29;
+    pol: string = 70;      // the policy's metadata.name now (related ^1)
+  }
+  message PodGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    sep: string = 17;
+    name: string = 18;
+    ctx: Ctx = 254;
+  }
+  message PodNow {
+    cid: int = 1;
+    status: int = 2;
+    ip: string = 40;       // store_effect `paths: "status.podIP"`
+    ctx: Ctx = 254;
+  }
+  // A delete is CONDITIONAL on the revision the verdict read (28): a row
+  // rewritten between the read and the delete is not the row judged stale.
+  message SelDel {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
+  }
+  decision psel(s: Sel) -> PodGet {
+    // No policy: ask after no pod — the empty key reads 404 — so the drop
+    // stage deletes the selection by the same path as a vanished pod.
+    when s.pol == "" ->
+      PodGet { cid: s.seq, op: GET, key: "", sep: "", name: "", ctx: Ctx { key: s.key, ip: "", rev: s.rev } };
+    default ->
+      PodGet { cid: s.seq, op: GET, key: s.ns, sep: "/", name: s.pod, ctx: Ctx { key: s.key, ip: s.ip, rev: s.rev } };
+  }
+  decision psel_drop(p: PodNow) -> SelDel {
+    when p.status == 200 && p.ip == p.ctx.ip ->
+      SelDel { cid: p.cid, op: NOOP, key: "", rev: 0 };
+    default -> SelDel { cid: p.cid, op: DELETE, key: p.ctx.key, rev: p.ctx.rev };
+  }
+  message Row {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    g: string = 4;
+    now: string = 70;      // the /np-sel/ row's digest now (related ^1, .!hash)
+  }
+  decision prow(r: Row) -> SelDel {
+    when r.g != r.now -> SelDel { cid: r.seq, op: DELETE, key: r.key, rev: r.rev };
+    default -> SelDel { cid: r.seq, op: NOOP, key: "", rev: 0 };
+  }
+
+  // Scalars and counts only: a path read returns a repeated field's FIRST
+  // element, so copying one here would silently truncate it.
+  transformation tp(p: Pair) -> Pair {
+    Pair { seq: p.seq, key: p.key, spec: p.spec, pod: p.pod, ip: p.ip, over: p.over,
+           xf: p.xf, xu: p.xu, lf: p.lf, lu: p.lu }
+  }
+  transformation tr(r: Rule) -> Rule {
+    Rule { seq: r.seq, key: r.key, ip: r.ip, types: r.types, peers: r.peers, ports: r.ports,
+           protos: r.protos, excepts: r.excepts, idx: r.idx, at: r.at, n: r.n, g: r.g }
+  }
+  transformation ts(s: Sel) -> Sel { Sel { seq: s.seq, rev: s.rev, key: s.key, ip: s.ip, ns: s.ns, pod: s.pod, pol: s.pol } }
+  transformation tn(p: PodNow) -> PodNow { PodNow { cid: p.cid, status: p.status, ip: p.ip, ctx: Ctx { key: p.ctx.key, ip: p.ctx.ip, rev: p.ctx.rev } } }
+  transformation tw(r: Row) -> Row { Row { seq: r.seq, rev: r.rev, key: r.key, g: r.g, now: r.now } }
+  pipeline np_selmap(p: Pair) -> Pair { call a = mexpr(p); call b = mlab(a); return b; }
+  pipeline np_sel(p: Pair) -> SelPut { call x = tp(p); call y = sel(x); return y; }
+  pipeline np_in(r: Rule) -> RulePut { call x = tr(r); call y = rin(x); return y; }
+  pipeline np_out(r: Rule) -> RulePut { call x = tr(r); call y = rout(x); return y; }
+  pipeline np_psel(s: Sel) -> PodGet { call x = ts(s); call y = psel(x); return y; }
+  pipeline np_psel_drop(p: PodNow) -> SelDel { call x = tn(p); call y = psel_drop(x); return y; }
+  pipeline np_prow(r: Row) -> SelDel { call x = tw(r); call y = prow(x); return y; }
+  entry np_selmap = np_selmap;
+  entry np_sel = np_sel;
+  entry np_in = np_in;
+  entry np_out = np_out;
+  entry np_psel = np_psel;
+  entry np_psel_drop = np_psel_drop;
+  entry np_prow = np_prow;
+  provenance revision "netpolicy-rows" toolchain "chronicle-authoring";
+}

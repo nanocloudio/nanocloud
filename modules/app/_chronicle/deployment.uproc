@@ -10,6 +10,20 @@
 //   record   the ScalingReplicaSet event, from the write's own reply
 module nanocloud.deployment {
 
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: dp.Read, dp.Cur, dp.Arch, dp.Arched, dp.Write, dp.Written
+  message Ctx {
+    key: string = 30;
+    spec: string = 31;
+    hash: string = 32;
+    evt: string = 33;
+    ns: string = 34;
+    name: string = 35;
+  }
+
   message dp.Dep {
     seq: int = 1;
     rev: int = 2;
@@ -27,23 +41,15 @@ module nanocloud.deployment {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_key: string = 30;
-    c_spec: string = 31;
-    c_hash: string = 32;
-    c_ns: string = 34;
-    c_name: string = 35;
+    ctx: Ctx = 254;
   }
   message dp.Cur {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_spec: string = 31;
-    c_hash: string = 32;
-    c_ns: string = 34;
-    c_name: string = 35;
     cur_hash: string = 40; // metadata.labels.pod-template-hash on the current RS
     cur_spec: string = 41; // its spec
+    ctx: Ctx = 254;
   }
 
   // Stage 2: archive the previous spec on a template change. The verdict for
@@ -58,23 +64,13 @@ module nanocloud.deployment {
     key: string = 3;    // "<ns>/<name>" under /controllerrevisions.apps/
     xk: string = 17;    // "/previous"
     v1: string = 4;     // the old spec
-    c_key: string = 30;
-    c_spec: string = 31;
-    c_hash: string = 32;
-    c_evt: string = 33;
-    c_ns: string = 34;
-    c_name: string = 35;
+    ctx: Ctx = 254;
   }
   message dp.Arched {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_spec: string = 31;
-    c_hash: string = 32;
-    c_evt: string = 33;
-    c_ns: string = 34;
-    c_name: string = 35;
+    ctx: Ctx = 254;
   }
 
   // Stage 3: the ReplicaSet document, as value parts the connector joins.
@@ -86,19 +82,13 @@ module nanocloud.deployment {
     p4: string = 7;   p5: string = 8;   p6: string = 9;
     p7: string = 10;  p8: string = 11;  p9: string = 12;
     p10: string = 13; p11: string = 14;
-    c_key: string = 30;
-    c_evt: string = 33;
-    c_ns: string = 34;
-    c_name: string = 35;
+    ctx: Ctx = 254;
   }
   message dp.Written {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    c_key: string = 30;
-    c_evt: string = 33;
-    c_ns: string = 34;
-    c_name: string = 35;
+    ctx: Ctx = 254;
   }
 
   // Stage 4: the event.
@@ -120,67 +110,55 @@ module nanocloud.deployment {
   decision read(d: dp.Dep) -> dp.Read {
     // A Deployment must declare spec.replicas to project a ReplicaSet.
     when d.replicas == "" ->
-      dp.Read { cid: d.seq, op: NOOP, key: "",
-                c_key: d.key, c_spec: d.spec, c_hash: d.hash, c_ns: d.ns, c_name: d.name };
+      dp.Read { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name } };
     default ->
-      dp.Read { cid: d.seq, op: GET, key: d.key,
-                c_key: d.key, c_spec: d.spec, c_hash: d.hash, c_ns: d.ns, c_name: d.name };
+      dp.Read { cid: d.seq, op: GET, key: d.key, ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name } };
   }
 
   decision archive(c: dp.Cur) -> dp.Arch {
     when c.status == 404 ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
-                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "create",
-                c_ns: c.c_ns, c_name: c.c_name };
-    when c.status == 200 && c.cur_hash != c.c_hash ->
-      dp.Arch { cid: c.cid, op: PUT, key: c.c_key, xk: "/previous", v1: c.cur_spec,
-                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "roll",
-                c_ns: c.c_ns, c_name: c.c_name };
-    when c.status == 200 && c.cur_spec != c.c_spec ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
-                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "scale",
-                c_ns: c.c_ns, c_name: c.c_name };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "create", ns: c.ctx.ns, name: c.ctx.name } };
+    when c.status == 200 && c.cur_hash != c.ctx.hash ->
+      dp.Arch { cid: c.cid, op: PUT, key: c.ctx.key, xk: "/previous", v1: c.cur_spec, ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "roll", ns: c.ctx.ns, name: c.ctx.name } };
+    when c.status == 200 && c.cur_spec != c.ctx.spec ->
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "scale", ns: c.ctx.ns, name: c.ctx.name } };
     default ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "",
-                c_key: c.c_key, c_spec: c.c_spec, c_hash: c.c_hash, c_evt: "",
-                c_ns: c.c_ns, c_name: c.c_name };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "", ns: c.ctx.ns, name: c.ctx.name } };
   }
 
   decision write(a: dp.Arched) -> dp.Write {
-    when a.c_evt == "" ->
-      dp.Write { cid: a.cid, op: NOOP, key: "", c_key: a.c_key, c_evt: "",
-                 c_ns: a.c_ns, c_name: a.c_name };
+    when a.ctx.evt == "" ->
+      dp.Write { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: a.ctx.key, evt: "", ns: a.ctx.ns, name: a.ctx.name } };
     default ->
-      dp.Write { cid: a.cid, op: PUT, key: a.c_key,
+      dp.Write { cid: a.cid, op: PUT, key: a.ctx.key,
                  p1: "{\"metadata\":{\"name\":\"",
-                 p2: a.c_name,
+                 p2: a.ctx.name,
                  p3: "\",\"namespace\":\"",
-                 p4: a.c_ns,
+                 p4: a.ctx.ns,
                  p5: "\",\"ownerReferences\":[{\"kind\":\"Deployment\",\"name\":\"",
-                 p6: a.c_name,
+                 p6: a.ctx.name,
                  p7: "\"}],\"labels\":{\"pod-template-hash\":\"",
-                 p8: a.c_hash,
+                 p8: a.ctx.hash,
                  p9: "\"}},\"spec\":",
-                 p10: a.c_spec,
-                 p11: "}",
-                 c_key: a.c_key, c_evt: a.c_evt, c_ns: a.c_ns, c_name: a.c_name };
+                 p10: a.ctx.spec,
+                 p11: "}", ctx: Ctx { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, name: a.ctx.name } };
   }
 
   // One event for every change, as the module records it: k8s says
   // ScalingReplicaSet for a create and a scale alike.
   decision record(w: dp.Written) -> dp.Evt {
-    when w.c_evt != "" && w.status == 200 ->
-      dp.Evt { cid: w.cid, op: PUT, key: w.c_key, xk: ".ScalingReplicaSet.0",
+    when w.ctx.evt != "" && w.status == 200 ->
+      dp.Evt { cid: w.cid, op: PUT, key: w.ctx.key, xk: ".ScalingReplicaSet.0",
                v1: "{\"metadata\":{\"name\":\"",
-               v2: w.c_name,
+               v2: w.ctx.name,
                v3: ".ScalingReplicaSet.0\",\"namespace\":\"",
-               v4: w.c_ns,
+               v4: w.ctx.ns,
                v5: "\"},\"involvedObject\":{\"kind\":\"Deployment\",\"namespace\":\"",
-               v6: w.c_ns,
+               v6: w.ctx.ns,
                v7: "\",\"name\":\"",
-               v8: w.c_name,
+               v8: w.ctx.name,
                v9: "\"},\"reason\":\"ScalingReplicaSet\",\"message\":\"Scaled up replica set ",
-               v10: w.c_name,
+               v10: w.ctx.name,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
     default ->
       dp.Evt { cid: w.cid, op: NOOP, key: "", xk: "" };
@@ -191,18 +169,14 @@ module nanocloud.deployment {
              spec: d.spec, replicas: d.replicas, hash: d.hash }
   }
   transformation pass_cur(c: dp.Cur) -> dp.Cur {
-    dp.Cur { cid: c.cid, status: c.status, value: c.value, c_key: c.c_key,
-             c_spec: c.c_spec, c_hash: c.c_hash, c_ns: c.c_ns, c_name: c.c_name,
-             cur_hash: c.cur_hash, cur_spec: c.cur_spec }
+    dp.Cur { cid: c.cid, status: c.status, value: c.value,
+             cur_hash: c.cur_hash, cur_spec: c.cur_spec, ctx: c.ctx }
   }
   transformation pass_arched(a: dp.Arched) -> dp.Arched {
-    dp.Arched { cid: a.cid, status: a.status, value: a.value, c_key: a.c_key,
-                c_spec: a.c_spec, c_hash: a.c_hash, c_evt: a.c_evt,
-                c_ns: a.c_ns, c_name: a.c_name }
+    dp.Arched { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }
   }
   transformation pass_written(w: dp.Written) -> dp.Written {
-    dp.Written { cid: w.cid, status: w.status, value: w.value, c_key: w.c_key,
-                 c_evt: w.c_evt, c_ns: w.c_ns, c_name: w.c_name }
+    dp.Written { cid: w.cid, status: w.status, value: w.value, ctx: w.ctx }
   }
 
   pipeline rd(d: dp.Dep) -> dp.Read {

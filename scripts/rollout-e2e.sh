@@ -45,28 +45,31 @@ with os.fdopen(fd, "r+b") as f:
 PY
 }
 
-store_last() { # store_last <key>
-  python3 - "$D/store.log" "$1" <<'PY'
-import struct, sys
-data = open(sys.argv[1], "rb").read()
-want = sys.argv[2].encode()
-p, out = 0, None
-while p + 15 <= len(data):
-    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
-    if p + 15 + kl + vl > len(data):
-        break
-    if data[p+15:p+15+kl] == want:
-        out = data[p+15+kl:p+15+kl+vl] if op == 1 else b""
-    p += 15 + kl + vl
-print(out.decode() if out else "")
-PY
-}
+# The store is this node's replica: read between runs, as that replica.
+store_last() { nc_replica_get "$D" "$1"; }
 
-run() { FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
+run() { env -C "$D" RUST_LOG=warn timeout 5 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true; }
 
 echo "== 1. build config + module table =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+# The reconcilers run as this node's replica of the store (the packaged
+# fragment spliced into the workload graph), and so does the CLI: one
+# store, held by one process at a time. Seeds are appended to the host log,
+# which each start imports through the replica's log.
+python3 - "$GRAPH" "$D/workload-template.yaml" <<'PY'
+import sys
+g = open(sys.argv[1]).read()
+assert "\nmodules:\n" in g and "\nwiring:\n" in g
+if "\nplatform:\n" not in g:
+    g = g.replace("\nmodules:\n", "\nplatform:\n  net: {}\n\nmodules:\n", 1)
+g = g.replace("\nmodules:\n", "\nmodules:\n__REPLICA_MODULES__\n", 1)
+g = g.replace("\nwiring:\n", "\nwiring:\n__REPLICA_WIRING__\n", 1)
+open(sys.argv[2], "w").write(g)
+PY
+nc_node_pki "$D" || fail "no node PKI"
+mkdir -p "$D/lattice"
+nc_render_graph "$D" "$D/workload-template.yaml" "$D/workload.yaml" || fail "the workload graph did not render"
+nc_build_workload "$ROOT" "$D/workload.yaml" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. rollout v1: Deployment web (replicas=2, image=nginx) =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'
@@ -99,9 +102,9 @@ case "$PREV" in *nginx*) : ;; *) fail "no archived previous revision: '$PREV'" ;
 echo "   archived previous revision (nginx) at /controllerrevisions.apps/default/web/previous"
 
 # The CLI verbs run under the cli graph.
-CLI_GRAPH="$ROOT/packaging/cli/linux.yaml"
-nc_build_workload "$ROOT" "$CLI_GRAPH" "$D/cli-config.bin" "$D/cli-modules.bin"
-cli() { FLUXOR_STORE_DIR="$D" "$FLUXOR_RUNTIME" --config "$D/cli-config.bin" --modules "$D/cli-modules.bin" -- "$@" </dev/null 2>/dev/null; }
+nc_cli_graph "$D" "$D/cli.yaml" || fail "the CLI did not render"
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/cli-config.bin" "$D/cli-modules.bin"
+cli() { env -C "$D" "$FLUXOR_RUNTIME" --config "$D/cli-config.bin" --modules "$D/cli-modules.bin" -- "$@" </dev/null 2>/dev/null; }
 
 echo "== 5. nanocloud rollout status default/web =="
 ST="$(cli rollout status default/web)"

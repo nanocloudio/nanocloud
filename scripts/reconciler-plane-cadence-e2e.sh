@@ -15,7 +15,7 @@
 #      to a ready node. Enabling variable cadence does not break reconcile logic.
 #   4. FLEET INVARIANT — every nanocloud app module is adaptive-safe
 #      (timer_class agnostic/wall_clock/replicated_clock; none tick_counted,
-#      guaranteed, or unattested). After probe_runner + pod_lifecycle were
+#      guaranteed, or unattested). After the node-plane modules were
 #      converted to wall_clock there is no tick_counted module left in the tree,
 #      so the whole control plane AND node plane are admissible on a
 #      variable-cadence domain. This guard fails if a future module reintroduces

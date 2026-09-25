@@ -1,0 +1,173 @@
+// The Kubernetes request as the API plane reads it — the decision half of
+// what kube_decode did. The bytes are decoded by kube.rd (a Chronicle decode
+// program on the pipeline node); this reads the PATH's shape:
+//
+//   /api/v1/<res>                       collection (every namespace)
+//   /api/v1/<res>/<name>                cluster-scoped object (a namespace too)
+//   /api/v1/namespaces/<ns>/<res>       namespaced collection
+//   /api/v1/namespaces/<ns>/<res>/<name>
+//   and the same under /apis/<group>/<version>/
+//
+// and emits resource, namespace, name and the store key the decoder built for
+// that shape. Any other target (a discovery document, a probe) passes with
+// those EMPTY and its target at 9 — the first decision downstream answers by
+// target and refuses what it does not know. `watch` is 1 when the query says
+// `watch=true` (or `=1`).
+module nanocloud.kube {
+  message Dec {
+    id: int = 1;
+    method: int = 2;
+    body: string = 6;
+    cred: string = 8;
+    ctype: string = 11;
+    table: string = 15;    // "1": the Accept header asks for a server-side Table
+    fm: string = 16;       // the writer's field manager (kube.rd)
+    ws: string = 17;       // the write's marks after the key's `#` (mpatch)
+    path: string = 9;
+    query: string = 10;
+    peer: string = 12;
+    s1: string = 41; s2: string = 42; s3: string = 43; s4: string = 44;
+    s5: string = 45; s6: string = 46; s7: string = 47; s8: string = 48;
+    k1: string = 51; k2: string = 52; k3: string = 53; k4: string = 54;
+  }
+  // As kube_sel.rd leaves it: the decoded request and its query's facts
+  // (66), which kube_facts.rd folds into a list/watch registration.
+  message DecSel {
+    id: int = 1;
+    method: int = 2;
+    body: string = 6;
+    cred: string = 8;
+    ctype: string = 11;
+    table: string = 15;    // "1": the Accept header asks for a server-side Table
+    fm: string = 16;       // the writer's field manager (kube.rd)
+    ws: string = 17;       // the write's marks after the key's `#` (mpatch)
+    path: string = 9;
+    query: string = 10;
+    peer: string = 12;
+    s1: string = 41; s2: string = 42; s3: string = 43; s4: string = 44;
+    s5: string = 45; s6: string = 46; s7: string = 47; s8: string = 48;
+    k1: string = 51; k2: string = 52; k3: string = 53; k4: string = 54;
+    facts: string = 66;
+  }
+  message Req {
+    id: int = 1;
+    method: int = 2;
+    res: string = 3;
+    ns: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+    cred: string = 8;
+    path: string = 9;
+    query: string = 10;
+    watch: int = 11;
+    peer: string = 12;
+    group: string = 13;    // the API group: "" for /api/v1, <group> under /apis
+  }
+  decision route(d: Dec) -> Req {
+    // /api/v1/<res>[/<name>]
+    when d.s1 == "api" && d.s2 == "v1" && d.s3 != "" && d.s5 == "" ->
+      Req { id: d.id, method: d.method, res: d.s3, group: "", ns: "", name: d.s4, body: d.body, key: d.k1 + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /api/v1/namespaces/<ns>/<res>[/<name>]
+    when d.s1 == "api" && d.s2 == "v1" && d.s3 == "namespaces" && d.s5 != "" && d.s7 == "" ->
+      Req { id: d.id, method: d.method, res: d.s5, group: "", ns: d.s4, name: d.s6, body: d.body, key: d.k2 + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/<res>[/<name>]
+    when d.s1 == "apis" && d.s2 != "" && d.s3 != "" && d.s4 != "" && d.s6 == "" ->
+      Req { id: d.id, method: d.method, res: d.s4, group: d.s2, ns: "", name: d.s5, body: d.body, key: d.k3 + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/namespaces/<ns>/<res>[/<name>]
+    when d.s1 == "apis" && d.s2 != "" && d.s3 != "" && d.s4 == "namespaces" && d.s6 != "" && d.s8 == "" ->
+      Req { id: d.id, method: d.method, res: d.s6, group: d.s2, ns: d.s5, name: d.s7, body: d.body, key: d.k4 + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // A write's marks (`ws`, from `mpatch`) follow the key's `#`.
+    // A SUBRESOURCE (`…/<name>/scale`, `…/<name>/status`): the object's own
+    // key, read and written through a view (`<key>#<sub>`); the resource is
+    // `<res>/<sub>`, as RBAC names it upstream.
+    // /api/v1/<res>/<name>/<sub>   (a node's status; not a namespace's)
+    when d.s1 == "api" && d.s2 == "v1" && d.s3 != "namespaces" && d.s5 != "" && d.s6 == "" ->
+      Req { id: d.id, method: d.method, res: d.s3 + "/" + d.s5, group: "", ns: "", name: d.s4, body: d.body,
+            key: d.k1 + "#" + d.s5 + d.ws, cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /api/v1/namespaces/<ns>/<res>/<name>/<sub>
+    when d.s1 == "api" && d.s2 == "v1" && d.s3 == "namespaces" && d.s7 != "" && d.s8 == "" ->
+      Req { id: d.id, method: d.method, res: d.s5 + "/" + d.s7, group: "", ns: d.s4, name: d.s6, body: d.body,
+            key: d.k2 + "#" + d.s7 + d.ws, cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/<res>/<name>/<sub>
+    when d.s1 == "apis" && d.s4 != "namespaces" && d.s6 != "" && d.s7 == "" ->
+      Req { id: d.id, method: d.method, res: d.s4 + "/" + d.s6, group: d.s2, ns: "", name: d.s5, body: d.body,
+            key: d.k3 + "#" + d.s6 + d.ws, cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/namespaces/<ns>/<res>/<name>/<sub>
+    when d.s1 == "apis" && d.s4 == "namespaces" && d.s8 != "" ->
+      Req { id: d.id, method: d.method, res: d.s6 + "/" + d.s8, group: d.s2, ns: d.s5, name: d.s7, body: d.body,
+            key: d.k4 + "#" + d.s8 + d.ws, cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    default ->
+      Req { id: d.id, method: d.method, res: "", group: "", ns: "", name: "", body: d.body, key: "",
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+  }
+  // A WRITE's marks, after the key's `#` (and its view): `@<manager>` — `@+`
+  // when an apply forces conflicts (`force=true`) — then `!` for a dry run
+  // (`?dryRun=All`, or a DELETE's options body `"dryRun":["All"]`): the store
+  // records who wrote (managedFields), and a dry run computes and answers the
+  // write and stores nothing. A read (GET, method 1) carries no manager.
+  //
+  // A PATCH's meaning is its Content-Type, and the chain downstream carries a
+  // method, so the type is folded INTO the method: 6 merge patch (RFC 7386),
+  // 16 JSON Patch (RFC 6902), 26 strategic merge, 36 server-side apply. Any
+  // other method keeps its code (`is6` is 1 only for 6: 1 - min(1, |m - 6|)).
+  transformation mpatch(d: Dec) -> Dec {
+    Dec { id: d.id,
+          method: d.method + (1 - math.least(1, math.greatest(d.method - 6, 6 - d.method)))
+                  * (10 * math.least(1, d.ctype.indexOf("json-patch") + 1)
+                     + 20 * math.least(1, d.ctype.indexOf("strategic-merge") + 1)
+                     + 30 * math.least(1, d.ctype.indexOf("apply-patch") + 1)),
+          body: d.body, cred: d.cred, ctype: d.ctype, table: d.table, fm: d.fm,
+          ws: ("@" + "+".substring(0, math.least(1, d.query.indexOf("force=true") + 1)) + d.fm)
+                .substring(0, (1 + math.least(1, d.query.indexOf("force=true") + 1) + d.fm.size())
+                              * math.least(1, d.fm.size()) * math.least(1, math.greatest(0, d.method - 2)))
+              + "!".substring(0, math.least(1, d.query.indexOf("dryRun=All") + 1 + d.body.indexOf("\"dryRun\":[\"All\"]") + 1)),
+          path: d.path, query: d.query,
+          peer: d.peer, s1: d.s1, s2: d.s2, s3: d.s3, s4: d.s4, s5: d.s5, s6: d.s6, s7: d.s7,
+          s8: d.s8, k1: d.k1, k2: d.k2, k3: d.k3, k4: d.k4 }
+  }
+  transformation pass(d: Dec) -> Dec {
+    Dec { id: d.id, method: d.method, body: d.body, cred: d.cred, ctype: d.ctype, table: d.table, fm: d.fm, ws: d.ws, path: d.path, query: d.query,
+          peer: d.peer, s1: d.s1, s2: d.s2, s3: d.s3, s4: d.s4, s5: d.s5, s6: d.s6, s7: d.s7,
+          s8: d.s8, k1: d.k1, k2: d.k2, k3: d.k3, k4: d.k4 }
+  }
+  transformation pass_sel(d: DecSel) -> DecSel {
+    DecSel { id: d.id, method: d.method, body: d.body, cred: d.cred, ctype: d.ctype, table: d.table, fm: d.fm, ws: d.ws, path: d.path, query: d.query,
+             peer: d.peer, s1: d.s1, s2: d.s2, s3: d.s3, s4: d.s4, s5: d.s5, s6: d.s6, s7: d.s7,
+             s8: d.s8, k1: d.k1, k2: d.k2, k3: d.k3, k4: d.k4, facts: d.facts }
+  }
+  pipeline kd_pass(d: Dec) -> Dec { call x = pass(d); return x; }
+  pipeline ks_pass(d: DecSel) -> DecSel { call x = pass_sel(d); return x; }
+  pipeline kd_route(d: Dec) -> Req { call x = pass(d); call y = route(x); return y; }
+  // kube_facts' stage program: the Content-Type folded into the method. It
+  // runs on that PIPELINE node, after its codec — kube_route is a decision
+  // node, and a transformation lowered with a decision is a node of its own.
+  pipeline kd_facts(d: Dec) -> Dec { call x = mpatch(d); return x; }
+  entry kd_pass = kd_pass;
+  entry ks_pass = ks_pass;
+  entry kd_route = kd_route;
+  entry kd_facts = kd_facts;
+  provenance revision "kube-request" toolchain "chronicle-authoring";
+}

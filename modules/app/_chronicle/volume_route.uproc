@@ -1,0 +1,154 @@
+// Which chain an effect's outcome belongs to.
+//
+// The effectors are shared: one `volume_host` holds a node's instances for
+// every chain that touches them, one `kagi_storage_effect` keeps Kagi's
+// creations between the steps that use them, and each answers every request
+// on one output. An outcome must reach the one chain that asked, because a
+// chain's record decision MERGEs `out=` into that chain's record. Each chain
+// therefore takes the effectors' outcomes through its route: the outcome
+// passes, whole and with its carry, when its phase is one of the chain's,
+// and is dropped (an empty phase, which every record decision NOOPs)
+// otherwise. A phase names exactly one chain and one seam, so exactly one
+// route passes each outcome; the pipeline suites hold the graph to that.
+module nanocloud.volume_route {
+
+  // The carry, as far as routing reads it; the rest rides through whole.
+  // Carried by: Outcome
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+  }
+  message Outcome {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    code: string = 4;
+    fence: int = 5;
+    lease_exp: int = 6;
+    exp: int = 7;
+    inst: string = 8;
+    dev: string = 9;
+    vol: string = 10;
+    set: string = 11;
+    grant: string = 12;
+    n: int = 13;
+    r1: string = 14;
+    r2: string = 15;
+    r3: string = 16;
+    ctx: Ctx = 254;
+  }
+
+  // The attach and detach chains (`/volume-attachments/`), volume_effect's seam.
+  decision vx_route_attach(o: Outcome) -> Outcome {
+    when o.ctx.ph == "granting" || o.ctx.ph == "leasing" || o.ctx.ph == "instantiating" ||
+         o.ctx.ph == "recipient" || o.ctx.ph == "releasing" || o.ctx.ph == "unlocking" ||
+         o.ctx.ph == "publishing" || o.ctx.ph == "claiming" || o.ctx.ph == "renew_lease" ||
+         o.ctx.ph == "renew_grant" || o.ctx.ph == "d_unmount" || o.ctx.ph == "d_flush" ||
+         o.ctx.ph == "d_unclaim" || o.ctx.ph == "d_unpublish" || o.ctx.ph == "d_destroy" ||
+         o.ctx.ph == "d_release" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vx_route_attach(o: Outcome) -> Outcome { call y = vx_route_attach(o); return y; }
+  entry vx_route_attach = vx_route_attach;
+
+  // Provisioning (`/volume-provisions/`).
+  decision vx_route_provision(o: Outcome) -> Outcome {
+    when o.ctx.ph == "p_create" || o.ctx.ph == "p_authorise" || o.ctx.ph == "p_split" ||
+         o.ctx.ph == "p_recordset" || o.ctx.ph == "p_vekdrop" || o.ctx.ph == "p_grant" ||
+         o.ctx.ph == "p_persist" || o.ctx.ph == "p_bind" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vx_route_provision(o: Outcome) -> Outcome { call y = vx_route_provision(o); return y; }
+  entry vx_route_provision = vx_route_provision;
+
+  // The attachment's second epoch and detach's crypto-erase (`/volume-attachments/`), volume_key_effect's seam.
+  decision vk_route_attach(o: Outcome) -> Outcome {
+    when o.ctx.ph == "e_recipient" || o.ctx.ph == "e_releasing" || o.ctx.ph == "e_unlocking" ||
+         o.ctx.ph == "d_erase" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vk_route_attach(o: Outcome) -> Outcome { call y = vk_route_attach(o); return y; }
+  entry vk_route_attach = vk_route_attach;
+
+  // Grant rotation, replacement and revocation (`/volume-grants/`).
+  decision vk_route_grant(o: Outcome) -> Outcome {
+    when o.ctx.ph == "g_rotate" || o.ctx.ph == "g_revoke" || o.ctx.ph == "g_detach" ||
+         o.ctx.ph == "g_replace" || o.ctx.ph == "g_grant" || o.ctx.ph == "g_evict" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vk_route_grant(o: Outcome) -> Outcome { call y = vk_route_grant(o); return y; }
+  entry vk_route_grant = vk_route_grant;
+
+  // Data-key rotation (`/volume-rotations/`).
+  decision vk_route_rotate(o: Outcome) -> Outcome {
+    when o.ctx.ph == "r_kagi" || o.ctx.ph == "r_split" || o.ctx.ph == "r_recordset" ||
+         o.ctx.ph == "r_vekdrop" || o.ctx.ph == "r_mark" || o.ctx.ph == "r_probe" ||
+         o.ctx.ph == "r_recipient" || o.ctx.ph == "r_release" || o.ctx.ph == "r_deliver" ||
+         o.ctx.ph == "r_steady" || o.ctx.ph == "r_pins" || o.ctx.ph == "r_retire" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vk_route_rotate(o: Outcome) -> Outcome { call y = vk_route_rotate(o); return y; }
+  entry vk_route_rotate = vk_route_rotate;
+
+  // Snapshot and restore (`/volume-snapshots/`).
+  decision vl_route_snapshot(o: Outcome) -> Outcome {
+    when o.ctx.ph == "s_flush" || o.ctx.ph == "s_capture" || o.ctx.ph == "s_clone" ||
+         o.ctx.ph == "s_identity" || o.ctx.ph == "s_drop" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vl_route_snapshot(o: Outcome) -> Outcome { call y = vl_route_snapshot(o); return y; }
+  entry vl_route_snapshot = vl_route_snapshot;
+
+  // Recovery-authority use (`/volume-recoveries/`).
+  decision vl_route_recovery(o: Outcome) -> Outcome {
+    when o.ctx.ph == "rc_audit" || o.ctx.ph == "rc_ticket" || o.ctx.ph == "rc_lease" ||
+         o.ctx.ph == "rc_start" || o.ctx.ph == "rc_recipient" || o.ctx.ph == "rc_recover" ||
+         o.ctx.ph == "rc_unlock" || o.ctx.ph == "rc_regrant" || o.ctx.ph == "rc_flush" ||
+         o.ctx.ph == "rc_destroy" || o.ctx.ph == "rc_release" || o.ctx.ph == "rc_grant" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vl_route_recovery(o: Outcome) -> Outcome { call y = vl_route_recovery(o); return y; }
+  entry vl_route_recovery = vl_route_recovery;
+
+  // Secure deletion (`/volume-deletions/`).
+  decision vl_route_delete(o: Outcome) -> Outcome {
+    when o.ctx.ph == "x_pins" || o.ctx.ph == "x_quiesce" || o.ctx.ph == "x_kagi" || o.ctx.ph == "x_loam" ||
+         o.ctx.ph == "x_forget" ->
+      Outcome { cid: o.cid, op: o.op, key: o.key, code: o.code, fence: o.fence, lease_exp: o.lease_exp, exp: o.exp,
+                inst: o.inst, dev: o.dev, vol: o.vol, set: o.set, grant: o.grant, n: o.n, r1: o.r1, r2: o.r2, r3: o.r3,
+                ctx: o.ctx };
+    default ->
+      Outcome { cid: o.cid, op: 0, key: "", code: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+  pipeline vl_route_delete(o: Outcome) -> Outcome { call y = vl_route_delete(o); return y; }
+  entry vl_route_delete = vl_route_delete;
+  provenance revision "volume-effect-routes" toolchain "chronicle-authoring";
+}

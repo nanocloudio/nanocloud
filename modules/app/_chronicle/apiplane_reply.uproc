@@ -1,0 +1,155 @@
+// The API plane's answer: the reply the chain decided, or the Status a store
+// refusal overrules it with, and the encoder's pass over it. Split from
+// apiplane.uproc, which holds the request path and had reached the authoring
+// tool's per-document rule table (48): this stage reads only the step after
+// the write (`ActReply`) and writes only the encoder's `Reply`.
+module nanocloud.apiplane_reply {
+  message ActReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    // The status the WRITE came back with (409: the store refused it), from
+    // the step after the write; 0 on the watch chain.
+    c_wstatus: int = 36;
+  }
+
+  // What the write came back with (se_probe's reply: the store's status and
+  // the object as stored, with the carry) — `act` makes it the answer.
+  message Wrote {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    c_key: string = 34;
+    c_verb: string = 37;
+  }
+  message Acted {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    c_key: string = 34;
+  }
+  // The answer, from what the store did: a delete of nothing is NotFound; an
+  // apply that CREATED is 201; everything else was decided before the write
+  // (and a refusal of it — 409, a patch's 400/422 — is `reply`'s).
+  decision d_answer(w: Wrote) -> Acted {
+    when w.c_verb == "delete" && w.status == 404 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 404,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}", c_stream: 0, c_key: w.c_key };
+    when w.status == 201 ->
+      Acted { cid: w.cid, status: 200, value: w.value, c_cid: w.c_cid, c_status: 201,
+              c_answer: w.c_answer, c_stream: w.c_stream, c_key: w.c_key };
+    default ->
+      Acted { cid: w.cid, status: w.status, value: w.value, c_cid: w.c_cid, c_status: w.c_status,
+              c_answer: w.c_answer, c_stream: w.c_stream, c_key: w.c_key };
+  }
+  transformation pass_wrote(w: Wrote) -> Wrote {
+    Wrote { cid: w.cid, status: w.status, value: w.value, c_cid: w.c_cid, c_status: w.c_status,
+            c_answer: w.c_answer, c_stream: w.c_stream, c_key: w.c_key, c_verb: w.c_verb }
+  }
+  pipeline act(w: Wrote) -> Acted {
+    call x = pass_wrote(w);
+    call y = d_answer(x);
+    return y;
+  }
+
+  // The read path's reply shape, field for field, so the SAME `ser` encoder
+  // turns it into `http_chain`'s reply envelope.
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    // The reply envelope's FLAGS byte. 0 is a complete response; 1 (MORE)
+    // says this envelope is the first slice of a stream, and 4 (HOLD) that it
+    // is held open on purpose — with no Content-Length declared the response
+    // is chunked or close-delimited. That is what a Kubernetes watch is on
+    // the wire.
+    flags: int = 4;
+  }
+
+  // The answer, already decided — except where the STORE overrules it: a
+  // conditional write it refused (409, carried as c_wstatus by the step after
+  // the write). A 500 from the store is the other case
+  // worth adding when the store learns to report one distinctly.
+  // A status of 0 is "there is nothing to send" (a LIST, answered by the watch
+  // chain instead; an event no one should see). The encoder still writes an
+  // envelope, so it goes to cid 0xFFFFFFFF — a cid `http_chain` never gives
+  // an exchange, so it answers no one. Every other cid may be a REAL
+  // exchange: a stray answer there would reach whichever request holds it.
+  decision d_reply(a: ActReply) -> Reply {
+    when a.c_status == 0 ->
+      Reply { cid: 4294967295, status: 204, value: "", flags: 0 };
+    // The store refused a conditional write. A create that lost the race is
+    // AlreadyExists; an update against a moved object is Conflict — the two
+    // reasons `kubectl` distinguishes when it decides whether to re-read.
+    when a.c_wstatus == 409 && a.c_status == 201 ->
+      Reply { cid: a.c_cid, status: 409,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"AlreadyExists\",\"code\":409}",
+              flags: 0 };
+    when a.c_wstatus == 409 ->
+      Reply { cid: a.c_cid, status: 409,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Conflict\",\"code\":409,\"message\":\"the object has been modified; please apply your changes to the latest version and try again\"}",
+              flags: 0 };
+    // A PATCH the store refused ("@stored" was to be the object).
+    when a.c_answer == "@stored" && a.c_wstatus == 404 ->
+      Reply { cid: a.c_cid, status: 404,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}",
+              flags: 0 };
+    when a.c_answer == "@stored" && a.c_wstatus == 400 ->
+      Reply { cid: a.c_cid, status: 400,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"BadRequest\",\"code\":400,\"message\":\"the patch is not valid JSON of its type\"}",
+              flags: 0 };
+    when a.c_answer == "@stored" && a.c_wstatus == 422 ->
+      Reply { cid: a.c_cid, status: 422,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Invalid\",\"code\":422,\"message\":\"the patch cannot be applied: a test failed, a path names nothing, or the result is another object\"}",
+              flags: 0 };
+    when a.c_answer == "@stored" && a.c_wstatus == 413 ->
+      Reply { cid: a.c_cid, status: 413,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"RequestEntityTooLarge\",\"code\":413}",
+              flags: 0 };
+    when a.c_answer == "@stored" ->
+      Reply { cid: a.c_cid, status: 500,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"InternalError\",\"code\":500}",
+              flags: 0 };
+    default -> Reply { cid: a.c_cid, status: a.c_status, value: a.c_answer,
+                       flags: a.c_stream };
+  }
+  transformation pass_areply(a: ActReply) -> ActReply {
+    ActReply { cid: a.cid, status: a.status, value: a.value,
+               c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer,
+               c_stream: a.c_stream, c_wstatus: a.c_wstatus }
+  }
+  pipeline reply(a: ActReply) -> Reply {
+    call x = pass_areply(a);
+    call y = d_reply(x);
+    return y;
+  }
+  // The encoder node's stage program: it rebuilds the Reply record so the
+  // `ser` program that follows sees every field. It must copy FOUR — the read
+  // path's copied three, and field 4 (the envelope flags) silently vanished
+  // when this chain started setting it.
+  transformation pass_reply(r: Reply) -> Reply {
+    Reply { cid: r.cid, status: r.status, value: r.value, flags: r.flags }
+  }
+  pipeline encode(r: Reply) -> Reply {
+    call x = pass_reply(r);
+    return x;
+  }
+
+  entry act = act;
+  entry reply = reply;
+  entry encode = encode;
+
+  provenance revision "apiplane-reply" toolchain "chronicle-authoring";
+}

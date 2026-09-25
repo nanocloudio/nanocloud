@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Live E2E for the Device identity chain + cert_manager: a Device CR is admitted
-# and a SPIFFE identity is provisioned end to end. The chain writes a /cert-req/
-# for the Device, cert_manager mints a real X.509 leaf carrying the SPIFFE URI
-# SAN, and the chain projects the identity at /deviceidentities…/<ns>/<name>.
-# OpenSSL then proves the projected leaf is genuine, carries the family-canonical
-# SPIFFE id, and chains to the minter's CA.
+# Device identities as params over kagi's certificate_endpoint
+# (packaging/debian/fluxor-device.yaml). A Device names the public key it holds;
+# the chain has it certified — POST /pki/certificate through http_effect — and
+# writes the identity back. OpenSSL proves the leaf is genuine: it certifies the
+# DEVICE's key (whose private half never left the test), carries the SPIFFE URI
+# SAN, and chains to the CA the authority answered with.
 #
-#   /devices.nanocloud.io/<ns>/<name>          = <DeviceSpec JSON>       (input)
-#   /cert-req/<ns>-<name>                       = "cn=…;dns=…;spiffe=…"   (reconciler → minter)
-#   /cert-resp/<ns>-<name>                      = "crt=<hex>;key=<hex>"   (minter → reconciler)
-#   /deviceidentities.nanocloud.io/<ns>/<name>  = "spiffe=…;crt=<hex>;ca=<hex>"  (output)
+#   /devices.nanocloud.io/<ns>/<name>          = {"spec":{"publicKey":"<b64url>"}}  (input)
+#   /deviceidentities.nanocloud.io/<ns>/<name>  = "spiffe=…;crt=<b64url DER>;ca=<b64url DER>"
+#   /ca-cert                                    = the CA certificate, b64url DER
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +22,7 @@ fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl required for this E2E"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/cert_manager.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/http_effect.fmod" "$MODULES_DIR/certificate_endpoint.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -69,52 +68,76 @@ print(out.decode() if out is not None else "")
 PY
 }
 
-hex_to_pem() { # hex_to_pem <hex> <out.pem>
+b64u_to_pem() { # b64u_to_pem <b64url DER> <out.pem>
   python3 - "$1" "$2" <<'PY'
 import sys, base64
-der = bytes.fromhex(sys.argv[1])
+v = sys.argv[1]
+der = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
 pem = b"-----BEGIN CERTIFICATE-----\n" + base64.encodebytes(der) + b"-----END CERTIFICATE-----\n"
 open(sys.argv[2], "wb").write(pem)
 PY
 }
 
+SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+run() { # run <seconds>
+  FLUXOR_SEAL_KEY="$SEAL" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout "$1" "$FLUXOR_RUNTIME" \
+    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+}
+
 echo "== 1. build the config + module table from the packaged graph =="
 nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
-echo "== 2. admit a Device CR (default/alice) =="
-store_put "/devices.nanocloud.io/default/alice" '{"spec":{"hash":"a1b2c3","certificateSubject":"device:alice"}}'
-
-echo "== 3. run the device chain + cert_manager over the shared store =="
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+echo "== 2. alice holds a P-256 key and names its public half; bob names none =="
+openssl ecparam -name prime256v1 -genkey -noout -out "$D/alice.key" 2>/dev/null
+PK="$(openssl ec -in "$D/alice.key" -pubout -outform DER 2>/dev/null | tail -c 65 | python3 -c 'import sys,base64; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).rstrip(b"=").decode())')"
+store_put "/devices.nanocloud.io/default/alice" "{\"spec\":{\"publicKey\":\"$PK\"}}"
+store_put "/devices.nanocloud.io/default/bob" '{"spec":{}}'
+run 5
 
 SPIFFE_ID="spiffe://nanocloud.local/device/default/alice"
 
-echo "== 4. the chain wrote a SPIFFE-shaped cert-req =="
-REQ="$(store_last /cert-req/default-alice)"
-[ -n "$REQ" ] || fail "the device chain did not write /cert-req/default-alice"
-echo "$REQ" | grep -q "spiffe=$SPIFFE_ID" || fail "cert-req missing the SPIFFE id: $REQ"
-echo "   /cert-req/default-alice = $REQ"
-
-echo "== 5. cert_manager minted a response =="
-RESP="$(store_last /cert-resp/default-alice)"
-[ -n "$RESP" ] || fail "cert_manager did not mint /cert-resp/default-alice"
-
-echo "== 6. the chain projected the device identity =="
+echo "== 3. the chain wrote alice's identity, and the CA =="
 IDENT="$(store_last /deviceidentities.nanocloud.io/default/alice)"
-[ -n "$IDENT" ] || fail "the device chain did not project the identity status"
-echo "$IDENT" | grep -q "spiffe=$SPIFFE_ID" || fail "identity missing the SPIFFE id"
-CRT_HEX="${IDENT#*;crt=}"; CRT_HEX="${CRT_HEX%%;ca=*}"
-CA_HEX="${IDENT##*;ca=}"
-[ -n "$CRT_HEX" ] && [ -n "$CA_HEX" ] || fail "identity missing crt/ca"
-hex_to_pem "$CRT_HEX" "$D/leaf.pem"
-hex_to_pem "$CA_HEX" "$D/ca.pem"
+[ -n "$IDENT" ] || fail "no identity for alice"
+echo "$IDENT" | grep -q "^spiffe=$SPIFFE_ID;" || fail "identity missing the SPIFFE id: ${IDENT:0:80}"
+CRT="${IDENT#*;crt=}"; CRT="${CRT%%;ca=*}"
+CA="${IDENT##*;ca=}"
+[ -n "$CRT" ] && [ -n "$CA" ] || fail "identity missing crt/ca"
+[ "$(store_last /ca-cert)" = "$CA" ] || fail "/ca-cert is not the CA the identity chains to"
+[ -z "$(store_last /deviceidentities.nanocloud.io/default/bob)" ] || fail "bob has no key and must not be certified"
+echo "   alice certified; /ca-cert published; bob (no key) left alone"
+b64u_to_pem "$CRT" "$D/leaf.pem"
+b64u_to_pem "$CA" "$D/ca.pem"
 
-echo "== 7. openssl: the provisioned leaf carries the SPIFFE URI SAN and chains =="
+echo "== 4. openssl: the leaf certifies ALICE's key, carries the SPIFFE SAN, and chains =="
 SAN="$(openssl x509 -in "$D/leaf.pem" -noout -ext subjectAltName 2>/dev/null)"
-echo "$SAN" | grep -q "URI:$SPIFFE_ID" || fail "provisioned leaf missing SPIFFE URI SAN; got: $SAN"
+echo "$SAN" | grep -q "URI:$SPIFFE_ID" || fail "leaf missing SPIFFE URI SAN; got: $SAN"
 openssl verify -CAfile "$D/ca.pem" "$D/leaf.pem" >/dev/null 2>&1 \
-  || fail "openssl verify rejected the provisioned leaf against the CA"
-echo "   identity leaf SAN = URI:$SPIFFE_ID; chains to nanocloud-ca"
+  || fail "openssl verify rejected the leaf against the CA"
+[ "$(openssl x509 -in "$D/leaf.pem" -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum)" = \
+  "$(openssl ec -in "$D/alice.key" -pubout -outform DER 2>/dev/null | sha256sum)" ] \
+  || fail "the leaf does not certify alice's key"
+echo "   leaf SAN = URI:$SPIFFE_ID; certifies alice's key; chains to nanocloud-ca"
 
-echo "== E2E green: Device admitted → SPIFFE identity provisioned (reconciler + cert_manager) =="
+echo "== 5. restart: certified once, and the CA is the same (a vault key) =="
+PUTS="$(python3 - "$D/store.log" <<'PY'
+import struct, sys
+data = open(sys.argv[1], "rb").read(); p = n = 0
+while p + 15 <= len(data):
+    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+    if p + 15 + kl + vl > len(data): break
+    if data[p+15:p+15+kl] == b"/deviceidentities.nanocloud.io/default/alice" and op == 1: n += 1
+    p += 15 + kl + vl
+print(n)
+PY
+)"
+[ "$PUTS" = 1 ] || fail "alice certified $PUTS times"
+store_put "/devices.nanocloud.io/default/carol" "{\"spec\":{\"publicKey\":\"$PK\"}}"
+run 4
+CA2="$(store_last /deviceidentities.nanocloud.io/default/carol)"; CA2="${CA2##*;ca=}"
+b64u_to_pem "$CA2" "$D/ca2.pem"
+[ "$(openssl x509 -in "$D/ca.pem" -noout -pubkey)" = "$(openssl x509 -in "$D/ca2.pem" -noout -pubkey)" ] \
+  || fail "the CA key changed across a restart"
+echo "   alice not re-certified; carol's CA has the same key"
+
+echo "== E2E green: Device identities as params — certified by kagi under the node's vault root =="

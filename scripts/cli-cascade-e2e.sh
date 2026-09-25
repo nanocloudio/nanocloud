@@ -4,7 +4,7 @@
 # a PIC fmod. A Deployment is reconciled to its pods; the `nanocloud scale`
 # cli-applet mutates desired state; the control-plane graph reconciles the CLI's
 # change to the new pod count. No host code, no HTTP — just fmods over
-# the store.
+# the store, which both run as the node's one replica of it (one at a time).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,20 +24,18 @@ for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/store_source.fmod" "$MODULES_DIR/store_
 done
 
 D="$(mktemp -d /tmp/nc-cascade-XXXXXX)"
-trap 'rm -rf "$D"' EXIT
-fail() { echo "FAIL: $1"; exit 1; }
-
-count_pods() {
-  python3 - "$D/store.log" <<'PY'
-import struct, sys
-d = open(sys.argv[1], "rb").read(); p = 0; last = {}
-while p + 15 <= len(d):
-    r, o, kl, vl = struct.unpack("<QBHI", d[p:p+15])
-    k = d[p+15:p+15+kl].decode("utf8", "replace"); last[k] = o
-    p += 15 + kl + vl
-print(sum(1 for k, o in last.items() if k.startswith("/pods/") and o == 1))
-PY
+RUNTIME_PID=""
+cleanup() {
+  if [ -n "$RUNTIME_PID" ]; then kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; fi
+  rm -rf "$D"
 }
+trap cleanup EXIT
+# Both graphs open the store (lattice's) in $D, one after the other, as the
+# same replica of it.
+nc_lattice_prepare "$D"
+fail() { echo "FAIL: $1"; tail -20 "$D/cp.log" 2>/dev/null || true; exit 1; }
+
+count_pods() { nc_store_keys "$D" /pods/ | grep -c . || true; }
 
 echo "== 1. seed a Deployment (replicas=2) + a ready node =="
 python3 - "$D/store.log" <<'PY'
@@ -48,27 +46,34 @@ with open(os.sys.argv[1],"wb") as f:
     rec(f,2,b"/nodes/node-1",b'{"metadata":{"name":"node-1"},"status":{"ready":true}}')
 PY
 
-echo "== 2. build both graphs (control plane + cli) =="
-# The packaged control-plane graph references /etc/nanocloud.io/certs/... (which
-# postinst provisions). For the test, generate a P-256 cert and point a copy of
-# the graph at it — so this exercises the REAL production graph structure (TLS).
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout "$D/k.pem" -out "$D/c.pem" -days 1 -subj "/CN=nanocloud" 2>/dev/null
-openssl x509 -in "$D/c.pem" -outform DER -out "$D/server.der" 2>/dev/null
-openssl ec   -in "$D/k.pem" -outform DER -out "$D/server.key.der" 2>/dev/null
-sed -e "s#/etc/nanocloud.io/certs/server.der#$D/server.der#" \
-    -e "s#/etc/nanocloud.io/certs/server.key.der#$D/server.key.der#" \
-    "$CP_GRAPH" > "$D/cp-graph.yaml"
+echo "== 2. build both graphs (control plane + cli), rendered as this node's replica =="
+# Both templates render as replica 0 of a one-voter group, with one PKI —
+# what postinst provisions on a node.
+nc_controlplane_graph "$D" "$D/cp-graph.yaml" || fail "the control plane did not render"
+nc_render_graph "$D" "$CLI_GRAPH" "$D/cli-graph.yaml" || fail "the CLI did not render"
 nc_build_workload "$ROOT" "$D/cp-graph.yaml" "$D/cp.bin" "$D/cp.mods"
-nc_build_workload "$ROOT" "$CLI_GRAPH" "$D/cli.bin" "$D/cli.mods"
+nc_build_workload "$ROOT" "$D/cli-graph.yaml" "$D/cli.bin" "$D/cli.mods"
 
-cp_run()  { FLUXOR_STORE_DIR="$D" timeout 3 "$FLUXOR_RUNTIME" --config "$D/cp.bin"  --modules "$D/cp.mods"  >/dev/null 2>&1 || true; }
-cli()     { FLUXOR_STORE_DIR="$D"           "$FLUXOR_RUNTIME" --config "$D/cli.bin" --modules "$D/cli.mods" -- "$@" 2>/dev/null; }
+# cp_until <pods>: run the control plane until it reconciles to <pods>, then
+# stop it (the CLI holds the replica next).
+cp_until() {
+  env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$D/cp.bin" --modules "$D/cp.mods" >>"$D/cp.log" 2>&1 &
+  RUNTIME_PID=$!
+  nc_store_ready "$D" || fail "the store never answered"
+  for _ in $(seq 60); do
+    [ "$(count_pods)" = "$1" ] && break
+    sleep 0.5
+  done
+  N="$(count_pods)"
+  kill "$RUNTIME_PID"; wait "$RUNTIME_PID" 2>/dev/null || true
+  RUNTIME_PID=""
+}
+cli()     { env -C "$D"           "$FLUXOR_RUNTIME" --config "$D/cli.bin" --modules "$D/cli.mods" -- "$@" 2>/dev/null; }
 
 echo "== 3. control plane reconciles the Deployment → pods =="
-cp_run
-n="$(count_pods)"; [ "$n" = "2" ] || fail "expected 2 pods after initial reconcile, got $n"
-echo "   pods: $n"
+cp_until 2
+[ "$N" = "2" ] || fail "expected 2 pods after initial reconcile, got $N"
+echo "   pods: $N"
 
 echo "== 4. the CLI scales desired state: nanocloud scale deployments default/web 5 =="
 out="$(cli scale deployments default/web 5)"
@@ -76,8 +81,8 @@ echo "   $out"
 echo "$out" | grep -q "scaled to 5" || fail "scale command failed"
 
 echo "== 5. control plane reconciles the CLI's change → pods scale up =="
-cp_run
-n="$(count_pods)"; [ "$n" = "5" ] || fail "expected 5 pods after scale reconcile, got $n"
-echo "   pods: $n"
+cp_until 5
+[ "$N" = "5" ] || fail "expected 5 pods after scale reconcile, got $N"
+echo "   pods: $N"
 
 echo "== E2E green: fluxor-native CLI (scale) → fluxor-native control plane (reconcile) → 5 pods, all fmods =="

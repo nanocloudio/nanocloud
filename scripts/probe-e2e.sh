@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Live E2E for probes: probe_runner drives
-# exec probes through sandbox_runner's /sandbox-exec/ seam and writes
-# /probe-status/<uid>; pod_lifecycle folds a live=0 verdict into its
+# Live E2E for probes as Chronicle params (probe.uproc, probe_collect.uproc;
+# the pb_ nodes of fluxor-podlifecycle.yaml): exec probes run through
+# the sandbox runtime's /sandbox-exec/ seam, each probe's state lives at
+# /probe-rt-<l|r>/<uid> (its due/deadline arm the kernel timer), verdicts land
+# at /probe-status/<uid>; pod_lifecycle folds a live=0 verdict into its
 # restart+backoff machinery. Runs UNPRIVILEGED (null sandboxes; exec is the
 # already-shipped seam).
 #
 # Matrix:
-#   pod-ready  rprobe=exec:/bin/true...   → readiness flips 0→1
+#   pod-ready  rp_cmd=/bin/true            → readiness flips 0→1
 #              (readiness starts 0 — not ready until proven; live defaults 1)
-#   pod-live   lprobe=exec:/bin/false...  restart=always
+#   pod-live   lp_cmd=/bin/false           restart=always
 #              → live flips 1→0 past the failure threshold → pod_lifecycle
 #                kills + relaunches under backoff (restarts=n persisted);
 #                the verdict resets to live=1 for the fresh run
-#   pod-tcp    lprobe=tcp:8080...         → parsed but NOT IMPLEMENTED (no
-#                nanocloud module has a dial surface): ignored for verdicts —
-#                never faked as pass OR fail, no restart may fire
+#   pod-tcp    lp_tcp=8080                 → a tcp probe is not an exec probe and
+#                no dial connector exists yet: it gets NO probe state and no
+#                status — never faked as pass OR fail, no restart may fire
 #
-# Probe encoding (see probe_runner/mod.rs):
-#   <kind>:<target>:<period_s>:<timeout_s>:<fail_n>:<success_n>
+# Probe fields on /pod-specs/<uid> (flat, per kind l|r):
+#   <k>p_cmd <k>p_period <k>p_timeout <k>p_fail <k>p_succ
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,7 +32,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/workload_effect.fmod" "$MODULES_DIR/store_source.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -96,20 +98,20 @@ while p + 15 <= len(data):
 PY
 }
 
-echo "== 1. build the config + module table from the graph (3 modules) =="
+echo "== 1. build the config + module table from the graph =="
 nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. materialize sleeper bundles + the probe matrix =="
 mkdir -p "$D/slp"
 # Readiness: /bin/true every 1s, timeout 2s, 1 fail / 1 success to flip.
-store_put "/pod-specs/pod-ready" "cmd=/bin/sleep 60;desired=running;rprobe=exec:/bin/true:1:2:1:1"
+store_put "/pod-specs/pod-ready" "cmd=/bin/sleep 60;desired=running;rp_cmd=/bin/true;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
 # Liveness: /bin/false every 1s, 2 consecutive fails flip live→0.
-store_put "/pod-specs/pod-live"  "cmd=/bin/sleep 60;desired=running;restart=always;lprobe=exec:/bin/false:1:2:2:1"
+store_put "/pod-specs/pod-live"  "cmd=/bin/sleep 60;desired=running;restart=always;lp_cmd=/bin/false;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
 # tcp: parsed, NOT IMPLEMENTED — must be ignored (no fake verdict, no restart).
-store_put "/pod-specs/pod-tcp"   "cmd=/bin/sleep 60;desired=running;lprobe=tcp:8080:1:2:2:1"
+store_put "/pod-specs/pod-tcp"   "cmd=/bin/sleep 60;desired=running;lp_tcp=8080;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
 
 echo "== 3. run the pipeline (probe cadence ~1s; liveness kill + backoff ~4s) =="
-FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 8 "$FLUXOR_RUNTIME" \
+FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 14 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
 
 echo "== 4. readiness: /probe-status/pod-ready flips ready 0→1 =="
@@ -142,7 +144,8 @@ esac
 
 echo "== 6. tcp probe honesty: ignored, never faked, no restart =="
 PT="$(store_last /probe-status/pod-tcp)"
-[ "$PT" = "live=1;ready=1" ] || fail "pod-tcp (unimplemented kind) should publish the no-probe defaults, got '$PT'"
+[ -z "$PT" ] || fail "pod-tcp (no exec probe) should have no probe status, got '$PT'"
+[ -z "$(store_last /probe-rt-l/pod-tcp)" ] || fail "pod-tcp should have no liveness probe state"
 if store_history /pod-lifecycle-status/pod-tcp | grep -Eq 'Restarting|restarts='; then
   fail "an unimplemented tcp probe must never drive a restart"
 fi
@@ -151,4 +154,4 @@ case "$(store_last /pod-lifecycle-status/pod-tcp)" in
   *) fail "pod-tcp should be Running, got '$(store_last /pod-lifecycle-status/pod-tcp)'";;
 esac
 
-echo "== E2E green: exec probes over the /sandbox-exec/ seam — readiness flip, liveness kill+backoff, tcp ignored honestly =="
+echo "== E2E green: probes as params over the /sandbox-exec/ seam — readiness flip, liveness kill+backoff, tcp ignored honestly =="

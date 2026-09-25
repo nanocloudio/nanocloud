@@ -1,0 +1,110 @@
+// ServiceAccount tokens as params: the k8s `serviceaccounts/token` surface.
+//
+// A request at /token-req/<id> (`ns=…;sa=…[;aud=…]`) with no /token-resp/<id>
+// yet is minted by kagi's `token_mint` through the `kagi_mint` connector, and
+// the token is written to /token-resp/<id> as `token=<JWT>`. The signing key is
+// a vault LABEL kagi opens and never exports; nothing here holds or sees it.
+//
+//   mint   request -> the mint record: subject in parts
+//          ("system:serviceaccount:" ns ":" sa), audience, and the
+//          `kubernetes.io` claim a Kubernetes client reads, as JSON in parts
+//   store  the reply -> PUT /token-resp/<id>; a refusal is answered too
+//          (`error=mint-refused`), so a caller polling for its token is told
+//          rather than left to time out
+module nanocloud.sa_token {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: MintCall, Minted
+  message Ctx {
+    id: string = 30;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+
+  message TokReq {          // store_source, flat: ns / sa / aud
+    seq: int = 1;
+    key: string = 3;
+    ns: string = 4;
+    sa: string = 5;
+    aud: string = 6;
+  }
+  message MintCall {        // kagi_mint's request record
+    cid: int = 1;
+    s1: string = 40;
+    s2: string = 41;
+    s3: string = 42;
+    s4: string = 43;
+    aud: string = 44;
+    ck: string = 47;
+    j1: string = 48;
+    j2: string = 49;
+    j3: string = 50;
+    j4: string = 51;
+    j5: string = 52;
+    ctx: Ctx = 254;
+  }
+  message Minted {          // kagi_mint's reply record
+    cid: int = 1;
+    status: int = 2;
+    token: string = 3;
+    ctx: Ctx = 254;
+  }
+  message RespPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+  }
+
+  // `ns` defaults to "default" and `aud` to "nanocloud", as the issuer this
+  // replaces did. A request naming no ServiceAccount asks for nobody: its
+  // subject is left empty, which the connector refuses (MALFORMED), and the
+  // refusal is answered below like any other.
+  decision mint(r: TokReq) -> MintCall {
+    when r.sa == "" ->
+      MintCall { cid: r.seq, s1: "", s2: "", s3: "", s4: "", aud: "",
+                 ck: "", j1: "", j2: "", j3: "", j4: "", j5: "", ctx: Ctx { id: r.key } };
+    when r.ns == "" && r.aud == "" ->
+      MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: "default",
+                 s3: ":", s4: r.sa, aud: "nanocloud", ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: "default",
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+    when r.ns == "" ->
+      MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: "default",
+                 s3: ":", s4: r.sa, aud: r.aud, ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: "default",
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+    when r.aud == "" ->
+      MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: r.ns,
+                 s3: ":", s4: r.sa, aud: "nanocloud", ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: r.ns,
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+    default ->
+      MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: r.ns,
+                 s3: ":", s4: r.sa, aud: r.aud, ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: r.ns,
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+  }
+  decision store(m: Minted) -> RespPut {
+    when m.status == 0 ->
+      RespPut { cid: m.cid, op: PUT, key: m.ctx.id, v1: "token=", v2: m.token };
+    default ->
+      RespPut { cid: m.cid, op: PUT, key: m.ctx.id, v1: "error=mint-refused", v2: "" };
+  }
+
+  transformation pt(r: TokReq) -> TokReq {
+    TokReq { seq: r.seq, key: r.key, ns: r.ns, sa: r.sa, aud: r.aud }
+  }
+  transformation pm(m: Minted) -> Minted {
+    Minted { cid: m.cid, status: m.status, token: m.token, ctx: m.ctx }
+  }
+  pipeline tk_mint(r: TokReq) -> MintCall { call x = pt(r); call y = mint(x); return y; }
+  pipeline tk_store(m: Minted) -> RespPut { call x = pm(m); call y = store(x); return y; }
+  entry tk_mint = tk_mint;
+  entry tk_store = tk_store;
+  provenance revision "sa-token" toolchain "chronicle-authoring";
+}

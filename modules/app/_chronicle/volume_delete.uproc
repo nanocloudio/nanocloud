@@ -1,0 +1,180 @@
+// Secure deletion of an encrypted volume, and the retention expiry that asks
+// for it — as params over ONE record per claim:
+//
+//   /volume-deletions/<ns>/<pvc>   (flat; CREATEd by an operator, the PV's
+//                                   reclaim, or ve_retain below)
+//     why actor     delete | retention; who asked
+//     pins          retained snapshots and live clones needing this volume's keys
+//     erased        keys (every epoch retired and recovery set destroyed) |
+//                   shared_key (a clone: its keys are its source's)
+//     phase out at tries wake reason note   as every lifecycle record
+//   related: /volume-attachments/<ns>/<pvc> vol phase reason inst dev fence,
+//            /volume-keys/<ns>/<pvc> kvol epoch
+//
+//   x_pins     EPOCH_PINS   any retained snapshot or live clone that needs
+//                           this volume's keys? Then refused, and held:
+//   x_blocked  —            `note=snapshot_retained`, scanned again every
+//                           PIN_POLL_MS. Erasing keys a snapshot still needs
+//                           would be data loss, not crypto-erasure.
+//   x_quiesce  ATT_DETACH   `reason=deleting;erase=1` on the attachment: it
+//                           never attaches again, and detach tears it down in
+//                           its order — unmount, flush, withdraw the claim
+//                           and the device, crypto-erase the instance (FXER:
+//                           its masters destroyed, superblocks zeroed),
+//                           destroy it, release the lease
+//   x_wait     —            until the attachment holds nothing
+//   x_kagi     KAGI_ERASE   every epoch retired, every recovery set destroyed,
+//                           as of the current key epoch the pin scan covered,
+//                           the grant revoked (an original only)
+//   x_loam     LOAM_DELETE  the volume unbound under a lease; its bodies go to
+//                           Loam's orphan GC
+//   x_forget   VOLUME_FORGET  the identity, key record and PV
+//   erased
+//
+// Nothing is destroyed before the device is quiesced, keys go before
+// ciphertext (a crash part-way has already left nothing readable), and the
+// keys go only when no snapshot or clone needs them. Once it has begun, a
+// deletion is never abandoned half way: every step is idempotent and is asked
+// again until it answers. A snapshot is not taken of a volume being deleted.
+// A clone's deletion deletes its data but never its source's keys.
+//
+// ve_retain: an unattached volume whose `retain` deadline has passed is
+// deleted (`why=retention`). A snapshot's own retention is volume_snapshot.uproc's.
+module nanocloud.volume_delete {
+
+  // The shared carry (volume_data_effect.uproc).
+  // carried by: Step
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    epoch: string = 48;
+    actor: string = 54;
+    erase: string = 56;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum TIMEOUT_MS = 30000;
+  enum RETRY_MS = 5000;
+  enum POLL_MS = 5000;
+  enum PIN_POLL_MS = 30000;
+
+  message Del {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    why: string = 4;
+    actor: string = 5;
+    phase: string = 6;
+    out: string = 7;
+    reason: string = 8;
+    note: string = 9;
+    erased: string = 10;
+    pins: int = 50;
+    at: int = 51;
+    tries: int = 52;
+    wake: int = 53;
+    now: int = 58;
+    vol: string = 70;      // /volume-attachments/<claim> (related, flat)
+    aphase: string = 71;
+    areason: string = 72;
+    inst: string = 73;
+    dev: string = 74;
+    fence: string = 75;
+    kvol: string = 80;     // /volume-keys/<claim>
+    kepoch: string = 81;
+  }
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; n1: int = 7;
+    v4: string = 8; n2: int = 9; v5: string = 10; n3: int = 11;
+    ctx: Ctx = 254;
+  }
+
+  decision estep(d: Del) -> Step {
+    when d.phase == "erased" ->
+      Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    when d.phase == "" && d.vol == "" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=erased;out=;note=absent", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+    // A clone: its keys are its source's, so there is nothing of its own to scan.
+    when (d.phase == "" && d.kvol != "" && d.kvol != d.vol) || (d.phase == "x_pins" && d.out == "x_pins:ok" && d.pins == 0) ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_quiesce;out=;tries=0;note=", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS,
+             ctx: Ctx { claim: d.key, ph: "x_quiesce", vol: d.vol, erase: "1", actor: d.actor } };
+    when d.phase == "" || (d.phase == "x_blocked" && d.now >= d.at + PIN_POLL_MS) ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_pins;out=;tries=0", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS, ctx: Ctx { claim: d.key, ph: "x_pins", vol: d.vol } };
+    when d.phase == "x_pins" && d.out == "x_pins:ok" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_blocked;out=;tries=0;note=snapshot_retained", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + PIN_POLL_MS, ctx: Ctx { claim: "", ph: "" } };
+    when d.phase == "x_quiesce" && d.out == "x_quiesce:ok" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_wait;out=;tries=0", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── quiesced: keys, then ciphertext, then the identity ──
+    when d.phase == "x_wait" && (d.aphase == "" || d.aphase == "detached" || d.aphase == "failed") && d.areason == "deleting"
+         && d.inst == "" && d.dev == "" && (d.fence == "" || d.fence == "0") && d.kvol == d.vol ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_kagi;out=;tries=0;erased=keys", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS, ctx: Ctx { claim: d.key, ph: "x_kagi", vol: d.vol, epoch: d.kepoch, actor: d.actor } };
+    when (d.phase == "x_wait" && (d.aphase == "" || d.aphase == "detached" || d.aphase == "failed") && d.areason == "deleting"
+          && d.inst == "" && d.dev == "" && (d.fence == "" || d.fence == "0")) ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_loam;out=;tries=0;erased=shared_key", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS, ctx: Ctx { claim: d.key, ph: "x_loam", vol: d.vol } };
+    when d.phase == "x_kagi" && d.out == "x_kagi:ok" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_loam;out=;tries=0", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS, ctx: Ctx { claim: d.key, ph: "x_loam", vol: d.vol } };
+    when d.phase == "x_loam" && d.out == "x_loam:ok" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=x_forget;out=;tries=0", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: d.now + TIMEOUT_MS, ctx: Ctx { claim: d.key, ph: "x_forget" } };
+    when d.phase == "x_forget" && d.out == "x_forget:ok" ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "phase=erased;out=;tries=0;note=", v3: ";at=", n1: d.now,
+             v4: ";wake=", n2: 0, ctx: Ctx { claim: "", ph: "" } };
+
+    // ── never abandoned half way: a refusal or silence is asked again ──
+    when (d.phase == "x_pins" || d.phase == "x_quiesce" || d.phase == "x_kagi" || d.phase == "x_loam" || d.phase == "x_forget")
+         && ((d.out != "" && d.now >= d.at + RETRY_MS) || d.now >= d.at + TIMEOUT_MS) ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "out=;note=", v2: d.out, v3: ";tries=", n1: d.tries + 1,
+             v4: ";at=", n2: d.now, v5: ";wake=", n3: d.now + TIMEOUT_MS,
+             ctx: Ctx { claim: d.key, ph: d.phase, vol: d.vol, epoch: d.kepoch, erase: "1", actor: d.actor } };
+    when d.phase == "x_wait" && d.now >= d.wake ->
+      Step { cid: d.seq, op: MERGE, key: d.key, v1: "note=quiescing", v3: ";at=", n1: d.at,
+             v4: ";wake=", n2: d.now + POLL_MS, ctx: Ctx { claim: "", ph: "" } };
+    default ->
+      Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  // ── retention expiry ──
+  // store_source over /volume-attachments/ (flat): paths desired, vol; ints
+  // retain (a monotonic ms deadline, 0: none); due = retain.
+  message Kept {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    desired: string = 4;
+    vol: string = 5;
+    retain: int = 50;
+    now: int = 58;
+  }
+  message Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision retain(k: Kept) -> Ask {
+    when k.retain > 0 && k.now >= k.retain && k.desired != "attached" && k.vol != "" ->
+      Ask { cid: k.seq, op: CREATE, key: k.key, v1: "why=retention;actor=retention" };
+    default ->
+      Ask { cid: k.seq, op: NOOP, key: "" };
+  }
+
+  pipeline ve_step(d: Del) -> Step { call y = estep(d); return y; }
+  pipeline ve_retain(k: Kept) -> Ask { call y = retain(k); return y; }
+  entry ve_step = ve_step;
+  entry ve_retain = ve_retain;
+  provenance revision "volume-delete" toolchain "chronicle-authoring";
+}

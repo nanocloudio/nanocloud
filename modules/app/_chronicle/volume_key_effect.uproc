@@ -1,0 +1,210 @@
+// The typed-effect seam of the key-side encrypted-volume pipelines: grant
+// rotation and device replacement (volume_grant.uproc), data-key rotation
+// (volume_rotate.uproc), an attachment's second key epoch
+// (volume_attach_epoch.uproc) and detach's crypto-erase step
+// (volume_detach.uproc). Same contract as volume_effect.uproc: only a step
+// MERGE the store accepted issues the effect its phase names, and the typed
+// outcome comes back as `out=<phase>:<code>[;<result>=<value>…]`. No key
+// material, recipient or bundle crosses it.
+//
+// Effect request: 1 cid  2 op  3 key  4..8 a1..a5  9 n1  10 n2  254 carry
+//   op 21 KAGI_REPLACE      a1 old device a2 new device a3 vol  (Kagi op 7)
+//      22 KAGI_RELEASE      a1 inst a2 vol a3 device a4 epoch a5 key resource
+//                           n1 fence  (Kagi op 5 for that epoch)
+//      25 KAGI_RECORD_SET   a1 vol a2 epoch -> set  (Kagi op 3)
+//      31 VAULT_SPLIT       a1 vol a2 epoch  (the epoch's key, split 2-of-3
+//                           to the custodians inside the provisioning vault)
+//      32 VAULT_DESTROY     a1 vol a2 epoch
+//      60 KAGI_ROTATE_GRANT a1 vol a2 device a3 custody a4 actor n1 tier
+//                           n2 lifetime  (Kagi op 8: same key, new policy)
+//      61 KAGI_REVOKE       a1 vol a2 actor  (Kagi op 6)
+//      62 ATT_DETACH        a1 reason a2 erase  (MERGE `reason=` — only when
+//                           none is set — and `erase=1` into the attachment)
+//      63 ATT_GRANT         a1 device  (MERGE `grant=` into the attachment)
+//      64 ROTATION_REQUEST  a1 why a2 actor  (CREATE `/volume-rotations/<claim>`)
+//      65 KAGI_ROTATE_KEY   a1 vol a2 from epoch a3 actor -> r1 the new epoch
+//                           (Kagi op 9; answers the same epoch again when that
+//                           rotation from `from` already happened)
+//      66 KEY_EPOCHS        a1 epoch a2 next  (MERGE into `/volume-keys/<claim>`)
+//      67 CB_STATUS         a1 inst a2 epoch -> r1 none | prepared | active |
+//                           migrating | retiring | steady, n cursor: crypt_block's
+//                           rotation toward that epoch, from its superblock
+//      68 CB_RECIPIENT      a1 inst a2 epoch  (crypt_block announces a fresh
+//                           recipient for that epoch: FXRT in attach mode)
+//      69 CB_BUNDLE         a1 inst a2 epoch -> ready | stale | eacces  (that
+//                           epoch's FXSB bundle on `bundle`; stale: the
+//                           container has retired it)
+//      70 EPOCH_PINS        a1 key resource a2 epoch ("0": any) a3 claim -> n,
+//                           the retained snapshots and live clones (other than
+//                           the claim itself) whose container needs it
+//      71 KAGI_RETIRE_EPOCH a1 vol a2 epoch a3 actor  (Kagi op 10: the old
+//                           custody set destroyed, audited)
+//      72 CB_ERASE          a1 inst  (FXER)
+//
+// Outcome: volume_effect.uproc's twelve fields, then 13 n (i64), 14 r1,
+// 15 r2, 16 r3, 254 the carry.
+module nanocloud.volume_key_effect {
+
+  // The shared carry (volume_effect.uproc's numbers, extended from 50).
+  // carried by: Reply, Eff, Outcome
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    custody: string = 42;
+    tier: int = 46;
+    lifetime: int = 47;
+    epoch: string = 48;
+    kvol: string = 49;
+    from: string = 50;
+    to: string = 51;
+    new: string = 52;
+    why: string = 53;
+    actor: string = 54;
+    reason: string = 55;
+    erase: string = 56;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+
+  enum KAGI_REPLACE = 21;
+  enum KAGI_RELEASE = 22;
+  enum KAGI_RECORD_SET = 25;
+  enum VAULT_SPLIT = 31;
+  enum VAULT_DESTROY = 32;
+  enum KAGI_ROTATE_GRANT = 60;
+  enum KAGI_REVOKE = 61;
+  enum ATT_DETACH = 62;
+  enum ATT_GRANT = 63;
+  enum ROTATION_REQUEST = 64;
+  enum KAGI_ROTATE_KEY = 65;
+  enum KEY_EPOCHS = 66;
+  enum CB_STATUS = 67;
+  enum CB_RECIPIENT = 68;
+  enum CB_BUNDLE = 69;
+  enum EPOCH_PINS = 70;
+  enum KAGI_RETIRE_EPOCH = 71;
+  enum CB_ERASE = 72;
+
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Eff {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    a1: string = 4; a2: string = 5; a3: string = 6; a4: string = 7; a5: string = 8;
+    n1: int = 9; n2: int = 10;
+    ctx: Ctx = 254;
+  }
+  decision act(r: Reply) -> Eff {
+    when r.status < 200 || r.status >= 300 || r.ctx.ph == "" ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+    // ── grant rotation, device replacement, revocation ──
+    when r.ctx.ph == "g_rotate" ->
+      Eff { cid: r.cid, op: KAGI_ROTATE_GRANT, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.grant, a3: r.ctx.custody,
+            a4: r.ctx.actor, n1: r.ctx.tier, n2: r.ctx.lifetime, ctx: r.ctx };
+    when r.ctx.ph == "g_revoke" ->
+      Eff { cid: r.cid, op: KAGI_REVOKE, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.actor, ctx: r.ctx };
+    when r.ctx.ph == "g_detach" ->
+      Eff { cid: r.cid, op: ATT_DETACH, key: r.ctx.claim, a1: r.ctx.reason, ctx: r.ctx };
+    when r.ctx.ph == "g_replace" ->
+      Eff { cid: r.cid, op: KAGI_REPLACE, key: r.ctx.claim, a1: r.ctx.grant, a2: r.ctx.new, a3: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "g_grant" ->
+      Eff { cid: r.cid, op: ATT_GRANT, key: r.ctx.claim, a1: r.ctx.new, ctx: r.ctx };
+    when r.ctx.ph == "g_evict" ->
+      Eff { cid: r.cid, op: ROTATION_REQUEST, key: r.ctx.claim, a1: "evict", a2: r.ctx.actor, ctx: r.ctx };
+    // ── data-key rotation ──
+    when r.ctx.ph == "r_kagi" ->
+      Eff { cid: r.cid, op: KAGI_ROTATE_KEY, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.from, a3: r.ctx.actor, ctx: r.ctx };
+    when r.ctx.ph == "r_split" ->
+      Eff { cid: r.cid, op: VAULT_SPLIT, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.to, ctx: r.ctx };
+    when r.ctx.ph == "r_recordset" ->
+      Eff { cid: r.cid, op: KAGI_RECORD_SET, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.to, ctx: r.ctx };
+    when r.ctx.ph == "r_vekdrop" ->
+      Eff { cid: r.cid, op: VAULT_DESTROY, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.to, ctx: r.ctx };
+    when r.ctx.ph == "r_mark" ->
+      Eff { cid: r.cid, op: KEY_EPOCHS, key: r.ctx.claim, a1: r.ctx.from, a2: r.ctx.to, ctx: r.ctx };
+    when r.ctx.ph == "r_probe" ->
+      Eff { cid: r.cid, op: CB_STATUS, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.to, ctx: r.ctx };
+    when r.ctx.ph == "r_recipient" || r.ctx.ph == "e_recipient" ->
+      Eff { cid: r.cid, op: CB_RECIPIENT, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.epoch, ctx: r.ctx };
+    when r.ctx.ph == "r_release" || r.ctx.ph == "e_releasing" ->
+      Eff { cid: r.cid, op: KAGI_RELEASE, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.vol, a3: r.ctx.device, a4: r.ctx.epoch,
+            a5: r.ctx.kvol, n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "r_deliver" || r.ctx.ph == "e_unlocking" ->
+      Eff { cid: r.cid, op: CB_BUNDLE, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.epoch, ctx: r.ctx };
+    when r.ctx.ph == "r_steady" ->
+      Eff { cid: r.cid, op: KEY_EPOCHS, key: r.ctx.claim, a1: r.ctx.to, a2: "", ctx: r.ctx };
+    when r.ctx.ph == "r_pins" ->
+      Eff { cid: r.cid, op: EPOCH_PINS, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.from, a3: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "r_retire" ->
+      Eff { cid: r.cid, op: KAGI_RETIRE_EPOCH, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.from, a3: r.ctx.actor, ctx: r.ctx };
+    // ── detach's crypto-erase ──
+    when r.ctx.ph == "d_erase" ->
+      Eff { cid: r.cid, op: CB_ERASE, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    default ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+  }
+
+  message Outcome {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    code: string = 4;
+    set: string = 11;
+    n: int = 13;
+    r1: string = 14;
+    ctx: Ctx = 254;
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: int = 9; v7: string = 10; v8: int = 11; v9: string = 12;
+  }
+
+  decision record(o: Outcome) -> Row {
+    when o.ctx.ph == "" ->
+      Row { cid: o.cid, op: NOOP, key: "" };
+    when o.ctx.ph == "r_kagi" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";to=", v7: o.r1 };
+    when o.ctx.ph == "r_split" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";vek=1" };
+    when o.ctx.ph == "r_recordset" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";set=", v7: o.set };
+    when o.ctx.ph == "r_vekdrop" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";vek=0" };
+    // Progress: crypt_block's state toward the new epoch and its cursor.
+    when o.ctx.ph == "r_probe" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";cursor=", v6: o.n, v7: ";cstate=", v9: o.r1 };
+    when o.ctx.ph == "r_pins" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";pins=", v6: o.n };
+    when o.ctx.ph == "e_unlocking" && o.code == "ready" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ready=1" };
+    when o.ctx.ph == "d_erase" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";erase=2" };
+    default ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code };
+  }
+  pipeline vk_act(r: Reply) -> Eff { call y = act(r); return y; }
+  pipeline vk_record(o: Outcome) -> Row { call y = record(o); return y; }
+  entry vk_act = vk_act;
+  entry vk_record = vk_record;
+  provenance revision "volume-key-effect" toolchain "chronicle-authoring";
+}

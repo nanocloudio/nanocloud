@@ -90,39 +90,27 @@ modules:
     join_match: "metadata.labels:spec.selector"
     join_paths: "status.ready,status.podIP,metadata.uid"
     watch: "/pods/,/probe-status/"
-  - name: ask
-    type: decision
-    params:
-      decision: "${DEC_AK}"
   - name: probe
     type: store_effect
+    decision: "${DEC_AK}"
     key_prefix: "/probe-status/"
     flat: 1
     paths: "ready"
-  - name: slice
-    type: decision
-    params:
-      decision: "${DEC_SL}"
   - name: slices
     type: store_effect
+    decision: "${DEC_SL}"
     key_prefix: "/endpointslices/"
   - name: sl_source
     type: store_source
     prefix: "/endpointslices/"
     watch: "/pods/"
-  - name: exists
-    type: decision
-    params:
-      decision: "${DEC_EX}"
   - name: podexists
     type: store_effect
+    decision: "${DEC_EX}"
     key_prefix: "/pods/"
-  - name: prune
-    type: decision
-    params:
-      decision: "${DEC_PR}"
   - name: collect
     type: store_effect
+    decision: "${DEC_PR}"
     key_prefix: "/endpointslices/"
   - name: svcs
     type: store_source
@@ -131,45 +119,27 @@ modules:
     list_children: "/endpointslices/"
     child_sep: "/"
     watch: "/endpointslices/"
-  - name: doc
-    type: decision
-    params:
-      decision: "${DEC_DC}"
   - name: write
     type: store_effect
+    decision: "${DEC_DC}"
     key_prefix: "/endpoints/"
 wiring:
   - from: pairs.status
     to: pairs.changes
   - from: pairs.record_out
-    to: ask.record_in
-  - from: ask.result_out
     to: probe.request_in
-    buffer_group: 1
   - from: probe.response_out
-    to: slice.record_in
-  - from: slice.result_out
     to: slices.request_in
-    buffer_group: 2
   - from: sl_source.status
     to: sl_source.changes
   - from: sl_source.record_out
-    to: exists.record_in
-  - from: exists.result_out
     to: podexists.request_in
-    buffer_group: 3
   - from: podexists.response_out
-    to: prune.record_in
-  - from: prune.result_out
     to: collect.request_in
-    buffer_group: 4
   - from: svcs.status
     to: svcs.changes
   - from: svcs.record_out
-    to: doc.record_in
-  - from: doc.result_out
     to: write.request_in
-    buffer_group: 5
 YAML
 
 run() { # run <seconds>

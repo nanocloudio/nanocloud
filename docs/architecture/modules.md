@@ -1,24 +1,33 @@
-# Nanocloud as a Module Graph
+# Nanocloud as a Fluxor Graph
 
-Nanocloud is a graph of cooperative [fluxor](../../../fluxor/) modules. The
+Nanocloud is a graph of cooperating [fluxor](../../../fluxor/) nodes. The
 organizing idea: **a Kubernetes control plane is mostly APIs, and an API is a
-pure transform** — request in, store reads and writes, response out. Pure
-transforms are exactly what fluxor app modules are. Everything that is *logic*
+pure transform** — request in, store reads and writes, response out. A pure
+transform over records is what a rules VM does, so everything that is *logic*
 — API handling, admission, scheduling, reconcile loops, policy compilation, DNS
-projection, edge routing — is a `no_std` PIC module wired over channels and the
-control-plane store. Everything that is a *host fact* — sockets, namespaces,
-cgroups, nftables, durable disk, private keys — is reached only through fluxor
-**capability surfaces**: kernel providers addressed by contract class, which
-admission can gate.
+projection, edge routing — is **rules**: authored in
+`modules/app/_chronicle/*.uproc` and compiled to the params that generic
+Chronicle engines carry. Everything that is a *host fact* — sockets,
+namespaces, cgroups, packet policy, durable disk, private keys — is reached
+only through fluxor **capability surfaces**: kernel providers addressed by
+contract class, which admission can gate.
 
-Two rules hold everywhere in this tree:
+Between the two sit the `.fmod` modules, and the control plane has ten of
+them. Nine are **connectors**: each moves bytes across a seam a rules VM
+cannot cross, and decides nothing. The tenth is the CLI, which is an operator's entry point
+rather than part of any chain. No `.fmod` in this tree holds what a Deployment
+is, what `/api/v1` names, or when a Pod may restart.
 
-1. **Decision in a module, effect behind a surface.** A controller computes; a
-   backend acts. The compiler that decides an nftables ruleset publishes it to
-   the store; programming nft is a node concern. The kubelet's decision half
-   projects desired sandboxes; the runner creates them through the `workload`
-   contract.
-2. **A module holds no host facts of its own.** No module calls libc. One that
+Three rules hold everywhere:
+
+1. **Decision in rules, effect behind a surface.** A chain computes; a
+   connector acts. The rules that decide packet policy publish rows to the
+   store; encoding them as a `net.policy` table and replacing it is
+   `net_apply`'s job, and realizing that table is the platform's.
+2. **A connector holds no Kubernetes meaning.** It is told which key, which
+   field, which op. Give one a special case for a resource and the next
+   resource needs one too.
+3. **A module holds no host facts of its own.** No module calls libc. One that
    needs a namespace, a socket or a durable byte asks a provider whose contract
    its manifest declares.
 
@@ -54,43 +63,105 @@ file.
 ## 2. The API plane
 
 The apiserver is a chain, not a module. Wave's `http` terminates HTTP/1.1
-behind `tls` and hands each request to the chain as an envelope; every stage
-after that is a decision carrying params, and every node between the decisions
-moves bytes and decides nothing:
+behind `tls` and hands each request to its application routes as an exchange
+(fluxor's exchange contract: `http` the requester, the route's provider
+answering); `http_chain` is that provider, and turns each exchange into one
+request envelope for the chain and the chain's reply envelopes into its
+response. Every stage after that is a decision carrying params, and every node
+between the decisions moves bytes and decides nothing:
 
 ```
-tls → http → kube_decode → admit → kagi_verify ⇄ token_verify → ident
-    → authz → rbac_gate → gate → api_admission → probe → store_effect
-    → act → store_effect → reply → http
+tls → http ⇄ http_chain → kube_decode → kube_route → admit → kagi_verify ⇄ token_verify
+    → ident → rbac → gate → ad_pol → ad_cnt → ad_dec → se_probe → se_act
+    → reply → enc_http → http_chain ⇄ http
 ```
+
+| Node | Type | Rules | What it does |
+| ---- | ---- | ----- | ------- |
+| `http_chain` | provider | — | each exchange one request envelope; the reply envelopes its response |
+| `kube_decode` | pipeline | `kube.rd`, `kube.uproc kd_pass` | projects the envelope into a record |
+| `kube_route` | decision | `kube.uproc kd_route` | which resource, namespace and name a path shape names |
+| `admit` | decision | `apiplane.uproc admit` | which credential to verify, the request riding as carry |
+| `kagi_verify` | connector | — | the signature check, which is kagi's |
+| `ident` | decision | `apiplane.uproc ident` | the identity, namespace, verb and resource to authorize |
+| `rbac` | store_effect | `apiplane.uproc authz` | one `EXISTS_ANY` probe of the grant index |
+| `gate` | decision | `apiplane.uproc gate` | admitted, or the refusal and its status |
+| `ad_pol` | store_effect | `admission.uproc ad_pol` | reads `/admission-policy/<resource>` |
+| `ad_cnt` | store_effect | `admission.uproc ad_cnt` | COUNTs live objects when a create is quota'd |
+| `ad_dec` | pipeline | `admission.rd` + `admission.uproc ad_dec` | the policy applied: defaults in, required paths looked up |
+| `ad_ver` | decision | `admission.uproc ad_dec` | the object as admitted, or 403 |
+| `se_probe` | store_effect | `apiplane.uproc probe` | GETs the object or LISTs the collection |
+| `se_act` | store_effect | `apiplane.uproc act` | the PUT, DELETE or NOOP the verb implied |
+| `reply` | decision | `apiplane.uproc reply` | the status and body the client receives |
+| `enc_http` | pipeline | `apiplane.uproc encode` | renders `http_chain`'s reply envelope |
 
 What a path names, which verb a method implies, whether a credential is good
 enough, what a refusal answers, which store operation to run: all of it is
-params compiled from `modules/app/_chronicle/apiplane.uproc`. Two nodes in the
-path hold Kubernetes meaning in compiled code, and only because a rules VM
-cannot walk a set:
+params compiled from `modules/app/_chronicle/apiplane.uproc`.
 
-| Module | Answers | Why not params |
-| ------ | ------- | -------------- |
-| `rbac_gate` | did any binding → role → rule match this `(identity, verb, resource)` | the walk is over a set of bindings, and the 403 it implies stays in params |
-| `api_admission` | a status, and the object as admitted with defaults applied | quota counts live objects under a prefix; what a refusal does to the request stays in params |
+Authorization is ONE store probe. Real `rbac.authorization.k8s.io/v1` Roles,
+ClusterRoles, RoleBindings and ClusterRoleBindings are expanded by the `rb_`
+chains into a grant index, `/rbac-g/<identity>/<scope>|<verb>|<group>|<resource>|<name>`
+(`resourceNames` fill the last part; a `nonResourceURLs` grant is
+`~|<verb>|~|<url>|~`, cluster scope only), and the `rbac` node asks whether a
+grant covers the request — or the same with the namespace, verb, group,
+resource or name as `*`, never widening a `~` — in one `EXISTS_ANY`. An
+`aggregationRule` is `rbac_agg.uproc`: every binding of an aggregating
+ClusterRole is mirrored as a binding of each ClusterRole its selectors match
+(depth ≤ 4), so no ClusterRole object is ever rewritten. Every derived row is
+pruned when the object it came from no longer produces it, so revocation is as
+fast as those chains. No node in the path holds Kubernetes meaning in compiled
+code.
 
-`kube_decode` is the chain's entry: it projects a wave `HttpRequest` envelope
-into a flat record frame — method, resource, namespace, name, body, the
-assembled store key, the bearer credential with its scheme stripped, the raw
-request target, and the verified peer identity the TLS trailer carried. It
-decides nothing; the routing meaning stays in params.
+Admission is two store reads, a decode and one decision, all params
+(`admission.uproc`, `admission.rd`): `ad_pol` reads
+`/admission-policy/<resource>`, `ad_cnt` COUNTs the live objects under
+`/<resource>/<ns>/` when a create is quota'd, `ad_dec`'s decode program applies
+the policy's defaults to the object (`JSONDEF`) and then looks each required
+path up in the DEFAULTED object (`JSONAT`) — mutate, then validate, upstream's
+order — and `ad_ver` answers 403 `missing <path>` for the first absent required
+field, 403 `quota exceeded`, else 200 with the defaulted object. JSON is read
+and written by the decode program; no decision parses it.
+
+`http_chain` is the chain's door. It takes each exchange whole — its body
+streamed on the credit it grants, up to `max_body_kib` (413 past it) — and
+hands the chain ONE request envelope under a cid of its own:
+`[cid u32][method u8][flags u8][target_len u16][hdr_len u16][body_len u16]`
+then the target, headers and body, and the connection's verified mTLS peer as
+a trailer behind flag `0x02`. A body past `body_inline_max` is staged in the
+store at `<body_ref_prefix>sha256/<hex>` (its expiry beside it, for
+`gc_blob`) and handed on as `sha256:<hex>` behind flag `0x04`. The chain
+answers with reply envelopes —
+`[cid u32][status u16][flags u8][ct_len u8][hdr_len u16][body_len u16]` then
+the content type, headers and body; flag `0x01` says more follow, `0x04`
+holds the response open (a watch) — and `http_chain` sends them as the
+exchange's response within the server's credit, holding what the server has
+not yet taken (up to 4 MiB an exchange, past which the exchange is aborted as
+too slow, never holding another up). A reply to cid `0xFFFFFFFF`, or to an
+exchange already gone, answers no one.
+
+`kube_decode` is the chain's entry: a `pipeline` node whose Chronicle decode
+program (`modules/app/_chronicle/kube.rd`, assembled by `scripts/rdasm.py`)
+projects `http_chain`'s request envelope into a record — method, body, the
+bearer credential with its scheme stripped, the raw target and query, the
+verified peer identity from the trailer, the path segments and a store-key
+candidate per path shape. `kube_route` (`kube.uproc`) picks the shape:
+resource, namespace, name and key.
 
 `kagi_verify` is the chain's other connector — the role `store_source` and
 `store_effect` play for the store, played here for kagi's
-`token_verify`. A record arrives, the credential goes out on kagi's own
-`auth_wire`, a typed `VerifiedIdentity` comes back, and the request's identity
+`token_verify`. A record arrives, the credential goes out as one exchange
+(`kagi_verify` the requester, `token_verify` the provider of kagi's typed
+operation: the body one `MSG_VERIFY_REQ` envelope of kagi's own `auth_wire`),
+a typed `VerifiedIdentity` comes back in a 200, and the request's identity
 rides across as carry-through in fields 30..=39. It decides nothing either — the
 200/401/503 ladder is params (`modules/app/_chronicle/apiplane_auth.uproc`), and
 the signature check is kagi's, because a second JOSE verifier here is a second
-answer to "is this credential genuine". It holds one request in flight and drops
-rather than retries when the verifier's ring is full; `scripts/apiplane-auth-e2e.sh`
-drives the seam on its own.
+answer to "is this credential genuine". It holds one request in flight, its
+exchange id the correlation; an exchange that ends without a typed answer is
+status 255, refused like any credential that did not verify, and a call the
+verifier loses to `LINK DOWN` is sent again after `LINK UP`.
+`scripts/apiplane-auth-e2e.sh` drives the seam on its own.
 
 This chain is what `packaging/debian/fluxor-controlplane.yaml` boots, and
 `packaging/debian/fluxor-apiplane.yaml` is the same path on its own for a test
@@ -99,17 +170,28 @@ to drive. `scripts/apiplane-e2e.sh` covers the whole surface: the CRUD verbs, th
 surface is data), an unauthenticated refusal, an unauthorized one, and
 admission's defaulting and quota.
 
-`?watch=true` is served too, by a second store-change-driven chain
-(`apiplane_watch.uproc`) merging into the same reply stage — `watch` is checked
-as its own RBAC verb, as Kubernetes does. Two limits ride with it: wave holds a
-watch connection for a 30 s idle deadline, and each change re-emits the object
-level-triggered rather than as a delta.
+A collection GET — LIST or `?watch=true` — is served by a second chain
+(`apiplane_watch.uproc`) merging into the same reply stage. The request chain
+registers the connection at `/watch-reg/<cid>` with the facts `kube_sel.rd` and
+`kube_facts.rd` parsed from the query (resume revision, `timeoutSeconds`,
+bookmarks, `limit`/`continue`, label and field selectors); the watch connector
+(`store_source` `events`) serves every registration and runs the selector
+filter — a Chronicle pipeline, `ir_stages` — on each candidate:
+
+| | Served as |
+| --- | --- |
+| LIST | a stream: the typed envelope's head (`PodList`, …), the items that pass, then `metadata` with the revision the listing was read at and `continue` when `limit` cut it |
+| WATCH | the store's change feed strictly after the registration's cursor: ADDED/MODIFIED/DELETED (DELETED carries the last state, from store_effect's `tomb`), BOOKMARK when asked, 410 Expired past the history, the end at `timeoutSeconds`; the exchange is HELD open between events |
+
+`watch` is checked as its own RBAC verb, as Kubernetes does. Known limit: a
+watch filtered by a label selector sees nothing when an object's labels stop
+matching (upstream sends DELETED) — the change feed carries no prior value.
 
 Identity is a host fact and stays one. `tls` runs `peer_auth` against the
 cluster CA, so a client certificate that does not chain never opens a
 connection at all; an accepted leaf's public key is hashed into a 32-byte SVID
-and emitted on `peer_identity`, which wave's `http` carries into the request
-envelope's trailer. `kube_decode` lands it on the record, and the RBAC walk
+and emitted on `peer_identity`, which wave's `http` carries on each exchange
+and `http_chain` puts in the request envelope's trailer. The decode program lands it on the record, and the RBAC walk
 authorizes that SVID. Absent a verified peer, the `Authorization` bearer token
 is the credential, verified through `kagi_verify`. `scripts/apiplane-mtls-e2e.sh`
 proves both gates: an unissued certificate is refused at the handshake, and an
@@ -121,31 +203,29 @@ A controller is a pure function of store state, re-applied on change: it
 SUBSCRIBEs its inputs, recomputes, and writes its outputs back — guarding every
 write with a read-compare, so a settled cluster spends no revisions and a
 controller that writes under a prefix it watches does not wake itself forever.
-That shape holds whether the rules are compiled into a module or carried as
-params. Almost all of it is params; what stays a module is what a rules VM
-cannot do — allocate from a free set, or render a whole ruleset from a walk
-over two prefixes.
+Every controller is params. That includes allocation, where uniqueness is the
+store's create-only precondition rather than a module's private bitmap — an
+allocator with no state of its own cannot disagree with the store about what it
+handed out.
 
-| Controller | Watches → writes |
-| ---------- | ---------------- |
-| `service_ipam` | `/services/` → the lowest free ClusterIP from 10.96.0.0/16, collision-safe against the addresses already held |
+Packet policy is the same shape with one more connector. The chains write
+rows; `net_apply` encodes them as a `net.policy` table and replaces it whole,
+and the platform realizes it — nftables on Linux, the packet filter on bare
+metal, a recorded no-op on wasm — with whether it is ENFORCED written to
+`/np-status/<table>`:
 
-The compilers are the same shape with a dataplane output:
+| Prefix | Params | Rows |
+| ------ | ------ | ---- |
+| `px_` | `proxy.uproc` | `/services/` JOIN their `/endpointslices/` → one DNAT row per (Service, ready backend), ports as aligned lists; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves |
+| `np_` | `netpolicy.uproc` | `/networkpolicies/` JOIN `/pods/` by podSelector → `/np-sel/` selections → per-rule ALLOW rows and a per-direction ISOLATE (Kubernetes' policyTypes reading); a selector peer allows nothing it cannot name. Selections and rows pruned by digest and pod address, conditional on the revision judged |
 
-| Compiler | Watches → publishes |
-| -------- | ------------------- |
-| `netpolicy_compiler` | `/networkpolicies/`, `/pods/` → the filter ruleset at `/dataplane/netpolicy` (per-pod allow chains aggregated across policies, then drop; a pod no policy selects gets no chain) |
-| `proxy_compiler` | `/services/`, `/endpoints/` → the NAT ruleset at `/dataplane/proxy` (ClusterIP DNAT, several backends load-balanced with `numgen random mod N map`) |
-| `cni_ipam` | `/ipam-request/` → the pod's address at `/ipam-lease/`, lowest free host in the pool CIDR |
+### The controller chains
 
-### The workload controllers are params
-
-Every workload controller is a **Chronicle chain**, not a compiled module:
-`store_source` turns a prefix subscription into record frames, a generic
-`decision` engine evaluates the rules one record at a time, and `store_effect`
-performs the reads and writes. The rules are authored in
-`modules/app/_chronicle/*.uproc` and compiled to the hex params a graph carries.
-Nothing in an `.fmod` holds what a Deployment means.
+Every workload controller is a **Chronicle chain**: `store_source` turns a
+prefix subscription into record frames, a generic `decision` engine evaluates
+the rules one record at a time, and `store_effect` performs the reads and
+writes. The rules are authored in `modules/app/_chronicle/*.uproc` and compiled
+to the hex params a graph carries.
 
 | Chain | Rules | Does |
 | ----- | ----- | ---- |
@@ -158,13 +238,18 @@ Nothing in an `.fmod` holds what a Deployment means.
 | `gc_` | `gc.uproc` | the ownerRef cascade, plus the Event count cap |
 | `ns_` | `namespace.uproc` | sweep every namespaced prefix of a Terminating namespace, then finalize |
 | `sc_` | `scheduler.uproc` | bind the first unbound Pod to the least-loaded ready Node, one per pass |
+| `rb_` | `rbac_rules.uproc`, `rbac_grants.uproc`, `rbac_prune.uproc` | Kubernetes RBAC: roles → per-rule and per-(verb × resource) rows, bindings → per-subject rows, their join → the grant index the API plane probes; stale rows pruned by the source object's digest |
 | `ep_` | `endpoints.uproc` | Services JOIN Pods by selector → per-pod slices → the folded `/endpoints/` document |
 | `pj_`, `pl_`, `pr_` | `pod_project.uproc`, `pod_lifecycle.uproc`, `pod_effect.uproc` | the kubelet's decision half: the sandbox artifact, the lifecycle state machine and its writes, and the prune of a runtime record whose spec is gone |
+| `pb_` | `probe.uproc`, `probe_collect.uproc` | liveness/readiness probes: per-probe state at `/probe-rt-<l\|r>/<uid>` whose `due`/`deadline` arm the kernel timer, exec attempts over the `/sandbox-exec/` seam, verdicts at `/probe-status/` (the lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates on `ready`) |
 | `pi_` | `pod_image.uproc` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
 | `sn_` | `snapshot.uproc` | VolumeSnapshot → a bound VolumeSnapshotContent, marked ready |
-| `dv_` | `device.uproc` | a Device's `/cert-req/`, and its provisioned SPIFFE identity |
-| `dns_` | `service_dns.uproc` | each Service's ready backends as an A-record set at `<svc>.<ns>.svc.cluster.local` |
-| `wh_` | `webhook_validator.uproc` | first-error Webhook validation → `/webhook-status/` |
+| `dv_` | `device.uproc` | a Device naming its public key → certified once by kagi's `certificate_endpoint` (via `http_effect`) → `/deviceidentities…/` and `/ca-cert` |
+| `tk_` | `sa_token.uproc` | a `/token-req/` → kagi's `token_mint` (via `kagi_mint`) → `/token-resp/` `token=<JWT>` |
+| `is_` | `ipam_svc.uproc` | ClusterIPs from 10.96.0.0/16: next-fit over a cursor, each address claimed create-only at `/ipam/svc/<u32>` (409 = taken, skip), PATCHed into `spec.clusterIP`; held addresses are claimed before allocation starts; a deleted Service's claim is released |
+| `ip_` | `ipam_pod.uproc`, `ipam_pod_release.uproc` | pod IPs from the `/ipam-pool` CIDR: the same claims, committed as a create-only `/ipam-lease/<id>`; a request whose sandbox is gone releases its lease, request and claim |
+| `dns_` | `service_dns.uproc` | each Service's ready backends as an A-record set at `<svc>.<ns>.svc.cluster.local`: a key of four parts and two literals the connector joins, and a value the walk decorates (`list_item: "a="`, `list_join: ";"`) as it reads the per-backend `/endpointslices/` children |
+| `wh_` | `webhook_validator.uproc` | Webhook validation: five comparisons in spec order as a first-hit decision, its message text as much the contract as its verdict → `/webhook-status/` |
 | — | `route.uproc` | the edge-route compile, below |
 | — | `route_validator.uproc` | first-error Route validation → `/route-status/` |
 | — | `apiplane*.uproc` | the API request path (the API plane, above) |
@@ -212,38 +297,59 @@ store:
   kernel timer for whichever comes first.
 - **execution** — the `unshare`/`clone3`, `pivot_root` and mount assembly,
   cgroup2 limits, veth and address realization, spawning PID 1 and reaping it.
-  That is the fluxor `workload` contract (`0x1A`), driven by `sandbox_runner`.
+  That is the fluxor `workload` contract (`0x1A`), reached through the
+  `workload_effect` connector.
 
-`sandbox_runner` and `kubelet` are the only two modules that hold
-`requires_contract = "workload"` plus `platform_raw`, so namespace surgery is
-two auditable grants and nothing else in the tree can ask for it.
-`sandbox_runner` composes the CREATE header and explicit spawn params —
-nanocloud owns the image→rootfs and pod-spec→argv mapping; the backend reads no
-OCI format.
+WHEN a sandbox is created, started, signalled, paused, exec'd into or torn down
+is params (`sb_`, `sandbox.uproc`): the desired `/sandboxes/` against the
+observed `/sandbox-status/`, the IPAM lease, the pod's bound volumes
+(`vb_`, `volume.uproc` → workload `mount`/`bind` options) and the runtime's boot
+(a status recorded under another boot is a workload that no longer exists).
+`workload_effect` performs the op and owns only what cannot live in the store:
+the live handles and their continuous observation (WAIT, READ, the PTY pump),
+reported as events the chain writes back. It is the only holder of the
+`workload` contract, and one of exactly two modules granted `platform_raw` —
+`net_apply` is the other, for the same reason: rewriting a host's namespaces
+and rewriting its packet policy are both privileged, so each is a single
+auditable grant on a module that decides nothing. Nanocloud owns the
+image→rootfs and pod-spec→argv mapping, and the backend reads no OCI format.
 
-`kubelet` is its sibling for bare metal: on bcm2712 a "pod" is not a container
-image but a composition of flash fmod modules wired into an owned subgraph with
-its own IP identity. It drives the metal backend of the same `0x1A` contract,
-composing the subgraph off-node and handing it inline in the CREATE source-ref.
-A pod spec names a pre-registered template rather than enumerating modules.
+The image plane sits beside them, and is chains too: `image.uproc` turns
+`/image-requests/` into one work queue `/fetch-q/`, then a manifest (through an
+index: the arm64/linux entry), the runtime config and each missing layer, into
+`/image-manifests/`, `/image-config/`, `/blobs/` and `/image-layer-ok/`;
+`image_asm.uproc` waits for every layer to be cached, runs the assembly job over
+the sandbox seam, and writes `/image-rootfs/<name> state=ready|failed`. The
+bytes move through the `http_fetch` connector.
 
-Around them:
+## 5. The connectors
 
-| Module | Role |
-| ------ | ---- |
-| `probe_runner` | liveness/readiness probes: exec probes through the `/sandbox-exec/` seam, verdicts at `/probe-status/`. The lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates membership on `ready` |
-| `image_puller` | the pull *decision*: manifest layers minus the blobs already cached → `/image-pull-plan/` |
-| `image_fetcher` | the pull *effect*: HTTP/1.1 plus the OCI distribution API on its own net pair, multi-arch index → platform manifest → config → layers, digest-verified into the blob cache via `fs` |
-| `image_assembler` | rootfs assembly: projects an extraction job through `sandbox_runner` and maps its terminal status to `/image-rootfs/<name> state=ready\|failed` |
-| `volume_manager` | mount planning: resolve each mount's claim to its bound device and filesystem, unbound claims into `pending=` |
+The control plane's `.fmod` modules are connectors: each crosses one seam a
+rules VM cannot, and each decides nothing — told which key, which field, which
+op, it performs it and reports what happened. (The encrypted-volume effectors
+are connectors of the same kind; `docs/design/encrypted-volumes.md` names
+them.) `nanocloud_cli` is the exception, and the only
+module a chain never talks to: it is the operator's way into the same store.
 
-## 5. Identity and crypto
+| Module | Seam | Role |
+| ------ | ---- | ---- |
+| `store_source` | `storage.namespace`, `timer` | subscription-driven entry into a chain: a prefix's changes and timer deadlines become record frames, optionally walking each object's children (`list_children`, `list_values`) and decorating them as it goes |
+| `store_effect` | `storage.object`, `storage.namespace` | the reads and writes a chain asks for — GET, CREATE, guarded PUT, PATCH, MERGE (conditional on a revision when one is given), REPLACE, APPEND, DELETE, LIST, COUNT (optionally of the children a `count_where` decision keeps), EXISTS and `EXISTS_ANY` — over a key assembled from record fields; a fused decision builds the request from the arriving record, given the wall clock when `wall` is set |
+| `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Five request inputs, so the runtime's chains feed it without a merge |
+| `net_apply` | `net_policy` (`0x1E`) | rows under a prefix → one `net.policy` table, replaced whole (a row set that does not fit is not applied); the platform's ENFORCED bit and the generation at `/np-status/<table>` |
+| `http_fetch` | net pair, `fs` | one GET at a time (behind `tls`, or plaintext); the answer comes back as the JSON members the record asked for (`a[].b` collect, `a[k=v].b` select), or lands as a sha256-verified file (optionally in Range chunks); a request whose result already exists is answered 304 without a byte on the wire |
+| `http_chain` | Wave's `http` (an exchange PROVIDER on an application route) | each exchange → one request envelope for a chain, a large body staged in the store; the chain's reply envelopes → the exchange's response, a watch held open, within the server's credit |
+| `http_effect` | an HTTP endpoint, in the graph or through Wave's `http` client (an exchange REQUESTER) | a record → one exchange (kagi's `certificate_endpoint`) → the answer, with chosen top-level JSON members lifted, as a record |
+| `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the verification key from `/authn-keys/sa` |
+| `kagi_mint` | kagi's `token_mint` (an exchange REQUESTER of the typed operation) | a record → the signed token as a record; names the signing key by vault label and stores the public half the mint announces at `/authn-keys/sa` |
+| `nanocloud_cli` | the host's argv and stdio | a cli-applet: argv in, the store read and written directly, bytes to stdout and a latched exit code — so the CLI works with no HTTP edge running |
 
-| Module | Role |
-| ------ | ---- |
-| `crypto_signer` | the mechanism: generate a P-256 keypair, deposit the private scalar in the kernel key vault (contract `0x0010`), wipe the in-module copy, and sign by handle. A conformance fixture, not a service — it signs anything written to `/sign-req/`, so it too refuses to construct without `development: 1` |
-| `cert_manager` | one-shot minting: a `/cert-req/` yields a fresh leaf keypair and a real X.509 certificate built by an in-module ASN.1 DER encoder, signed by handle. Development-only — it refuses to construct without `development: 1`, since it regenerates its CA at every start and returns leaf private keys on the store |
-| `sa_token` | ServiceAccount tokens: an ES256 JWS with a real one-hour `iat`/`exp`, signed by a key opened by label so a restart is not a new issuer, with the verification key published for `authn` at `/authn-keys/sa` |
+The token mint and the certificate issuer sign under the same vault key,
+`nanocloud.ca`: generated inside the vault on first open, sealed under the
+node's `FLUXOR_SEAL_KEY` (written once by the package's postinst), and never
+exported. That symmetric key and that signing key are the node's only two
+roots; nothing else is provisioned, and no private key is issued or written to
+the store.
 
 ## 6. Capability-surface inventory
 
@@ -255,9 +361,10 @@ below it is debt — it is the platform working as designed.
 | `storage.object` | `0x14` | keyed byte values, CAS, ranged read, delete |
 | `storage.namespace` | `0x13` | prefix LIST with cursor, change SUBSCRIBE with a revision fence |
 | `workload` | `0x1A` | isolated workload lifecycle: typed CREATE header (identity, posture, resource intents, network identity) + a backend-opaque options envelope; CREATE/START/READ/SIGNAL/WAIT/DESTROY plus exec and TTY |
-| `fs` | `0x09` | files — the blob cache the image fetcher lands bytes in |
+| `fs` | `0x09` | files — the blob cache `http_fetch` lands image layers in |
+| `net_policy` | `0x1E` | the host's packet policy as a table, replaced whole; the platform realizes it and reports whether it is enforced |
 | key vault | `0x0010` | private keys held by the kernel, signed by handle |
-| `timer` | — | deadline wakeups for the Chronicle store source |
+| `timer` | `0x06` | deadline wakeups for the Chronicle store source |
 | `linux_net` / `tls` | channel contract | leased sockets and TLS termination, delivered as a `net_proto` stream |
 
 A module's manifest declares what it needs; a graph that asks for a surface it
@@ -269,20 +376,21 @@ relaxed tick is safe for it.
 ## 7. Hot paths, as wiring
 
 ```
-API write:   linux_net → tls → http → kube_decode → verify → authorize →
-             admit → store PUT (CAS) ─→ every watcher's change stream
+API write:   linux_net → tls → http → decode → route → verify → authorize
+             → admission → store PUT (CAS) ─→ every watcher's change stream
 
-Watch:       the watch chain: a store change wakes it, the object is read and
-             wrapped, and the event is written into the request chain's reply
-             stage on the connection wave is holding open
+List/Watch:  the request chain registers the connection; the watch connector
+             streams the listing, or reads the change feed from the
+             registration's cursor, filters by the selectors, and writes each
+             item or event into the reply stage on the connection wave holds
 
 Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices → the folded
-             /endpoints document → service_dns projects the zone;
-             proxy_compiler compiles the NAT ruleset → the node programs nft
+             /endpoints document → the dns_ chain projects the zone;
+             px_ rows → net_apply → the `proxy` net.policy table
 
 Pod start:   apps/v1 PUT → dp_ → rs_ → Pods → sc_ binds → pj_/pl_ project
-             /sandboxes/ → image_fetcher + image_assembler materialise the
-             rootfs → sandbox_runner CREATE/START → status written back →
+             /sandboxes/ → the im_ chains over http_fetch materialise the
+             rootfs → sb_ chain → workload_effect CREATE/START → status written back →
              the watch chain serves it
 ```
 
@@ -327,8 +435,8 @@ construction.
 
 Write a module only for what a rules VM cannot express: a walk over a set, a
 signature check, bytes moved to something outside the graph. Those are
-connectors and they decide nothing — `store_effect`, `kagi_verify`, and the
-connector halves of `rbac_gate` and `api_admission` are the pattern.
+connectors and they decide nothing — `store_effect`, `kagi_verify`,
+`http_fetch` and `workload_effect` are the pattern.
 
 ### A new module
 
@@ -362,20 +470,3 @@ A new module is a directory under `modules/app/` with `mod.rs` and
 - **Prove it live.** Add a `scripts/<name>-e2e.sh` that boots the real `.fmod`
   in a runtime and asserts on the store. Inline `#[cfg(test)]` is forbidden
   under `modules/`: in a `no_std` module it compiles away silently.
-
-### Two more compilers became params
-
-`webhook_validator` and `service_dns` are gone. Both were "pure store
-transforms" that a decision plus the connectors' byte-joining express directly:
-
-* **webhook validation** is five comparisons in spec order — a first-hit
-  decision — and one status string. Its E2E passes unchanged, message text
-  included: the words a user reads are as much the contract as the verdict.
-* **the DNS zone** is a key of four parts and a value of the ready addresses
-  decorated as `a=<ip>` and joined with `;`. That per-element decoration used
-  to be the reason it needed a module; `store_source`'s `list_item`/`list_join`
-  do it while WALKING the children, so it is a property of the walk rather than
-  a computation over a list the VM cannot iterate.
-
-It reads `/endpointslices/` rather than the folded `/endpoints/` document, for
-the same reason the route compiler does: the elements are already separate.

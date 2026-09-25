@@ -86,12 +86,9 @@ modules:
     type: store_source
     prefix: "/nodes/"
     paths: "status.ready"
-  - name: ready
-    type: decision
-    params:
-      decision: "$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
   - name: mark
     type: store_effect
+    decision: "$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
     key_prefix: "/ready-nodes/"
   # bind: the first unbound pod, the least-loaded ready node
   - name: unbound
@@ -102,40 +99,25 @@ modules:
     join: "/ready-nodes/"
     join_pick: "mincount:/pods/:spec.nodeName"
     watch: "/ready-nodes/"
-  - name: bind
-    type: decision
-    params:
-      decision: "${DEC_BD}"
   - name: patch
     type: store_effect
+    decision: "${DEC_BD}"
     key_prefix: "/pods/"
-  - name: record
-    type: decision
-    params:
-      decision: "${DEC_RC}"
   - name: events
     type: store_effect
+    decision: "${DEC_RC}"
     key_prefix: "/events/"
 wiring:
   - from: nodes.status
     to: nodes.changes
   - from: nodes.record_out
-    to: ready.record_in
-  - from: ready.result_out
     to: mark.request_in
-    buffer_group: 1
   - from: unbound.status
     to: unbound.changes
   - from: unbound.record_out
-    to: bind.record_in
-  - from: bind.result_out
     to: patch.request_in
-    buffer_group: 2
   - from: patch.response_out
-    to: record.record_in
-  - from: record.result_out
     to: events.request_in
-    buffer_group: 3
 YAML
 run() { # run <seconds>
   nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null

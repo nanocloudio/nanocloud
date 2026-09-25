@@ -15,13 +15,26 @@ version = "0.0.1"
 fluxor = "0.0.1"
 wave = "0.0.1"
 chronicle = "0.0.1"
-# kagi owns the identity protocols, and `authn` / `sa_token` speak them rather
+# kagi owns the identity protocols, and nanocloud's connectors speak them rather
 # than reimplementing them: `authn` compiles kagi's own `kagi-common` fragments
 # (`jose`, `verify_keyset`, `auth_wire`, `b64`) to decide whether a credential
-# is genuine, and `sa_token` publishes its verification key in kagi's key-frame
+# is genuine, and ServiceAccount tokens are minted by kagi's `token_mint` in its
 # wire format. What nanocloud keeps is the question "is this caller allowed to
 # do this" — not the cryptography behind the answer.
 kagi = "0.0.1"
+# lattice's storage engine is the control plane's store: its state worker
+# serves fluxor's storage.object / storage.namespace contracts
+# (`kv_state_worker_store`), durable on its own command log.
+lattice = "0.0.1"
+# loam owns the volume protocols: the encrypted-volume connectors compile its
+# own admin wire and volume-map codec (`loam-common`) to drive a volume's
+# lease, creation, snapshots and deletion, rather than restating them.
+loam = "0.0.1"
+# clustor replicates that store: its consensus, durability and peer links
+# carry every write through one log, so the control plane (the voter) and
+# each node (a learner) hold the same store, and a node's writes are decided
+# by the control plane.
+clustor = "0.0.1"
 
 [ci]
 # Module targets to build in CI. Nanocloud nodes are Pi 5; the deb
@@ -29,18 +42,21 @@ kagi = "0.0.1"
 targets = ["bcm2712"]
 
 [ci.test]
-# The runtime test gate. nanocloud has no cargo tests — its behaviour is
-# proven by graph E2Es that boot the built `.fmod` artefacts and drive them
-# (real HTTP, the store seam, mTLS). `fluxor ci` runs each after the strict
-# module build, so `make ci` is the full gate (lint + build + behaviour),
-# not lint/build alone. `make test` runs the same scripts standalone.
+# The runtime test gate: graph E2Es that boot the built `.fmod` artefacts and
+# drive them (real HTTP, the store seam, mTLS). `fluxor ci` runs each after the
+# strict module build, so `make ci` is the full gate (lint + build +
+# behaviour), not lint/build alone. `make test` runs the same scripts
+# standalone. The shared no_std cores (`modules/app/_shared/`) are also tested
+# on the host: `tests/harness` (shadow-tracked) mounts them, and `fluxor ci`'s
+# `cargo-test (harness)` phase runs it.
 scripts = ["scripts/*-e2e.sh"]
 
 [ci.hygiene]
 # nanocloud is fluxor-only — no host `src/` crate. Every PIC fmod under
 # `modules/` is `no_std`, where an inline `#[cfg(test)]` block compiles away
 # silently and a green run would mean nothing, so inline tests are banned there.
-# Behaviour is proven by the graph E2Es (`scripts/*-e2e.sh`, `make test`).
+# Behaviour is proven by the graph E2Es (`scripts/*-e2e.sh`, `make test`) and
+# the shared cores by `tests/harness`.
 forbid_inline_tests = ["modules"]
 
 # Every module mounts the SDK wholesale: `include!` of `runtime.rs` and a
@@ -53,3 +69,7 @@ forbid_inline_tests = ["modules"]
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/"
 reason = """PIC modules mount the SDK wholesale via include!, so each compile sees the entire surface and uses a subset."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/harness/"
+reason = """The harness suites mount the modules' shared cores (`modules/app/_shared/*.rs`) via include! — the code under test is the code that ships — and each suite uses a subset of what it mounts. Shadow-tracked (../standards/test-tracking.md §1)."""

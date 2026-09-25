@@ -96,58 +96,34 @@ modules:
     prefix: "/deployments.apps/"
     paths: "spec,spec.replicas"
     hash: "spec.template"
-  - name: read
-    type: decision
-    params:
-      decision: "${DEC_RD}"
   - name: current
     type: store_effect
+    decision: "${DEC_RD}"
     key_prefix: "/replicasets.apps/"
     paths: "metadata.labels.pod-template-hash,spec"
-  - name: archive
-    type: decision
-    params:
-      decision: "${DEC_ARCH}"
   - name: history
     type: store_effect
+    decision: "${DEC_ARCH}"
     key_prefix: "/controllerrevisions.apps/"
-  - name: write
-    type: decision
-    params:
-      decision: "${DEC_WR}"
   - name: apply
     type: store_effect
+    decision: "${DEC_WR}"
     key_prefix: "/replicasets.apps/"
-  - name: record
-    type: decision
-    params:
-      decision: "${DEC_REC}"
   - name: events
     type: store_effect
+    decision: "${DEC_REC}"
     key_prefix: "/events/"
 wiring:
   - from: store_source.status
     to: store_source.changes
   - from: store_source.record_out
-    to: read.record_in
-  - from: read.result_out
     to: current.request_in
-    buffer_group: 1
   - from: current.response_out
-    to: archive.record_in
-  - from: archive.result_out
     to: history.request_in
-    buffer_group: 2
   - from: history.response_out
-    to: write.record_in
-  - from: write.result_out
     to: apply.request_in
-    buffer_group: 3
   - from: apply.response_out
-    to: record.record_in
-  - from: record.result_out
     to: events.request_in
-    buffer_group: 4
 YAML
 
 run() { # run <seconds>

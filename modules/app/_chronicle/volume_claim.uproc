@@ -1,0 +1,241 @@
+// Device-backed volume claims and the mount effect.
+//
+// A claim has two forms, both at `/volumes/<ns>/<pvc>`:
+//
+//   path=<host directory>                        an operator's host directory
+//   device=<path>;fs=<type>[;mkfs=1]             an attached encrypted volume
+//
+// The device form is written only by the attach pipeline (volume_attach.uproc,
+// phase `claiming`), naming the block device it published and the filesystem
+// the volume was provisioned with; `mkfs=1` rides along only on a volume whose
+// identity says it has never held a filesystem. This chain is the mount effect:
+// it checks the filesystem, mounts it, and adds the derived `path=` that
+// volume.uproc already turns into `/volume-binds/<uid>/<i>` — so the bind step
+// never learns whether a claim is a directory or an encrypted device. What it
+// adds to a device claim:
+//
+//   mount=<state>   mounting · mounted · fsck_failed · format_failed ·
+//                   mount_failed · denied · invalid · refused · unmount ·
+//                   unmounting · unmounted · busy
+//   dir=<host dir>  where it is mounted     code=<exit status>   at=<ms>
+//   path=<host dir> only while mounted — withdrawn BEFORE the unmount runs
+//
+//   claim  the claim record -> the next mount state, written back as a
+//          REPLACE conditional on the revision the claim was read at, so a
+//          stale emission never resurrects a claim detach has withdrawn — and
+//          only a write the store took issues the effect (write-ahead). A
+//          device claim is mounted only when the attachment record for the
+//          same claim published exactly that device (related
+//          `/volume-attachments/<claim>` dev): a device named by anyone else
+//          is `refused`, so nothing but the attach pipeline can point this
+//          effect at a block device.
+//   act    the write's reply -> the typed MOUNT / UNMOUNT request
+//   done   the actuator's raw result -> the typed outcome, MERGEd into the
+//          claim (with `path=` on success)
+//
+// The actuator (a host effector holding CAP_SYS_ADMIN) mounts every claim at
+// `<mount root>/<claim>` and answers raw facts, never a verdict, so the mapping
+// to typed outcomes is here and is tested without root:
+//   1 cid  2 op  3 key  4 priv (i64: 1 when it holds the privilege to mount;
+//   checked before anything runs)  5 fsck (i64, fsck(8) exit status; -1 not
+//   run)  6 code (i64, mount(8)/umount(8) exit status; -1 not run)  7 dir
+//   8 was (i64: 1 when the directory was a mount point before an unmount)
+//   9 mkfs (i64, mkfs(8) exit status; -1 not run)  254 carry
+// MOUNT runs `fsck -p` (or, with mkfs=1 and no filesystem signature on the
+// device, `mkfs -t <fs>` instead), then `mount -t <fs> -o nodev,nosuid`.
+// fsck(8) statuses 0, 1 and 2 are a clean or repaired filesystem (2 asks for
+// a reboot only when the ROOT filesystem was repaired); 4 and above leave it
+// unrepaired or unchecked. An unprivileged actuator answers priv=0 and runs
+// nothing: `denied` for a mount, and `busy` for an unmount — a filesystem that
+// could not be unmounted is still mounted, and detach must not go past it.
+module nanocloud.volume_claim {
+
+  // carried by: Step, Reply, Mnt, Done
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    dev: string = 32;
+    fs: string = 33;
+    dir: string = 34;
+    mkfs: string = 35;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+  enum REPLACE = 9;
+  enum MOUNT = 50;
+  enum UNMOUNT = 51;
+  enum MOUNT_TIMEOUT_MS = 900000;
+
+  message Claim {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    path: string = 4;
+    device: string = 5;
+    fs: string = 6;
+    mount: string = 7;
+    dir: string = 8;
+    mkfs: string = 9;
+    at: int = 50;
+    now: int = 58;
+    att_dev: string = 70;  // /volume-attachments/<claim> dev (related, flat)
+  }
+  // A REPLACE carries the whole claim: every field it keeps is restated.
+  message Step {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: string = 9; v7: string = 10; v8: string = 11;
+    v9: string = 12; v10: int = 13;
+    rev: int = 28;
+    ctx: Ctx = 254;
+  }
+
+  decision claim(c: Claim) -> Step {
+    // A path claim is volume.uproc's alone.
+    when c.device == "" && c.fs == "" ->
+      Step { cid: c.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // A filesystem with nothing to put it on.
+    when c.device == "" && c.mount != "invalid" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "path=", v2: c.path, v3: ";fs=", v4: c.fs, v9: ";mount=invalid;at=", v10: c.now,
+             ctx: Ctx { claim: "", ph: "" } };
+    when c.device == "" ->
+      Step { cid: c.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // Only the filesystems the provision pipeline admits.
+    when c.fs != "ext4" && c.fs != "xfs" && c.mount != "invalid" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";path=", v6: c.path,
+             v9: ";mount=invalid;at=", v10: c.now, ctx: Ctx { claim: "", ph: "" } };
+    when c.fs != "ext4" && c.fs != "xfs" ->
+      Step { cid: c.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // The gate: a device the attachment did not publish is never mounted.
+    when c.att_dev != c.device && c.mount != "refused" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";path=", v6: c.path,
+             v9: ";mount=refused;at=", v10: c.now, ctx: Ctx { claim: "", ph: "" } };
+    when c.att_dev != c.device ->
+      Step { cid: c.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+    // Refused while the attachment's own record lagged the claim: look again.
+    when c.mount == "refused" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";path=", v6: c.path,
+             v7: ";mkfs=", v8: c.mkfs, v9: ";at=", v10: c.now, ctx: Ctx { claim: "", ph: "" } };
+    // A device claim arrives without a path; one that carries one was not
+    // written by the attach pipeline.
+    when c.mount == "" && c.path != "" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";path=", v6: c.path,
+             v9: ";mount=invalid;at=", v10: c.now, ctx: Ctx { claim: "", ph: "" } };
+    when c.mount == "" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v7: ";mkfs=", v8: c.mkfs,
+             v9: ";mount=mounting;at=", v10: c.now,
+             ctx: Ctx { claim: c.key, ph: "m_mount", dev: c.device, fs: c.fs, dir: "", mkfs: c.mkfs } };
+    // Detach asked for the unmount: the binds go first (`path=` is not
+    // restated, so this write withdraws it), then the filesystem.
+    when c.mount == "unmount" ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";dir=", v6: c.dir,
+             v9: ";mount=unmounting;at=", v10: c.now,
+             ctx: Ctx { claim: c.key, ph: "m_unmount", dev: c.device, fs: c.fs, dir: c.dir, mkfs: "" } };
+    // The actuator never answered: ask again. Both requests are idempotent — a
+    // directory already mounted from this device reports mounted, one already
+    // unmounted reports unmounted.
+    when c.mount == "mounting" && c.now >= c.at + MOUNT_TIMEOUT_MS ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v7: ";mkfs=", v8: c.mkfs,
+             v9: ";mount=mounting;at=", v10: c.now,
+             ctx: Ctx { claim: c.key, ph: "m_mount", dev: c.device, fs: c.fs, dir: "", mkfs: c.mkfs } };
+    when c.mount == "unmounting" && c.now >= c.at + MOUNT_TIMEOUT_MS ->
+      Step { cid: c.seq, op: REPLACE, key: c.key, rev: c.rev,
+             v1: "device=", v2: c.device, v3: ";fs=", v4: c.fs, v5: ";dir=", v6: c.dir,
+             v9: ";mount=unmounting;at=", v10: c.now,
+             ctx: Ctx { claim: c.key, ph: "m_unmount", dev: c.device, fs: c.fs, dir: c.dir, mkfs: "" } };
+    default ->
+      Step { cid: c.seq, op: NOOP, key: "", ctx: Ctx { claim: "", ph: "" } };
+  }
+
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Mnt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    dev: string = 4;
+    fs: string = 5;
+    dir: string = 6;
+    mkfs: string = 7;
+    ctx: Ctx = 254;
+  }
+  // Only a write the store took issues the effect it recorded.
+  decision act(r: Reply) -> Mnt {
+    when r.status < 200 || r.status >= 300 || r.ctx.ph == "" ->
+      Mnt { cid: r.cid, op: NOOP, key: "" };
+    when r.ctx.ph == "m_mount" ->
+      Mnt { cid: r.cid, op: MOUNT, key: r.ctx.claim, dev: r.ctx.dev, fs: r.ctx.fs, mkfs: r.ctx.mkfs, ctx: r.ctx };
+    when r.ctx.ph == "m_unmount" ->
+      Mnt { cid: r.cid, op: UNMOUNT, key: r.ctx.claim, dev: r.ctx.dev, dir: r.ctx.dir, ctx: r.ctx };
+    default ->
+      Mnt { cid: r.cid, op: NOOP, key: "" };
+  }
+
+  message Done {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    priv: int = 4;
+    fsck: int = 5;
+    code: int = 6;
+    dir: string = 7;
+    was: int = 8;
+    mkfs: int = 9;
+    ctx: Ctx = 254;
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: string = 9;
+  }
+  decision done(d: Done) -> Row {
+    when d.op == MOUNT && d.priv == 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=denied;code=", v2: -1 };
+    when d.op == MOUNT && d.mkfs > 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=format_failed;code=", v2: d.mkfs };
+    when d.op == MOUNT && d.fsck >= 4 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=fsck_failed;code=", v2: d.fsck };
+    when d.op == MOUNT && d.code != 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=mount_failed;code=", v2: d.code };
+    when d.op == MOUNT && d.dir == "" ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=mount_failed;code=", v2: -1 };
+    // Mounted: the one write that makes the claim bindable. `mkfs=` goes with
+    // it — the volume holds a filesystem now.
+    when d.op == MOUNT ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=mounted;mkfs=;code=", v2: 0,
+            v3: ";dir=", v4: d.dir, v5: ";path=", v6: d.dir };
+    when d.op == UNMOUNT && d.was == 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=unmounted;dir=;code=", v2: 0 };
+    when d.op == UNMOUNT && d.priv == 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=busy;code=", v2: -1 };
+    when d.op == UNMOUNT && d.code == 0 ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=unmounted;dir=;code=", v2: 0 };
+    when d.op == UNMOUNT ->
+      Row { cid: d.cid, op: MERGE, key: d.ctx.claim, v1: "mount=busy;code=", v2: d.code };
+    default ->
+      Row { cid: d.cid, op: NOOP, key: "" };
+  }
+
+  pipeline vc_claim(c: Claim) -> Step { call y = claim(c); return y; }
+  pipeline vc_act(r: Reply) -> Mnt { call y = act(r); return y; }
+  pipeline vc_done(d: Done) -> Row { call y = done(d); return y; }
+  entry vc_claim = vc_claim;
+  entry vc_act = vc_act;
+  entry vc_done = vc_done;
+  provenance revision "volume-device-claims" toolchain "chronicle-authoring";
+}

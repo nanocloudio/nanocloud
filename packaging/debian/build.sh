@@ -3,8 +3,8 @@
 # binary: nanocloud IS the fluxor CLI + runtime plus the nanocloud PIC fmods and
 # the graphs that compose them. `/usr/bin/nanocloud` is a busybox-style symlink
 # to `fluxor`, so `nanocloud <cmd>` runs the `nanocloud_cli` applet fmod
-# (`fluxor exec nanocloud -- <cmd>`); the control plane runs as
-# `fluxor run controlplane.yaml` under systemd.
+# (`fluxor exec nanocloud -- <cmd>`); the node runs its graph — the control
+# plane or a worker, rendered per node — as `fluxor run` under systemd.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -83,6 +83,14 @@ done
 echo "==> Staging graphs + service files"
 # The control-plane graph the systemd service runs (apiserver + reconcilers).
 install -Dm644 "${SCRIPT_DIR}/fluxor-controlplane.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/controlplane.yaml"
+# A worker's graph, and the store's replica both splice in: templates the
+# unit renders per node at each start (nanocloud-graph.sh), with the cluster
+# admin helper beside it.
+install -Dm644 "${SCRIPT_DIR}/fluxor-worker.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/worker.yaml"
+install -Dm644 "${SCRIPT_DIR}/fluxor-replica.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/replica.yaml"
+install -Dm644 "${SCRIPT_DIR}/fluxor-podlifecycle.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/kubelet.yaml"
+install -Dm755 "${SCRIPT_DIR}/nanocloud-graph.sh" "${STAGING_ROOT}/usr/lib/nanocloud/nanocloud-graph.sh"
+install -Dm755 "${SCRIPT_DIR}/nanocloud-cluster.sh" "${STAGING_ROOT}/usr/sbin/nanocloud-cluster"
 # The node graph (dataplane workload substrate).
 install -Dm644 "${SCRIPT_DIR}/fluxor-node.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/node.yaml"
 # The image plane (pod-image pull → assemble → run).
@@ -93,10 +101,12 @@ install -Dm644 "${SCRIPT_DIR}/nanocloud.default" "${STAGING_ROOT}/etc/default/na
 # The `nanocloud` CLI applet bundle source (postinst runs `fluxor install`) + the
 # profile snippet that points interactive shells at the system applet registry.
 install -Dm644 "${REPO_ROOT}/packaging/cli/workload.toml" "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/app.fluxor.toml"
-install -Dm644 "${REPO_ROOT}/packaging/cli/linux.yaml"       "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/linux.yaml"
+# The applet's graph is a template (this node's replica): postinst renders
+# linux.yaml from it before installing the applet.
+install -Dm644 "${REPO_ROOT}/packaging/cli/linux.yaml"       "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/linux.yaml.in"
 install -Dm644 "${SCRIPT_DIR}/nanocloud-profile.sh"       "${STAGING_ROOT}/etc/profile.d/nanocloud.sh"
 
-# The image-assembly effect script: run as a host workload by sandbox_runner
+# The image-assembly effect script: run as a host workload by the sandbox runtime
 # when image_assembler projects an assembly job.
 install -Dm755 "${SCRIPT_DIR}/assemble-image.sh"          "${STAGING_ROOT}/usr/lib/nanocloud/assemble-image.sh"
 
@@ -118,6 +128,7 @@ install -Dm755 "${SCRIPT_DIR}/prerm"    "${DEBIAN_DIR}/prerm"
 install -Dm755 "${SCRIPT_DIR}/postrm"   "${DEBIAN_DIR}/postrm"
 install -Dm644 "${SCRIPT_DIR}/conffiles" "${DEBIAN_DIR}/conffiles"
 install -Dm644 "${SCRIPT_DIR}/nanocloud.logrotate" "${STAGING_ROOT}/etc/logrotate.d/nanocloud"
+install -Dm644 "${SCRIPT_DIR}/60-nanocloud-nbd.rules" "${STAGING_ROOT}/lib/udev/rules.d/60-nanocloud-nbd.rules"
 
 INSTALLED_SIZE=$(du -sk "${STAGING_ROOT}" | cut -f1)
 cat >"${DEBIAN_DIR}/control" <<EOF

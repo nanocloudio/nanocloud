@@ -80,7 +80,7 @@ PY
 DEC_RDY="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
 DEC_PRB="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" prb)"
 DEC_MK="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" mk)"
-DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" ask)"
+DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" ask_p)"
 DEC_PRN="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" prn)"
 for v in "$DEC_RDY" "$DEC_PRB" "$DEC_MK" "$DEC_ASK" "$DEC_PRN"; do
   [ -n "$v" ] || { echo "FAIL: a daemonset.uproc entry did not compile"; exit 1; }
@@ -96,12 +96,9 @@ modules:
     type: store_source
     prefix: "/nodes/"
     paths: "status.ready"
-  - name: ready
-    type: decision
-    params:
-      decision: "${DEC_RDY}"
   - name: mark
     type: store_effect
+    decision: "${DEC_RDY}"
     key_prefix: "/ready-nodes/"
   # place: DaemonSets x ready Nodes
   - name: ds_source
@@ -110,19 +107,13 @@ modules:
     paths: "spec.template.spec.*"
     join: "/ready-nodes/"
     watch: "/ready-nodes/,/pods/"
-  - name: probe
-    type: decision
-    params:
-      decision: "${DEC_PRB}"
   - name: exists
     type: store_effect
+    decision: "${DEC_PRB}"
     key_prefix: "/pods/"
-  - name: create
-    type: decision
-    params:
-      decision: "${DEC_MK}"
   - name: apply
     type: store_effect
+    decision: "${DEC_MK}"
     key_prefix: "/pods/"
   # prune: DaemonSet Pods on Nodes no longer ready
   - name: pods
@@ -130,52 +121,31 @@ modules:
     prefix: "/pods/"
     paths: "metadata.ownerReferences.0.kind,spec.nodeName"
     watch: "/ready-nodes/"
-  - name: ask
-    type: decision
-    params:
-      decision: "${DEC_ASK}"
   - name: known
     type: store_effect
+    decision: "${DEC_ASK}"
     key_prefix: "/ready-nodes/"
-  - name: prune
-    type: decision
-    params:
-      decision: "${DEC_PRN}"
   - name: collect
     type: store_effect
+    decision: "${DEC_PRN}"
     key_prefix: "/pods/"
 wiring:
   - from: nodes.status
     to: nodes.changes
   - from: nodes.record_out
-    to: ready.record_in
-  - from: ready.result_out
     to: mark.request_in
-    buffer_group: 1
   - from: ds_source.status
     to: ds_source.changes
   - from: ds_source.record_out
-    to: probe.record_in
-  - from: probe.result_out
     to: exists.request_in
-    buffer_group: 2
   - from: exists.response_out
-    to: create.record_in
-  - from: create.result_out
     to: apply.request_in
-    buffer_group: 3
   - from: pods.status
     to: pods.changes
   - from: pods.record_out
-    to: ask.record_in
-  - from: ask.result_out
     to: known.request_in
-    buffer_group: 4
   - from: known.response_out
-    to: prune.record_in
-  - from: prune.result_out
     to: collect.request_in
-    buffer_group: 5
 YAML
 
 run() { # run <seconds>

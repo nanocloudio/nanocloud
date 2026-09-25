@@ -1,0 +1,64 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+# mod.rs is a SYMLINK to ../store_effect/mod.rs: the same source, built with `big`.
+# (A symlink, not `entry = "../store_effect/mod.rs"`: the build's staleness check
+# walks the module's own directory, so an entry outside it never rebuilt.)
+timer_class = "agnostic"
+
+# Store big — store_effect with a heap, for the few nodes that handle a
+# document past a record: a request body the HTTP server STAGED (`blob`),
+# written as the object it is; an object past a record, answered as existing
+# and projected from a heap copy. A separate module TYPE, not a variant: one
+# graph image carries one build of a type, and every other store_effect keeps
+# bounded memory. Params, ports and frame are store_effect's; see its
+# manifest.
+
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings", "big"]
+default  = true
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+# NOT declared `framed`: either edge shape works. On a byte stream the module
+# self-frames (peeks the record header and consumes exactly one record); on a
+# mailbox (`buffer_group`) it reads the record whole. Wire a stream from a
+# producer that emits a page of records per step (store_source), so a page is
+# not stalled a record at a time.
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+# Optional: a TERMINAL writer has nobody to answer, and requiring a sink would
+# put a `debug` node in a production graph purely to swallow replies. Wire it
+# when a later stage needs the status; leave it unwired at the end of a chain.
+required = false
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (this repo's modules, `debug`) does need mailbox,
+# and declares it on its own INPUT port.
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# OP_LIST walks a prefix, which is the namespace contract, not the object one.
+# READ only: this module lists and reads through it, and never subscribes or
+# writes a namespace.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[observability]
+exempt = "a read-only store effect at the graph edge — observed through the store it reads and the engine it answers"

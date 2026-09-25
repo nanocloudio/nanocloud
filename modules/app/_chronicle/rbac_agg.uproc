@@ -1,0 +1,183 @@
+// Kubernetes RBAC `aggregationRule` as params. Upstream a controller rewrites
+// an aggregating ClusterRole's rules as the union of the rules of every
+// ClusterRole its `clusterRoleSelectors` match. Here the grant index does the
+// same without rewriting any object: every BINDING of the aggregating role is
+// mirrored as a binding of each role it aggregates, so those roles' grants
+// reach its subjects — and a mirror of a mirror carries the union on
+// (admin ⊇ edit ⊇ view, as the defaults are built), to a bounded depth.
+//
+//   sel      /clusterroles/ expand aggregationRule.clusterRoleSelectors[] ->
+//            /rbac-aggsel/<A>/<k> = {"sel":{…},"g":"<A's digest>"}
+//   agg      /rbac-aggsel/ JOIN /clusterroles/: the selector on map stages
+//            (matchLabels AND matchExpressions; selectors are ORed as rows) ->
+//            /rbac-agg/C::<A>/<S>~<k> = {"src":"/rbac-aggsel/<A>/<k>","g":…,"rule":"/clusterroles/<S>"}
+//   mirror   /rbac-bind/C::<A>/… JOIN /rbac-agg/C::<A>/ ->
+//            /rbac-bind/C::<S>/<scope>|<binding>@<A>|<i> = the binding's own
+//            id/scope/src/g, plus "agg" (the /rbac-agg/ row) and "d" (depth)
+//
+// Prunes: a selector row against its role's digest (rbac_prune dv_*); an agg
+// row against its selector row's digest (dv_*) and its role's existence
+// (pm_*); a mirror against the binding's digest (the bind prune it already
+// has) and its agg row's existence (pm_* on "agg").
+module nanocloud.rbac_agg {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  // A mirror of a mirror of … stops here: an aggregation CYCLE would otherwise
+  // grow keys without bound.
+  enum MAX_DEPTH = 4;
+
+  message Req {
+    key: string = 1;
+    op: string = 2;
+    values: string = 3;
+    lv: string = 4;        // the labelled object's value for `key` — absent when it has none
+  }
+  message Label {
+    key: string = 1;
+    value: string = 2;
+    lv: string = 3;        // the labelled object's value for `key` — absent when it has none
+  }
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+  }
+
+  // ---- sel: one row per clusterRoleSelector ----
+  message SelSrc {
+    seq: int = 1;
+    key: string = 3;       // <A>
+    sel: string = 4;       // aggregationRule.clusterRoleSelectors.# (JSON)
+    at: string = 21;
+    g: string = 27;        // A's digest
+  }
+  decision sel(s: SelSrc) -> Put {
+    when s.sel == "" ->
+      Put { cid: s.seq, op: NOOP, key: "", k17: "", k18: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    default ->
+      Put { cid: s.seq, op: PUT, key: s.key, k17: "/", k18: s.at,
+            v1: "{\"sel\":", v2: s.sel, v3: ",\"src\":\"/clusterroles/", v4: s.key,
+            v5: "\",\"g\":\"", v6: s.g, v7: "\"}", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- agg: a selector x every ClusterRole ----
+  message Pair {
+    seq: int = 1;
+    key: string = 3;       // <A>/<k>
+    role: string = 21;     // the joined ClusterRole's name (S)
+    g: string = 27;        // the selector row's digest
+    agg: string = 28;      // A (the key's first segment)
+    exprs: Req = 90;
+    mlabels: Label = 92;
+    xt: int = 93; xf: int = 94; xu: int = 95;
+    lt: int = 96; lf: int = 97; lu: int = 98;
+  }
+  map sel_expr(p: Pair) -> Pair {
+    over p.exprs as e: Req max 16;
+    count p.xt, p.xf, p.xu;
+    when (e.op == "In" && has(e.lv) && ("," + e.values + ",").contains("," + e.lv + ","))
+      || (e.op == "NotIn" && (!has(e.lv) || !("," + e.values + ",").contains("," + e.lv + ",")))
+      || (e.op == "Exists" && has(e.lv))
+      || (e.op == "DoesNotExist" && !has(e.lv));
+  }
+  map sel_lab(p: Pair) -> Pair {
+    over p.mlabels as e: Label max 32;
+    count p.lt, p.lf, p.lu;
+    when has(e.lv) && e.lv == e.value;
+  }
+  decision agg(p: Pair) -> Put {
+    // A role never aggregates itself.
+    when p.role == p.agg ->
+      Put { cid: p.seq, op: NOOP, key: "", k17: "", k18: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when p.xf + p.xu + p.lf + p.lu == 0 ->
+      Put { cid: p.seq, op: PUT, key: "C::" + p.agg, k17: "/", k18: p.role + "~" + p.key.substring(p.key.indexOf("/") + 1),
+            v1: "{\"src\":\"/rbac-aggsel/", v2: p.key, v3: "\",\"g\":\"", v4: p.g,
+            v5: "\",\"rule\":\"/clusterroles/", v6: p.role, v7: "\"}", v8: "", v9: "", v10: "" };
+    default ->
+      Put { cid: p.seq, op: DELETE, key: "C::" + p.agg, k17: "/", k18: p.role + "~" + p.key.substring(p.key.indexOf("/") + 1),
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+  // ---- mirror: each binding of an aggregating role, as one of each role it
+  //      aggregates ----
+  message Bind {
+    seq: int = 1;
+    key: string = 3;       // C::<A>/<scope>|<binding>|<i>
+    id: string = 4;
+    scope: string = 5;
+    src: string = 6;
+    g: string = 7;
+    agg: string = 24;      // the /rbac-agg/ row's full key
+    target: string = 21;   // its last segment: <S>~<k>
+    last: string = 29;     // the bind key's last segment: <scope>|<binding>|<i>
+    a: string = 28;        // C::<A>
+    d: int = 50;           // this binding's mirror depth (0 = a real binding)
+  }
+  // The mirror records its depth (one more than the binding it mirrors), so a
+  // chain of aggregations stops at MAX_DEPTH.
+  decision mirror(b: Bind) -> Put {
+    when b.id == "" || b.d >= MAX_DEPTH ->
+      Put { cid: b.seq, op: NOOP, key: "", k17: "", k18: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+    when b.d == 0 ->
+      Put { cid: b.seq, op: PUT, key: "C::" + b.target.substring(0, b.target.indexOf("~")), k17: "/",
+            k18: b.last + "@" + b.a,
+            v1: "{\"id\":\"" + b.id + "\",\"scope\":\"" + b.scope, v2: "\",\"src\":\"" + b.src,
+            v3: "\",\"g\":\"", v4: b.g, v5: "\",\"agg\":\"", v6: b.agg,
+            v7: "\",\"d\":1}", v8: "", v9: "", v10: "" };
+    when b.d == 1 ->
+      Put { cid: b.seq, op: PUT, key: "C::" + b.target.substring(0, b.target.indexOf("~")), k17: "/",
+            k18: b.last + "@" + b.a,
+            v1: "{\"id\":\"" + b.id + "\",\"scope\":\"" + b.scope, v2: "\",\"src\":\"" + b.src,
+            v3: "\",\"g\":\"", v4: b.g, v5: "\",\"agg\":\"", v6: b.agg,
+            v7: "\",\"d\":2}", v8: "", v9: "", v10: "" };
+    when b.d == 2 ->
+      Put { cid: b.seq, op: PUT, key: "C::" + b.target.substring(0, b.target.indexOf("~")), k17: "/",
+            k18: b.last + "@" + b.a,
+            v1: "{\"id\":\"" + b.id + "\",\"scope\":\"" + b.scope, v2: "\",\"src\":\"" + b.src,
+            v3: "\",\"g\":\"", v4: b.g, v5: "\",\"agg\":\"", v6: b.agg,
+            v7: "\",\"d\":3}", v8: "", v9: "", v10: "" };
+    when b.d == 3 ->
+      Put { cid: b.seq, op: PUT, key: "C::" + b.target.substring(0, b.target.indexOf("~")), k17: "/",
+            k18: b.last + "@" + b.a,
+            v1: "{\"id\":\"" + b.id + "\",\"scope\":\"" + b.scope, v2: "\",\"src\":\"" + b.src,
+            v3: "\",\"g\":\"", v4: b.g, v5: "\",\"agg\":\"", v6: b.agg,
+            v7: "\",\"d\":4}", v8: "", v9: "", v10: "" };
+    default ->
+      Put { cid: b.seq, op: NOOP, key: "", k17: "", k18: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "" };
+  }
+
+
+  transformation t_sel(s: SelSrc) -> SelSrc {
+    SelSrc { seq: s.seq, key: s.key, sel: s.sel, at: s.at, g: s.g }
+  }
+  // Scalars and counts only in a pass stage: a path read returns a repeated
+  // field's FIRST element.
+  transformation t_pair(p: Pair) -> Pair {
+    Pair { seq: p.seq, key: p.key, role: p.role, g: p.g, agg: p.agg,
+           xf: p.xf, xu: p.xu, lf: p.lf, lu: p.lu }
+  }
+  transformation t_bind(b: Bind) -> Bind {
+    Bind { seq: b.seq, key: b.key, id: b.id, scope: b.scope, src: b.src, g: b.g,
+           agg: b.agg, target: b.target, last: b.last, a: b.a, d: b.d }
+  }
+
+  pipeline ag_sel(s: SelSrc) -> Put { call x = t_sel(s); call y = sel(x); return y; }
+  pipeline ag_map(p: Pair) -> Pair { call a = sel_expr(p); call b = sel_lab(a); return b; }
+  pipeline ag_agg(p: Pair) -> Put { call x = t_pair(p); call y = agg(x); return y; }
+  pipeline ag_mirror(b: Bind) -> Put { call x = t_bind(b); call y = mirror(x); return y; }
+  entry ag_sel = ag_sel;
+  entry ag_map = ag_map;
+  entry ag_agg = ag_agg;
+  entry ag_mirror = ag_mirror;
+  provenance revision "rbac-aggregation" toolchain "chronicle-authoring";
+}

@@ -1,0 +1,69 @@
+name = "net_apply"
+version = "0.1.0"
+description = "Rows under a store prefix → one net.policy table, replaced whole, with its enforcement stated"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The net.policy connector — the effect half of the proxy and NetworkPolicy
+# chains, as `store_effect` is the effect half of a reconciler.
+#
+# The chains decide WHICH traffic is allowed and where a virtual address leads,
+# as rows in the store (params, `proxy.uproc` / `netpolicy.uproc`). This module
+# does the one thing the VM cannot: encode those rows as `net.policy` rule
+# records and REPLACE the table, whole and atomically. The platform then
+# realizes it — nftables on Linux, the packet filter on bare metal, a recorded
+# no-op on wasm — and this module never names which.
+#
+# Rows: one flat `k=v;…` record per key under `prefix`:
+#   kind=allow|drop  dir=in|out  subj=<ip>[/<n>]
+#                    peers=<cidr>,…   ("" = any peer; `-` = one it cannot name,
+#                                      and that entry allows nothing)
+#                    ports=<p>,…      ("" = any port; `-`/named = skipped)
+#                    protos=<P>,…     (aligned to ports; `-`/"" = TCP)
+#     -> one ALLOW/DROP record per (peer × port)
+#   kind=isolate     dir=in|out  subj=<ip>[/<n>]           -> one ISOLATE
+#   kind=dnat        vip=<ip>  vports=<p>,…  tports=<p>,…  protos=<P>,…
+#                    backend=<ip>
+#     -> one DNAT per port with this backend; the platform merges records
+#        naming the same (proto, vip, port) into one balanced service
+#   anything else is skipped and counted.
+# A row set that does not fit the table is NOT applied: the previous table
+# stands, and the status says why. Half a policy is a policy nobody wrote.
+#
+# Status, written put-if-changed to `status_key` after every apply:
+#   enforced=1|0;rules=<n>;generation=<g>        — applied
+#   error=<errno>;rules=<n>                        — refused (old table stands)
+#   error=table-full;rules=<n>                     — not applied
+# `enforced=0` is the platform saying it records the table and enforces
+# nothing (wasm; bare metal with no filter attached). A NetworkPolicy that
+# exists and is not enforced is a gap the cluster must be able to see.
+timer_class = "agnostic"
+# REPLACE rewrites the host's packet policy: privileged, as spawning is.
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "net_policy"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+metrics = ["np_applied", "np_refused", "np_skipped_rows"]

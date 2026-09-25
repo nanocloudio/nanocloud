@@ -1,0 +1,55 @@
+# A worker node's graph: its replica of the control plane's store — a
+# learner, outside the voter set, given the group's log once an operator
+# adds it (`nanocloud-cluster add-node <id>` on a control-plane node) — its
+# lease, and its pod plane (fluxor-podlifecycle.yaml: the kubelet's chains
+# and the sandbox runtime, spliced in by the render).
+#
+#   renew   /nodes/<this node>: absent, or due -> ready, its heartbeat this
+#           node's clock (node_lease.uproc `renew`). Written here, decided
+#           by the voters: the control plane projects the node ready, takes
+#           it out of service when it stops renewing, and schedules onto it.
+#
+# Its replica is scoped to this node: the pod plane's records (/pod-specs/,
+# /pod-runtime/, /sandboxes/, /sandbox-…, /probe-…, /image-…, …) are this
+# node's own, kept in the store under /~node/<this node>. The control plane
+# writes what it asks of the node there (/~node/<node>/pod-specs/<uid>), so
+# the pod plane reads its own asks by their plain names and no other
+# node's. A template: nanocloud-graph.sh renders it per node
+# (NANOCLOUD_ROLE=node in /etc/nanocloud.io/cluster.env).
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
+scheduler:
+  accept_cycles: true
+
+modules:
+__REPLICA_MODULES__
+__KUBELET_MODULES__
+  - name: nl_self
+    type: store_source
+    prefix: "/nodes/"
+    where: "metadata.name=__NODE_NAME__"
+    paths: "status.ready"
+    ints: "status.heartbeat"
+    count: 1
+    empty: 1
+    label: "__NODE_NAME__"
+    now: 1
+    due: "status.heartbeat+10000"
+  - name: nl_renew
+    type: store_effect
+    # chronicle-source: modules/app/_chronicle/node_lease.uproc renew_p
+    decision: "03050000000c00010002300000001200002000080000002300010002010000004001000000100000000000000000400200000012000040030000004105000000120001000216000000100000000000000000200015000000940001000201000000400100000010030000000000000040020000000100023000000040030000001215007b226d65746164617461223a7b226e616d65223a224004000000010002300000004005000000122600227d2c22737461747573223a7b227265616479223a747275652c22686561727462656174223a40060000000100023a00000040070000001202007d7d400800000041180000004c000100020400000012040074727565210100023200000010000000000000000020310100023a0000000100023200000022310100023a000000010002320000001010270000000000005025310015000000940001000201000000400100000010030000000000000040020000000100023000000040030000001215007b226d65746164617461223a7b226e616d65223a224004000000010002300000004005000000122600227d2c22737461747573223a7b227265616479223a747275652c22686561727462656174223a40060000000100023a00000040070000001202007d7d4008000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"
+    key_prefix: "/nodes/"
+
+wiring:
+  - from: nl_self.status
+    to: nl_self.changes
+  - from: nl_self.record_out
+    to: nl_renew.request_in
+__REPLICA_WIRING__
+__KUBELET_WIRING__

@@ -97,23 +97,16 @@ modules:
     flat: 1
     ints: "deadline"
     due: "deadline"
-  - name: expire
-    type: decision
-    domain: main
-    params:
-      decision: "${DEC_EX}"
   - name: reap
     type: store_effect
+    decision: "${DEC_EX}"
     domain: main
     key_prefix: "/leases/"
 wiring:
   - from: leases.status
     to: leases.changes
   - from: leases.record_out
-    to: expire.record_in
-  - from: expire.result_out
     to: reap.request_in
-    buffer_group: 1
 YAML
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
 

@@ -1,0 +1,144 @@
+name = "kagi_storage_effect"
+version = "0.1.0"
+description = "Chronicle connector for Kagi's storage-key service — a volume key effect in, storage-key requests out, the typed outcome back as a record"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The encrypted-volume pipelines' control-plane effector for Kagi (docs/design/
+# encrypted-volumes.md). It decides nothing: each key effect becomes Kagi
+# storage-key requests (`_shared/kagi_storage_ops.rs`, over kagi-common's own
+# codecs), and Kagi's decision becomes the outcome the pipeline maps.
+#
+# A REQUESTER of Kagi's `storage_key` typed operation, wired inside the
+# control plane's graph: `request_out` into `storage_key.request_in` and
+# `storage_key.response_out` into `response_in` — the edge that carries the
+# control verbs, which the service does not authenticate and its network
+# endpoint refuses. Each request is one exchange (Kagi's typed-operation
+# shape: POST, the body one REQUEST envelope `[op][kind][resource 16][body]`,
+# the answer a 200 whose body is one REPLY envelope), and its exchange id is
+# the correlation: the call's counter and this module's request port, so the
+# endpoint and this connector share the service's answers and each takes only
+# its own. A call the service loses to `LINK DOWN` is sent again after `LINK
+# UP`; an exchange that ends without a REPLY is `unavailable` when the service
+# was busy or gone (503, 502, 504, an ABORT) and `failed` otherwise.
+#
+# The provisioning vault is this node's: VAULT_SPLIT generates the volume key
+# there (a KDF key, WRAP only), splits it 2-of-3 under the creation Kagi
+# authorised, one envelope sealed to each custodian, and the key never leaves.
+# The creation and envelopes are held from the create (or rotation) until the
+# record set; VAULT_DESTROY destroys the handle.
+#
+# CUSTODIANS. `custodian_1..3` pin the three recovery keys a creation names.
+# With none pinned, the connector asks the custodians wired to it
+# (`custodian_req` into each custodian's `orders`, their `results` into
+# `custodian_in`) with CUSTODIAN_KEY_REQ until each has named its key — the
+# packaged control plane, whose custodians share its graph. Pin all three or
+# none.
+#
+# KEY. At start this names the storage-grant signing key to the service: a
+# SIGN `MSG_KEY_ADD` on `key_out`, to `storage_key.signing_key`, whose
+# reference is a vault label (`signing_label`) — never key material. The
+# service opens it (generated in its vault on first open, persisted, never
+# exported) and announces the public half on its own `key_announce`, which
+# the graph wires to every custodian's `verify_key`.
+#
+# In (`request_in`, a Chronicle record; a byte stream, self-framed, or a
+# mailbox):
+#   1 cid (i64)  2 op (i64)  3 key: the claim  4..8 a1..a5  9 n1 (i64)  10 n2
+#   254 carry, echoed
+# Ops (Kagi op in brackets):
+#   20 KAGI_GRANT        a1 vol a2 device a3 custody n1 tier n2 lifetime [4]
+#                        -> grant (12)
+#   21 KAGI_REPLACE      a1 old device a2 new device a3 vol [7] -> grant (12)
+#   24 KAGI_CREATE       a1 vol a2 tenant a3 custody n1 tier n2 lifetime [2]
+#   25 KAGI_RECORD_SET   a1 vol a2 epoch [3] -> set (11)
+#   31 VAULT_SPLIT       a1 vol a2 epoch
+#   32 VAULT_DESTROY     a1 vol a2 epoch
+#   60 KAGI_ROTATE_GRANT a1 vol a2 device a3 custody a4 actor n1 tier
+#                        n2 lifetime [8]
+#   61 KAGI_REVOKE       a1 vol a2 actor [6]
+#   65 KAGI_ROTATE_KEY   a1 vol a2 from epoch a3 actor [9] -> r1 (14) the epoch
+#   71 KAGI_RETIRE_EPOCH a1 vol a2 epoch a3 actor [10]
+#   78 KAGI_RECOVERY_AUTHORISE a1 vol a2 epoch a3 device a4 actor n1 ttl s [11]
+#                        -> r1 (14) the ticket
+#   80 KAGI_REGRANT      a1 vol a2 device a3 actor a4 the device the grant names
+#                        [7, or 4 over a revoked grant] -> grant (12)
+#   81 KAGI_ERASE        a1 vol a2 actor a3 epoch n1 pins [14]
+#   Any other op is not Kagi's and is dropped unanswered.
+# Custody is `possession` or `hardware`; an epoch argument left empty is the
+# first. The resource is sha256(vol)[..16]. Set and ticket ids are hex.
+# Out (`response_out`): the pipelines' Outcome, every field present:
+#   1 cid 2 op 3 key 4 code 5 fence 6 lease_exp 7 exp 8 inst 9 dev 10 vol
+#   11 set 12 grant 13 n 14 r1 15 r2 16 r3, 254 carry
+# Codes: ok refused failed unavailable. A refusal this connector can show
+# answers its own earlier decision (a second revoke, the same grant, a
+# rotation or create whose creation it holds) is `ok`.
+#
+# One effect in flight; one unanswered for `timeout_ms` is `unavailable`, and
+# its exchange is aborted.
+timer_class = "wall_clock"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# `storage_key.response_out`: every party's answers, this connector's by
+# exchange id.
+[[ports]]
+name = "response_in"
+direction = "input"
+index = 1
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+required = true
+
+# Every custodian's `results`: their recovery keys, when none are pinned.
+[[ports]]
+name = "custodian_in"
+direction = "input"
+index = 2
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+# To `storage_key.request_in`.
+[[ports]]
+name = "request_out"
+direction = "output"
+index = 1
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+required = true
+
+# To `storage_key.signing_key`.
+[[ports]]
+name = "key_out"
+direction = "output"
+index = 2
+content_type = "OctetStream"
+buffer_size = 512
+
+# Into every custodian's `orders`: CUSTODIAN_KEY_REQ, when none are pinned.
+[[ports]]
+name = "custodian_req"
+direction = "output"
+index = 3
+content_type = "OctetStream"
+buffer_size = 512
+
+[observability]
+exempt = "connector — every decision it carries is Kagi's, audited in its ledger; each outcome is a record in the store"

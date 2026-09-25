@@ -1,14 +1,28 @@
 # The nanocloud CLI as a fluxor cli-applet: one PIC module
 # (nanocloud_cli) dispatches subcommands (status, get, help) over the cli host
 # surface. Install + run: `fluxor exec nanocloud -- <cmd>` (busybox: `nanocloud <cmd>`).
+#
+# The applet reads and writes the control-plane store directly: it runs as
+# this node's replica of the store (packaging/debian/fluxor-replica.yaml),
+# in the store's state directory, never while the node's service runs (one
+# process holds a replica at a time). Its writes are the group's, decided
+# through the log like the service's. A template: postinst renders it with
+# packaging/debian/nanocloud-graph.sh before installing the applet.
 target: linux
 tick_us: 100
 
 platform:
   cli: {}
+  # The replica's peer links.
+  net: {}
+
+# The store's clock and chunk sweeps loop back into it.
+scheduler:
+  accept_cycles: true
 
 modules:
   - name: nanocloud_cli
+__REPLICA_MODULES__
 
 wiring:
   - from: cli_in.args_out
@@ -19,3 +33,4 @@ wiring:
     to: cli_out.bytes_in
   - from: nanocloud_cli.exit
     to: cli_out.exit_in
+__REPLICA_WIRING__

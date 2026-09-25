@@ -1,0 +1,241 @@
+// Kubernetes RBAC as params: bindings and grants. The design, the row
+// shapes and the key scheme are described in rbac_rules.uproc.
+module nanocloud.rbac_grants {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: SrcPut, SrcDone
+  message Ctx {
+    id: string = 30;
+    scope: string = 31;
+    verb: string = 32;
+    res: string = 33;
+    group: string = 34;
+    name: string = 35;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+
+  // ---- binds: one row per subject ----
+  message Subject {
+    seq: int = 1;
+    key: string = 3;
+    skind: string = 4;
+    sname: string = 5;
+    sns: string = 6;
+    rkind: string = 7;
+    rname: string = 8;
+    idxd: string = 21;
+    g: string = 27;
+    ns: string = 28;
+    bname: string = 29;
+  }
+  message BindPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    k25: string = 25;
+    k26: string = 26;
+    k27: string = 27;
+    k20: string = 20;
+    k21: string = 21;
+    k22: string = 22;
+    k23: string = 23;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+    v8: string = 11;
+    v9: string = 12;
+    v10: string = 13;
+    v11: string = 14;
+    v12: string = 15;
+    v13: string = 16;
+  }
+  // A RoleBinding grants in its own namespace; its roleRef may name a Role
+  // (in that namespace) or a ClusterRole. A ServiceAccount subject without a
+  // namespace is in the binding's.
+  decision rb_bind(b: Subject) -> BindPut {
+    when b.rkind == "ClusterRole" && b.skind == "ServiceAccount" && b.sns != "" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"system:serviceaccount:", v2: b.sns, v3: ":", v4: b.sname,
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "ClusterRole" && b.skind == "ServiceAccount" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"system:serviceaccount:", v2: b.ns, v3: ":", v4: b.sname,
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "ClusterRole" && b.skind == "User" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "ClusterRole" && b.skind == "Group" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"group:", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "Role" && b.skind == "ServiceAccount" && b.sns != "" ->
+      BindPut { cid: b.seq, op: PUT, key: "R:", k17: b.ns, k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"system:serviceaccount:", v2: b.sns, v3: ":", v4: b.sname,
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "Role" && b.skind == "ServiceAccount" ->
+      BindPut { cid: b.seq, op: PUT, key: "R:", k17: b.ns, k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"system:serviceaccount:", v2: b.ns, v3: ":", v4: b.sname,
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "Role" && b.skind == "User" ->
+      BindPut { cid: b.seq, op: PUT, key: "R:", k17: b.ns, k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "Role" && b.skind == "Group" ->
+      BindPut { cid: b.seq, op: PUT, key: "R:", k17: b.ns, k18: ":", k25: b.rname, k26: "/",
+                k27: b.ns, k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"group:", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: b.ns, v7: "\",\"src\":\"/rolebindings/", v8: b.ns,
+                v9: "/", v10: b.bname, v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    default -> BindPut { cid: b.seq, op: NOOP, key: "" };
+  }
+  // A ClusterRoleBinding grants everywhere (scope `*`) and must name a
+  // ClusterRole; its ServiceAccount subjects must name their namespace.
+  decision crb_bind(b: Subject) -> BindPut {
+    when b.rkind == "ClusterRole" && b.skind == "ServiceAccount" && b.sns != "" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: "*", k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"system:serviceaccount:", v2: b.sns, v3: ":", v4: b.sname,
+                v5: "\",\"scope\":\"", v6: "*", v7: "\",\"src\":\"/clusterrolebindings/", v8: b.bname,
+                v9: "", v10: "", v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "ClusterRole" && b.skind == "User" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: "*", k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: "*", v7: "\",\"src\":\"/clusterrolebindings/", v8: b.bname,
+                v9: "", v10: "", v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    when b.rkind == "ClusterRole" && b.skind == "Group" ->
+      BindPut { cid: b.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: b.rname, k26: "/",
+                k27: "*", k20: "|", k21: b.bname, k22: "|", k23: b.idxd,
+                v1: "{\"id\":\"group:", v2: b.sname, v3: "", v4: "",
+                v5: "\",\"scope\":\"", v6: "*", v7: "\",\"src\":\"/clusterrolebindings/", v8: b.bname,
+                v9: "", v10: "", v11: "\",\"g\":\"", v12: b.g, v13: "\"}" };
+    default -> BindPut { cid: b.seq, op: NOOP, key: "" };
+  }
+
+  // ---- grants: a perm meets a bind on the role key ----
+  message PermBind {
+    seq: int = 1;
+    ptail: string = 3;     // the perm's key tail: <rolekey>/<g>-<i>-<m>
+    verb: string = 4;
+    group: string = 5;
+    res: string = 6;
+    name: string = 7;
+    blast: string = 21;    // the bind's last segment: <scope>|<binding>|<i>
+    bkey: string = 24;     // the bind's full key
+    id: string = 60;
+    scope: string = 61;
+  }
+  message SrcPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    k25: string = 25;
+    k26: string = 26;
+    k27: string = 27;
+    k20: string = 20;
+    k21: string = 21;
+    k22: string = 22;
+    k23: string = 23;
+    k24: string = 24;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    ctx: Ctx = 254;
+  }
+  message SrcDone {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message GPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    k25: string = 25;
+    k26: string = 26;
+    k27: string = 27;
+    k20: string = 20;
+    k21: string = 21;
+    k22: string = 22;
+    k23: string = 23;
+    k24: string = 24;
+    v1: string = 4;
+  }
+  // The grant key is <id>/<scope>|<verb>|<group>|<res>|<name>, what the API
+  // plane probes. A nonResourceURLs perm (group `~`) grants only through a
+  // ClusterRoleBinding (scope `*`), and is written with scope `~` — a literal
+  // no probe wildcard widens, so a resource grant never reaches a URL.
+  decision grant_src(j: PermBind) -> SrcPut {
+    when j.id == "" || j.scope == "" || j.verb == "" || j.res == "" || j.name == "" ->
+      SrcPut { cid: j.seq, op: NOOP, key: "", ctx: Ctx { id: "", scope: "", verb: "", res: "", group: "", name: "" } };
+    when j.group == "~" && j.scope != "*" ->
+      SrcPut { cid: j.seq, op: NOOP, key: "", ctx: Ctx { id: "", scope: "", verb: "", res: "", group: "", name: "" } };
+    when j.group == "~" ->
+      SrcPut { cid: j.seq, op: PUT, key: j.id, k17: "/", k18: "~", k25: "|", k26: j.verb,
+               k27: "|", k20: "~", k21: "|", k22: j.res, k23: "|", k24: "~/" + j.ptail + "+" + j.blast,
+               v1: "perm=/rbac-perm/", v2: j.ptail, v3: ";bind=", v4: j.bkey,
+               ctx: Ctx { id: j.id, scope: "~", verb: j.verb, res: j.res, group: "~", name: "~" } };
+    default ->
+      SrcPut { cid: j.seq, op: PUT, key: j.id, k17: "/", k18: j.scope, k25: "|", k26: j.verb,
+               k27: "|", k20: j.group, k21: "|", k22: j.res, k23: "|", k24: j.name + "/" + j.ptail + "+" + j.blast,
+               v1: "perm=/rbac-perm/", v2: j.ptail, v3: ";bind=", v4: j.bkey,
+               ctx: Ctx { id: j.id, scope: j.scope, verb: j.verb, res: j.res, group: j.group, name: j.name } };
+  }
+  decision grant_g(d: SrcDone) -> GPut {
+    when d.ctx.id == "" -> GPut { cid: d.cid, op: NOOP, key: "" };
+    default ->
+      GPut { cid: d.cid, op: PUT, key: d.ctx.id, k17: "/", k18: d.ctx.scope, k25: "|",
+             k26: d.ctx.verb, k27: "|", k20: d.ctx.group, k21: "|", k22: d.ctx.res, k23: "|",
+             k24: d.ctx.name, v1: "1" };
+  }
+  transformation psub(b: Subject) -> Subject {
+    Subject { seq: b.seq, key: b.key, skind: b.skind, sname: b.sname, sns: b.sns,
+              rkind: b.rkind, rname: b.rname, idxd: b.idxd, g: b.g, ns: b.ns, bname: b.bname }
+  }
+  transformation ppb(j: PermBind) -> PermBind {
+    PermBind { seq: j.seq, ptail: j.ptail, verb: j.verb, group: j.group, res: j.res, name: j.name,
+               blast: j.blast, bkey: j.bkey, id: j.id, scope: j.scope }
+  }
+  transformation psd(d: SrcDone) -> SrcDone {
+    SrcDone { cid: d.cid, status: d.status, ctx: d.ctx }
+  }
+  pipeline rb_row(b: Subject) -> BindPut { call x = psub(b); call y = rb_bind(x); return y; }
+  pipeline crb_row(b: Subject) -> BindPut { call x = psub(b); call y = crb_bind(x); return y; }
+  pipeline gr_src(j: PermBind) -> SrcPut { call x = ppb(j); call y = grant_src(x); return y; }
+  pipeline gr_g(d: SrcDone) -> GPut { call x = psd(d); call y = grant_g(x); return y; }
+  entry rb_row = rb_row;
+  entry crb_row = crb_row;
+  entry gr_src = gr_src;
+  entry gr_g = gr_g;
+  provenance revision "rbac-index" toolchain "chronicle-authoring";
+}

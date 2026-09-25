@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's service_ipam module (modules/app/service_ipam) —
-# ClusterIP allocation over the fluxor-native control-plane store, consumed
-# through the standard storage contracts (storage.object 0x14 + storage.namespace
-# 0x13). the store lives inside
-# the runtime and is seeded from its durable append-log ($D/store.log) at boot.
+# Live E2E for Service ClusterIP allocation as Chronicle params
+# (modules/app/_chronicle/ipam_svc.uproc; graph EXTRACTED from
+# fluxor-controlplane.yaml into packaging/debian/fluxor-service-ipam.yaml) over
+# the fluxor-native control-plane store, seeded from its durable append-log.
 #
-# Proves IPAM on real binaries: Services without a clusterIP are seeded into the
-# store log; the allocator fmod assigns each the lowest free address from the
-# service CIDR (10.96.0.0/16), skipping IPs already held by other Services, and
-# leaves already-allocated Services alone.
+# Proves: a ClusterIP a Service already holds is CLAIMED before allocation
+# starts and never handed out again (the allocator is refused by the store,
+# 409, and skips it); unallocated Services get next-fit addresses PATCHed into
+# spec.clusterIP; and a deleted Service's claim is released.
 #
-#   /services/<ns>/<name> = "sel=k=v[;clusterIP=<ip>]"
+#   /services/<ns>/<name> = {"metadata":…,"spec":{…,"clusterIP":"<ip>"}}
+#   /ipam/svc/<u32>       = "owner=<ns>/<name>;ip=<u32>"   (the claim)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +23,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/service_ipam.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/store_source.fmod" "$MODULES_DIR/store_effect.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor sync && fluxor modules build --target bcm2712)"; exit 1; }
 done
 
@@ -71,26 +71,64 @@ PY
 echo "== 1. build the config + module table from the packaged graph =="
 nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
-echo "== 2. two unallocated Services + one pre-allocated (holds 10.96.0.5) =="
-store_put "/services/default/a"   '{"metadata":{"name":"a"},"spec":{"selector":{"app":"a"}}}'
-store_put "/services/default/b"   '{"metadata":{"name":"b"},"spec":{"selector":{"app":"b"}}}'
-store_put "/services/default/pre" '{"metadata":{"name":"pre"},"spec":{"selector":{"app":"pre"},"clusterIP":"10.96.0.5"}}'
-
-echo "== 3. run the allocator =="
-FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
-
-echo "== 4. verify lowest-free allocation, skipping the held IP =="
-expect() { # expect <svc> <clusterIP>
-  local got; got="$(store_last "/services/default/$1")"
-  case "$got" in *"\"clusterIP\":\"$2\""*) echo "   $1 -> $2"; return 0;; *) fail "$1 wrong: got '$got' want clusterIP=$2";; esac
-  [ "$got" = "$2" ] || fail "$1 wrong: got '$got', want '$2'"
-  echo "   $1: $got"
+RUNTIME_PID=""
+trap 'kill $RUNTIME_PID 2>/dev/null || true; rm -rf "$D"' EXIT
+start() {
+  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  RUNTIME_PID=$!
 }
-# a and b get 10.96.0.1 and 10.96.0.2 (byte order); .5 is skipped (held by pre).
-expect a   10.96.0.1
-expect b   10.96.0.2
-# the pre-allocated Service is left untouched.
-expect pre 10.96.0.5
+stop() { kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""; }
+ip_of() { store_last "/services/default/$1" | python3 -c "import json,sys;d=sys.stdin.read();print(json.loads(d)['spec'].get('clusterIP','') if d else '')"; }
+await_ip() { # await_ip <svc> <ip>
+  for _ in $(seq 300); do
+    [ "$(ip_of "$1")" = "$2" ] && return 0
+    kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited while waiting for $1"
+    sleep 0.1
+  done
+  fail "$1: clusterIP '$(ip_of "$1")', want '$2' after 30s"
+}
+ip_u32() { python3 -c "import sys;a=[int(x) for x in sys.argv[1].split('.')];print((a[0]<<24)|(a[1]<<16)|(a[2]<<8)|a[3])" "$1"; }
+svc() { store_put "/services/default/$1" "{\"metadata\":{\"name\":\"$1\"},\"spec\":{\"selector\":{\"app\":\"$1\"}$2}}"; }
 
-echo "== E2E green: ClusterIP allocation (lowest-free, collision-safe) over the store =="
+echo "== 2. five unallocated Services, and one that already holds 10.96.0.5 =="
+svc pre ',"clusterIP":"10.96.0.5"'
+for n in a b c d e; do svc "$n" ""; done
+
+echo "== 3. run: the held address is claimed first, then next-fit =="
+start
+await_ip e 10.96.0.6
+stop
+for pair in a:10.96.0.1 b:10.96.0.2 c:10.96.0.3 d:10.96.0.4 e:10.96.0.6 pre:10.96.0.5; do
+  n="${pair%%:*}"; want="${pair#*:}"
+  [ "$(ip_of "$n")" = "$want" ] || fail "$n: clusterIP '$(ip_of "$n")', want $want"
+  claim="$(store_last "/ipam/svc/$(ip_u32 "$want")")"
+  [ "$claim" = "owner=default/$n;ip=$(ip_u32 "$want")" ] || fail "claim for $want: '$claim'"
+  echo "   $n -> $want (claimed)"
+done
+grep -q '"image"\|"selector":{"app":"a"}' <(store_last /services/default/a) || fail "PATCH dropped the Service's other fields"
+echo "   .5 was refused by the store and skipped; the PATCH kept every other field"
+
+echo "== 4. release: Service b is deleted -> its claim goes; a new Service gets .7 =="
+python3 - "$D/store.log" "/services/default/b" <<'PY'
+import struct, sys, os
+path, key = sys.argv[1], sys.argv[2].encode()
+with open(path, "r+b") as f:
+    data = f.read(); p, last = 0, 0
+    while p + 15 <= len(data):
+        rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    f.write(struct.pack("<QBHI", last + 1, 2, len(key), 0) + key)
+    f.flush(); os.fsync(f.fileno())
+PY
+svc f ""
+start
+await_ip f 10.96.0.7
+for _ in $(seq 300); do [ -z "$(store_last "/ipam/svc/$(ip_u32 10.96.0.2)")" ] && break; sleep 0.1; done
+stop
+[ -z "$(store_last "/ipam/svc/$(ip_u32 10.96.0.2)")" ] || fail "b's claim on 10.96.0.2 was not released"
+echo "   b's claim on 10.96.0.2 released; f -> 10.96.0.7 (next-fit)"
+
+echo "== E2E green: ClusterIPs allocated as params — claims make every address unique =="

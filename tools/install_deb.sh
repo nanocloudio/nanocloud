@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Install the newest built Debian package (target/debian/nanocloud_*.deb)
 # and restart the nanocloud service if it is currently running.
-# Formerly `make install`; build the package first with
-# packaging/debian/build.sh.
+# Build the package first with packaging/debian/build.sh.
 
 set -euo pipefail
 

@@ -1,0 +1,176 @@
+// Kubernetes RBAC as params (roles -> rule and perm rows here; bindings and
+// grants in rbac_grants.uproc — one design, split only for the per-module
+// declaration limits): the grant INDEX the API plane's authorization
+// stage probes with one store read (apiplane.uproc, EXISTS_ANY).
+//
+// The objects are the real rbac.authorization.k8s.io/v1 ones, as JSON:
+//   /roles/<ns>/<name>            Role                 rules[]
+//   /clusterroles/<name>          ClusterRole          rules[]
+//   /rolebindings/<ns>/<name>     RoleBinding          subjects[] + roleRef
+//   /clusterrolebindings/<name>   ClusterRoleBinding   subjects[] + roleRef
+// A role is keyed ONE segment wide — `R:<ns>:<name>` or `C::<name>` — so
+// every row derived from it shares that first segment and a scoped join can
+// meet them there.
+//
+//   rules    each rule of a role    -> /rbac-rule/<rolekey>/<g>-<i>
+//            (g = the role's digest, so a changed role's old rows are stale by key)
+//   perms    each verb x apiGroup x resource x resourceName
+//                                   -> /rbac-perm/<rolekey>/<g>-<i>-<m>
+//            (a rule naming no resourceNames grants every name: `*`; a
+//            nonResourceURLs rule — ClusterRoles only — grants its URLs with
+//            group, scope and name `~`, which no probe wildcard widens)
+//   binds    each subject           -> /rbac-bind/<rolekey>/<scope>|<binding>|<i>
+//            (scope = the binding's namespace, or `*` for a ClusterRoleBinding)
+//   grants   perm JOIN bind on the role key
+//                                   -> /rbac-src/<id>/<scope>|<verb>|<group>|<res>|<name>/<perm>+<bind>
+//                                   -> /rbac-g/<id>/<scope>|<verb>|<group>|<res>|<name>   (what is probed)
+// A `*` verb or resource is kept literally: the probe asks for it by name.
+// Rows a changed or deleted object no longer produces are removed by
+// rbac_prune.uproc; /rbac-g/ goes when its last /rbac-src/ row does.
+//
+// apiGroups are distinguished (a rule without them grants no resource, as
+// upstream); resourceNames restrict a rule to those names — a request with no
+// name (list, create, watch) is never granted by one.
+module nanocloud.rbac_rules {
+  enum NOOP = 0;
+  enum PUT = 3;
+
+  // ---- rules ----
+  message RoleRule {
+    seq: int = 1;
+    key: string = 3;
+    verbs: string = 4;     // rules.#.verbs, JSON array text
+    res: string = 5;       // rules.#.resources
+    names: string = 6;     // rules.#.resourceNames
+    groups: string = 7;    // rules.#.apiGroups
+    urls: string = 8;      // rules.#.nonResourceURLs
+    idxd: string = 21;
+    g: string = 27;        // digest of the whole role
+    ns: string = 28;
+    name: string = 29;
+  }
+  message RulePut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    k25: string = 25;
+    k26: string = 26;
+    k27: string = 27;
+    k20: string = 20;
+    k21: string = 21;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+    v8: string = 11;
+    v9: string = 12;
+    v10: string = 13;
+    v11: string = 14;
+  }
+  decision role_rule(r: RoleRule) -> RulePut {
+    when r.verbs == "" || (r.res == "" && r.urls == "") ->
+      RulePut { cid: r.seq, op: NOOP, key: "" };
+    // A Role cannot grant nonResourceURLs (they are cluster-scoped).
+    when r.res == "" ->
+      RulePut { cid: r.seq, op: NOOP, key: "" };
+    when r.groups == "" ->
+      RulePut { cid: r.seq, op: NOOP, key: "" };
+    when (r.names != "" && r.names != "[]") ->
+      RulePut { cid: r.seq, op: PUT, key: "R:", k17: r.ns, k18: ":", k25: r.name,
+                k26: "/", k27: r.g, k20: "-", k21: r.idxd,
+                v1: "{\"v\":" + r.verbs + ",\"a\":" + r.groups + ",\"n\":" + r.names, v2: ",\"r\":", v3: "", v4: r.res,
+                v5: ",\"src\":\"/roles/", v6: r.ns, v7: "/", v8: r.name,
+                v9: "\",\"g\":\"", v10: r.g, v11: "\"}" };
+    default ->
+      RulePut { cid: r.seq, op: PUT, key: "R:", k17: r.ns, k18: ":", k25: r.name,
+                k26: "/", k27: r.g, k20: "-", k21: r.idxd,
+                v1: "{\"v\":" + r.verbs + ",\"a\":" + r.groups + ",\"n\":" + "[\"*\"]", v2: ",\"r\":", v3: "", v4: r.res,
+                v5: ",\"src\":\"/roles/", v6: r.ns, v7: "/", v8: r.name,
+                v9: "\",\"g\":\"", v10: r.g, v11: "\"}" };
+  }
+  decision crole_rule(r: RoleRule) -> RulePut {
+    when r.verbs == "" || (r.res == "" && r.urls == "") ->
+      RulePut { cid: r.seq, op: NOOP, key: "" };
+    // nonResourceURLs: cluster-scoped paths, never widened by a probe wildcard.
+    when r.res == "" ->
+      RulePut { cid: r.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: r.name,
+                k26: "/", k27: r.g, k20: "-", k21: r.idxd,
+                v1: "{\"v\":" + r.verbs + ",\"a\":" + "[\"~\"]" + ",\"n\":" + "[\"~\"]", v2: ",\"r\":", v3: "", v4: r.urls,
+                v5: ",\"src\":\"/clusterroles/", v6: r.name, v7: "", v8: "",
+                v9: "\",\"g\":\"", v10: r.g, v11: "\"}" };
+    when r.groups == "" ->
+      RulePut { cid: r.seq, op: NOOP, key: "" };
+    when (r.names != "" && r.names != "[]") ->
+      RulePut { cid: r.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: r.name,
+                k26: "/", k27: r.g, k20: "-", k21: r.idxd,
+                v1: "{\"v\":" + r.verbs + ",\"a\":" + r.groups + ",\"n\":" + r.names, v2: ",\"r\":", v3: "", v4: r.res,
+                v5: ",\"src\":\"/clusterroles/", v6: r.name, v7: "", v8: "",
+                v9: "\",\"g\":\"", v10: r.g, v11: "\"}" };
+    default ->
+      RulePut { cid: r.seq, op: PUT, key: "C:", k17: "", k18: ":", k25: r.name,
+                k26: "/", k27: r.g, k20: "-", k21: r.idxd,
+                v1: "{\"v\":" + r.verbs + ",\"a\":" + r.groups + ",\"n\":" + "[\"*\"]", v2: ",\"r\":", v3: "", v4: r.res,
+                v5: ",\"src\":\"/clusterroles/", v6: r.name, v7: "", v8: "",
+                v9: "\",\"g\":\"", v10: r.g, v11: "\"}" };
+  }
+
+  // ---- perms: the verb x group x resource x name cross product ----
+  message RulePair {
+    seq: int = 1;
+    key: string = 3;
+    verb: string = 4;      // v.#0
+    group: string = 5;     // a.#1
+    res: string = 6;       // r.#2
+    name: string = 7;      // n.#3
+    md: string = 21;
+    rolekey: string = 28;
+    rest: string = 57;
+  }
+  message PermPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: string = 17;
+    k18: string = 18;
+    k25: string = 25;
+    k26: string = 26;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+    v8: string = 11;
+    v9: string = 12;
+  }
+  decision rule_perm(p: RulePair) -> PermPut {
+    when p.verb == "" || p.res == "" || p.name == "" -> PermPut { cid: p.seq, op: NOOP, key: "" };
+    default ->
+      PermPut { cid: p.seq, op: PUT, key: p.rolekey, k17: "/", k18: p.rest, k25: "-", k26: p.md,
+                v1: "{\"v\":\"" + p.verb + "\",\"a\":\"" + p.group, v2: "\",\"n\":\"" + p.name,
+                v3: "\",\"r\":\"", v4: p.res,
+                v5: "\",\"rule\":\"/rbac-rule/", v6: p.rolekey, v7: "/", v8: p.rest, v9: "\"}" };
+  }
+
+  transformation prr(r: RoleRule) -> RoleRule {
+    RoleRule { seq: r.seq, key: r.key, verbs: r.verbs, res: r.res, names: r.names,
+               groups: r.groups, urls: r.urls, idxd: r.idxd, g: r.g, ns: r.ns, name: r.name }
+  }
+  transformation ppair(p: RulePair) -> RulePair {
+    RulePair { seq: p.seq, key: p.key, verb: p.verb, group: p.group, res: p.res, name: p.name,
+               md: p.md, rolekey: p.rolekey, rest: p.rest }
+  }
+  pipeline ro_rule(r: RoleRule) -> RulePut { call x = prr(r); call y = role_rule(x); return y; }
+  pipeline cr_rule(r: RoleRule) -> RulePut { call x = prr(r); call y = crole_rule(x); return y; }
+  pipeline ru_perm(p: RulePair) -> PermPut { call x = ppair(p); call y = rule_perm(x); return y; }
+  entry ro_rule = ro_rule;
+  entry cr_rule = cr_rule;
+  entry ru_perm = ru_perm;
+  provenance revision "rbac-index" toolchain "chronicle-authoring";
+}

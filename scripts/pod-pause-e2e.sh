@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Live E2E for PAUSE/RESUME through the node pipeline: the paused-aware status
-# loop in sandbox_runner and the paused-aware pod_lifecycle state machine.
+# loop in the sandbox runtime and the paused-aware pod_lifecycle state machine.
 #
 # No CLI/API verb can issue PAUSE yet, so this script plays the orchestrator
 # the way the other E2Es drive effects — through the store seam:
-# /sandbox-pause/<id> = "pause" | "resume" (consumed by sandbox_runner, gated
+# /sandbox-pause/<id> = "pause" | "resume" (consumed by the sandbox runtime, gated
 # on the backend CAPS PAUSE bit).
 #
 # PRIVILEGE GATE: the Linux backend's PAUSE is the cgroup2 freezer on the
@@ -33,7 +33,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
 fi
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH (cargo install --locked --path ../fluxor/tools)"; exit 1; }
-for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/sandbox_runner.fmod" "$MODULES_DIR/probe_runner.fmod" "$GRAPH"; do
+for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/workload_effect.fmod" "$GRAPH"; do
   [ -e "$f" ] || { echo "FAIL: missing $f (fluxor modules build --target bcm2712)"; exit 1; }
 done
 

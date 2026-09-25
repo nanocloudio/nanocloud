@@ -1,10 +1,10 @@
-# Workload source manifest for the proxy-compiler bundle. postinst emits it and
-# publishes it into the node's OCI store, so `proxy-compiler:1.0.0` resolves offline.
-# Portless — the compiler drives the store provider via provider_call, not a
-# socket. The graph (linux.yaml, staged beside this file) runs the
-# proxy_compiler module.
+# Workload source manifest for the proxy bundle. postinst emits it and
+# publishes it into the node's OCI store, so `proxy:1.0.0` resolves offline.
+# Portless — the chains and net_apply drive the store and net.policy providers
+# via provider_call, not a socket. The graph (linux.yaml, staged beside this
+# file) is packaging/debian/fluxor-proxy.yaml: proxy.uproc params plus net_apply.
 [workload]
-name = "proxy-compiler"
+name = "proxy"
 version = "1.0.0"
 role = "service"
 

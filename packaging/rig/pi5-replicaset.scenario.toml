@@ -21,10 +21,10 @@
 # what it matched. Counting the objects the chain actually created is the
 # stronger claim and the simpler one.
 
-# Lives beside its graph rather than under tests/: the fluxor standard reserves
-# tests/** for shadow-tracking, and nanocloud has no shadow repo — a scenario
-# there would be untracked with no recovery path, which is the exact failure
-# that standard exists to prevent.
+# Lives beside its graph rather than under tests/: a scenario is read with the
+# graph it drives, and the pair is deployment config for a target rather than
+# integration coverage. It names no host and no address — only the `pi5` build
+# target — so it belongs in the published history with the graph.
 
 name = "pi5_replicaset"
 target = "pi5"

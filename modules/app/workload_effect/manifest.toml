@@ -1,0 +1,105 @@
+name = "workload_effect"
+version = "1.0.0"
+description = "Chronicle connector for the workload contract — op records in, lifecycle / log / exec / pty events out"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The workload seam as a connector — what `store_effect` is to the store.
+#
+# WHEN to create, start, signal, pause, exec or tear a sandbox down is decided
+# by params (`sandbox.uproc`), from the desired specs and the observed status.
+# This module performs the op and reports what happened, and it owns only what
+# cannot live in the store: the table of live workload HANDLES, and the
+# continuous observation of them (WAIT for state changes, READ for output, the
+# PTY pump). It is the only module holding `requires_contract = "workload"`
+# plus `platform_raw`, so namespace surgery stays one auditable grant.
+#
+# In: five request inputs (so five chains feed it without a merge), each a
+# Chronicle record (a byte stream, self-framed, or a mailbox):
+#   1 correlation (i64)   2 op (i64)   3 id (the sandbox; the pty session's
+#   tail for the pty ops)   30..39 carry, echoed on the op's event
+#   op 1 CREATE   4 cmd (argv, whitespace-split)  5 rootfs  6 iso ("1")
+#                 7 tasks (decimal, the pids envelope)  8 addr (IPv4, own
+#                 netns when set)  9 prefix (decimal)  10 binds
+#                 (`<src>:<dst>[:ro]`, `,`-separated — the workload `mount`/
+#                 `bind` option)  → status created | failed(errno). An id
+#                 already live is not created twice: its status is re-reported
+#   op 2 START    → running
+#   op 3 DESTROY  → destroyed (an id with no workload: nothing)
+#   op 4 SIGNAL   4 `term` | `kill` — each level delivered once
+#   op 5 PAUSE / op 6 RESUME — each intent issued once
+#   op 7 EXEC     4 command, 11 the request's revision (i64) → exec event:
+#                 code, output. A request named at 30 runs once per revision,
+#                 however often it is re-offered before its result lands. A request carrying
+#                 its name at 30 is run once, however often it is re-offered
+#                 before its result lands
+#   op 8 TTY_OPEN 4 the sandbox id, 5 rows, 6 cols, 7 cmd → pty status
+#   op 9 TTY_CLOSE
+#   op 10 TTY_IN  4 bytes, 5 the revision they were read at (i64; bytes at a
+#                 revision already taken are not typed twice) → an `in`
+#                 event once they are queued for the pty
+# Out (`event_out`): 1 correlation (0 when spontaneous)  2 kind  3 id / tail
+#   4 label  5 code (i64)  6 bytes  7 boot  8 code as decimal text
+#   30..39 carry
+#   kind 1 status (created running paused exited failed killed destroyed)
+#   kind 2 log (bytes: the workload's merged stdout/stderr)
+#   kind 3 exec (code, bytes: the output)
+#   kind 4 pty output (bytes)   kind 5 pty status (open | failed |
+#   exited, code)   kind 6 boot (emitted once at start)   kind 7 pty input
+#   consumed
+# `boot` is this process's identity: a status recorded under another boot
+# describes a workload that no longer exists (the node restarted), which is
+# how the chain knows to create it again.
+timer_class = "agnostic"
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "request_in_2"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "request_in_3"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "request_in_4"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "request_in_5"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "event_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
+[observability]
+exempt = "control-plane connector — discrete op/event records, not a sustained byte data path"

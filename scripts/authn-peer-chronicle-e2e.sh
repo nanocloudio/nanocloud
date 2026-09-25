@@ -90,19 +90,13 @@ modules:
     prefix: "/authn-req/"
     flat: 1
     paths: "peer"
-  - name: ask
-    type: decision
-    params:
-      decision: "${DEC_ASK}"
   - name: get
     type: store_effect
+    decision: "${DEC_ASK}"
     key_prefix: "/peer-ids/"
-  - name: verdict
-    type: decision
-    params:
-      decision: "${DEC_VERDICT}"
   - name: put
     type: store_effect
+    decision: "${DEC_VERDICT}"
     key_prefix: "/authn-resp/"
   - name: dbg
     type: debug
@@ -112,15 +106,9 @@ wiring:
     to: store_source.changes
   # Engine inputs are byte FIFOs: a Chronicle engine self-frames.
   - from: store_source.record_out
-    to: ask.record_in
-  - from: ask.result_out
     to: get.request_in
-    buffer_group: 1
   - from: get.response_out
-    to: verdict.record_in
-  - from: verdict.result_out
     to: put.request_in
-    buffer_group: 2
   - from: put.response_out
     to: dbg.data
     buffer_group: 3

@@ -1,0 +1,289 @@
+// The typed-effect seam every encrypted-volume lifecycle chain shares: the
+// request a recorded phase names, and its answer written back.
+//
+// Every chain here is write-ahead. Its step decision MERGEs the next phase into
+// its own record (`/volume-provisions/<ns>/<pvc>` or
+// `/volume-attachments/<ns>/<pvc>`) with `out` cleared; `act` turns the store's
+// acceptance of that MERGE into the typed effect the phase names, and nothing
+// else issues one. The effect's typed outcome comes back to `record` and
+// becomes
+//
+//   out=<phase>:<code>[;<result>=<value>…]
+//
+// so the record always says which step is in flight, which one answered, and
+// how. Chronicle carries phases, identifiers, fence tokens and deadlines only:
+// no block payload, no key material and no attachment bundle ever crosses this
+// seam — the FXRK recipient and the FXSB bundle stay inside the effector,
+// between Kagi and the `crypt_block` instance.
+//
+// Effect request (`act`'s output, one record per effect):
+//   1 cid  2 op  3 key (the claim)  4..8 a1..a5  9 n1 (i64)  10 n2 (i64)
+//   254 the carry, echoed on the outcome
+//   op  1 LEASE_ACQUIRE  a1 vol                      -> fence lease_exp | held
+//       2 LEASE_RENEW    a1 vol  n1 fence            -> lease_exp | lost
+//       3 LEASE_RELEASE  a1 vol  n1 fence            -> ok | lost
+//      10 GRAPH_START    a1 vol  a2 fresh  n1 fence  -> inst (loam_volume +
+//                        crypt_block attach=1, quiesced, unpublished)
+//      11 RECIPIENT      a1 inst                     -> ok (FXRK announced)
+//      12 BUNDLE_DELIVER a1 inst                     -> ready | eacces
+//      13 NBD_START      a1 inst                     -> dev
+//      14 FLUSH          a1 inst                     -> ok (lower fence reached)
+//      15 NBD_STOP       a1 inst a2 dev              -> ok
+//      16 GRAPH_DESTROY  a1 inst                     -> ok (handles destroyed)
+//      20 KAGI_GRANT     a1 vol a2 device a3 custody n1 tier n2 lifetime -> grant
+//      21 KAGI_REPLACE   a1 old device a2 new device a3 vol           -> grant
+//      22 KAGI_RELEASE   a1 inst a2 vol a3 device a4 epoch a5 key resource
+//                        n1 fence -> exp | refused
+//      23 KAGI_RENEW     a1 inst a2 vol a3 device a4 epoch a5 key resource
+//                        n1 fence -> exp | refused | fence_changed | expired |
+//                        conflict (Kagi 29 / 30 / 19: detach and attach again)
+//      24 KAGI_CREATE    a1 vol a2 tenant a3 custody n1 tier n2 lifetime
+//      25 KAGI_RECORD_SET a1 vol                     -> set
+//      30 LOAM_CREATE    a1 tenant a2 pvc a3 size    -> vol
+//      31 VAULT_SPLIT    a1 vol                      -> ok (VEK held, 3 shares
+//                        sealed to the custodians)
+//      32 VAULT_DESTROY  a1 vol                      -> ok (VEK handle gone)
+//      40 CLAIM_PUT      a1 dev a2 fs a3 fresh  (`/volumes/<claim>`
+//                        device=<dev>;fs=<fs>[;mkfs=1])
+//      41 CLAIM_DELETE   —
+//      42 UNMOUNT_REQ    —  (MERGE `mount=unmount` into the claim)
+//      43 VOLUME_PERSIST a1 vol a2 fs a3 device a4 access a5 set  (CREATE the
+//                        attachment record: the volume's identity)
+//      44 PV_BIND        a1 tenant a2 pvc a3 vol a4 size a5 access
+//
+// Outcome (every effector answers with one, carry echoed):
+//   1 cid   2 op   3 key (the claim)   4 code   5 fence (i64)   6 lease_exp
+//   (i64, monotonic ms)   7 exp (i64, the attachment's handle expiry)   8 inst
+//   9 dev   10 vol   11 set   12 grant   254 the carry (claim, phase, …)
+// Codes: ok · ready · held (lease held elsewhere) · lost (lease passed on) ·
+// refused (a Kagi refusal) · eacces (a bundle not for this recipient/volume) ·
+// failed · unavailable. An effect that fails holds nothing new: the effector
+// undoes its own partial work before answering.
+//
+// A result field is written only by the phase that produces it, so a stale
+// answer from an earlier phase cannot plant a handle the record never asked for.
+module nanocloud.volume_effect {
+
+  // THE carry of every volume lifecycle chain: attach and detach fill 32..39
+  // and 48..49, provision 32 and 35..47. Each chain declares the subset it
+  // writes, at these numbers; volume_key_effect.uproc and
+  // volume_data_effect.uproc extend it from 50.
+  // carried by: Reply, Eff, Outcome
+  message Ctx {
+    claim: string = 30;
+    ph: string = 31;
+    vol: string = 32;
+    inst: string = 33;
+    dev: string = 34;
+    fs: string = 35;
+    device: string = 36;
+    grant: string = 37;
+    fence: int = 38;
+    fresh: string = 39;
+    tenant: string = 40;
+    pvc: string = 41;
+    custody: string = 42;
+    set: string = 43;
+    access: string = 44;
+    size: string = 45;
+    tier: int = 46;
+    lifetime: int = 47;
+    epoch: string = 48;
+    kvol: string = 49;
+  }
+  enum NOOP = 0;
+  enum MERGE = 6;
+
+  enum LEASE_ACQUIRE = 1;
+  enum LEASE_RENEW = 2;
+  enum LEASE_RELEASE = 3;
+  enum GRAPH_START = 10;
+  enum RECIPIENT = 11;
+  enum BUNDLE_DELIVER = 12;
+  enum NBD_START = 13;
+  enum FLUSH = 14;
+  enum NBD_STOP = 15;
+  enum GRAPH_DESTROY = 16;
+  enum KAGI_GRANT = 20;
+  enum KAGI_REPLACE = 21;
+  enum KAGI_RELEASE = 22;
+  enum KAGI_RENEW = 23;
+  enum KAGI_CREATE = 24;
+  enum KAGI_RECORD_SET = 25;
+  enum LOAM_CREATE = 30;
+  enum VAULT_SPLIT = 31;
+  enum VAULT_DESTROY = 32;
+  enum CLAIM_PUT = 40;
+  enum CLAIM_DELETE = 41;
+  enum UNMOUNT_REQ = 42;
+  enum VOLUME_PERSIST = 43;
+  enum PV_BIND = 44;
+
+  // The store's answer to a step's MERGE, carry echoed.
+  message Reply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message Eff {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    a1: string = 4; a2: string = 5; a3: string = 6; a4: string = 7; a5: string = 8;
+    n1: int = 9; n2: int = 10;
+    ctx: Ctx = 254;
+  }
+  // Only a MERGE the store took issues the effect it recorded.
+  decision act(r: Reply) -> Eff {
+    when r.status < 200 || r.status >= 300 || r.ctx.ph == "" ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+    // ── attach ──
+    when r.ctx.ph == "granting" ->
+      Eff { cid: r.cid, op: KAGI_REPLACE, key: r.ctx.claim, a1: r.ctx.grant, a2: r.ctx.device, a3: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "leasing" ->
+      Eff { cid: r.cid, op: LEASE_ACQUIRE, key: r.ctx.claim, a1: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "instantiating" ->
+      Eff { cid: r.cid, op: GRAPH_START, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.fresh, n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "recipient" ->
+      Eff { cid: r.cid, op: RECIPIENT, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "releasing" ->
+      Eff { cid: r.cid, op: KAGI_RELEASE, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.vol, a3: r.ctx.device, a4: r.ctx.epoch,
+            a5: r.ctx.kvol, n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "unlocking" ->
+      Eff { cid: r.cid, op: BUNDLE_DELIVER, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "publishing" ->
+      Eff { cid: r.cid, op: NBD_START, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "claiming" ->
+      Eff { cid: r.cid, op: CLAIM_PUT, key: r.ctx.claim, a1: r.ctx.dev, a2: r.ctx.fs, a3: r.ctx.fresh, ctx: r.ctx };
+    when r.ctx.ph == "renew_lease" ->
+      Eff { cid: r.cid, op: LEASE_RENEW, key: r.ctx.claim, a1: r.ctx.vol, n1: r.ctx.fence, ctx: r.ctx };
+    when r.ctx.ph == "renew_grant" ->
+      Eff { cid: r.cid, op: KAGI_RENEW, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.vol, a3: r.ctx.device, a4: r.ctx.epoch,
+            a5: r.ctx.kvol, n1: r.ctx.fence, ctx: r.ctx };
+    // ── detach ──
+    when r.ctx.ph == "d_unmount" ->
+      Eff { cid: r.cid, op: UNMOUNT_REQ, key: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "d_flush" ->
+      Eff { cid: r.cid, op: FLUSH, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "d_unclaim" ->
+      Eff { cid: r.cid, op: CLAIM_DELETE, key: r.ctx.claim, ctx: r.ctx };
+    when r.ctx.ph == "d_unpublish" ->
+      Eff { cid: r.cid, op: NBD_STOP, key: r.ctx.claim, a1: r.ctx.inst, a2: r.ctx.dev, ctx: r.ctx };
+    when r.ctx.ph == "d_destroy" ->
+      Eff { cid: r.cid, op: GRAPH_DESTROY, key: r.ctx.claim, a1: r.ctx.inst, ctx: r.ctx };
+    when r.ctx.ph == "d_release" ->
+      Eff { cid: r.cid, op: LEASE_RELEASE, key: r.ctx.claim, a1: r.ctx.vol, n1: r.ctx.fence, ctx: r.ctx };
+    // ── provision ──
+    when r.ctx.ph == "p_create" ->
+      Eff { cid: r.cid, op: LOAM_CREATE, key: r.ctx.claim, a1: r.ctx.tenant, a2: r.ctx.pvc, a3: r.ctx.size, ctx: r.ctx };
+    when r.ctx.ph == "p_authorise" ->
+      Eff { cid: r.cid, op: KAGI_CREATE, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.tenant, a3: r.ctx.custody,
+            n1: r.ctx.tier, n2: r.ctx.lifetime, ctx: r.ctx };
+    when r.ctx.ph == "p_split" ->
+      Eff { cid: r.cid, op: VAULT_SPLIT, key: r.ctx.claim, a1: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "p_recordset" ->
+      Eff { cid: r.cid, op: KAGI_RECORD_SET, key: r.ctx.claim, a1: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "p_vekdrop" ->
+      Eff { cid: r.cid, op: VAULT_DESTROY, key: r.ctx.claim, a1: r.ctx.vol, ctx: r.ctx };
+    when r.ctx.ph == "p_grant" ->
+      Eff { cid: r.cid, op: KAGI_GRANT, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.device, a3: r.ctx.custody,
+            n1: r.ctx.tier, n2: r.ctx.lifetime, ctx: r.ctx };
+    when r.ctx.ph == "p_persist" ->
+      Eff { cid: r.cid, op: VOLUME_PERSIST, key: r.ctx.claim, a1: r.ctx.vol, a2: r.ctx.fs, a3: r.ctx.device,
+            a4: r.ctx.access, a5: r.ctx.set, ctx: r.ctx };
+    when r.ctx.ph == "p_bind" ->
+      Eff { cid: r.cid, op: PV_BIND, key: r.ctx.claim, a1: r.ctx.tenant, a2: r.ctx.pvc, a3: r.ctx.vol,
+            a4: r.ctx.size, a5: r.ctx.access, ctx: r.ctx };
+    // A phase with no effect of its own (mounting, attached, the terminal ones).
+    default ->
+      Eff { cid: r.cid, op: NOOP, key: "" };
+  }
+
+  message Outcome {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    code: string = 4;
+    fence: int = 5;
+    lease_exp: int = 6;
+    exp: int = 7;
+    inst: string = 8;
+    dev: string = 9;
+    vol: string = 10;
+    set: string = 11;
+    grant: string = 12;
+    ctx: Ctx = 254;
+  }
+  message Row {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: int = 9; v7: string = 10; v8: int = 11;
+  }
+
+  decision record(o: Outcome) -> Row {
+    when o.ctx.ph == "" ->
+      Row { cid: o.cid, op: NOOP, key: "" };
+    // ── attach ──
+    when o.ctx.ph == "leasing" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";fence=", v6: o.fence, v7: ";lease_exp=", v8: o.lease_exp };
+    when o.ctx.ph == "renew_lease" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v7: ";lease_exp=", v8: o.lease_exp };
+    when o.ctx.ph == "granting" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";grant=", v7: o.grant };
+    when o.ctx.ph == "instantiating" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";inst=", v7: o.inst };
+    when (o.ctx.ph == "releasing" || o.ctx.ph == "renew_grant") && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v7: ";exp=", v8: o.exp };
+    when o.ctx.ph == "unlocking" && o.code == "ready" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ready=1" };
+    when o.ctx.ph == "publishing" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";dev=", v7: o.dev };
+    // ── detach ──
+    when o.ctx.ph == "d_flush" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";ready=0" };
+    when o.ctx.ph == "d_unpublish" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";dev=" };
+    // The instance takes its recipient and volume-key handles with it.
+    when o.ctx.ph == "d_destroy" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";inst=;ready=0" };
+    // A lease that already passed on is as released as this holder can make it.
+    when o.ctx.ph == "d_release" && (o.code == "ok" || o.code == "lost") ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";fence=0" };
+    // ── provision ──
+    when o.ctx.ph == "p_create" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";vol=", v7: o.vol };
+    when o.ctx.ph == "p_split" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";vek=1" };
+    when o.ctx.ph == "p_recordset" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";set=", v7: o.set };
+    when o.ctx.ph == "p_vekdrop" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";vek=0" };
+    when o.ctx.ph == "p_grant" && o.code == "ok" ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code,
+            v5: ";grant=", v7: o.grant };
+    default ->
+      Row { cid: o.cid, op: MERGE, key: o.ctx.claim, v1: "out=", v2: o.ctx.ph, v3: ":", v4: o.code };
+  }
+  pipeline vx_act(r: Reply) -> Eff { call y = act(r); return y; }
+  pipeline vx_record(o: Outcome) -> Row { call y = record(o); return y; }
+  entry vx_act = vx_act;
+  entry vx_record = vx_record;
+  provenance revision "volume-effect-outcomes" toolchain "chronicle-authoring";
+}

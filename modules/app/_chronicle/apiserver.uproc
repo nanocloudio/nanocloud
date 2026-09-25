@@ -2,7 +2,7 @@
 // `chronicle author` decodes a document into a 2048-byte buffer.
 module nanocloud.apiserver {
 
-  // What `kube_decode` projects out of a wave HttpRequest envelope. `key` is
+  // What `kube_decode` projects out of `http_chain`'s request envelope. `key` is
   // assembled there because the VM has no string concatenation.
   message ns.Request {
     cid: int = 1;
@@ -15,14 +15,14 @@ module nanocloud.apiserver {
   }
 
   // What `store_effect` takes. cid rides through so the answer finds its
-  // connection, the same trick conn_id plays across the OCI registry.
+  // exchange.
   message ns.StoreCall {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
   }
 
-  enum GET = 1;      // wave wire/method.rs
+  enum GET = 1;      // the exchange method byte
   enum OP_GET = 1;   // store_effect
   enum OP_EXISTS = 2;
 
@@ -45,8 +45,8 @@ module nanocloud.apiserver {
     }
   }
 
-  // What `store_effect` answers with; the reply leg re-serializes it into a
-  // wave HttpResponse envelope via the `encode` program.
+  // What `store_effect` answers with; the reply leg re-serializes it into
+  // `http_chain`'s reply envelope via the `encode` program.
   message ns.StoreReply {
     cid: int = 1;
     status: int = 2;

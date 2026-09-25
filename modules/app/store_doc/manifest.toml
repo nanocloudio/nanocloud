@@ -1,0 +1,79 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+timer_class = "agnostic"
+
+# Store doc — the record adapter in front of lattice's JSON document dialect.
+#
+# The API's WRITER, as store_big is, but the document semantics are not
+# here: a create, replace, patch, apply or delete leaves on `doc_out` as ONE
+# MSG_JSON_DOC_REQUEST (lattice's `doc_json.rs`) to `doc_json_dialect`, whose
+# schema says what Kubernetes stamps, keeps, guards, owns and merges, and
+# whose executor writes the object as JSON at its own key (`codec=path`) —
+# the key every other connector reads. The answer (`doc_in`) becomes the
+# record store_big would have answered, so the chain after it is unchanged.
+# One request in flight: the next record is read once this one is answered.
+#
+# Wire: store_effect's record frames (see its manifest), the fields this
+# node reads —
+#   request_in   1 cid, 2 op, 3/17/18 key parts (after `key_prefix`), 4..16
+#                value parts (a staged body: `sha256:<hex>` under `blob`),
+#                28 expected revision, 30..39 carried
+#   response_out 1 cid, 2 status, 3 value (the object as stored, when it
+#                fits a record), 30..39 carried
+# Ops: 8 CREATE, 9 REPLACE, 13 PATCH_MERGE, 14 PATCH_JSON, 15 PATCH_SMP
+# (the keyed merge), 16 APPLY, 4 DELETE — the document's; 3 PUT (a flat
+# record: the watch registration) and 0 NOOP stay the store's. Any other op
+# is refused 400.
+# Key: `/<collection>/<namespace>/<name>` (or `/<collection>/<name>`), then
+# store_big's marks — `#<view>`, `@[+]<manager>`, `!` (views.rs). A create
+# states the id its key names (a namespace only, for a generated name).
+# Status: 200 done (201: an apply that created), 404 absent, 409 exists /
+# moved / ownership conflicts (their Status as the value), 422 invalid, 400
+# malformed, 413 too large, 503 unavailable, 500 anything else.
+# `tomb = <prefix>`: a delete leaves the object's last state at
+# `<prefix><key>` as `{"deadline":<ms>,"obj":<object>}` before it is sent
+# (the watch chain may meet the delete before this node sees its answer),
+# as store_big does.
+
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# MSG_JSON_DOC_RESPONSE (or its MSG_PART parts) from doc_json_dialect.resp_out.
+[[ports]]
+name = "doc_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+required = false
+
+# MSG_JSON_DOC_REQUEST (or its MSG_PART parts) to doc_json_dialect.req_in.
+[[ports]]
+name = "doc_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+# A flat PUT, a staged body's read and a tomb's write.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "a record adapter at the store edge — observed through the dialect and executor it drives"

@@ -1,0 +1,69 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+# mod.rs is a SYMLINK to ../store_source/mod.rs: the same source, built with `big`.
+# (A symlink, not `entry = "../store_source/mod.rs"`: the build's staleness check
+# walks the module's own directory, so an entry outside it never rebuilt.)
+# Deadlines (timeoutSeconds, bookmarks) are wall-clock milliseconds.
+timer_class = "wall_clock"
+
+# Store watch — the watch connector: store_source's `events` mode with a heap.
+#
+# A separate module TYPE, not a variant, because one graph image carries one
+# build of a module type: every other store_source in a control plane keeps
+# bounded memory, and only this node takes a heap arena (`module_arena_size`,
+# BIG_ARENA) — for objects past one record (read whole, stamped, and
+# streamed to the client across records) and for change-feed batches past
+# EV_BUF. Frame, params and ports are store_source's; see its manifest.
+
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings", "big"]
+default  = true
+
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+# record_out is the PRIMARY output: `module_new` hands it over directly, so the
+# hot path never depends on resolving a port by index.
+[[ports]]
+name = "record_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+required = true
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (`debug`, this repo's modules) needs mailbox and
+# says so on its own INPUT port; a graph feeding such a consumer sets
+# `buffer_group` on the edge, as store-source-e2e.sh does.
+
+[[ports]]
+name = "status"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+# Write only for `stale_at_open`: a previous runtime's registrations,
+# deleted once at the first step.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# `due` arms a kernel timer fd for the earliest deadline in the records; the
+# kernel steps this module when it fires. A timer is an fd.
+[[resources]]
+requires_contract = "timer"
+access = "write"
+
+[observability]
+exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"

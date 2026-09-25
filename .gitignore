@@ -3,3 +3,8 @@
 target
 .fluxor.lock.lock
 *.rmeta
+
+# Shadow-tracked (see ../standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote.
+/tests/
+/.git-shadow/

@@ -1,0 +1,489 @@
+// The encrypted-volume pipelines' record effects, as a chain on the effect
+// bus: a volume effect that names a store write in, the write made, the
+// typed outcome back. Three store_effect stages, each deciding its request
+// from the record it is handed (vw_s1 from the effect, vw_s2 and vw_s3 from
+// the stage before's reply), and a decision that answers the Outcome.
+//
+//   40 CLAIM_PUT        `/volumes/<claim>` = device=<a1>;fs=<a2>[;mkfs=1 when
+//                       a3 "1"]
+//   41 CLAIM_DELETE     `/volumes/<claim>` deleted (gone already: ok)
+//   42 UNMOUNT_REQ      `mount=unmount` into the claim, if it stands
+//   43 VOLUME_PERSIST   the identity `/volume-attachments/<claim>` = vol a1,
+//                       fs a2, grant a3, access a4, set a5, fresh=1, and its
+//                       key record `/volume-keys/<claim>` = kvol=<a1>;epoch=1,
+//                       the key record first — created once
+//   44 PV_BIND          `/persistentvolumes/pvc-<ns>-<pvc>` (CSI driver
+//                       encrypted.loam.nanocloud.io, handle a3, capacity a4,
+//                       access a5, claimRef; Bound) and the claim's
+//                       spec.volumeName naming it (a claim gone: ok)
+//   62 ATT_DETACH       reason=<a1> (only when none is set), erase=1 when a2
+//                       "1", into the attachment, if it stands
+//   63 ATT_GRANT        grant=<a1> into the attachment, if it stands
+//   64 ROTATION_REQUEST `/volume-rotations/<claim>` = why=<a1>;actor=<a2>,
+//                       unless one is in flight (any phase but retired or
+//                       failed)
+//   66 KEY_EPOCHS       epoch=<a1>;next=<a2> into the key record, if it
+//                       stands (an empty a2 removes `next`)
+//   70 EPOCH_PINS       a1 key resource, a2 epoch ("0": any), a3 the claim
+//                       -> n: retained snapshots and live clones (not the
+//                       claim) whose key record or epoch range needs it
+//   75 CLONE_PERSIST    the clone's identity (vol a1; fs, access, grant and
+//                       set the snapshot's source carries in the effect's
+//                       context) and key record (kvol a2, epoch a3, next a4
+//                       when it differs) — created once
+//   77 AUDIT            `/volume-audit/<claim>/<unix ms>-<cid>` =
+//                       event;actor;approver;device;at, created
+//   83 VOLUME_FORGET    the identity, the key record and the PersistentVolume
+//   Any other effect is dropped at vw_s1 unanswered.
+//
+// "If it stands": the merge is conditional on the revision the stage before
+// read (store_effect MERGE with field 28), so a record another chain removed
+// is never recreated by a merge into it.
+//
+// The chain's carry rides in 30..38 beside the effect's own context (254),
+// which passes through every stage whole:
+//   30 op  31 claim  32..36 a1..a5  37 the result once known  38 n
+// A stage whose record already holds a result sends a NOOP that carries it
+// on. The stage after an op's last write turns that write's status into the
+// result; vw_answer does it for the ops whose last write is at vw_s3.
+//
+// EPOCH_PINS is two filtered COUNTs: store_effect walks the prefix and runs
+// vw_pin_snap / vw_pin_key over each child (its tail at 3, the request's
+// carry, the child's flat `paths` / `ints`). A child present but unreadable,
+// a walk that fails, or a predicate that does not decide answers 500 —
+// `failed`, never a short count.
+module nanocloud.volume_records {
+
+  // The fields of the effect's context this chain reads: the snapshot's
+  // source attachment, for CLONE_PERSIST (volume_snapshot.uproc's s_identity).
+  message Ctx {
+    fs: string = 35;
+    grant: string = 37;
+    set: string = 43;
+    access: string = 44;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum PATCH = 5;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum REPLACE = 9;
+  enum COUNT = 12;
+
+  enum CLAIM_PUT = 40;
+  enum CLAIM_DELETE = 41;
+  enum UNMOUNT_REQ = 42;
+  enum VOLUME_PERSIST = 43;
+  enum PV_BIND = 44;
+  enum ATT_DETACH = 62;
+  enum ATT_GRANT = 63;
+  enum ROTATION_REQUEST = 64;
+  enum KEY_EPOCHS = 66;
+  enum EPOCH_PINS = 70;
+  enum CLONE_PERSIST = 75;
+  enum AUDIT = 77;
+  enum VOLUME_FORGET = 83;
+
+  message Eff {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    a1: string = 4; a2: string = 5; a3: string = 6; a4: string = 7; a5: string = 8;
+    ctx: Ctx = 254;
+  }
+
+  // A store_effect request: key parts 3, 17, 18 (25..27 at vw_s2), value
+  // parts 4..16, the PATCH path 19, the expected revision 28, the carry.
+  message Req1 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13; v11: string = 14;
+    v12: string = 15; v13: string = 16;
+    c_op: int = 30;
+    c_claim: string = 31;
+    c_a1: string = 32; c_a2: string = 33; c_a3: string = 34; c_a4: string = 35; c_a5: string = 36;
+    c_st: string = 37;
+    c_n: int = 38;
+    ctx: Ctx = 254;
+  }
+
+  // A store_effect reply: vw_s1's `paths` reason, phase, kvol (40..42),
+  // the key's revision (59), a COUNT's count (45).
+  message Rep {
+    cid: int = 1;
+    status: int = 2;
+    reason: string = 40;
+    phase: string = 41;
+    count: int = 45;
+    rev: int = 59;
+    c_op: int = 30;
+    c_claim: string = 31;
+    c_a1: string = 32; c_a2: string = 33; c_a3: string = 34; c_a4: string = 35; c_a5: string = 36;
+    c_st: string = 37;
+    c_n: int = 38;
+    wall: int = 60;
+    ctx: Ctx = 254;
+  }
+
+  message Req2 {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    k4: int = 25;
+    k5: string = 26;
+    k6: int = 27;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    v7: string = 10; v8: string = 11; v9: string = 12; v10: int = 13;
+    path: string = 19;
+    rev: int = 28;
+    c_op: int = 30;
+    c_claim: string = 31;
+    c_a1: string = 32; c_a2: string = 33; c_a3: string = 34; c_a4: string = 35; c_a5: string = 36;
+    c_st: string = 37;
+    c_n: int = 38;
+    ctx: Ctx = 254;
+  }
+
+  // ── vw_s1: the effect's first store call ──
+  decision s1(e: Eff) -> Req1 {
+    when e.op == CLAIM_PUT && has(e.a3) && e.a3 == "1" ->
+      Req1 { cid: e.cid, op: PUT, key: "/volumes/", k2: e.key,
+             v1: "device=", v2: e.a1, v3: ";fs=", v4: e.a2, v5: ";mkfs=1",
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == CLAIM_PUT ->
+      Req1 { cid: e.cid, op: PUT, key: "/volumes/", k2: e.key,
+             v1: "device=", v2: e.a1, v3: ";fs=", v4: e.a2,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == CLAIM_DELETE ->
+      Req1 { cid: e.cid, op: DELETE, key: "/volumes/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: "", c_a2: "", c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == UNMOUNT_REQ ->
+      Req1 { cid: e.cid, op: GET, key: "/volumes/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: "", c_a2: "", c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == ATT_GRANT ->
+      Req1 { cid: e.cid, op: GET, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: "", c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == KEY_EPOCHS ->
+      Req1 { cid: e.cid, op: GET, key: "/volume-keys/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == ATT_DETACH && has(e.a2) ->
+      Req1 { cid: e.cid, op: GET, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == ATT_DETACH ->
+      Req1 { cid: e.cid, op: GET, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: "", c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == ROTATION_REQUEST ->
+      Req1 { cid: e.cid, op: GET, key: "/volume-rotations/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == VOLUME_PERSIST ->
+      Req1 { cid: e.cid, op: EXISTS, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: e.a3, c_a4: e.a4, c_a5: e.a5, c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == CLONE_PERSIST ->
+      Req1 { cid: e.cid, op: EXISTS, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: e.a3, c_a4: e.a4, c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == PV_BIND ->
+      Req1 { cid: e.cid, op: PUT, key: "/persistentvolumes/", k2: "pvc-" + e.a1 + "-" + e.a2,
+             v1: "{\"metadata\":{\"name\":\"pvc-", v2: e.a1, v3: "-", v4: e.a2,
+             v5: "\"},\"spec\":{\"csi\":{\"driver\":\"encrypted.loam.nanocloud.io\",\"volumeHandle\":\"", v6: e.a3,
+             v7: "\"},\"capacity\":{\"storage\":\"", v8: e.a4,
+             v9: "\"},\"accessModes\":[\"", v10: e.a5,
+             v11: "\"],\"claimRef\":{\"namespace\":\"", v12: e.a1,
+             v13: "\",\"name\":\"" + e.a2 + "\"}},\"status\":{\"phase\":\"Bound\"}}",
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == EPOCH_PINS ->
+      Req1 { cid: e.cid, op: COUNT, key: "/volume-snapshots/",
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: e.a3, c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == AUDIT ->
+      Req1 { cid: e.cid, op: NOOP, key: "",
+             c_op: e.op, c_claim: e.key, c_a1: e.a1, c_a2: e.a2, c_a3: e.a3, c_a4: e.a4, c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    when e.op == VOLUME_FORGET ->
+      Req1 { cid: e.cid, op: DELETE, key: "/volume-attachments/", k2: e.key,
+             c_op: e.op, c_claim: e.key, c_a1: "", c_a2: "", c_a3: "", c_a4: "", c_a5: "", c_st: "", c_n: 0,
+             ctx: e.ctx };
+    default -> Req1 {};
+  }
+
+  // ── vw_s2: from vw_s1's reply ──
+  decision s2(r: Rep) -> Req2 {
+    when r.c_st != "" ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: r.c_st, c_n: r.c_n, ctx: r.ctx };
+    // The last write was vw_s1's.
+    when (r.c_op == CLAIM_PUT && (r.status == 200 || r.status == 204)) || (r.c_op == CLAIM_DELETE && r.status == 200) ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    // A record that does not stand takes no merge; what was read must be
+    // what is merged into.
+    when (r.c_op == UNMOUNT_REQ || r.c_op == ATT_GRANT || r.c_op == KEY_EPOCHS || r.c_op == ATT_DETACH) && r.status == 404 ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    when r.c_op == UNMOUNT_REQ && r.status == 200 ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volumes/", k2: r.c_claim, v1: "mount=unmount", rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ATT_GRANT && r.status == 200 ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volume-attachments/", k2: r.c_claim, v1: "grant=", v2: r.c_a1, rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == KEY_EPOCHS && r.status == 200 ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volume-keys/", k2: r.c_claim,
+             v1: "epoch=", v2: r.c_a1, v3: ";next=", v4: r.c_a2, rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    // ATT_DETACH: the first reason stands; erase is added whatever it is.
+    when r.c_op == ATT_DETACH && r.status == 200 && r.reason == "" && r.c_a2 == "1" ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volume-attachments/", k2: r.c_claim,
+             v1: "reason=", v2: r.c_a1, v3: ";erase=1", rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ATT_DETACH && r.status == 200 && r.reason == "" ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volume-attachments/", k2: r.c_claim,
+             v1: "reason=", v2: r.c_a1, rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ATT_DETACH && r.status == 200 && r.c_a2 == "1" ->
+      Req2 { cid: r.cid, op: MERGE, key: "/volume-attachments/", k2: r.c_claim, v1: "erase=1", rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ATT_DETACH && r.status == 200 ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    // ROTATION_REQUEST: none yet, or the last one ended; one in flight is
+    // the request already made.
+    when r.c_op == ROTATION_REQUEST && r.status == 404 ->
+      Req2 { cid: r.cid, op: CREATE, key: "/volume-rotations/", k2: r.c_claim,
+             v1: "why=", v2: r.c_a1, v3: ";actor=", v4: r.c_a2,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ROTATION_REQUEST && r.status == 200 && (r.phase == "retired" || r.phase == "failed") ->
+      Req2 { cid: r.cid, op: REPLACE, key: "/volume-rotations/", k2: r.c_claim,
+             v1: "why=", v2: r.c_a1, v3: ";actor=", v4: r.c_a2, rev: r.rev,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == ROTATION_REQUEST && r.status == 200 ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    // VOLUME_PERSIST / CLONE_PERSIST: an identity that stands was made; else
+    // the key record first.
+    when (r.c_op == VOLUME_PERSIST || r.c_op == CLONE_PERSIST) && r.status == 200 ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    when r.c_op == VOLUME_PERSIST && r.status == 404 ->
+      Req2 { cid: r.cid, op: PUT, key: "/volume-keys/", k2: r.c_claim, v1: "kvol=", v2: r.c_a1, v3: ";epoch=1",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == CLONE_PERSIST && r.status == 404 && r.c_a4 != r.c_a3 ->
+      Req2 { cid: r.cid, op: PUT, key: "/volume-keys/", k2: r.c_claim,
+             v1: "kvol=", v2: r.c_a2, v3: ";epoch=", v4: r.c_a3, v5: ";next=", v6: r.c_a4,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == CLONE_PERSIST && r.status == 404 ->
+      Req2 { cid: r.cid, op: PUT, key: "/volume-keys/", k2: r.c_claim,
+             v1: "kvol=", v2: r.c_a2, v3: ";epoch=", v4: r.c_a3, v5: ";next=",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    // PV_BIND: the claim names its PersistentVolume.
+    when r.c_op == PV_BIND && (r.status == 200 || r.status == 204) ->
+      Req2 { cid: r.cid, op: PATCH, key: "/persistentvolumeclaims/", k2: r.c_a1, k3: "/", k5: r.c_a2,
+             path: "spec.volumeName", v1: "\"pvc-", v2: r.c_a1, v3: "-", v4: r.c_a2, v5: "\"",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    // EPOCH_PINS: the snapshots counted; now the key records.
+    when r.c_op == EPOCH_PINS && r.status == 200 ->
+      Req2 { cid: r.cid, op: COUNT, key: "/volume-keys/",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: r.count, ctx: r.ctx };
+    // AUDIT: one record, keyed by the wall clock and the effect's cid.
+    when r.c_op == AUDIT ->
+      Req2 { cid: r.cid, op: CREATE, key: "/volume-audit/", k2: r.c_claim, k3: "/", k4: r.wall, k5: "-", k6: r.cid,
+             v1: "event=", v2: r.c_a1, v3: ";actor=", v4: r.c_a2, v5: ";approver=", v6: r.c_a3,
+             v7: ";device=", v8: r.c_a4, v9: ";at=", v10: r.wall,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    // VOLUME_FORGET: the identity's delete counted, then the key record.
+    when r.c_op == VOLUME_FORGET && r.status == 200 ->
+      Req2 { cid: r.cid, op: DELETE, key: "/volume-keys/", k2: r.c_claim,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == VOLUME_FORGET ->
+      Req2 { cid: r.cid, op: DELETE, key: "/volume-keys/", k2: r.c_claim,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 1, ctx: r.ctx };
+    default ->
+      Req2 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "failed", c_n: 0, ctx: r.ctx };
+  }
+
+  // ── vw_s3: from vw_s2's reply ──
+  decision s3(r: Rep) -> Req1 {
+    when r.c_st != "" ->
+      Req1 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: r.c_st, c_n: r.c_n, ctx: r.ctx };
+    // The last write was vw_s2's: a merge into what was read, a request
+    // made (or one in flight already), the claim named (or gone), an audit
+    // kept, the pins counted.
+    when ((r.c_op == UNMOUNT_REQ || r.c_op == ATT_GRANT || r.c_op == KEY_EPOCHS || r.c_op == ATT_DETACH) &&
+            (r.status == 200 || r.status == 204)) ||
+         (r.c_op == ROTATION_REQUEST && (r.status == 200 || r.status == 409)) ||
+         (r.c_op == PV_BIND && (r.status == 200 || r.status == 204 || r.status == 404)) ||
+         (r.c_op == AUDIT && r.status == 200) ->
+      Req1 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: 0, ctx: r.ctx };
+    when r.c_op == EPOCH_PINS && r.status == 200 ->
+      Req1 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "ok", c_n: r.c_n + r.count, ctx: r.ctx };
+    // The identity, after its key record.
+    when r.c_op == VOLUME_PERSIST && (r.status == 200 || r.status == 204) ->
+      Req1 { cid: r.cid, op: CREATE, key: "/volume-attachments/", k2: r.c_claim,
+             v1: "vol=", v2: r.c_a1, v3: ";fs=", v4: r.c_a2, v5: ";grant=", v6: r.c_a3, v7: ";access=", v8: r.c_a4,
+             v9: ";set=", v10: r.c_a5, v11: ";fresh=1",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    when r.c_op == CLONE_PERSIST && (r.status == 200 || r.status == 204) ->
+      Req1 { cid: r.cid, op: CREATE, key: "/volume-attachments/", k2: r.c_claim,
+             v1: "vol=", v2: r.c_a1, v3: ";fs=", v4: r.ctx.fs, v5: ";access=", v6: r.ctx.access,
+             v7: ";grant=", v8: r.ctx.grant, v9: ";set=", v10: r.ctx.set,
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: 0, ctx: r.ctx };
+    // The PersistentVolume, after the key record.
+    when r.c_op == VOLUME_FORGET && r.status == 200 ->
+      Req1 { cid: r.cid, op: DELETE, key: "/persistentvolumes/", k2: "pvc-" + r.c_claim.replace("/", "-"),
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: r.c_n, ctx: r.ctx };
+    when r.c_op == VOLUME_FORGET ->
+      Req1 { cid: r.cid, op: DELETE, key: "/persistentvolumes/", k2: "pvc-" + r.c_claim.replace("/", "-"),
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "", c_n: r.c_n + 1, ctx: r.ctx };
+    default ->
+      Req1 { cid: r.cid, op: NOOP, key: "",
+             c_op: r.c_op, c_claim: r.c_claim, c_a1: r.c_a1, c_a2: r.c_a2, c_a3: r.c_a3, c_a4: r.c_a4, c_a5: r.c_a5,
+             c_st: "failed", c_n: 0, ctx: r.ctx };
+  }
+
+  // ── vw_answer: the Outcome, every field present ──
+  message Fin {
+    cid: int = 1;
+    status: int = 2;
+    c_op: int = 30;
+    c_claim: string = 31;
+    c_st: string = 37;
+    c_n: int = 38;
+    ctx: Ctx = 254;
+  }
+  message Outcome {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    code: string = 4;
+    fence: int = 5;
+    lease_exp: int = 6;
+    exp: int = 7;
+    inst: string = 8;
+    dev: string = 9;
+    vol: string = 10;
+    set: string = 11;
+    grant: string = 12;
+    n: int = 13;
+    r1: string = 14;
+    r2: string = 15;
+    r3: string = 16;
+    ctx: Ctx = 254;
+  }
+  decision answer(f: Fin) -> Outcome {
+    when f.c_st != "" ->
+      Outcome { cid: f.cid, op: f.c_op, key: f.c_claim, code: f.c_st, fence: 0, lease_exp: 0, exp: 0,
+                inst: "", dev: "", vol: "", set: "", grant: "", n: f.c_n, r1: "", r2: "", r3: "", ctx: f.ctx };
+    // The last write was vw_s3's: an identity made once, or the
+    // PersistentVolume forgotten after the rest.
+    when ((f.c_op == VOLUME_PERSIST || f.c_op == CLONE_PERSIST) && (f.status == 200 || f.status == 409)) ||
+         (f.c_op == VOLUME_FORGET && f.status == 200 && f.c_n == 0) ->
+      Outcome { cid: f.cid, op: f.c_op, key: f.c_claim, code: "ok", fence: 0, lease_exp: 0, exp: 0,
+                inst: "", dev: "", vol: "", set: "", grant: "", n: 0, r1: "", r2: "", r3: "", ctx: f.ctx };
+    default ->
+      Outcome { cid: f.cid, op: f.c_op, key: f.c_claim, code: "failed", fence: 0, lease_exp: 0, exp: 0,
+                inst: "", dev: "", vol: "", set: "", grant: "", n: 0, r1: "", r2: "", r3: "", ctx: f.ctx };
+  }
+
+  // ── the pin predicates: one child of a COUNT walk ──
+  // The epoch asked about is a2 ("0" or empty: any).
+  message Snap {
+    tail: string = 3;
+    phase: string = 41;
+    kvol: string = 42;
+    elo: int = 50;
+    ehi: int = 51;
+    c_a1: string = 32;
+    c_a2: string = 33;
+  }
+  message Keep {
+    k: int = 1;
+  }
+  decision pin_snap(c: Snap) -> Keep {
+    when c.kvol == c.c_a1 && c.phase != "dropped" && c.phase != "failed" && c.elo != 0 &&
+         (c.c_a2 == "" || int(c.c_a2) == 0 || (c.elo <= int(c.c_a2) && int(c.c_a2) <= c.ehi)) ->
+      Keep { k: 1 };
+    default -> Keep {};
+  }
+  message Key {
+    tail: string = 3;
+    kvol: string = 40;
+    epoch: int = 50;
+    next: int = 51;
+    c_a1: string = 32;
+    c_a2: string = 33;
+    c_a3: string = 34;
+  }
+  decision pin_key(c: Key) -> Keep {
+    when c.tail != c.c_a3 && c.kvol == c.c_a1 &&
+         (c.c_a2 == "" || int(c.c_a2) == 0 || c.epoch == int(c.c_a2) || c.next == int(c.c_a2)) ->
+      Keep { k: 1 };
+    default -> Keep {};
+  }
+
+  pipeline vw_s1(e: Eff) -> Req1 { call y = s1(e); return y; }
+  pipeline vw_s2(r: Rep) -> Req2 { call y = s2(r); return y; }
+  pipeline vw_s3(r: Rep) -> Req1 { call y = s3(r); return y; }
+  pipeline vw_answer(f: Fin) -> Outcome { call y = answer(f); return y; }
+  pipeline vw_pin_snap(c: Snap) -> Keep { call y = pin_snap(c); return y; }
+  pipeline vw_pin_key(c: Key) -> Keep { call y = pin_key(c); return y; }
+  entry vw_s1 = vw_s1;
+  entry vw_s2 = vw_s2;
+  entry vw_s3 = vw_s3;
+  entry vw_answer = vw_answer;
+  entry vw_pin_snap = vw_pin_snap;
+  entry vw_pin_key = vw_pin_key;
+  provenance revision "volume-records" toolchain "chronicle-authoring";
+}
