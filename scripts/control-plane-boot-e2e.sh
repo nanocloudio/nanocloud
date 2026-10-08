@@ -15,7 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 GRAPH="$ROOT/packaging/debian/fluxor-controlplane.yaml"
 PORT=7443
 
@@ -37,7 +37,7 @@ mkdir -p "$STORE" "$STATE"
 nc_lattice_prepare "$STORE"
 RUNTIME_PID=""
 cleanup() {
-  [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true
+  if [ -n "$RUNTIME_PID" ]; then kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; fi
   rm -rf "$D"
 }
 trap cleanup EXIT

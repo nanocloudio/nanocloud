@@ -1,0 +1,11 @@
+name = "pi5_fence_verify"
+target = "pi5"
+config = "pi5-fence-verify.yaml"
+requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
+timeout_s = 240
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[fs_async_seed\\] verify ok=8 bad=0"
+[[fail]]
+source = "telemetry.monitor_udp"
+regex = "PANIC|EXCEPTION|halted|\\[fs_async_seed\\] FAIL|\\[fs_async_seed\\] verify ok=[0-9]+ bad=[1-9]"

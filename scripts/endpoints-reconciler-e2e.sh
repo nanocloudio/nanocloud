@@ -27,7 +27,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 GRAPH="$ROOT/packaging/debian/fluxor-endpoints.yaml"
 
 # The runtime pinned by fluxor.lock (registry bin shelf), overridable.

@@ -26,6 +26,7 @@ module nanocloud.replicaset {
     prev: string = 37;
     gate: string = 38;
     pod: string = 39;
+    labels: string = 40;  // the ReplicaSet's metadata.labels, an opaque subtree
   }
   // carried by: rs.Act, rs.Applied
   message Ctx2 {
@@ -52,6 +53,7 @@ module nanocloud.replicaset {
                          // because a document that NAMES the object wants the
                          // bare name where a store key wants "<ns>/".
     hash: string = 5;    // metadata.labels.pod-template-hash on the ReplicaSet
+    labels: string = 6;  // metadata.labels, an opaque subtree: the pods' labels
   }
 
   // Stage 1 asks about the PREDECESSOR, so the verdict can roll strictly in
@@ -157,13 +159,13 @@ module nanocloud.replicaset {
   // and let the answer's 204 stand for "ungated".
   decision ask_prev(o: rs.Ord) -> rs.PrevQ {
     when o.prevstr == "" && o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
     when o.prevstr == "" ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
     when o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
     default ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod } };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
   }
 
   // Stage 2: ask about THIS ordinal, carrying the predecessor verdict. The gate
@@ -171,11 +173,11 @@ module nanocloud.replicaset {
   // predecessor at all (status 204 from the NOOP above).
   decision probe(a: rs.PrevA) -> rs.Probe {
     when a.status == 204 ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels } };
     when a.phash == a.ctx.hash ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels } };
     default ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "", pod: a.ctx.pod } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "", pod: a.ctx.pod, labels: a.ctx.labels } };
   }
 
   // Four cases, and only two act:
@@ -189,9 +191,26 @@ module nanocloud.replicaset {
     // create-if-absent is what preserves the fields a kubelet adds.
     when a.ctx.in == "1" && a.status == 200 && a.ctx.gate == "1" && a.myhash != a.ctx.hash ->
       rs.Act { cid: a.cid, op: DELETE, key: a.ctx.key, ctx: Ctx2 { key: a.ctx.key, evt: "roll", ns: a.ctx.ns, pod: a.ctx.pod } };
+    // A Pod names its kind, and is labelled as its ReplicaSet is: the
+    // template's labels and the hash, so a selector finds it.
+    when a.ctx.in == "1" && a.status == 404 && a.ctx.labels != "" && a.ctx.labels != "{}" ->
+      rs.Act { cid: a.cid, op: PUT, key: a.ctx.key,
+               p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
+               p2: a.ctx.name,
+               p3: "-",
+               p4: a.ctx.ord,
+               p5: "\",\"namespace\":\"",
+               p6: a.ctx.ns,
+               p7: "\",\"ownerReferences\":[{\"kind\":\"ReplicaSet\",\"name\":\"",
+               p8: a.ctx.name,
+               p9: "\"}],\"labels\":",
+               p10: a.ctx.labels,
+               p11: "},\"spec\":",
+               p12: a.ctx.tmpl,
+               p13: ",\"status\":{\"phase\":\"Pending\"}}", ctx: Ctx2 { key: a.ctx.key, evt: "create", ns: a.ctx.ns, pod: a.ctx.pod } };
     when a.ctx.in == "1" && a.status == 404 ->
       rs.Act { cid: a.cid, op: PUT, key: a.ctx.key,
-               p1: "{\"metadata\":{\"name\":\"",
+               p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
                p2: a.ctx.name,
                p3: "-",
                p4: a.ctx.ord,
@@ -203,7 +222,7 @@ module nanocloud.replicaset {
                p10: a.ctx.hash,
                p11: "\"}},\"spec\":",
                p12: a.ctx.tmpl,
-               p13: "}", ctx: Ctx2 { key: a.ctx.key, evt: "create", ns: a.ctx.ns, pod: a.ctx.pod } };
+               p13: ",\"status\":{\"phase\":\"Pending\"}}", ctx: Ctx2 { key: a.ctx.key, evt: "create", ns: a.ctx.ns, pod: a.ctx.pod } };
     when a.ctx.in == "" && a.status == 200 ->
       rs.Act { cid: a.cid, op: DELETE, key: a.ctx.key, ctx: Ctx2 { key: a.ctx.key, evt: "delete", ns: a.ctx.ns, pod: a.ctx.pod } };
     default ->
@@ -265,11 +284,11 @@ module nanocloud.replicaset {
              selfkey: o.selfkey, prevkey: o.prevkey }
   }
   transformation pass_prev(a: rs.PrevA) -> rs.PrevA {
-    rs.PrevA { cid: a.cid, status: a.status, value: a.value, phash: a.phash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, prev: a.ctx.prev, pod: a.ctx.pod } }
+    rs.PrevA { cid: a.cid, status: a.status, value: a.value, phash: a.phash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, prev: a.ctx.prev, pod: a.ctx.pod, labels: a.ctx.labels } }
   }
   transformation pass_ans(a: rs.Answer) -> rs.Answer {
     rs.Answer { cid: a.cid, status: a.status, value: a.value,
-                myhash: a.myhash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: a.ctx.gate, pod: a.ctx.pod } }
+                myhash: a.myhash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: a.ctx.gate, pod: a.ctx.pod, labels: a.ctx.labels } }
   }
 
   transformation pass_applied(a: rs.Applied) -> rs.Applied {

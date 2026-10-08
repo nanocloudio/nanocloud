@@ -20,7 +20,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 for m in kagi_storage_effect storage_key storage_custodian security_state remote_channel; do

@@ -313,7 +313,15 @@ module nanocloud.apiplane {
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
                    c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIGroupList\",\"groups\":[{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+                   c_answer: "{\"kind\":\"APIGroupList\",\"groups\":[{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}]},{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    // nanocloud.io/v1: a Graph is a module subgraph a bare-metal node runs as
+    // a Pod (spec.flxa, hex) — stored at /graphs.nanocloud.io/<name>, where the
+    // node's workload_effect reads it.
+    when r.target == "/apis/nanocloud.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"nanocloud.io/v1\",\"resources\":[{\"name\":\"graphs\",\"singularName\":\"graph\",\"namespaced\":false,\"kind\":\"Graph\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
     when r.target == "/api/v1" ->
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
@@ -337,13 +345,19 @@ module nanocloud.apiplane {
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
                    c_verdict: 200,
-                   c_answer: "{\"paths\":{\"api/v1\":{\"serverRelativeURL\":\"/openapi/v3/api/v1\"},\"apis/apps/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/apps/v1\"}}}",
+                   c_answer: "{\"paths\":{\"api/v1\":{\"serverRelativeURL\":\"/openapi/v3/api/v1\"},\"apis/apps/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/apps/v1\"},\"apis/nanocloud.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/nanocloud.io/v1\"}}}",
                    c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
     when r.target == "/openapi/v3/api/v1" ->
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",
                    c_verdict: 200,
                    c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/api/v1/namespaces/{namespace}/pods/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Pod\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/services/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Service\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/configmaps/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ConfigMap\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/secrets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Secret\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/serviceaccounts/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ServiceAccount\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/endpoints/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Endpoints\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/events/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Event\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolumeClaim\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Namespace\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/nodes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Node\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/persistentvolumes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolume\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/openapi/v3/apis/nanocloud.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/nanocloud.io/v1/graphs/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"nanocloud.io\",\"version\":\"v1\",\"kind\":\"Graph\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
                    c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
     when r.target == "/openapi/v3/apis/apps/v1" ->
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",

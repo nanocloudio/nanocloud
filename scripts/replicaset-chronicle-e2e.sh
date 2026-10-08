@@ -27,7 +27,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 . "$ROOT/scripts/fluxor-env.sh"
 . "$ROOT/scripts/chronicle-params.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -91,7 +91,7 @@ scheduler:
 modules:
   - name: store_source
     prefix: "/replicasets.apps/"
-    paths: "spec.template.spec,metadata.labels.pod-template-hash"
+    paths: "spec.template.spec,metadata.labels.pod-template-hash,metadata.labels"
     expand: "spec.replicas"
     expand_tail: 4
     # ...and past the highest EXISTING child, whatever the count: a surplus far

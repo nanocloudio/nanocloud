@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 GRAPH="$ROOT/packaging/debian/fluxor-service-ipam.yaml"
 
 . "$ROOT/scripts/fluxor-env.sh"

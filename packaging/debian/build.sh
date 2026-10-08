@@ -26,7 +26,7 @@ ARCH=$(detect_arch)
 STAGING_ROOT="${TARGET_DIR}/nanocloud_${VERSION}_${ARCH}"
 DEBIAN_DIR="${STAGING_ROOT}/DEBIAN"
 FXROOT="${STAGING_ROOT}/usr/lib/nanocloud/fluxor"
-SILICON=bcm2712
+MODULE_ABI=aarch64
 FLUXOR_TARGET=aarch64-unknown-linux-gnu
 
 rm -rf "${STAGING_ROOT}"
@@ -41,13 +41,13 @@ mkdir -p "${DEBIAN_DIR}"
 FLUXOR_DIR="${FLUXOR_DIR:-${REPO_ROOT}/../fluxor}"
 FLUXOR_CLI="${FLUXOR_DIR}/target/${FLUXOR_TARGET}/release/fluxor"
 FLUXOR_RUNTIME="${REPO_ROOT}/target/${FLUXOR_TARGET}/release/fluxor-linux"
-NANO_MODULES="${REPO_ROOT}/target/fluxor/${SILICON}/modules"
+NANO_MODULES="${REPO_ROOT}/target/fluxor/${MODULE_ABI}/modules"
 FLUXOR_MODULES="${NANO_MODULES}"
 
 for f in "${FLUXOR_CLI}" "${FLUXOR_RUNTIME}" "${FLUXOR_DIR}/fluxor.toml" \
          "${FLUXOR_DIR}/stacks" "${FLUXOR_DIR}/targets" "${NANO_MODULES}/kube_decode.fmod"; do
     [[ -e "$f" ]] || { echo "missing artifact: $f" >&2
-        echo "  build the fluxor release CLI, then 'fluxor sync' and 'fluxor modules build --target ${SILICON}' here" >&2; exit 1; }
+        echo "  build the fluxor release CLI, then 'fluxor sync' and 'fluxor modules build --target ${MODULE_ABI}' here" >&2; exit 1; }
 done
 
 echo "==> Staging fluxor CLI + runtime"
@@ -61,8 +61,8 @@ strip --strip-debug "${STAGING_ROOT}/usr/bin/fluxor" \
 ln -sf fluxor "${STAGING_ROOT}/usr/bin/nanocloud"
 
 echo "==> Staging the fluxor project (palette fmods + scaffolding)"
-mkdir -p "${FXROOT}/target/fluxor/${SILICON}/modules"
-cp "${FLUXOR_MODULES}"/*.fmod "${FXROOT}/target/fluxor/${SILICON}/modules/"
+mkdir -p "${FXROOT}/target/fluxor/${MODULE_ABI}/modules"
+cp "${FLUXOR_MODULES}"/*.fmod "${FXROOT}/target/fluxor/${MODULE_ABI}/modules/"
 install -Dm644 "${FLUXOR_DIR}/fluxor.toml" "${FXROOT}/fluxor.toml"
 cp -r "${FLUXOR_DIR}/stacks" "${FLUXOR_DIR}/targets" "${FXROOT}/"
 (cd "${FLUXOR_DIR}" && find modules -name manifest.toml -exec install -Dm644 {} "${FXROOT}/{}" \;)
@@ -75,8 +75,8 @@ for MODDIR in "${REPO_ROOT}"/modules/app/*/; do
     [[ -f "${MODDIR}manifest.toml" ]] || continue
     FMOD="${NANO_MODULES}/${NAME}.fmod"
     [[ -f "${FMOD}" ]] || { echo "nanocloud module missing: ${FMOD}" >&2
-        echo "  run: fluxor modules build --target ${SILICON}" >&2; exit 1; }
-    install -Dm644 "${FMOD}" "${FXROOT}/target/fluxor/${SILICON}/modules/${NAME}.fmod"
+        echo "  run: fluxor modules build --target ${MODULE_ABI}" >&2; exit 1; }
+    install -Dm644 "${FMOD}" "${FXROOT}/target/fluxor/${MODULE_ABI}/modules/${NAME}.fmod"
     install -Dm644 "${MODDIR}manifest.toml" "${FXROOT}/modules/app/${NAME}/manifest.toml"
 done
 

@@ -1,0 +1,46 @@
+# Reset the board: remove the control plane's store runs, manifests, log and
+# snapshots from the FAT32 root. Run it before a from-fresh M1 pass:
+#
+#   fluxor rig test --rig pi5-a --scenario packaging/rig/pi5-clean.scenario.toml
+#
+# The board boots dark with a deadline on nvme; fat32 needs its budget or it
+# answers ENOSYS once terminated (standards: rig step budgets).
+target: pi5
+tick_us: 1000
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+modules:
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    path: /
+    init_free_hint: 20000
+    clear_free_region: 4096
+    # The root directory itself: FAT32 directories never shrink, and a
+    # root grown through thousands of create/unlink cycles (every WAL
+    # segment and store run) is walked past the provider's scan budget
+    # on every open — E_AGAIN forever, the store never serving
+    # (2026-10-10, after ~30k log entries). Truncate it to one cluster.
+    # Gated on the volume id (pi5-a's NVMe: `vol=AD8B-FACC`); a
+    # different disk refuses, by design.
+    expect_volume_id: 2911632076
+    clean_root: 1
+  - name: fs_clean
+    # The walk of a root that grew to hundreds of names outlives the
+    # default step budget (terminated at tick 5093 on 2026-10-10).
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    params:
+      suffixes: ".wal,.kmn,.klg,.krn,.run,.snp"
+wiring:
+  - from: nvme.blocks
+    to: fat32.blocks

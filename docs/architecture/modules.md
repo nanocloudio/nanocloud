@@ -403,7 +403,7 @@ modules/app/_shared/            include-only helpers: JSON walk, store ops,
                                 compact fields, events, key paths
 modules/app/_chronicle/         controller rules authored for Chronicle params
 target/fluxor/fluxor-abi/sdk/   the SDK the modules compile against
-target/fluxor/bcm2712/modules/  the built .fmod artefacts
+target/fluxor/aarch64/modules/  the built .fmod artefacts
 packaging/debian/               graphs, bundle sources and the .deb build
 scripts/*-e2e.sh                live graph E2Es — the behaviour gate
 ```

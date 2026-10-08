@@ -47,6 +47,11 @@ modules:
   - name: ttl_scheduler
     params:
       propose_wrap: 1
+      # Every tick is a committed entry, idle or not. At the module's
+      # 250 ms default an idle node wrote ~4 entries/s — 95% of its log
+      # (the rig: ~15k entries per hour of uptime, all replayed at boot).
+      # Leases here are second-granular; one tick a second is plenty.
+      tick_interval_ms: 1000
 
   # ── The group: clustor's consensus and durability, every peer link under
   # mutual TLS. `nanocloud-graph.sh` renders this node's values from

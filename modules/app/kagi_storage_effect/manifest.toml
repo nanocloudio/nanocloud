@@ -4,7 +4,7 @@ description = "Chronicle connector for Kagi's storage-key service — a volume k
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The encrypted-volume pipelines' control-plane effector for Kagi (docs/design/
 # encrypted-volumes.md). It decides nothing: each key effect becomes Kagi

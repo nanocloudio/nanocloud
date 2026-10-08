@@ -2,7 +2,9 @@
 // node that stops renewing out of service.
 //
 //   renew   (node)  /nodes/<self> — absent, or due — -> PUT it ready, its
-//                   heartbeat the node's monotonic clock now. The source's
+//                   heartbeat the node's monotonic clock now. The record is
+//                   the Node the API serves, so it carries its apiVersion
+//                   and kind: a client decodes nothing without them. The source's
 //                   `label` is the node's name; `empty` emits when there is
 //                   no record yet, `due` wakes it to renew.
 //   seen    (plane) /nodes/<node> at a revision not yet seen -> /node-seen/
@@ -44,14 +46,14 @@ module nanocloud.nodelease {
       nl.Put { cid: n.seq, op: NOOP, key: "" };
     when n.total == 0 ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
-               v1: "{\"metadata\":{\"name\":\"", v2: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
                v3: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v4: n.now,
-               v5: "}}" };
+               v5: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}}" };
     when n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000 ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
-               v1: "{\"metadata\":{\"name\":\"", v2: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
                v3: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v4: n.now,
-               v5: "}}" };
+               v5: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}}" };
     default ->
       nl.Put { cid: n.seq, op: NOOP, key: "" };
   }
@@ -90,11 +92,15 @@ module nanocloud.nodelease {
     value: string = 4;
     path: string = 19;
   }
-  // Three missed renewals.
+  // Three missed renewals. The whole status goes, heartbeat included: a
+  // node that comes back sees hb == 0 and renews at once; kubectl sees
+  // Ready=False meanwhile. `ready` stays beside `conditions` because the
+  // plane's own decisions read it.
   decision stale(n: nl.Seen) -> nl.Patch {
     when n.ready == "true" && n.at > 0 && n.now >= n.at + 30000 ->
-      nl.Patch { cid: n.seq, op: PATCH, key: n.key, value: "false",
-                 path: "status.ready" };
+      nl.Patch { cid: n.seq, op: PATCH, key: n.key,
+                 value: "{\"ready\":false,\"conditions\":[{\"type\":\"Ready\",\"status\":\"False\",\"reason\":\"NodeStatusUnknown\"}]}",
+                 path: "status" };
     default ->
       nl.Patch { cid: n.seq, op: NOOP, key: "" };
   }

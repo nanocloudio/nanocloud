@@ -194,6 +194,14 @@ fn tbl_at<'a>(obj: &'a [u8], path: &[u8]) -> Option<&'a [u8]> {
     j_path(obj, &segs[..n])
 }
 
+/// The array (or object) at the dotted `path` of `obj`, brackets included —
+/// `tbl_at` sees scalars only, and a list column reads a list.
+fn tbl_sub<'a>(obj: &'a [u8], path: &[u8]) -> Option<&'a [u8]> {
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let n = split_dots(path, &mut segs);
+    j_sub(obj, &segs[..n])
+}
+
 /// `path|default`: the value, else the default (`none` without one).
 fn tbl_value(arg: &[u8], none: &[u8], obj: &[u8], out: &mut [u8], at: &mut usize) -> bool {
     let (path, dflt) = match arg.iter().position(|&b| b == b'|') {
@@ -216,7 +224,7 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
                 Some(i) => (&arg[..i], Some(&arg[i + 1..])),
                 None => (arg, None),
             };
-            let list = tbl_at(obj, path).unwrap_or(b"[]");
+            let list = tbl_sub(obj, path).unwrap_or(b"[]");
             let n = jp_elems(list)
                 .filter(|e| match want {
                     None => true,
@@ -233,7 +241,7 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
                 Some(i) => (&arg[..i], &arg[i + 1..]),
                 None => return false,
             };
-            let list = tbl_at(obj, path).unwrap_or(b"[]");
+            let list = tbl_sub(obj, path).unwrap_or(b"[]");
             let sum: u64 = jp_elems(list)
                 .map(|e| j_get1(e, member).map(parse_dec_u64).unwrap_or(0))
                 .sum();
@@ -243,6 +251,32 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
             Some(t) => tbl_age((now_ms / 1000) as i64 - t, out, at),
             None => put(out, at, b"<unknown>"),
         },
+        // kubectl's node STATUS: the Ready condition's status, in words — a
+        // Node carries no phase, and a missing condition is Unknown.
+        b"ready" => {
+            // `j_get1` hands a string back with its quotes.
+            fn unq(v: &[u8]) -> &[u8] {
+                if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+                    &v[1..v.len() - 1]
+                } else {
+                    v
+                }
+            }
+            let list = tbl_sub(obj, arg).unwrap_or(b"[]");
+            let status = jp_elems(list)
+                .find(|e| j_get1(e, b"type").map(unq) == Some(b"Ready"))
+                .and_then(|e| j_get1(e, b"status"))
+                .map(unq);
+            put(
+                out,
+                at,
+                match status {
+                    Some(b"True") => b"Ready",
+                    Some(b"False") => b"NotReady",
+                    _ => b"Unknown",
+                },
+            )
+        }
         _ => false,
     }
 }

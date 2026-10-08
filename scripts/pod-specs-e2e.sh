@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 . "$ROOT/scripts/fluxor-env.sh"
 . "$ROOT/scripts/chronicle-params.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -87,7 +87,7 @@ modules:
   - name: ps_pods
     type: store_source
     prefix: "/pods/"
-    paths: "metadata.uid,spec.nodeName,spec.containers.0.command!jargv,spec.containers.0.args!jargv,spec.containers.0.image,spec.restartPolicy!lower,spec.terminationGracePeriodSeconds,metadata.deletionTimestamp"
+    paths: "metadata.uid,spec.nodeName,spec.containers.0.command!jargv,spec.containers.0.args!jargv,spec.containers.0.image,spec.restartPolicy!lower,spec.terminationGracePeriodSeconds,metadata.deletionTimestamp,spec.runtimeClassName"
   - name: ps_spec
     type: store_effect
     decision: "${DEC_SPEC}"
@@ -95,7 +95,7 @@ modules:
   - name: ps_tombs
     type: store_source
     prefix: "/~tomb/pods/"
-    paths: "obj.metadata.uid,obj.spec.nodeName"
+    paths: "obj.metadata.uid,obj.spec.nodeName,obj.spec.runtimeClassName,obj.spec.containers.0.image"
   - name: ps_gone
     type: store_effect
     decision: "${DEC_GONE}"
@@ -130,7 +130,7 @@ store_put "/pods/default/bye" '{"metadata":{"name":"bye","namespace":"default","
 store_put "/~tomb/pods/default/gone" '{"deadline":1,"obj":{"metadata":{"name":"gone","namespace":"default","uid":"uid-gone"},"spec":{"nodeName":"node-a"}}}'
 run 5
 WEB="$(store_last /~node/node-a/pod-specs/uid-web)"
-[ "$WEB" = "node=node-a;image=busybox:1.36;restart=onfailure;grace=5;desired=running;cmd=sh -c echo%20hi%3B%20sleep%209" ] \
+[ "$WEB" = "node=node-a;image=busybox:1.36;restart=onfailure;grace=5;desired=running;cmd=sh -c echo%20hi%3B%20sleep%209;pod=default/web" ] \
   || fail "web's spec wrong: '$WEB'"
 echo "   web:  argv kept its bounds (sh, -c, 'echo hi; sleep 9'), restartPolicy as the node spells it"
 [ -z "$(store_last /~node//pod-specs/uid-wait)" ] || fail "an unscheduled Pod is no node's ask"

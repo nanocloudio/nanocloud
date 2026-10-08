@@ -1,0 +1,24 @@
+# Phase A3, first half: the control plane on the board takes a snapshot of
+# its own accord. The run holds until durability's `[snap] hb` reports one
+# taken — a WAL segment rotated (32 KiB on metal), the store flushed on
+# request and answered with its DISK-RESIDENT marker, the manifest landed.
+# Run the driver beside it to add history; a snapshot lands within minutes
+# of the first rotation. Then `pi5-resume.scenario.toml`.
+
+name = "pi5_diag"
+target = "pi5"
+config = "pi5-controlplane.yaml"
+
+requires_tags = ["nvme"]
+requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
+
+timeout_s = 240
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[kvw\\] store serving: Ready"
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[kvw\\] disk hb .* ph=2 .* rr=[1-9][0-9]*"
+

@@ -1,0 +1,47 @@
+# M1 of the bare-metal k3s node: the SHIPPED control plane on a Pi 5 with no
+# Linux, its store on the board's NVMe, driven with stock kubectl.
+#
+# The automated half boots the graph and holds the run open; the operator's
+# half is the driver, run beside it once the rig has power-cycled:
+#
+#   bash scripts/rig-controlplane-driver.sh 192.168.1.9
+#
+# Pass rules here are the board's own account: the store came up serving on
+# its disk, its consumers were held until it did (the contract-readiness
+# gate), trusted time anchored, and the seeds landed.
+
+name = "pi5_controlplane"
+target = "pi5"
+config = "pi5-controlplane.yaml"
+
+requires_tags = ["nvme"]
+requires = [
+    "deploy.netboot_tftp",
+    "power.cycle",
+    "telemetry.monitor_udp",
+]
+
+# Long enough for the driver: boot, mount, recover, then kubectl.
+timeout_s = 600
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[ready\\] contract 0x[0-9a-f]+: [0-9]+ consumer\\(s\\) wait on provider"
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[kvw\\] store serving: Ready"
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[sntp\\] hb synced=1 .* cls=3 flags=3"
+
+# The node renewed its own lease after the operator's objects were applied:
+# a store write path that works end to end, long after boot.
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[kvw\\] store hb calls=[0-9]{4,}"
+
+[[fail]]
+source = "telemetry.monitor_udp"
+regex = "\\[fluxor\\] PANIC|fault_code|\\[kvw\\] store provider=0|REFUSING GRAPH|\\[seed\\] rc=-|SUBSCRIBE refused"

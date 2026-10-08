@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Live E2E: the bare-metal node's shape, on Linux — the control plane AND the
+# kubelet's graph-pod slice in ONE graph over ONE store scoped to the node,
+# laid out as scripts/rig-render-controlplane.sh lays it out for the board
+# (the store's `scope`/`scoped`, the slice of fluxor-podlifecycle.yaml a
+# graph-backed Pod needs, `workload_modules`). A Graph and a Pod naming it
+# are applied through the API; the node stages the subgraph of its own
+# image and the Pod's phase reaches the object: `kubectl get pods` Running.
+#
+# PASS = the Pod's status.phase is Running within 90 s. On failure the
+# records of the chain are printed from the store, in order, so the stage
+# that stopped is named.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT=7443
+
+. "$ROOT/scripts/fluxor-env.sh"
+if [ -z "${FLUXOR_RUNTIME:-}" ]; then
+  FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
+fi
+command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
+command -v openssl >/dev/null || { echo "FAIL: openssl not found"; exit 1; }
+
+D="$(mktemp -d /tmp/nc-dep-api-XXXXXX)"
+STORE="$D/store"
+mkdir -p "$STORE"
+nc_lattice_prepare "$STORE"
+RUNTIME_PID=""
+cleanup() {
+  # Waited for, not just signalled: a runtime still draining holds :7443, and
+  # the next E2E to bind it finds no API.
+  if [ -n "$RUNTIME_PID" ]; then kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; fi
+  if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi
+}
+trap cleanup EXIT
+fail() { echo "FAIL: $1"; tail -30 "$D/run.log" 2>/dev/null || true; exit 1; }
+
+store_put() { # store_put <key> <hex-value>  — into the host log the store imports
+  python3 - "$STORE/store.log" "$1" "$2" <<'PY'
+import struct, sys, os, binascii
+path, key, val = sys.argv[1], sys.argv[2].encode(), binascii.unhexlify(sys.argv[3])
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+with os.fdopen(fd, "r+b") as f:
+    data = f.read(); p = last = 0
+    while p + 15 <= len(data):
+        rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    f.write(struct.pack("<QBHI", last + 1, 1, len(key), len(val)) + key + val)
+    f.flush(); os.fsync(f.fileno())
+PY
+}
+put_text() { store_put "$1" "$(printf '%s' "$2" | python3 -c 'import sys,binascii;print(binascii.hexlify(sys.stdin.buffer.read()).decode())')"; }
+
+echo "== 1. seed the operator's identity: SA key, cluster-admin binding, a ready node =="
+python3 - "$D" <<'PY'
+import base64, json, struct, sys, time, binascii
+from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives import hashes, serialization
+D = sys.argv[1]
+key = ec.generate_private_key(ec.SECP256R1())
+pub = key.public_key().public_bytes(
+    serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+ISSUER, KID = b"https://kubernetes.default.svc", b"sa-1"
+f8 = lambda b: bytes([len(b)]) + b
+f16 = lambda b: struct.pack("<H", len(b)) + b
+body = (f8(ISSUER) + struct.pack("<H", 1) + f8(KID) + struct.pack("<H", 1)
+        + bytes([1]) + bytes([0x01]) + struct.pack("<I", 1)
+        + struct.pack("<Q", 0) + struct.pack("<Q", 0) + f16(pub))
+open(f"{D}/keyframe.hex","w").write(
+    binascii.hexlify(bytes([0x22]) + struct.pack("<H", len(body)) + body).decode())
+b64u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=")
+HDR = b"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNhLTEifQ"
+now = int(time.time())
+claims = {"iss": ISSUER.decode(), "sub": "system:serviceaccount:default:admin",
+          "aud": "nanocloud", "iat": now, "exp": now + 3600}
+signing = HDR + b"." + b64u(json.dumps(claims, separators=(",", ":")).encode())
+r, s = utils.decode_dss_signature(key.sign(signing, ec.ECDSA(hashes.SHA256())))
+open(f"{D}/token.admin","w").write((signing + b"." + b64u(r.to_bytes(32,"big") + s.to_bytes(32,"big"))).decode())
+PY
+store_put "/authn-keys/sa" "$(cat "$D/keyframe.hex")"
+. "$ROOT/scripts/support/rbac.sh"
+rbac_clusterrole "$STORE/store.log" admin "*" "*"
+rbac_crb "$STORE/store.log" admins admin ServiceAccount admin default
+put_text "/namespaces/default" '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}'
+put_text "/nodes/node-1" '{"apiVersion":"v1","kind":"Node","metadata":{"name":"node-1"},"status":{"ready":true,"conditions":[{"type":"Ready","status":"True"}]}}'
+FLXA="$(python3 "$ROOT/scripts/support/flxa.py" churn_probe:1=0)"
+put_text "/graphs.nanocloud.io/probe" "{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"Graph\",\"metadata\":{\"name\":\"probe\"},\"spec\":{\"flxa\":\"$FLXA\"}}"
+
+echo "== 2. render the control plane for this node, splice the kubelet's graph-pod slice onto its store =="
+nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
+sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
+python3 - "$D/graph.yaml" "$ROOT" node-1 <<'PY2' || fail "the splice did not apply"
+import re, sys
+out, root, node = sys.argv[1:4]
+g = open(out).read()
+def sub(old, new):
+    global g
+    if g.count(old) != 1: sys.exit(f"expected 1 x {old[:50]!r}, found {g.count(old)}")
+    g = g.replace(old, new)
+SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
+          "/volume-binds/,/image-,/volume-ops/")
+sub('      scope: ""\n      scoped: ""\n', f'      scope: "{node}"\n      scoped: "{SCOPED}"\n')
+kube = open(f"{root}/packaging/debian/fluxor-podlifecycle.yaml").read()
+kube_mods = kube[kube.index("modules:\n") + len("modules:\n"):kube.index("\nwiring:")]
+kube_wire = kube[kube.index("wiring:\n") + len("wiring:\n"):]
+KEEP_PREFIX = ("pj_", "pl_", "pr_")
+KEEP = {"wl", "sb_mspec", "sb_mspecd", "sb_sig", "sb_sigd", "sb_pause", "sb_paused", "sb_ev", "sb_evout"}
+def kept(name): return name in KEEP or name.startswith(KEEP_PREFIX)
+blocks = re.split(r"(?m)^(?=  - name: )", kube_mods)
+kept_mods = "".join(b for b in blocks if b.startswith("  - name: ") and kept(b.split()[2]))
+pairs, frm = [], None
+for line in kube_wire.splitlines():
+    m = re.match(r"  - from: (\S+)$", line)
+    if m: frm = m.group(1); continue
+    m = re.match(r"    to: (\S+)$", line)
+    if m and frm: pairs.append((frm, m.group(1))); frm = None
+edges = "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs if kept(a.split(".")[0]) and kept(b.split(".")[0]))
+mods, wiring = g.split("\nwiring:\n", 1)
+g = (mods.rstrip("\n") + "\n  # ── The pod plane: fluxor-podlifecycle.yaml, its graph-pod slice ──\n"
+     + kept_mods.rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n" + edges
+     + "\nworkload_modules:\n  - churn_probe\n")
+open(out, "w").write(g)
+print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
+PY2
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+
+echo "== 3. run it; wait for the API over TLS =="
+env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+RUNTIME_PID=$!
+nc_store_ready "$STORE" 60 || fail "the store never answered"
+api() { # api <method> <path> [json-body] -> "<status>|<body>"
+  python3 - "$PORT" "$D/token.admin" "$1" "$2" "${3:-}" <<'PY'
+import socket, ssl, sys
+port, tokf, method, path, body = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+tok = open(tokf).read().strip()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+s = ctx.wrap_socket(raw, server_hostname="localhost")
+b = body.encode()
+req = (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {tok}\r\n"
+       f"Content-Type: application/json\r\nContent-Length: {len(b)}\r\nConnection: close\r\n\r\n").encode() + b
+s.sendall(req)
+buf = b""
+s.settimeout(10)
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+except (socket.timeout, ssl.SSLError):
+    pass
+s.close()
+head, _, body = buf.partition(b"\r\n\r\n")
+status = head.split(b"\r\n", 1)[0].split(b" ", 2)[1].decode() if head else "?"
+print(f"{status}|{body.decode(errors='replace')}")
+PY
+}
+for _ in $(seq 60); do
+  r="$(api GET /version 2>/dev/null || true)"
+  case "$r" in 200\|*) break ;; esac
+  sleep 1
+done
+case "$r" in 200\|*) echo "   GET /version -> 200" ;; *) fail "no API: $r" ;; esac
+
+
+echo "== 4. a Pod naming the Graph is created through the API =="
+POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"probe","namespace":"default"},"spec":{"runtimeClassName":"fluxor","containers":[{"name":"probe","image":"probe"}]}}'
+for _ in $(seq 90); do
+  r="$(api POST /api/v1/namespaces/default/pods "$POD")"
+  case "$r" in 503\|*|403\|*) sleep 1 ;; *) break ;; esac
+done
+case "$r" in 20[01]\|*) echo "   POST pods -> ${r%%|*}" ;; *) fail "POST pod: ${r:0:200}" ;; esac
+UID_="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["uid"])')"
+echo "   uid $UID_"
+
+echo "== 5. the node stages it; the Pod's phase reaches the object =="
+phase=""; node=""
+for _ in $(seq 90); do
+  r="$(api GET /api/v1/namespaces/default/pods/probe)"
+  phase="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); print(d.get("status",{}).get("phase",""), d.get("spec",{}).get("nodeName",""))
+except Exception: print("", "")' 2>/dev/null)"
+  node="${phase#* }"; phase="${phase%% *}"
+  [ "$phase" = "Running" ] && break
+  sleep 1
+done
+echo "   nodeName=${node:-} phase=${phase:-}"
+if [ "$phase" != "Running" ]; then
+  echo "   the chain, as the store holds it:"
+  for k in "/~node/node-1/pod-specs/$UID_" "/~node/node-1/metal-sandboxes/$UID_" "/~node/node-1/sandbox-status/$UID_" \
+           "/~node/node-1/pod-runtime/$UID_" "/~node/node-1/pod-lifecycle-status/$UID_" "/podstatus/$UID_"; do
+    printf '   %-48s %s\n' "$k" "$(nc_store_get "$STORE" "$k" 2>/dev/null | cut -c1-110)"
+  done
+  grep -a "\[live\]\|owners=\|workload" "$D/run.log" | tail -3 | cut -c1-120
+  fail "the Pod never reached Running (phase='${phase:-}')"
+fi
+echo "== E2E green: on one node-scoped store, the plane's Pod became the node's subgraph and its phase came back =="

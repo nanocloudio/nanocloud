@@ -18,7 +18,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 . "$ROOT/scripts/fluxor-env.sh"
 . "$ROOT/scripts/chronicle-params.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -94,7 +94,7 @@ scheduler:
 modules:
   - name: store_source
     prefix: "/deployments.apps/"
-    paths: "spec,spec.replicas"
+    paths: "spec,spec.replicas,spec.template.metadata.labels"
     hash: "spec.template"
   - name: current
     type: store_effect

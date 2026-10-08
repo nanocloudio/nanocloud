@@ -25,7 +25,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 FIXED_GRAPH="$ROOT/packaging/debian/fluxor-scheduler.yaml"
 ADAPTIVE_GRAPH="$ROOT/packaging/debian/fluxor-cadence.yaml"
 

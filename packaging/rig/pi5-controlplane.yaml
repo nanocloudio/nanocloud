@@ -1,0 +1,7 @@
+# render: scripts/rig-render-controlplane.sh
+#
+# The control plane on the bare-metal Pi 5: NOT written here. The rig build
+# (scripts/rig-build-pi5.sh) sees the marker above, renders the shipped
+# packaging/debian/fluxor-controlplane.yaml onto metal, and packs that
+# rendering — so the board runs the same graph a Linux node does, with only
+# its platform, disk, clock and bootstrap differing (see the renderer).

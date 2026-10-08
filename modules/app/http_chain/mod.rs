@@ -83,6 +83,8 @@ struct State {
     stage_cid: u32,
     stage_step: u8,
     stage_hex: [u8; 64],
+    /// The staged body's expiry, fixed when its staging starts.
+    stage_deadline: u64,
     staged: u32,
 
     desk: HcDesk<SLOTS>,
@@ -188,6 +190,7 @@ pub unsafe extern "C" fn module_new(
     s.prefix_len = 0;
     s.stage_at = -1;
     s.stage_step = 0;
+    s.stage_deadline = 0;
     s.staged = 0;
     params_def::set_defaults(s);
     params_def::parse_tlv(s, params, params_len);
@@ -291,6 +294,13 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
         s.stage_at = at as i32;
         s.stage_cid = cid;
         s.stage_step = 0;
+        // Fixed once per staging: the store identifies a write by its
+        // value, so a deadline recomputed on every retry of a pending write
+        // is a NEW write each step — it took a fresh slot until the
+        // replica's table (32) was full, and every writer on the node then
+        // waited 60 s for idle slots to be reclaimed (2026-10-10: every
+        // staged POST hung, and with them the RBAC index).
+        s.stage_deadline = dev_millis(sys).saturating_add(STAGED_TTL_MS);
     }
     let (at, cid) = (s.stage_at as usize, s.stage_cid);
     let mut key = [0u8; MAX_PREFIX + 7 + 64];
@@ -317,7 +327,7 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
         let mut v = [0u8; 40];
         let mut vl = 0usize;
         let mut digits = [0u8; 20];
-        let dl = dec_u64(dev_millis(sys).saturating_add(STAGED_TTL_MS), &mut digits);
+        let dl = dec_u64(s.stage_deadline, &mut digits);
         for part in [&b"{\"deadline\":"[..], &digits[..dl], &b"}"[..]] {
             v[vl..vl + part.len()].copy_from_slice(part);
             vl += part.len();

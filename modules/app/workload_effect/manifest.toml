@@ -4,7 +4,7 @@ description = "Chronicle connector for the workload contract — op records in, 
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The workload seam as a connector — what `store_effect` is to the store.
 #
@@ -21,6 +21,10 @@ hardware_targets = ["bcm2712"]
 #   1 correlation (i64)   2 op (i64)   3 id (the sandbox; the pty session's
 #   tail for the pty ops)   30..39 carry, echoed on the op's event
 #   op 1 CREATE   4 cmd (argv, whitespace-split)  5 rootfs  6 iso ("1")
+#                 12 graph: the workload is the FLXA subgraph of the Graph
+#                 object /graphs.nanocloud.io/<graph> (spec.flxa, hex) — a
+#                 module subgraph of the node's own image, the only kind a
+#                 bare-metal node runs; cmd/rootfs/binds are then unused
 #                 7 tasks (decimal, the pids envelope)  8 addr (IPv4, own
 #                 netns when set)  9 prefix (decimal)  10 binds
 #                 (`<src>:<dst>[:ro]`, `,`-separated — the workload `mount`/
@@ -91,6 +95,13 @@ buffer_size = 16384
 max_record = 8192
 
 [[ports]]
+name = "request_in_6"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
 name = "event_out"
 direction = "output"
 content_type = "OctetStream"
@@ -100,6 +111,11 @@ max_record = 8192
 [[resources]]
 requires_contract = "workload"
 access = "write"
+
+# The FLXA blob of a graph-backed workload, read from /graphs/<name>.
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
 
 [observability]
 exempt = "control-plane connector — discrete op/event records, not a sustained byte data path"

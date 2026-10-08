@@ -4,7 +4,7 @@ description = "Chronicle connector for kagi's token_verify — record in, verifi
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The kagi seam, as a connector.
 #

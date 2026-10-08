@@ -79,23 +79,49 @@ module nanocloud.sandbox {
     a4: string = 4; a5: string = 5; a6: string = 6; a7: string = 7;
     a8: string = 8; a9: string = 9; a10: string = 10;
     rev: int = 11;
+    a12: string = 12;
     ctx: Ctx = 254;
+  }
+  // A graph-backed sandbox (/metal-sandboxes/): the workload is the FLXA the
+  // node was given at /graphs/<graph>, realised as modules of its own image —
+  // no rootfs, binds or lease to wait for. Its own message, so the host
+  // decision never reads a field a host record does not carry.
+  message MSpec {
+    seq: int = 1;
+    key: string = 3;
+    phase: string = 4;
+    graph: string = 5;
+    st: string = 70;       // /sandbox-status/ state   (related, in order: 70, 80, 90)
+    boot: string = 80;     // /sandbox-boot: this runtime's
+    sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
+  }
+  decision mspec(s: MSpec) -> Op {
+    when s.phase == "delete" && s.st != "" && s.st != "destroyed" && s.sboot == s.boot ->
+      Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
+           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, ctx: Ctx { tag: "" } };
+    when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
+      Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
+    default ->
+      Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
   }
   decision spec(s: Spec) -> Op {
     when s.phase == "delete" && s.st != "" && s.st != "destroyed" && s.sboot == s.boot ->
-      Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
-           a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, ctx: Ctx { tag: "" } };
+           a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && s.bound >= s.nvol && s.net != "own" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
-           a8: "", a9: "", a10: s.binds, rev: 0, ctx: Ctx { tag: "" } };
+           a8: "", a9: "", a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
-      Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
-      Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
   }
 
   message Req {            // /sandbox-exec/, /sandbox-kill/, /sandbox-pause/
@@ -111,21 +137,21 @@ module nanocloud.sandbox {
   // not exist, or has ended, is answered (255) rather than left to hang.
   decision exec(r: Req) -> Op {
     when r.phase != "" && r.phase != "delete" && (r.st == "" || r.st == "created") ->
-      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
       Op { cid: r.seq, op: EXEC, id: r.first, a4: r.val, a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: r.rev, ctx: Ctx { tag: r.key } };
   }
   decision sig(r: Req) -> Op {
     when r.val == "sig=term" ->
-      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "term", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "term", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when r.val == "sig=kill" ->
-      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "kill", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: SIGNAL, id: r.key, a4: "kill", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when r.val == "pause" ->
-      Op { cid: r.seq, op: PAUSE, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: PAUSE, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when r.val == "resume" ->
-      Op { cid: r.seq, op: RESUME, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: RESUME, id: r.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
-      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, ctx: Ctx { tag: "" } };
+      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
   }
 
   message Tty {
@@ -240,6 +266,10 @@ module nanocloud.sandbox {
            net: s.net, tasks: s.tasks, bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
            lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol }
   }
+  transformation t_mspec(s: MSpec) -> MSpec {
+    MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph,
+            st: s.st, sboot: s.sboot, boot: s.boot }
+  }
   transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }
   transformation t_tty(t: Tty) -> Tty {
     Tty { seq: t.seq, rev: t.rev, key: t.key, val: t.val, rows: t.rows, cols: t.cols, cmd: t.cmd,
@@ -253,12 +283,14 @@ module nanocloud.sandbox {
     Done { cid: d.cid, status: d.status, ctx: d.ctx }
   }
   pipeline sb_spec(s: Spec) -> Op { call x = t_spec(s); call y = spec(x); return y; }
+  pipeline sb_mspec(s: MSpec) -> Op { call x = t_mspec(s); call y = mspec(x); return y; }
   pipeline sb_exec(r: Req) -> Op { call x = t_req(r); call y = exec(x); return y; }
   pipeline sb_sig(r: Req) -> Op { call x = t_req(r); call y = sig(x); return y; }
   pipeline sb_tty(t: Tty) -> TOp { call x = t_tty(t); call y = tty(x); return y; }
   pipeline sb_ev(e: Ev) -> W { call x = t_ev(e); call y = ev(x); return y; }
   pipeline sb_evout(d: Done) -> W2 { call x = t_done(d); call y = evout(x); return y; }
   entry sb_spec = sb_spec;
+  entry sb_mspec = sb_mspec;
   entry sb_exec = sb_exec;
   entry sb_sig = sb_sig;
   entry sb_tty = sb_tty;

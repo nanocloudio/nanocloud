@@ -4,7 +4,7 @@ description = "Chronicle connector for Loam — a volume effect in, admin-wire j
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The encrypted-volume pipelines' effector for Loam (docs/design/
 # encrypted-volumes.md). It decides nothing: it runs the op a record names as

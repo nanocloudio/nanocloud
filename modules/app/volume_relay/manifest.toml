@@ -4,7 +4,7 @@ description = "The encrypted-volume pipelines' relay between the control plane a
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Multi-node placement of the encrypted-volume pipelines (docs/design/
 # encrypted-volumes.md). A chain issues an effect on its graph's effect bus;

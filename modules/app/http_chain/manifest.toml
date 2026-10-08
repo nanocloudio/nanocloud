@@ -4,7 +4,7 @@ description = "An HTTP application route as a Chronicle chain — each exchange 
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The PROVIDER behind Wave's `http` server for a route served by a Chronicle
 # chain (the API plane: `kube_decode` ... `enc_http`). Wave is the requester

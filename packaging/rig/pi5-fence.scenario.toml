@@ -1,0 +1,11 @@
+name = "pi5_fence"
+target = "pi5"
+config = "pi5-fence.yaml"
+requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
+timeout_s = 240
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[fs_async_seed\\] DONE n=8 rounds=2"
+[[fail]]
+source = "telemetry.monitor_udp"
+regex = "PANIC|EXCEPTION|halted|\\[fs_async_seed\\] FAIL"

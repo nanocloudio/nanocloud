@@ -1,0 +1,36 @@
+// A Pod's phase, from the node that runs it. The node's lifecycle chain
+// reports `phase=<Pending|Running|Succeeded|Failed|Terminating>;pod=<ns>/
+// <name>` under /podstatus/<uid> — a prefix the node does not scope, so the
+// record lands in the plane's store as written — and this patches the Pod
+// object's status.phase, which is what `kubectl get pods` shows.
+module nanocloud.podstatus {
+
+  enum NOOP = 0;
+  enum PATCH = 5;
+
+  message st.Rec {
+    seq: int = 1;
+    key: string = 3;      // "<uid>"
+    phase: string = 4;
+    pod: string = 5;      // "<ns>/<name>"
+  }
+  message st.Op {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    value: string = 4;
+    path: string = 19;
+  }
+  decision decide(r: st.Rec) -> st.Op {
+    when r.pod != "" && r.phase != "" ->
+      st.Op { cid: r.seq, op: PATCH, key: r.pod, value: "\"" + r.phase + "\"", path: "status.phase" };
+    default ->
+      st.Op { cid: r.seq, op: NOOP, key: "", value: "", path: "" };
+  }
+
+  pipeline status(r: st.Rec) -> st.Op {
+    call x = decide(r);
+    return x;
+  }
+  entry status = status;
+}

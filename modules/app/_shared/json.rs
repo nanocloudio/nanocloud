@@ -352,12 +352,25 @@ fn j_u32_2(b: &[u8], k1: &[u8], k2: &[u8]) -> u32 {
 }
 
 /// Set a nested scalar `k1.k2` to `val` (raw JSON token): replace k2 within the
-/// object value of top-level k1. Returns len in `out`, or 0 if k1 isn't an
-/// object. Inserts k2 if absent.
+/// object value of top-level k1. Returns len in `out`, or 0 if k1 is present
+/// but isn't an object. Inserts k2 if absent; inserts k1 as `{k2: val}` when
+/// the object has no k1 at all — a Pod created through the API has no
+/// `status` until its node first reports one.
 fn j_set2(obj: &[u8], k1: &[u8], k2: &[u8], val: &[u8], out: &mut [u8]) -> usize {
     let s = match j_obj_get(obj, 0, k1) {
         Some(i) => j_ws(obj, i),
-        None => return 0,
+        None => {
+            let mut tok = [0u8; 4096];
+            if k2.len() + val.len() + 6 > tok.len() {
+                return 0;
+            }
+            let mut p = j_cp(&mut tok, 0, b"{\"");
+            p = j_cp(&mut tok, p, k2);
+            p = j_cp(&mut tok, p, b"\":");
+            p = j_cp(&mut tok, p, val);
+            p = j_cp(&mut tok, p, b"}");
+            return j_set_top(obj, k1, &tok[..p], out);
+        }
     };
     if s >= obj.len() || obj[s] != b'{' {
         return 0;

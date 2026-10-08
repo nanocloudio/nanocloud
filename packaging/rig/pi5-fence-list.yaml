@@ -1,0 +1,32 @@
+# The A6c experiment, second half: after the power cut that ended
+# pi5-fence, list (and remove) the files it wrote — fs_clean names every
+# file it removes, so `removed=` against the 8 the first half logged durable
+# is the verdict on the async fence tier.
+target: pi5
+tick_us: 1000
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+modules:
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    path: /
+    init_free_hint: 20000
+    clear_free_region: 4096
+  - name: fs_clean
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    params:
+      suffixes: ".dat"
+wiring:
+  - from: nvme.blocks
+    to: fat32.blocks

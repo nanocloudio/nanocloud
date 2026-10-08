@@ -408,6 +408,14 @@ struct State {
     /// what the graph is to its decisions (a node's own name).
     label: [u8; 64],
     label_len: u8,
+    /// `trace` param: a periodic counter line (`[store_source] trace`), for
+    /// a source whose silence needs explaining. Off by default.
+    trace: u8,
+    t_steps: u32,
+    t_scans: u32,
+    t_wakes: u32,
+    t_subrc: i32,
+    t_stalls: u32,
     watchers: [Watcher; MAX_WATCHERS],
     /// The watcher a pass is serving (`EV_IDLE` between passes), and its
     /// batch of changes: `ev_buf[ev_at..ev_len]` still to emit.
@@ -723,6 +731,9 @@ mod params_def {
                 s.label_len = n as u8;
                 if n > 0 { ptr_copy(s.label.as_mut_ptr(), d, n); }
             };
+
+        45, trace, u8, 0
+            => |s, d, len| { s.trace = super::p_u8(d, len, 0, 0); };
     }
 }
 
@@ -805,6 +816,58 @@ unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
         dev_log(sys, 1, m.as_ptr(), m.len());
     }
     rc
+}
+
+/// `[store_source] trace <prefix> scans= wakes= emitted= subrc= stalls= paging=`.
+unsafe fn trace_line(s: &State) {
+    let mut b = [0u8; 200];
+    let mut n = 0usize;
+    let mut put = |part: &[u8]| {
+        let k = part.len().min(b.len() - n);
+        b[n..n + k].copy_from_slice(&part[..k]);
+        n += k;
+    };
+    let num = |v: u64, neg: bool| {
+        let mut t = [0u8; 21];
+        let mut i = t.len();
+        let mut u = v;
+        loop {
+            i -= 1;
+            t[i] = b'0' + (u % 10) as u8;
+            u /= 10;
+            if u == 0 {
+                break;
+            }
+        }
+        if neg {
+            i -= 1;
+            t[i] = b'-';
+        }
+        (t, i)
+    };
+    put(b"[store_source] trace ");
+    put(&s.prefix[..s.prefix_len as usize]);
+    // Field by field: a table of (tag, value) pairs would be an array of
+    // slice literals, which PIC never relocates.
+    put(b" scans=");
+    let (t, i) = num(u64::from(s.t_scans), false);
+    put(&t[i..]);
+    put(b" wakes=");
+    let (t, i) = num(u64::from(s.t_wakes), false);
+    put(&t[i..]);
+    put(b" emitted=");
+    let (t, i) = num(u64::from(s.emitted), false);
+    put(&t[i..]);
+    put(b" subrc=");
+    let (t, i) = num(u64::from(s.t_subrc.unsigned_abs()), s.t_subrc < 0);
+    put(&t[i..]);
+    put(b" stalls=");
+    let (t, i) = num(u64::from(s.t_stalls), false);
+    put(&t[i..]);
+    put(b" paging=");
+    let (t, i) = num(u64::from(s.paging), false);
+    put(&t[i..]);
+    dev_log(&*s.syscalls, 3, b.as_ptr(), n);
 }
 
 unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
@@ -3130,6 +3193,12 @@ pub unsafe extern "C" fn module_new(
         s.total = 0;
         s.list_idx = 0;
         s.emitted = 0;
+        s.trace = 0;
+        s.t_steps = 0;
+        s.t_scans = 0;
+        s.t_wakes = 0;
+        s.t_subrc = 0;
+        s.t_stalls = 0;
         s.deferred = 0;
         s.truncated = 0;
         s.events = 0;
@@ -3214,7 +3283,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let plen = s.prefix_len as usize;
                 let mut pfx = [0u8; MAX_PREFIX];
                 pfx[..plen].copy_from_slice(&s.prefix[..plen]);
-                store_subscribe(sys, &pfx[..plen], s.sink);
+                s.t_subrc = store_subscribe(sys, &pfx[..plen], s.sink);
                 // Extra watches: changes here re-arm the scan but are never
                 // listed, so a deleted child wakes its parent.
                 let w = s.watch_len as usize;
@@ -3244,6 +3313,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
             s.dirty = 1;
+            s.t_wakes = s.t_wakes.wrapping_add(1);
+        }
+        if s.trace != 0 {
+            s.t_steps = s.t_steps.wrapping_add(1);
+            if s.t_steps.is_multiple_of(5000) {
+                trace_line(s);
+            }
         }
         // A deadline came due: the kernel stepped us for it. Cancel the
         // fire (an edge — the scan below re-arms for the next one) and scan.
@@ -3260,6 +3336,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // needs — an unbounded drain here stalls the whole graph.
         if s.record_out >= 0 {
             if !flush(s) {
+                s.t_stalls = s.t_stalls.wrapping_add(1);
                 return 0;
             }
             if s.events != 0 {
@@ -3268,6 +3345,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             if s.paging == 0 && s.dirty == 1 {
                 s.dirty = 0;
+                s.t_scans = s.t_scans.wrapping_add(1);
                 s.paging = 1;
                 s.clen = 0;
                 s.page_off = 0;

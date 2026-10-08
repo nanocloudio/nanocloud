@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 CLI_GRAPH="$ROOT/packaging/cli/linux.yaml"
 CP_GRAPH="$ROOT/packaging/debian/fluxor-controlplane.yaml"
 

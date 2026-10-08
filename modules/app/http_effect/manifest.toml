@@ -4,7 +4,7 @@ description = "Chronicle connector for an in-graph HTTP module — record in, on
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # `store_effect`'s role for an HTTP-speaking module in the same graph.
 #

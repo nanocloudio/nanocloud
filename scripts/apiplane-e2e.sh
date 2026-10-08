@@ -26,7 +26,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 GRAPH="$ROOT/packaging/debian/fluxor-apiplane.yaml"
 PORT=7444
 
@@ -268,7 +268,7 @@ case "${R#*|}" in *'"kind":"APIGroupList"'*) ;; *) fail "/apis: ${R#*|}";; esac
 echo "   GET  /apis      (anonymous) -> ${R%%|*} APIGroupList"
 
 echo "== 13b2. the remaining static documents the module apiserver served =="
-check "GET  /openapi/v3 (anonymous)" 200 '{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1"},"apis/apps/v1":{"serverRelativeURL":"/openapi/v3/apis/apps/v1"}}}' "$(drive - "http://127.0.0.1:$PORT/openapi/v3")"
+check "GET  /openapi/v3 (anonymous)" 200 '{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1"},"apis/apps/v1":{"serverRelativeURL":"/openapi/v3/apis/apps/v1"},"apis/nanocloud.io/v1":{"serverRelativeURL":"/openapi/v3/apis/nanocloud.io/v1"}}}' "$(drive - "http://127.0.0.1:$PORT/openapi/v3")"
 check "GET  /healthz   (anonymous)" 200 "ok" "$(drive - "http://127.0.0.1:$PORT/healthz")"
 # /metrics is RBAC-guarded (nonResourceURLs), as upstream: anonymous is
 # refused, a caller whose grants are all RESOURCE grants (admin: *|*|*|*|*) is

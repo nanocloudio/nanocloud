@@ -1,0 +1,41 @@
+# The A6c experiment, first half: write files through the fs contract's
+# ASYNC fence tier (the tier lattice's flush uses) on the board's NVMe, and
+# log each name once its fence polled Durable. Then the second half
+# (pi5-fence-list) cuts the power and lists what survived.
+#
+#   fluxor rig test --rig pi5-a --scenario packaging/rig/pi5-fence.scenario.toml
+#   fluxor rig test --rig pi5-a --scenario packaging/rig/pi5-fence-verify.scenario.toml
+#   fluxor rig test --rig pi5-a --scenario packaging/rig/pi5-fence-list.scenario.toml
+target: pi5
+tick_us: 1000
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+modules:
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    path: /
+    init_free_hint: 20000
+    clear_free_region: 4096
+  - name: fs_async_seed
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
+    params:
+      prefix: "/ASY"
+      count: 8
+      size: 4096
+      # Two passes: the second rewrites every file in place — a store's
+      # manifest-slot publish — and pi5-fence-verify reads the second back.
+      rounds: 2
+wiring:
+  - from: nvme.blocks
+    to: fat32.blocks

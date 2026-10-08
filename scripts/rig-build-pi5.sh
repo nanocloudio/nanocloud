@@ -22,6 +22,18 @@ cp "$FLUXOR_SRC/target/pi5/firmware.bin" "$ROOT/target/pi5/firmware.bin"
 echo "==> nanocloud modules (bcm2712)"
 ( cd "$ROOT" && fluxor modules build --target bcm2712 >/dev/null )
 
+# A graph that is RENDERED rather than written (its file names the renderer
+# on a `# render: <script>` line) is rendered first, and the rendering is
+# what gets packed: the shipped Linux template stays the one source.
+case "$GRAPH" in /*) GRAPH_FILE="$GRAPH" ;; *) GRAPH_FILE="$ROOT/$GRAPH" ;; esac
+RENDER="$(sed -n 's/^# render: //p' "$GRAPH_FILE" 2>/dev/null | head -1)"
+if [ -n "$RENDER" ]; then
+  OUT="$ROOT/target/pi5/render/$(basename "$GRAPH")"
+  echo "==> render $GRAPH via $RENDER"
+  bash "$ROOT/$RENDER" "$OUT"
+  GRAPH="target/pi5/render/$(basename "$GRAPH")"
+fi
+
 echo "==> pack $GRAPH"
 ( cd "$ROOT" && fluxor build "$GRAPH" >/dev/null )
 

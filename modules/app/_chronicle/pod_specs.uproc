@@ -2,7 +2,7 @@
 // /pod-specs/<uid> record the node's pod-lifecycle chain runs.
 //
 //   spec    /pods/<ns>/<name> bound to a node -> /pod-specs/<uid>
-//           node image restart grace desired cmd; desired=deleted once the
+//           node image restart grace desired cmd pod; desired=deleted once the
 //           Pod carries a deletionTimestamp
 //   gone    /~tomb/pods/<ns>/<name> (a Pod deleted outright: its last state)
 //           -> /pod-specs/<uid> desired=deleted
@@ -29,6 +29,7 @@ module nanocloud.podspecs {
     restart: string = 9;   // spec.restartPolicy, lowercased
     grace: string = 10;    // spec.terminationGracePeriodSeconds
     deleting: string = 11; // metadata.deletionTimestamp
+    rtc: string = 12;      // spec.runtimeClassName: "fluxor" names a graph-backed Pod
   }
   // Value parts 4..16 are joined into the record; the node reads it as flat
   // `k=v;` fields, in any order.
@@ -54,17 +55,25 @@ module nanocloud.podspecs {
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
                 p1: "node=", p2: p.node, p3: ";grace=", p4: p.grace,
                 p5: ";desired=deleted;cmd=", p6: p.cmd, p7: " ", p8: p.args };
+    // A graph-backed Pod (runtimeClassName fluxor): its image names the
+    // FLXA subgraph the node was given at /graphs/<image>; no process to
+    // spawn, so no cmd.
+    when p.rtc == "fluxor" ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";graph=", p4: p.image,
+                p5: ";restart=", p6: p.restart,
+                p7: ";grace=0;desired=running;cmd=;pod=" + p.key };
     when p.grace == "" ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
                 p1: "node=", p2: p.node, p3: ";image=", p4: p.image,
                 p5: ";restart=", p6: p.restart,
                 p7: ";grace=30;desired=running;cmd=", p8: p.cmd,
-                p9: " ", p10: p.args };
+                p9: " ", p10: p.args, p11: ";pod=", p12: p.key };
     default ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
                 p1: "node=", p2: p.node, p3: ";image=", p4: p.image,
                 p5: ";restart=", p6: p.restart, p7: ";grace=", p8: p.grace,
-                p9: ";desired=running;cmd=", p10: p.cmd, p11: " ", p12: p.args };
+                p9: ";desired=running;cmd=", p10: p.cmd, p11: " ", p12: p.args + ";pod=" + p.key };
   }
 
   message ps.Tomb {
@@ -73,10 +82,19 @@ module nanocloud.podspecs {
     key: string = 3;      // "<ns>/<name>"
     uid: string = 4;      // obj.metadata.uid
     node: string = 5;     // obj.spec.nodeName
+    rtc: string = 6;      // obj.spec.runtimeClassName
+    image: string = 7;    // obj.spec.containers.0.image
   }
+  // A graph-backed Pod's tombstone keeps naming its graph: the node's
+  // lifecycle chain tears a metal sandbox down only for a spec that says
+  // which graph it was (its delete arms carry `graph` to the metal effect).
   decision gone(t: ps.Tomb) -> ps.Spec {
     when t.uid == "" || t.node == "" ->
       ps.Spec { cid: t.seq, op: NOOP, key: "" };
+    when t.rtc == "fluxor" ->
+      ps.Spec { cid: t.seq, op: PUT, key: t.node + "/pod-specs/" + t.uid,
+                p1: "node=", p2: t.node, p3: ";graph=", p4: t.image,
+                p5: ";grace=0;desired=deleted;cmd=" };
     default ->
       ps.Spec { cid: t.seq, op: PUT, key: t.node + "/pod-specs/" + t.uid,
                 p1: "node=", p2: t.node, p3: ";grace=0;desired=deleted;cmd=" };

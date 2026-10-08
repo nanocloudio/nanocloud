@@ -46,7 +46,20 @@ const SIG_KILL: u32 = 2;
 
 const WL_CREATE_HEADER: usize = 68;
 const POSTURE_SHARED: u8 = 0;
+/// A workload that is a module subgraph (an FLXA blob), realised by the
+/// kernel's fmod-graph backend — the only kind a bare-metal node runs.
+const SOURCE_FMOD_GRAPH: u8 = 0;
 const SOURCE_HOST_PROCESS: u8 = 1;
+/// `storage.object`: the FLXA blob of a graph-backed workload is read from
+/// the Graph object (`graphs.nanocloud.io/v1`, `kubectl apply`'d to the
+/// plane and replicated to every node) at `/graphs.nanocloud.io/<name>`,
+/// whose `spec.flxa` carries it as hex.
+const OBJ_GET: u32 = 0x1421;
+const OBJ_RANGE_GET: u32 = 0x1423;
+const OBJ_CLOSE: u32 = 0x1425;
+const GRAPHS_PREFIX: &[u8] = b"/graphs.nanocloud.io/";
+const MAX_GRAPH: usize = 64;
+const FLXA_FIELD: &[u8] = b"\"flxa\":\"";
 const NET_ISO_OWN: u8 = 1;
 const NET_FAM_IPV4: u8 = 4;
 const OPT_REQUIRED: u8 = 0x01;
@@ -95,7 +108,7 @@ const LOG_READ: usize = 512;
 const EXEC_CAP: usize = 2048;
 const TTY_CAP: usize = 4096;
 const TTY_IN_CAP: usize = 1024;
-const INPUTS: usize = 5;
+const INPUTS: usize = 6;
 const EXEC_SEEN: usize = 16;
 
 #[repr(C)]
@@ -154,6 +167,12 @@ const TTY_EMPTY: Tty = Tty {
 
 #[repr(C)]
 struct State {
+    /// The host-process companion class (0x1B: READ, EXEC) answered
+    /// ENOSYS: a node that runs module subgraphs, not processes (bcm2712).
+    /// Asked once; a READ every tick for every live workload otherwise
+    /// floods the kernel's provider log (pi5-a: 150 lines/s) and drowns
+    /// every other telemetry line.
+    hp_absent: bool,
     syscalls: *const SyscallTable,
     inputs: [i32; INPUTS],
     event_out: i32,
@@ -485,6 +504,62 @@ fn bind_options(binds: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(p)
 }
 
+/// The FLXA bytes of graph `name`: the Graph object at
+/// `/graphs.nanocloud.io/<name>` read through `storage.object`, its
+/// `spec.flxa` decoded from hex into `out`. `None` when the object is
+/// absent, carries no flxa, is not hex, or is larger than `out` — a graph
+/// the node was not given is a workload it cannot run, reported
+/// `failed(-2)` by the caller.
+unsafe fn graph_source(sys: &SyscallTable, name: &[u8], out: &mut [u8]) -> Option<usize> {
+    if name.is_empty() || name.len() > MAX_GRAPH {
+        return None;
+    }
+    let mut key = [0u8; GRAPHS_PREFIX.len() + MAX_GRAPH];
+    key[..GRAPHS_PREFIX.len()].copy_from_slice(GRAPHS_PREFIX);
+    key[GRAPHS_PREFIX.len()..GRAPHS_PREFIX.len() + name.len()].copy_from_slice(name);
+    let klen = GRAPHS_PREFIX.len() + name.len();
+    let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), klen);
+    if h < 0 {
+        return None;
+    }
+    // The object is JSON; its hex is twice the bytes. One read of the whole
+    // record, then the `"flxa":"…"` string inside it.
+    let mut rec = [0u8; 2 * MAX_SRC + 512];
+    let mut rg = [0u8; 20];
+    rg[0..8].copy_from_slice(&0u64.to_le_bytes());
+    rg[8..12].copy_from_slice(&(rec.len() as u32).to_le_bytes());
+    rg[12..20].copy_from_slice(&(rec.as_mut_ptr() as u64).to_le_bytes());
+    let got = (sys.provider_call)(h, OBJ_RANGE_GET, rg.as_mut_ptr(), rg.len());
+    let mut z = [0u8; 1];
+    (sys.provider_call)(h, OBJ_CLOSE, z.as_mut_ptr(), 0);
+    if got <= 0 {
+        return None;
+    }
+    let rec = &rec[..(got as usize).min(rec.len())];
+    let start = rec
+        .windows(FLXA_FIELD.len())
+        .position(|w| w == FLXA_FIELD)
+        .map(|i| i + FLXA_FIELD.len())?;
+    let n = rec[start..].iter().position(|&c| c == b'"')?;
+    let hex = &rec[start..start + n];
+    if n % 2 != 0 || n / 2 > out.len() {
+        return None;
+    }
+    let v = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    for i in 0..n / 2 {
+        match (v(hex[2 * i]), v(hex[2 * i + 1])) {
+            (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
+            _ => return None,
+        }
+    }
+    Some(n / 2)
+}
+
 // ---- ops ----
 
 unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
@@ -507,18 +582,33 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
     let tasks = parse_u32(frame_bytes(req, 7));
     let addr = frame_bytes(req, 8);
     let prefix = parse_u32(frame_bytes(req, 9)).min(32) as u8;
+    let graph = frame_bytes(req, 12);
     let mut src = [0u8; MAX_SRC];
     let mut opts = [0u8; MAX_OPTS];
-    let (Some(sl), Some(ol)) = (
-        spawn_src(&mut src, cmd, rootfs, isolate),
-        bind_options(frame_bytes(req, 10), &mut opts),
-    ) else {
-        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
-        return;
+    // A graph-backed workload: its source is the FLXA subgraph the node's
+    // render seeded at `/graphs/<name>`, not a process. No options: the
+    // kernel realises it as modules of the node's own image.
+    let (sl, ol, kind) = if !graph.is_empty() {
+        match graph_source(sys, graph, &mut src) {
+            Some(n) => (n, 0usize, SOURCE_FMOD_GRAPH),
+            None => {
+                emit(s, cid, EV_STATUS, id, b"failed", -2, &[], Some(req));
+                return;
+            }
+        }
+    } else {
+        let (Some(sl), Some(ol)) = (
+            spawn_src(&mut src, cmd, rootfs, isolate),
+            bind_options(frame_bytes(req, 10), &mut opts),
+        ) else {
+            emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+            return;
+        };
+        (sl, ol, SOURCE_HOST_PROCESS)
     };
     let mut arg = [0u8; WL_CREATE_HEADER + MAX_SRC + MAX_OPTS];
     arg[16] = POSTURE_SHARED;
-    arg[17] = SOURCE_HOST_PROCESS;
+    arg[17] = kind;
     arg[32..36].copy_from_slice(&tasks.to_le_bytes());
     arg[40..42].copy_from_slice(&(sl as u16).to_le_bytes());
     arg[44..48].copy_from_slice(&(ol as u32).to_le_bytes());
@@ -812,7 +902,14 @@ unsafe fn poll_sandboxes(s: &mut State) {
         // recorded before its end.
         let mut arg = [0u8; 4 + LOG_READ];
         arg[0..4].copy_from_slice(&sb.handle.to_le_bytes());
-        let n = (sys.provider_call)(-1, WL_READ, arg.as_mut_ptr(), arg.len());
+        let n = if s.hp_absent {
+            0
+        } else {
+            (sys.provider_call)(-1, WL_READ, arg.as_mut_ptr(), arg.len())
+        };
+        if n == E_NOSYS {
+            s.hp_absent = true;
+        }
         if n > 0 {
             let n = (n as usize).min(LOG_READ);
             let mut out = [0u8; LOG_READ];
@@ -958,7 +1055,7 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.inputs = [in_chan, -1, -1, -1, -1];
+        s.inputs = [in_chan, -1, -1, -1, -1, -1];
         s.event_out = out_chan;
         s.resolved = 0;
         s.caps_ops = 0;

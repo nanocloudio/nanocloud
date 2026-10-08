@@ -1,0 +1,30 @@
+# Phase A3, second half: a reboot WITH history resumes from the snapshot the
+# previous boot took, instead of replaying the whole log. Run it after
+# `pi5-snapshot.scenario.toml` passed, without a wipe. The board's own
+# account: durability restored its local snapshot at boot and the WAL's
+# compaction floor stands above zero — apply started there.
+
+name = "pi5_resume"
+target = "pi5"
+config = "pi5-controlplane.yaml"
+
+requires_tags = ["nvme"]
+requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
+
+timeout_s = 600
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[snap\\] boot restored"
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[wal\\] scan .* floor=[1-9][0-9]* "
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[kvw\\] store serving: Ready"
+
+[[fail]]
+source = "telemetry.monitor_udp"
+regex = "\\[fluxor\\] PANIC|fault_code|\\[kvw\\] store provider=0|REFUSING GRAPH|\\[seed\\] rc=-|SUBSCRIBE refused"

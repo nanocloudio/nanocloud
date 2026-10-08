@@ -4,7 +4,7 @@ description = "The encrypted-volume claim chain's mount actuator — a Mnt recor
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The privileged mount actuator of `volume_claim.uproc` (docs/design/
 # encrypted-volumes.md, "The mount effect"). It decides nothing: the chain's

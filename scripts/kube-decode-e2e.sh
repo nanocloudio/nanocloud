@@ -20,7 +20,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 PORT=5394
 
 . "$ROOT/scripts/fluxor-env.sh"
@@ -197,7 +197,7 @@ cases = [
     # curl's User-Agent product (no `fieldManager` in the query).
     ("POST /apis/apps/v1/namespaces/kube-system/deployments",
      frame(None, 3, b"deployments", b"kube-system", b"",
-           b'{"metadata":{"name":"web"}}', b"/deployments/kube-system/web#@curl",
+           b'{"metadata":{"name":"web"}}', b"/deployments.apps/kube-system/web#@curl",
            b"", b"/apis/apps/v1/namespaces/kube-system/deployments", group=b"apps")),
     ("GET  .../pods/web-0 with Authorization: Bearer",
      frame(None, 1, b"pods", b"default", b"web-0", b"", b"/pods/default/web-0",

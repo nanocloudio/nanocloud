@@ -22,6 +22,7 @@ module nanocloud.deployment {
     evt: string = 33;
     ns: string = 34;
     name: string = 35;
+    labels: string = 36;  // spec.template.metadata.labels, an opaque subtree
   }
 
   message dp.Dep {
@@ -30,6 +31,7 @@ module nanocloud.deployment {
     key: string = 3;      // "<ns>/<name>" — the ReplicaSet has the SAME tail
     spec: string = 4;     // spec, an opaque subtree — becomes the RS spec
     replicas: string = 5; // spec.replicas; empty = not a projectable Deployment
+    labels: string = 6;   // spec.template.metadata.labels, an opaque subtree
     ns: string = 28;      // the key's namespace segment — NOT metadata.namespace,
     name: string = 29;    // which a CLI-written document does not carry
     hash: string = 27;    // FNV-1a of spec.template, from the source
@@ -110,28 +112,44 @@ module nanocloud.deployment {
   decision read(d: dp.Dep) -> dp.Read {
     // A Deployment must declare spec.replicas to project a ReplicaSet.
     when d.replicas == "" ->
-      dp.Read { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name } };
+      dp.Read { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name, labels: d.labels } };
     default ->
-      dp.Read { cid: d.seq, op: GET, key: d.key, ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name } };
+      dp.Read { cid: d.seq, op: GET, key: d.key, ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name, labels: d.labels } };
   }
 
   decision archive(c: dp.Cur) -> dp.Arch {
     when c.status == 404 ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "create", ns: c.ctx.ns, name: c.ctx.name } };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "create", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels } };
     when c.status == 200 && c.cur_hash != c.ctx.hash ->
-      dp.Arch { cid: c.cid, op: PUT, key: c.ctx.key, xk: "/previous", v1: c.cur_spec, ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "roll", ns: c.ctx.ns, name: c.ctx.name } };
+      dp.Arch { cid: c.cid, op: PUT, key: c.ctx.key, xk: "/previous", v1: c.cur_spec, ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "roll", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels } };
     when c.status == 200 && c.cur_spec != c.ctx.spec ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "scale", ns: c.ctx.ns, name: c.ctx.name } };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "scale", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels } };
     default ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "", ns: c.ctx.ns, name: c.ctx.name } };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels } };
   }
 
   decision write(a: dp.Arched) -> dp.Write {
     when a.ctx.evt == "" ->
       dp.Write { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: a.ctx.key, evt: "", ns: a.ctx.ns, name: a.ctx.name } };
+    // The ReplicaSet names its kind (a client decodes nothing without
+    // apiVersion and kind) and carries the template's labels beside the
+    // hash, as the ReplicaSet controller labels it.
+    when a.ctx.labels != "" && a.ctx.labels != "{}" ->
+      dp.Write { cid: a.cid, op: PUT, key: a.ctx.key,
+                 p1: "{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"metadata\":{\"name\":\"",
+                 p2: a.ctx.name,
+                 p3: "\",\"namespace\":\"",
+                 p4: a.ctx.ns,
+                 p5: "\",\"ownerReferences\":[{\"kind\":\"Deployment\",\"name\":\"",
+                 p6: a.ctx.name,
+                 p7: "\"}],\"labels\":{\"pod-template-hash\":\"",
+                 p8: a.ctx.hash,
+                 p9: "\"," + a.ctx.labels.substring(1, a.ctx.labels.size() - 1) + "}},\"spec\":",
+                 p10: a.ctx.spec,
+                 p11: "}", ctx: Ctx { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, name: a.ctx.name } };
     default ->
       dp.Write { cid: a.cid, op: PUT, key: a.ctx.key,
-                 p1: "{\"metadata\":{\"name\":\"",
+                 p1: "{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"metadata\":{\"name\":\"",
                  p2: a.ctx.name,
                  p3: "\",\"namespace\":\"",
                  p4: a.ctx.ns,

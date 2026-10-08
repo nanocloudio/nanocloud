@@ -77,6 +77,43 @@ module nanocloud.kube {
             cred: d.cred, path: d.path, query: d.query,
             watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
             peer: d.peer };
+    // A grouped resource the store keys by `<res>.<group>` — the form the
+    // controllers and the CLI use for apps, batch and nanocloud.io
+    // (`/deployments.apps/<ns>/<name>`); the k8s.io groups (rbac, discovery,
+    // networking, storage) stay bare. The candidate is rewritten, not
+    // rebuilt: a create's name comes from the body, which only kube.rd has.
+    // /apis/<g>/<v>/<res>[/<name>]
+    when d.s1 == "apis" && (d.s2 == "apps" || d.s2 == "batch" || d.s2 == "nanocloud.io")
+         && d.s3 != "" && d.s4 != "" && d.s6 == "" ->
+      Req { id: d.id, method: d.method, res: d.s4, group: d.s2, ns: "", name: d.s5, body: d.body,
+            key: "/" + d.s4 + "." + d.s2 + d.k3.substring(d.s4.size() + 1, d.k3.size()) + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/namespaces/<ns>/<res>[/<name>]
+    when d.s1 == "apis" && (d.s2 == "apps" || d.s2 == "batch" || d.s2 == "nanocloud.io")
+         && d.s3 != "" && d.s4 == "namespaces" && d.s6 != "" && d.s8 == "" ->
+      Req { id: d.id, method: d.method, res: d.s6, group: d.s2, ns: d.s5, name: d.s7, body: d.body,
+            key: "/" + d.s6 + "." + d.s2 + d.k4.substring(d.s6.size() + 1, d.k4.size()) + "#".substring(0, math.least(1, d.ws.size())) + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/<res>/<name>/<sub>
+    when d.s1 == "apis" && (d.s2 == "apps" || d.s2 == "batch" || d.s2 == "nanocloud.io")
+         && d.s4 != "namespaces" && d.s6 != "" && d.s7 == "" ->
+      Req { id: d.id, method: d.method, res: d.s4 + "/" + d.s6, group: d.s2, ns: "", name: d.s5, body: d.body,
+            key: "/" + d.s4 + "." + d.s2 + d.k3.substring(d.s4.size() + 1, d.k3.size()) + "#" + d.s6 + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
+    // /apis/<g>/<v>/namespaces/<ns>/<res>/<name>/<sub>
+    when d.s1 == "apis" && (d.s2 == "apps" || d.s2 == "batch" || d.s2 == "nanocloud.io")
+         && d.s4 == "namespaces" && d.s8 != "" ->
+      Req { id: d.id, method: d.method, res: d.s6 + "/" + d.s8, group: d.s2, ns: d.s5, name: d.s7, body: d.body,
+            key: "/" + d.s6 + "." + d.s2 + d.k4.substring(d.s6.size() + 1, d.k4.size()) + "#" + d.s8 + d.ws,
+            cred: d.cred, path: d.path, query: d.query,
+            watch: math.least(1, d.query.indexOf("watch=true") + 1 + d.query.indexOf("watch=1") + 1),
+            peer: d.peer };
     // /apis/<g>/<v>/<res>[/<name>]
     when d.s1 == "apis" && d.s2 != "" && d.s3 != "" && d.s4 != "" && d.s6 == "" ->
       Req { id: d.id, method: d.method, res: d.s4, group: d.s2, ns: "", name: d.s5, body: d.body, key: d.k3 + "#".substring(0, math.least(1, d.ws.size())) + d.ws,

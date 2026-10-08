@@ -1,0 +1,11 @@
+name = "pi5_clean"
+target = "pi5"
+config = "pi5-clean.yaml"
+requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
+timeout_s = 300
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[fs_clean\\] removed=[0-9]+ failed=0"
+[[fail]]
+source = "telemetry.monitor_udp"
+regex = "PANIC|EXCEPTION|halted"

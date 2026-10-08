@@ -32,7 +32,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 HEALTH_PORT="${HEALTH_PORT:-18081}"      # static listener (init path), no root
 DYN_PORT="${DYN_PORT:-18090}"            # mid-life-bound listener
 BACKEND_PORT="${BACKEND_PORT:-18099}"

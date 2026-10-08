@@ -33,7 +33,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES_DIR="$ROOT/target/fluxor/bcm2712/modules"
+MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 EDGE_PORT="${EDGE_PORT:-8443}"          # high port so the e2e needs no root
 BACKEND_PORT="${BACKEND_PORT:-18099}"
 BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}"
