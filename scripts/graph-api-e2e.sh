@@ -152,4 +152,36 @@ case "$r" in 200\|*'"name":"probe"'*"$FLXA"*) echo "   GET graphs/probe -> 200, 
 r="$(api GET /apis/nanocloud.io/v1/graphs)"
 case "$r" in 200\|*'"name":"probe"'*) echo "   LIST graphs -> probe" ;; *) fail "LIST graphs: ${r:0:200}" ;; esac
 
+echo "== 6. large objects over HTTP/2, as kubectl apply sends them =="
+# kubectl apply doubles a body with its last-applied annotation and speaks
+# HTTP/2, which puts two bounds in the path: the 4 KiB record the API
+# plane's answer decision reads, and the largest DATA frame the HTTP/2
+# front takes whole. 1800 hex characters make a 3895-byte Graph; 9000 make
+# an 18295-byte one, which must arrive across frames. Each must be
+# created, read back whole, and listed.
+command -v curl >/dev/null || fail "curl not found"
+graph_json() { # graph_json <name> <hex-len>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+name, n = sys.argv[1], int(sys.argv[2])
+o = {"apiVersion": "nanocloud.io/v1", "kind": "Graph", "metadata": {"name": name},
+     "spec": {"flxa": ("0123456789abcdef" * (n // 16 + 1))[:n]}}
+o["metadata"]["annotations"] = {"kubectl.kubernetes.io/last-applied-configuration": json.dumps(o) + "\n"}
+print(json.dumps(o, separators=(",", ":")))
+PY
+}
+for n in 1800 9000; do
+  G="$(graph_json "big-$n" "$n")"
+  code="$(curl -sk --http2 -m 20 -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $(cat "$D/token.admin")" -H 'Content-Type: application/json' \
+    --data "$G" "https://127.0.0.1:$PORT/apis/nanocloud.io/v1/graphs" || true)"
+  [ "$code" = 201 ] || fail "POST of a ${#G}-byte Graph over HTTP/2 answered '$code'"
+  r="$(api GET /apis/nanocloud.io/v1/graphs/big-$n)"
+  case "$r" in 200\|*"\"name\":\"big-$n\""*) ;; *) fail "GET big-$n: ${r:0:120}" ;; esac
+  [ "${#r}" -gt "${#G}" ] || fail "GET big-$n came back short (${#r} of at least ${#G} bytes)"
+  echo "   ${#G}-byte Graph: created over HTTP/2, read back whole"
+done
+r="$(api GET /apis/nanocloud.io/v1/graphs)"
+case "$r" in *'"name":"big-1800"'*'"name":"big-9000"'*) echo "   LIST graphs -> both" ;; *) fail "LIST graphs lacks the large ones: ${r:0:200}" ;; esac
+
 echo "== E2E green: a Graph is a Kubernetes object — discovered, stored where every node reads it, read back =="

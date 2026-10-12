@@ -5,9 +5,9 @@ graph. The apiserver, every controller and the node's own lifecycle are chains
 of generic engines carrying compiled rules. The `no_std` position-independent
 modules (`.fmod`) in the tree hold no Kubernetes meaning: every one but the CLI
 is a connector, moving bytes across one seam — the store, a socket, an HTTP
-route, a container, the packet filter, a volume. There is no host
-binary and no separate database: install the package, start one systemd unit,
-and the node serves the Kubernetes API.
+route, a container, the packet filter, a volume. There is no host binary and
+no separate database: install the package, start one systemd unit, and the
+node serves the Kubernetes API.
 
 ## Highlights
 
@@ -20,10 +20,10 @@ and the node serves the Kubernetes API.
   refusal answers: each is a chain of generic Chronicle engines carrying params
   compiled from `modules/app/_chronicle/*.uproc`. No `.fmod` holds what a
   Deployment is, or what a Kubernetes path names.
-- **Kubernetes-shaped API.** `kubectl` talks to it directly: core/v1,
-  `apps/v1`, `discovery.k8s.io/v1`, `node.k8s.io/v1` and `nanocloud.io/v1`
-  discovery documents, list/get/create/update/delete, and `?watch=true`
-  watches fenced on the store's own revisions.
+- **Kubernetes-shaped API.** `kubectl` talks to it directly: `core/v1`,
+  `apps/v1` and `nanocloud.io/v1` discovery documents,
+  list/get/create/update/delete, and `?watch=true` watches fenced on the
+  store's own revisions.
 - **One store, replicated.** Control-plane state lives in fluxor's
   `storage.object` / `storage.namespace` contracts — versioned keyed bytes with
   compare-and-swap, prefix listing and change subscriptions — served by
@@ -145,11 +145,13 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 
 | Group | Resources |
 | ----- | --------- |
-| core/v1 | pods (+ `pods/log`, `pods/exec`), services, endpoints, configmaps, secrets, events, persistentvolumeclaims |
+| core/v1 | pods (+ `pods/log`, `pods/status`), services, endpoints, configmaps, secrets, serviceaccounts, events, persistentvolumeclaims, persistentvolumes, namespaces, nodes |
 | apps/v1 | deployments, replicasets, statefulsets, daemonsets |
-| discovery.k8s.io/v1 | endpointslices |
-| node.k8s.io/v1 | runtimeclasses |
-| nanocloud.io/v1 | bundles, roles, rolebindings, volumesnapshots, certificates |
+| nanocloud.io/v1 | graphs |
+
+Those are what the discovery documents advertise. Path resolution is generic —
+the rules read a path's *shape*, not a list of kinds — so an object of any
+other kind is addressable at the same path shapes and keyed group-qualified.
 
 The request path is a Chronicle chain: wave's `http` terminates HTTP/1.1 behind
 `tls` and hands each request, as an exchange, to `http_chain`, which gives the

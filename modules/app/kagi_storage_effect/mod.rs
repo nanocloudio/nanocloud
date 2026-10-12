@@ -356,6 +356,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.custodian_in = dev_channel_port(sys, PORT_INPUT, 2);
             s.resolved = 1;
         }
+        if s.busy == 0 {
+            drain_foreign(s, sys);
+        }
         if s.configured == 0 {
             configure(s, sys);
         }
@@ -564,6 +567,29 @@ unsafe fn send(s: &mut State, sys: &SyscallTable) {
     if let Some(req) = s.call.outgoing() {
         if (sys.channel_write)(s.request_out, req.as_ptr(), req.len()) > 0 {
             s.call.sent();
+        }
+    }
+}
+
+/// Take and drop every answer waiting while no call is out. The service's
+/// answers fan out to every party on its edge, and that fan moves a record
+/// only once each party's mailbox is free: an answer meant for another
+/// party, left unread here, would stop the service's answers to everyone.
+/// With no call out, anything waiting is either another party's or the late
+/// answer to a call this effect cancelled on timeout — and neither may be
+/// matched to the next request, so both are dropped. `rec_buf` is scratch
+/// here: a request is held in `held`, and `admit` reads a fresh record.
+unsafe fn drain_foreign(s: &mut State, sys: &SyscallTable) {
+    if s.response_in < 0 {
+        return;
+    }
+    loop {
+        let poll = (sys.channel_poll)(s.response_in, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+            break;
+        }
+        if (sys.channel_read)(s.response_in, s.rec_buf.as_mut_ptr(), REC) <= 0 {
+            break;
         }
     }
 }

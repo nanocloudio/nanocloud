@@ -91,6 +91,15 @@ const OP_APPLY: i64 = 16;
 
 /// One record frame.
 const BUF: usize = 8192;
+/// The largest reply record the next stage reads: `se_act`, Chronicle's
+/// `decision`, whose in and out record buffers are both 4096 bytes. An
+/// object as stored that would carry the reply past it is sent with an
+/// EMPTY value instead, which `se_ans` (`apiplane_watch.uproc ans`) reads
+/// as "too large for a record" and answers with a GET registration the
+/// watch chain serves. A reply past the bound is dropped by the reader, so
+/// the client would wait out its timeout on a write that landed.
+const REPLY_RECORD_MAX: usize = 4096;
+const _: () = assert!(REPLY_RECORD_MAX <= BUF);
 /// The largest staged body read whole (store_big's bound).
 const DOC_MAX: usize = 3 << 20;
 /// A request message (its envelope, head and fields around the body) and
@@ -330,7 +339,7 @@ impl State {
                 carried += 4 + b.len();
             }
         }
-        let room = BUF.saturating_sub(1 + 3 * 4 + 16 + carried);
+        let room = REPLY_RECORD_MAX.saturating_sub(1 + 3 * 4 + 16 + carried);
         let value = if value.len() <= room { value } else { &[] };
         let out = &mut self.out_buf;
         let mut count = 3u8;

@@ -416,6 +416,18 @@ struct State {
     t_wakes: u32,
     t_subrc: i32,
     t_stalls: u32,
+    /// Slow-step breakdown, reset every step: time in the scan's LIST and
+    /// GET calls and how many, and which phase ran — 0 none of the below,
+    /// 1 subscribe, 2 flush, 3 events, 4 count, 5 emit. A step past
+    /// `SLOW_STEP_US` logs them, so a board run says what a source's step
+    /// spent its budget on.
+    st_list_us: u32,
+    st_get_us: u32,
+    st_lists: u16,
+    st_gets: u16,
+    st_phase: u8,
+    _st_pad: [u8; 3],
+    st_slow: u32,
     watchers: [Watcher; MAX_WATCHERS],
     /// The watcher a pass is serving (`EV_IDLE` between passes), and its
     /// batch of changes: `ev_buf[ev_at..ev_len]` still to emit.
@@ -816,6 +828,61 @@ unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
         dev_log(sys, 1, m.as_ptr(), m.len());
     }
     rc
+}
+
+/// Microseconds since `t0`, as a `u32`: one step's own time never needs more,
+/// and a clock that went backwards reads as zero rather than wrapping.
+unsafe fn since_us(sys: &SyscallTable, t0: u64) -> u32 {
+    let us = dev_micros(sys).saturating_sub(t0);
+    us.min(u64::from(u32::MAX)) as u32
+}
+
+unsafe fn st_list(s: &mut State, sys: &SyscallTable, t0: u64) {
+    s.st_list_us = s.st_list_us.saturating_add(since_us(sys, t0));
+    s.st_lists = s.st_lists.saturating_add(1);
+}
+
+unsafe fn st_get(s: &mut State, sys: &SyscallTable, t0: u64) {
+    s.st_get_us = s.st_get_us.saturating_add(since_us(sys, t0));
+    s.st_gets = s.st_gets.saturating_add(1);
+}
+
+/// `[store_source] slow <prefix> us= ph= list=<n>/<us> get=<n>/<us> nth=`:
+/// one step past `SLOW_STEP_US`. `ph` as `st_phase`; what the step spent
+/// outside the scan's LIST and GET calls is `us` less the two.
+unsafe fn slow_line(s: &State, us: u64) {
+    let mut b = [0u8; 200];
+    let mut n = 0usize;
+    let mut put = |part: &[u8]| {
+        let k = part.len().min(b.len() - n);
+        b[n..n + k].copy_from_slice(&part[..k]);
+        n += k;
+    };
+    let mut d = [0u8; 20];
+    put(b"[store_source] slow ");
+    put(&s.prefix[..s.prefix_len as usize]);
+    put(b" us=");
+    let k = dec_into(us, &mut d);
+    put(&d[..k]);
+    put(b" ph=");
+    let k = dec_into(u64::from(s.st_phase), &mut d);
+    put(&d[..k]);
+    put(b" list=");
+    let k = dec_into(u64::from(s.st_lists), &mut d);
+    put(&d[..k]);
+    put(b"/");
+    let k = dec_into(u64::from(s.st_list_us), &mut d);
+    put(&d[..k]);
+    put(b" get=");
+    let k = dec_into(u64::from(s.st_gets), &mut d);
+    put(&d[..k]);
+    put(b"/");
+    let k = dec_into(u64::from(s.st_get_us), &mut d);
+    put(&d[..k]);
+    put(b" nth=");
+    let k = dec_into(u64::from(s.st_slow), &mut d);
+    put(&d[..k]);
+    dev_log(&*s.syscalls, 2, b.as_ptr(), n);
 }
 
 /// `[store_source] trace <prefix> scans= wakes= emitted= subrc= stalls= paging=`.
@@ -2673,6 +2740,7 @@ unsafe fn count_page(s: &mut State) -> bool {
     cur[..clen].copy_from_slice(&s.cursor[..clen]);
     let mut lout = [0u8; LIST_BUF];
     let mut next = [0u8; MAX_CURSOR];
+    let tl = dev_micros(sys);
     let (n, nlen) = list_page(
         sys,
         &pfx[..plen],
@@ -2681,6 +2749,7 @@ unsafe fn count_page(s: &mut State) -> bool {
         &mut lout,
         &mut next,
     );
+    st_list(s, sys, tl);
     let mut rp = 0usize;
     while let Some((name, q)) = raw_entry(&lout[..n], rp) {
         rp = q;
@@ -2699,7 +2768,10 @@ unsafe fn count_page(s: &mut State) -> bool {
             // The filter applies to the count too, or the index is a position
             // in a set the emit walk does not emit.
             let mut v = [0u8; MAX_VALUE];
-            let Some(vl) = get_value(sys, name, &mut v) else {
+            let tg = dev_micros(sys);
+            let got = get_value(sys, name, &mut v);
+            st_get(s, sys, tg);
+            let Some(vl) = got else {
                 continue;
             };
             if !where_ok(s, &v[..vl]) {
@@ -2779,6 +2851,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
 
     let mut lout = [0u8; LIST_BUF];
     let mut next = [0u8; MAX_CURSOR];
+    let tl = dev_micros(sys);
     let (n, nlen) = list_page(
         sys,
         &pfx[..plen],
@@ -2787,6 +2860,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         &mut lout,
         &mut next,
     );
+    st_list(s, sys, tl);
 
     let mut wrote = 0u32;
     let mut rp = 0usize;
@@ -2815,7 +2889,10 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         key[..klen].copy_from_slice(name);
 
         let mut val = [0u8; MAX_VALUE];
-        let Some(vlen) = get_value(sys, &key[..klen], &mut val) else {
+        let tg = dev_micros(sys);
+        let got = get_value(sys, &key[..klen], &mut val);
+        st_get(s, sys, tg);
+        let Some(vlen) = got else {
             continue;
         };
         if !where_ok(s, &val[..vlen]) {
@@ -3199,6 +3276,12 @@ pub unsafe extern "C" fn module_new(
         s.t_wakes = 0;
         s.t_subrc = 0;
         s.t_stalls = 0;
+        s.st_list_us = 0;
+        s.st_get_us = 0;
+        s.st_lists = 0;
+        s.st_gets = 0;
+        s.st_phase = 0;
+        s.st_slow = 0;
         s.deferred = 0;
         s.truncated = 0;
         s.events = 0;
@@ -3255,6 +3338,11 @@ pub unsafe extern "C" fn module_new(
     }
 }
 
+/// A step slower than this logs its breakdown.
+const SLOW_STEP_US: u64 = 3000;
+/// Slow steps logged per source; the count goes on past it.
+const SLOW_LOG_MAX: u32 = 64;
+
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -3262,7 +3350,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if state.is_null() {
             return 0;
         }
+        // ONE `&mut State` for the whole step, reborrowed into the body: a
+        // second one taken from `state` while this is live would alias it,
+        // and the body writes the very counters this reads back afterwards.
         let s = &mut *(state as *mut State);
+        if s.syscalls.is_null() {
+            return 0;
+        }
+        let sys = &*s.syscalls;
+        let t0 = dev_micros(sys);
+        s.st_list_us = 0;
+        s.st_get_us = 0;
+        s.st_lists = 0;
+        s.st_gets = 0;
+        s.st_phase = 0;
+        let rc = step_body(s);
+        let us = dev_micros(sys).saturating_sub(t0);
+        if us >= SLOW_STEP_US {
+            s.st_slow = s.st_slow.wrapping_add(1);
+            if s.st_slow <= SLOW_LOG_MAX {
+                slow_line(s, us);
+            }
+        }
+        rc
+    }
+}
+
+unsafe fn step_body(s: &mut State) -> i32 {
+    unsafe {
         if s.syscalls.is_null() {
             return 0;
         }
@@ -3283,6 +3398,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let plen = s.prefix_len as usize;
                 let mut pfx = [0u8; MAX_PREFIX];
                 pfx[..plen].copy_from_slice(&s.prefix[..plen]);
+                s.st_phase = 1;
                 s.t_subrc = store_subscribe(sys, &pfx[..plen], s.sink);
                 // Extra watches: changes here re-arm the scan but are never
                 // listed, so a deleted child wakes its parent.
@@ -3335,11 +3451,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // step. Bounded work per step is the contract a cooperative scheduler
         // needs — an unbounded drain here stalls the whole graph.
         if s.record_out >= 0 {
+            s.st_phase = 2;
             if !flush(s) {
                 s.t_stalls = s.t_stalls.wrapping_add(1);
                 return 0;
             }
             if s.events != 0 {
+                s.st_phase = 3;
                 events_step(s);
                 return 0;
             }
@@ -3360,11 +3478,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.paging == 1 && s.counting == 1 {
                 // One page per step here too: the count walk is bounded work
                 // like the emit walk, and a large prefix must not stall a step.
+                s.st_phase = 4;
                 if count_page(s) {
                     s.counting = 0;
                     s.clen = 0;
                 }
             } else if s.paging == 1 {
+                s.st_phase = 5;
                 emit_page(s);
             }
         }

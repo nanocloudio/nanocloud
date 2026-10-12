@@ -134,8 +134,41 @@ echo "== 5. kill-with-grace + no-restart-during-delete pin =="
 # terminal → delete flow + the kill key is consumed.
 store_put "/pod-specs/pod-al"  "cmd=/bin/echo hello-pod;desired=deleted;restart=always;grace=1"
 store_put "/pod-specs/pod-slp" "cmd=/bin/sleep 30;desired=deleted;grace=5"
-FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 4 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run2.log" 2>&1 || true
+# Run until every condition step 6 asserts holds, rather than for a fixed
+# time: SIGTERM, the sleeper's exit, the delete and each kill key's
+# consumption are a chain of store round trips, so how long the chain takes
+# is a property of the host. Both pods are waited for — pod-al's writes are
+# the same chain as pod-slp's, and a wait that covered only one left the
+# other to a race.
+FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 120 "$FLUXOR_RUNTIME" \
+  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run2.log" 2>&1 &
+RUN2=$!
+settled() { # every assertion step 6 makes, as a predicate
+  local uid
+  for uid in pod-al pod-slp; do
+    case "$(store_last "/pod-lifecycle-status/$uid")" in phase=Terminating*) ;; *) return 1 ;; esac
+    case "$(store_last "/sandboxes/$uid")" in *phase=delete*) ;; *) return 1 ;; esac
+    [ -z "$(store_last "/sandbox-kill/$uid")" ] || return 1
+  done
+  case "$(store_last /sandbox-status/pod-slp)" in state=killed*|state=destroyed*) ;; *) return 1 ;; esac
+}
+# Settled AND still settled: the delete runs as a sequence (the kill key
+# written, the grace deadline waited out, the key consumed, the sandbox
+# projected gone), so a single sample can catch a state that holds for one
+# step only. Three in a row is the end of the sequence, not a moment in it.
+waited=0 hold=0
+for _ in $(seq 300); do
+  if settled; then
+    hold=$((hold + 1))
+    [ "$hold" -ge 3 ] && { waited=1; break; }
+  else
+    hold=0
+  fi
+  sleep 0.2
+done
+# Not settled in 60 s: stop anyway and let step 6 name the condition missing.
+[ "$waited" = 1 ] || echo "   (the wait expired; step 6 reports what did not land)"
+kill "$RUN2" 2>/dev/null || true; wait "$RUN2" 2>/dev/null || true
 
 echo "== 6. verify: Terminating, destroyed, kill key consumed, never relaunched =="
 for uid in pod-al pod-slp; do

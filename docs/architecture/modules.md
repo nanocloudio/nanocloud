@@ -12,11 +12,13 @@ namespaces, cgroups, packet policy, durable disk, private keys — is reached
 only through fluxor **capability surfaces**: kernel providers addressed by
 contract class, which admission can gate.
 
-Between the two sit the `.fmod` modules, and the control plane has ten of
-them. Nine are **connectors**: each moves bytes across a seam a rules VM
-cannot cross, and decides nothing. The tenth is the CLI, which is an operator's entry point
-rather than part of any chain. No `.fmod` in this tree holds what a Deployment
-is, what `/api/v1` names, or when a Pod may restart.
+Between the two sit the `.fmod` modules, and the control plane has eighteen
+of them. Seventeen are **connectors**: each crosses one seam a rules VM
+cannot — the store, a socket, a container, the packet filter, a mount, a key
+service — and decides nothing, performing the key, field and op it is told
+and reporting what happened. The eighteenth is the CLI, an operator's entry
+point rather than part of any chain. No `.fmod` in this tree holds what a
+Deployment is, what `/api/v1` names, or when a Pod may restart.
 
 Three rules hold everywhere:
 
@@ -307,12 +309,22 @@ observed `/sandbox-status/`, the IPAM lease, the pod's bound volumes
 (a status recorded under another boot is a workload that no longer exists).
 `workload_effect` performs the op and owns only what cannot live in the store:
 the live handles and their continuous observation (WAIT, READ, the PTY pump),
-reported as events the chain writes back. It is the only holder of the
-`workload` contract, and one of exactly two modules granted `platform_raw` —
-`net_apply` is the other, for the same reason: rewriting a host's namespaces
-and rewriting its packet policy are both privileged, so each is a single
-auditable grant on a module that decides nothing. Nanocloud owns the
-image→rootfs and pod-spec→argv mapping, and the backend reads no OCI format.
+reported as events the chain writes back. Nanocloud owns the image→rootfs
+and pod-spec→argv mapping, and the backend reads no OCI format.
+
+`platform_raw` is the tree's privileged grant, and exactly four modules carry
+it — each because its one effect rewrites the host, and each on a module that
+decides nothing:
+
+| Module | What it rewrites |
+| ------ | ---------------- |
+| `workload_effect` | namespaces, cgroups and the processes in them (`workload`) |
+| `net_apply` | the host's packet policy (`net_policy`) |
+| `mount_effect` | the mount table (`host_mount`, `proc`) |
+| `volume_host` | a node's block devices and their unlocked mappings (`workload`, `proc`) |
+
+The `workload` contract itself has two holders, `workload_effect` and
+`volume_host`, so namespace surgery stays a grant a graph asks for by name.
 
 The image plane sits beside them, and is chains too: `image.uproc` turns
 `/image-requests/` into one work queue `/fetch-q/`, then a manifest (through an
@@ -326,10 +338,10 @@ bytes move through the `http_fetch` connector.
 
 The control plane's `.fmod` modules are connectors: each crosses one seam a
 rules VM cannot, and each decides nothing — told which key, which field, which
-op, it performs it and reports what happened. (The encrypted-volume effectors
-are connectors of the same kind; `docs/design/encrypted-volumes.md` names
-them.) `nanocloud_cli` is the exception, and the only
-module a chain never talks to: it is the operator's way into the same store.
+op, it performs it and reports what happened. `nanocloud_cli` is the
+exception, and the only module a chain never talks to: it is the operator's
+way into the same store. The encrypted-volume connectors are the same kind of
+thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 
 | Module | Seam | Role |
 | ------ | ---- | ---- |
@@ -342,6 +354,14 @@ module a chain never talks to: it is the operator's way into the same store.
 | `http_effect` | an HTTP endpoint, in the graph or through Wave's `http` client (an exchange REQUESTER) | a record → one exchange (kagi's `certificate_endpoint`) → the answer, with chosen top-level JSON members lifted, as a record |
 | `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the verification key from `/authn-keys/sa` |
 | `kagi_mint` | kagi's `token_mint` (an exchange REQUESTER of the typed operation) | a record → the signed token as a record; names the signing key by vault label and stores the public half the mint announces at `/authn-keys/sa` |
+| `store_doc` | `storage.object` | the API writer's record adapter in front of lattice's JSON document dialect: each write leaves as one document request, and an object too large for the reply record is sent empty so the answer becomes a GET the watch chain serves |
+| `store_big` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a heap, for the few nodes handling a document past a record: a body the HTTP front staged, and an object projected from a heap copy. Every other `store_effect` stays bounded |
+| `store_watch` | `storage.namespace`, `storage.object`, `timer` | `store_source`'s `events` mode with a heap — the watch connector: objects past one record streamed across records, and change batches past `EV_BUF` |
+| `kagi_storage_effect` | Kagi's storage-key service | a volume-key effect in, storage-key requests out, the typed outcome back as a record |
+| `loam_effect` | Loam's admin wire, `fs` | a volume effect in, admin-wire jobs out, the typed outcome back as a record |
+| `volume_relay` | `storage.object`, `storage.namespace` | carries the encrypted-volume effects between the control plane and a node over the replicated store, so neither addresses the other |
+| `mount_effect` | `host_mount`, `proc` | the claim chain's mount actuator: a `Mnt` record in, the raw facts of what ran back |
+| `volume_host` | `workload`, `proc` | a node's volume effector: the volume's subgraph staged, unlocked through Kagi, published over NBD, and torn down |
 | `nanocloud_cli` | the host's argv and stdio | a cli-applet: argv in, the store read and written directly, bytes to stdout and a latched exit code — so the CLI works with no HTTP edge running |
 
 The token mint and the certificate issuer sign under the same vault key,
@@ -363,6 +383,8 @@ below it is debt — it is the platform working as designed.
 | `workload` | `0x1A` | isolated workload lifecycle: typed CREATE header (identity, posture, resource intents, network identity) + a backend-opaque options envelope; CREATE/START/READ/SIGNAL/WAIT/DESTROY plus exec and TTY |
 | `fs` | `0x09` | files — the blob cache `http_fetch` lands image layers in |
 | `net_policy` | `0x1E` | the host's packet policy as a table, replaced whole; the platform realizes it and reports whether it is enforced |
+| `host_mount` | `0x1F` | the host's mount table: a filesystem mounted and unmounted where a claim asks for it |
+| `proc` | `0x16` | a host process run to completion, its output and status returned — a host-scoped class, so a graph asks for it by name |
 | key vault | `0x0010` | private keys held by the kernel, signed by handle |
 | `timer` | `0x06` | deadline wakeups for the Chronicle store source |
 | `linux_net` / `tls` | channel contract | leased sockets and TLS termination, delivered as a `net_proto` stream |
