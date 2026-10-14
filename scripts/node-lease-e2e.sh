@@ -92,7 +92,7 @@ plane_modules() {
     related: "/node-seen/!flat:rev#,at#"
   - name: nl_seen
     type: store_effect
-    decision: "${DEC_SEEN}"
+    decision: {hex: "${DEC_SEEN}"}
     key_prefix: "/node-seen/"
   - name: nl_leases
     type: store_source
@@ -104,7 +104,7 @@ plane_modules() {
     related: "/nodes/!json:status.ready"
   - name: nl_stale
     type: store_effect
-    decision: "${DEC_STALE}"
+    decision: {hex: "${DEC_STALE}"}
     key_prefix: "/nodes/"
   - name: ds_nodes
     type: store_source
@@ -112,7 +112,7 @@ plane_modules() {
     paths: "status.ready"
   - name: ds_mark
     type: store_effect
-    decision: "${DEC_RDY}"
+    decision: {hex: "${DEC_RDY}"}
     key_prefix: "/ready-nodes/"
 YAML
 }
@@ -143,16 +143,17 @@ graph() { # graph <with-node: 0|1>
     type: store_source
     prefix: "/nodes/"
     where: "metadata.name=node-a"
-    paths: "status.ready"
+    paths: "status.ready,metadata.labels"
     ints: "status.heartbeat"
     count: 1
     empty: 1
     label: "node-a"
+    facts: '"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux","nanocloud.io/fluxor-abi":"d1579ff4"'
     now: 1
     due: "status.heartbeat+10000"
   - name: nl_renew
     type: store_effect
-    decision: "${DEC_RENEW}"
+    decision: {hex: "${DEC_RENEW}"}
     key_prefix: "/nodes/"
 YAML
     fi
@@ -185,6 +186,9 @@ run 1 5
 N="$(store_last /nodes/node-a)"
 has "$N" '"name":"node-a"' '"ready":true' '"heartbeat":' || fail "node-a did not register: '$N'"
 python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert d['status']['ready'] is True" "$N" || fail "not JSON: '$N'"
+python3 -c "import json,sys; l=json.loads(sys.argv[1])['metadata']['labels']; assert l=={'kubernetes.io/arch':'arm64','kubernetes.io/os':'linux','nanocloud.io/fluxor-abi':'d1579ff4'}, l" "$N" \
+  || fail "node-a does not carry its facts as labels: '$N'"
+echo "   labels: arch, os and the fluxor ABI, from the render's facts"
 [ "$(store_last /ready-nodes/node-a)" = "1" ] || fail "node-a not projected ready"
 has "$(store_last /node-seen/node-a)" "rev=" ";at=" || fail "the plane did not note node-a"
 echo "   /nodes/node-a ready, heartbeat stamped; /ready-nodes/node-a; /node-seen/node-a"

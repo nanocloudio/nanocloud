@@ -16,7 +16,7 @@
 //        names the record that means it is DONE, so a row whose work is done
 //        is answered 304 without a byte on the wire
 //   ans  the answer -> /image-manifests/ (repo, layers, sizes, config,
-//        configsize, n), /image-index/ (an index: the arm64/linux entry),
+//        configsize, n; kind=workload for a fluxor workload image), /image-index/ (an index: the arm64/linux entry),
 //        /image-config/ (the runtime contract, escaped lists), /blobs/<hex>;
 //        a 304 deletes the row
 // Assembly is image_asm.uproc.
@@ -168,6 +168,7 @@ module nanocloud.image {
     skip2: string = 22;
     size: int = 13;
     q0: string = 14; q1: string = 15; q2: string = 16; q3: string = 17; q4: string = 18; q5: string = 19;
+    q6: string = 20;
     ctx: Ctx2 = 254;
   }
   decision fq(q: Q) -> Get {
@@ -177,7 +178,7 @@ module nanocloud.image {
             file: "", sha: "", skip: "/image-manifests/", skip2: q.name, size: 0,
             q0: "layers[].digest!tag", q1: "layers[].size", q2: "config.digest!tag",
             q3: "config.size", q4: "manifests[platform.architecture=arm64&platform.os=linux].digest",
-            q5: "layers[]#", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize } };
+            q5: "layers[]#", q6: "artifactType", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize } };
     when q.kind == "c" ->
       Get { cid: q.seq, sink: REPLY, path: q.path, accept: "",
             file: "", sha: q.digest, skip: "/image-config/", skip2: q.name, size: q.size,
@@ -196,6 +197,7 @@ module nanocloud.image {
     cid: int = 1;
     status: int = 2;
     a0: string = 40; a1: string = 41; a2: string = 42; a3: string = 43; a4: string = 44; a5: string = 45;
+    a6: string = 46;       // artifactType
     ctx: Ctx2 = 254;
   }
   message Put {
@@ -210,6 +212,13 @@ module nanocloud.image {
     when a.status == 304 ->
       Put { cid: a.cid, op: DELETE, key: "/fetch-q/", k2: a.ctx.q,
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "" };
+    // A fluxor workload image (its FLXA, then a `.fmod` per module): marked,
+    // so it is staged as a pack rather than assembled into a rootfs.
+    when a.status == 200 && a.ctx.kind == "m" && a.a0 != ""
+         && a.a6 == "application/vnd.nanocloud.fluxor.workload-image.v1" ->
+      Put { cid: a.cid, op: PUT, key: "/image-manifests/", k2: a.ctx.name,
+            v1: "repo=", v2: a.ctx.repo, v3: ";layers=", v4: a.a0, v5: ";sizes=", v6: a.a1,
+            v7: ";config=", v8: a.a2, v9: ";configsize=", v10: a.a3, v11: ";kind=workload;n=", v12: a.a5 };
     when a.status == 200 && a.ctx.kind == "m" && a.a0 != "" ->
       Put { cid: a.cid, op: PUT, key: "/image-manifests/", k2: a.ctx.name,
             v1: "repo=", v2: a.ctx.repo, v3: ";layers=", v4: a.a0, v5: ";sizes=", v6: a.a1,
@@ -240,7 +249,8 @@ module nanocloud.image {
         repo: q.repo, ssize: q.ssize, size: q.size }
   }
   transformation t_ans(a: Ans) -> Ans {
-    Ans { cid: a.cid, status: a.status, a0: a.a0, a1: a.a1, a2: a.a2, a3: a.a3, a4: a.a4, a5: a.a5, ctx: a.ctx }
+    Ans { cid: a.cid, status: a.status, a0: a.a0, a1: a.a1, a2: a.a2, a3: a.a3, a4: a.a4, a5: a.a5,
+          a6: a.a6, ctx: a.ctx }
   }
   pipeline im_qm(r: Req) -> Row { call x = t_req(r); call y = qm(x); return y; }
   pipeline im_qc(m: Man) -> Row { call x = t_man(m); call y = qc(x); return y; }

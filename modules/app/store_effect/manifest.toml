@@ -16,6 +16,10 @@ hardware_targets = ["bcm2712", "linux"]
 #                                 nothing: a decision always yields an outcome
 #                                 and Chronicle has no conditional fork, so
 #                                 "no store operation needed" must be one.
+#                                 17 = TAKE: answer the value and delete it,
+#                                 conditional on the revision read (404 when
+#                                 absent or taken first) — a single-use claim
+#                                 in one step.
 #                3, 17, 18 = KEY PARTS (bytes), joined after `key_prefix`. An
 #                     owner key `<ns>/<owner>` is two projected fields and a
 #                     literal separator, and the VM cannot concatenate.
@@ -79,7 +83,7 @@ hardware_targets = ["bcm2712", "linux"]
 # moved or is gone, so a merge never recreates a record another writer
 # removed.
 # 12 COUNT (the key is a PREFIX; answers 200 with the number of keys under it
-# at field 45). `count_where = <hex>` counts only the children a decision
+# at field 45). `count_where` (a decision container, `{hex: …}`) counts only the children a decision
 # keeps: each child is handed to it as a reply would answer it — field 3 the
 # key's tail past the prefix, the request's carry (30..39, 254), this node's
 # `paths` / `ints` projected out of the child — and counts when the decision
@@ -89,6 +93,9 @@ hardware_targets = ["bcm2712", "linux"]
 # load, and every COUNT answers 500.
 # `wall = 1` hands the fused decision the wall clock (Unix ms) at field 60.
 # `flat = 1` reads `k=v;k=v` records for `paths`/`ints`.
+# 18 DROP_EACH (one key under several collections: for each name in the
+# value, comma-separated, delete-if-present `<key_prefix><name>/<key>`; 200).
+# A Pod's node records, keyed by its uid in a dozen collections, go together.
 # 8 CREATE (PUT under the store's ABSENT precondition: 200 created, 409 the key
 # already existed), 9 REPLACE (PUT under ETAG: conditional on field 28, or on
 # the body's `rv_path` when 28 is absent; 409 when the key moved; an ordinary

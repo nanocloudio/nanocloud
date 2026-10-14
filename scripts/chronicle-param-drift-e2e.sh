@@ -11,7 +11,7 @@
 # So every graph carrying a param declares its provenance:
 #
 #     # chronicle-source: <path-to-.uproc> <entry>
-#     decision: "<hex>"
+#     decision: {hex: "<hex>"}
 #
 # and this recompiles each one and compares. The param stays baked in the graph
 # because a deb ships no compiler; this is what stops it drifting silently.
@@ -35,11 +35,11 @@ while IFS= read -r graph; do
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
 for i, l in enumerate(lines):
-    # A decode program: `# rd-source: <path.rd>` above `decode: "<hex>"`.
+    # A decode program: `# rd-source: <path.rd>` above `decode: {hex: "<hex>"}`.
     r = re.search(r'rd-source:\s*(\S+)', l)
     if r:
         for j in range(i + 1, min(i + 12, len(lines))):
-            d = re.search(r'decode:\s*"([0-9a-f]+)"', lines[j])
+            d = re.search(r'decode:\s*\{hex:\s*"([0-9a-f]+)"\}', lines[j])
             if d:
                 print(r.group(1), "-", "decode", d.group(1))
                 break
@@ -48,11 +48,11 @@ for i, l in enumerate(lines):
     if not m:
         continue
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.search(r'(decision|ir_stages|count_where):\s*"([0-9a-f]+)"', lines[j])
+        d = re.search(r'(decision|ir_stages|count_where):\s*\{hex:\s*"([0-9a-f]+)"\}', lines[j])
         if d:
             print(m.group(1), m.group(2), d.group(1), d.group(2))
             if d.group(1) == "ir_stages":
-                k = re.search(r'stage_kinds:\s*"([0-9a-f]*)"', lines[j + 1] if j + 1 < len(lines) else "")
+                k = re.search(r'stage_kinds:\s*\{hex:\s*"([0-9a-f]*)"\}', lines[j + 1] if j + 1 < len(lines) else "")
                 print(m.group(1), m.group(2), "stage_kinds", k.group(1) if k else "-")
             break
 PY

@@ -1,0 +1,159 @@
+// The TokenRequest surface (`POST …/serviceaccounts/<name>/token`, what
+// `kubectl create token` calls), compiled to params.
+//
+// The request chain (apiplane.uproc `probe`) reads the ServiceAccount and
+// hands the request on as `@mint<key> <body>` in the answer; a missing
+// ServiceAccount was answered NotFound already (apiplane_reply `act`). This
+// stage, between the step after the write and the reply, builds the mint
+// call kagi's `token_mint` signs, and hands `reply` the TokenRequest's
+// name, namespace, audience and lifetime to answer with beside the token and
+// its expiry. The issuer is the ONE the store-driven
+// tokens use (sa_token.uproc: `tk_mint` over `token_mint`, vault key
+// `nanocloud.ca`) — a vault label is one module's, so a second mint could not
+// open that key, and a second key would be a second root every verifier must
+// learn. Its answers fan to both readers; each keeps its own.
+//
+//   se_ans  -> tk_api (here) -> tk_mint (kagi_mint) -> reply   (and tk_resp)
+//
+// Every other record passes with no subject, which `kagi_mint` refuses
+// without calling the mint and echoes with its carry — the reply reads only
+// the carry for those.
+//
+// The request's `spec.expirationSeconds` is honoured from upstream's floor,
+// 600 s (shorter is 422 Invalid, as upstream), and is an hour when absent;
+// its first `spec.audiences` entry is the token's audience, and `nanocloud`
+// (the audience this plane verifies) when it names none.
+module nanocloud.apiplane_token {
+
+  // The step after the write (se_ans), as `reply` reads it.
+  message ActReply {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    c_wstatus: int = 36;
+  }
+
+  // kagi_mint's request record (sa_token.uproc MintCall), with the reply's
+  // carry beside it.
+  message MintCall {
+    cid: int = 1;
+    s1: string = 40;
+    s2: string = 41;
+    s3: string = 42;
+    s4: string = 43;
+    aud: string = 44;
+    ttl: int = 46;
+    ck: string = 47;
+    j1: string = 48;
+    j2: string = 49;
+    j3: string = 50;
+    j4: string = 51;
+    j5: string = 52;
+    c_cid: int = 30;
+    // The TokenRequest's name, namespace, audience and lifetime, for `reply`
+    // (apiplane_reply), on carry numbers the step after the write leaves free.
+    tk_name: string = 34;
+    tk_ns: string = 35;
+    tk_aud: string = 37;
+    tk_ttl: string = 38;
+    c_status: int = 31;
+    c_answer: string = 32;
+    c_stream: int = 33;
+    c_wstatus: int = 36;
+  }
+
+  // Every `when` below is TOTAL — it cannot fail on any record, because a
+  // failed condition drops the record, and every reply passes this stage.
+  // Conditions are evaluated whole (`&&` does not short-circuit), so each
+  // piece is clamped into its string before it is used (kube.uproc's
+  // `i + (n + 1) * (1 - least(1, i + 1))` is `n` when `i` is -1), and the
+  // lifetime is tested as digits (`replace` each away, on at most 12
+  // characters) before anything reads it as a number. Substrings are views:
+  // nothing copies the answer, which may be as large as a record, into the
+  // 512 bytes of scratch a decision has. Each piece is bound once
+  // (`cel.bind`) — written out at every use, this decision was 12 KB of the
+  // 256 KiB a whole graph's config may be.
+  decision d_mint(a: ActReply) -> MintCall {
+    // A lifetime that is not a whole number of seconds.
+    when a.c_answer.startsWith("@mint/") && a.c_answer.contains("\"expirationSeconds\":")
+         && cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), cel.bind(t, x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim(), t.size() == 0 || t.size() > 10 || t.replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") != "")) ->
+      MintCall { cid: a.cid, s1: "", s2: "", s3: "", s4: "", aud: "", ttl: 0, ck: "",
+                 j1: "", j2: "", j3: "", j4: "", j5: "",
+                 c_cid: a.c_cid, c_status: 400,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"BadRequest\",\"code\":400,\"message\":\"spec.expirationSeconds: not a whole number of seconds\"}",
+                 c_stream: 0, c_wstatus: 0 };
+    // A lifetime under upstream's floor.
+    when a.c_answer.startsWith("@mint/") && a.c_answer.contains("\"expirationSeconds\":")
+         && cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), cel.bind(t, x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim(), t.size() < 3 || (t.size() == 3 && "012345".contains((t + "9").substring(0, 1))))) ->
+      MintCall { cid: a.cid, s1: "", s2: "", s3: "", s4: "", aud: "", ttl: 0, ck: "",
+                 j1: "", j2: "", j3: "", j4: "", j5: "",
+                 c_cid: a.c_cid, c_status: 422,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Invalid\",\"code\":422,\"message\":\"spec.expirationSeconds: Invalid value: may not specify a duration less than 10 minutes\"}",
+                 c_stream: 0, c_wstatus: 0 };
+    // Everything a TokenRequest can name: its lifetime and its audience.
+    when a.c_answer.startsWith("@mint/") && a.c_answer.contains("\"expirationSeconds\":") && a.c_answer.contains("\"audiences\":[\"") ->
+      MintCall { cid: a.cid,
+                 s1: "system:serviceaccount:", s2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), s3: ":", s4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))),
+                 aud: cel.bind(a0, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"audiences\":[\"")) + 14)), a0.substring(0, (a0.indexOf("\"") + (a0.size() + 1) * (1 - math.least(1, a0.indexOf("\"") + 1))))), ttl: int(cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim())), ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))),
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), j5: "\"}}",
+                 c_cid: a.c_cid, c_status: a.c_status, c_answer: "@mint:",
+                 tk_name: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), tk_ns: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), tk_aud: cel.bind(a0, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"audiences\":[\"")) + 14)), a0.substring(0, (a0.indexOf("\"") + (a0.size() + 1) * (1 - math.least(1, a0.indexOf("\"") + 1))))), tk_ttl: cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim()),
+                 c_stream: 0, c_wstatus: a.c_wstatus };
+    // A lifetime; the audience this plane verifies.
+    when a.c_answer.startsWith("@mint/") && a.c_answer.contains("\"expirationSeconds\":") ->
+      MintCall { cid: a.cid,
+                 s1: "system:serviceaccount:", s2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), s3: ":", s4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))),
+                 aud: "nanocloud", ttl: int(cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim())), ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))),
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), j5: "\"}}",
+                 c_cid: a.c_cid, c_status: a.c_status, c_answer: "@mint:",
+                 tk_name: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), tk_ns: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), tk_aud: "nanocloud", tk_ttl: cel.bind(x, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"expirationSeconds\":")) + 20)), x.substring(0, math.least(12, math.least((x.indexOf("}") + (x.size() + 1) * (1 - math.least(1, x.indexOf("}") + 1))), (x.indexOf(",") + (x.size() + 1) * (1 - math.least(1, x.indexOf(",") + 1)))))).trim()),
+                 c_stream: 0, c_wstatus: a.c_wstatus };
+    // An audience; an hour.
+    when a.c_answer.startsWith("@mint/") && a.c_answer.contains("\"audiences\":[\"") ->
+      MintCall { cid: a.cid,
+                 s1: "system:serviceaccount:", s2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), s3: ":", s4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))),
+                 aud: cel.bind(a0, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"audiences\":[\"")) + 14)), a0.substring(0, (a0.indexOf("\"") + (a0.size() + 1) * (1 - math.least(1, a0.indexOf("\"") + 1))))), ttl: 3600, ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))),
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), j5: "\"}}",
+                 c_cid: a.c_cid, c_status: a.c_status, c_answer: "@mint:",
+                 tk_name: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), tk_ns: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), tk_aud: cel.bind(a0, a.c_answer.substring(math.least(a.c_answer.size(), math.greatest(0, a.c_answer.indexOf("\"audiences\":[\"")) + 14)), a0.substring(0, (a0.indexOf("\"") + (a0.size() + 1) * (1 - math.least(1, a0.indexOf("\"") + 1))))), tk_ttl: "3600",
+                 c_stream: 0, c_wstatus: a.c_wstatus };
+    // Neither: the audience this plane verifies, for an hour.
+    when a.c_answer.startsWith("@mint/") ->
+      MintCall { cid: a.cid,
+                 s1: "system:serviceaccount:", s2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), s3: ":", s4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))),
+                 aud: "nanocloud", ttl: 3600, ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))),
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), j5: "\"}}",
+                 c_cid: a.c_cid, c_status: a.c_status, c_answer: "@mint:",
+                 tk_name: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(math.least(key.size(), (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1))) + 1)))), tk_ns: cel.bind(k0, a.c_answer.substring(math.least(22, a.c_answer.size())), cel.bind(key, k0.substring(0, (k0.indexOf(" ") + (k0.size() + 1) * (1 - math.least(1, k0.indexOf(" ") + 1)))), key.substring(0, (key.indexOf("/") + (key.size() + 1) * (1 - math.least(1, key.indexOf("/") + 1)))))), tk_aud: "nanocloud", tk_ttl: "3600",
+                 c_stream: 0, c_wstatus: a.c_wstatus };
+    // Not a TokenRequest: no subject, so the mint is not called; the carry
+    // passes.
+    default ->
+      MintCall { cid: a.cid, s1: "", s2: "", s3: "", s4: "", aud: "", ttl: 0, ck: "",
+                 j1: "", j2: "", j3: "", j4: "", j5: "",
+                 c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer,
+                 c_stream: a.c_stream, c_wstatus: a.c_wstatus };
+  }
+
+  transformation pass_areply(a: ActReply) -> ActReply {
+    ActReply { cid: a.cid, status: a.status, value: a.value,
+               c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer,
+               c_stream: a.c_stream, c_wstatus: a.c_wstatus }
+  }
+  pipeline tk_api(a: ActReply) -> MintCall {
+    call x = pass_areply(a);
+    call y = d_mint(x);
+    return y;
+  }
+  entry tk_api = tk_api;
+
+  provenance revision "apiplane-token" toolchain "chronicle-authoring";
+}

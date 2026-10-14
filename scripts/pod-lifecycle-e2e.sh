@@ -90,7 +90,7 @@ store_put "/pod-specs/pod-nf"  "cmd=/bin/false;desired=running;restart=never"
 store_put "/pod-specs/pod-of"  "cmd=/bin/false;desired=running;restart=onfailure"
 # pod-al: succeeds, restart=always -> restarts anyway (never terminal)
 store_put "/pod-specs/pod-al"  "cmd=/bin/echo hello-pod;desired=running;restart=always"
-# pod-slp: long-running (sleep) — killed in phase 5 via the two-phase kill seam
+# pod-slp: long-running (sleep) — deleted in phase 5, after a restart
 store_put "/pod-specs/pod-slp" "cmd=/bin/sleep 30;desired=running"
 
 echo "== 3. run the pipeline (pod_lifecycle -> the sandbox runtime -> oci) =="
@@ -127,13 +127,24 @@ esac
 echo "   pod1: Succeeded   pod-nf: Failed"
 
 echo "== 5. kill-with-grace + no-restart-during-delete pin =="
-# Flip a restart=always pod AND the live sleeper to desired=deleted. The
-# pin: the decision evaluates desired==deleted BEFORE the restart branch, so
-# neither pod may be relaunched by its restartPolicy. pod-slp is live, so the
-# two-phase kill runs: /sandbox-kill/ sig=term → SIGTERM kills sleep →
-# terminal → delete flow + the kill key is consumed.
+# Flip a restart=always pod AND the sleeper to desired=deleted. The pin: the
+# decision evaluates desired==deleted BEFORE the restart branch, so neither
+# pod may be relaunched by its restartPolicy. Both are deleted across a
+# RESTART (the next run is another boot): what ran in the last boot is gone,
+# so the delete is direct — no kill to send, nothing created again. The
+# graceful kill of a LIVE Pod, within one boot, is step 7.
 store_put "/pod-specs/pod-al"  "cmd=/bin/echo hello-pod;desired=deleted;restart=always;grace=1"
 store_put "/pod-specs/pod-slp" "cmd=/bin/sleep 30;desired=deleted;grace=5"
+# And a Pod whose status says `running` under ANOTHER boot: the node
+# restarted, so no process is left to signal. It must take the direct delete,
+# never the graceful kill — a kill key nothing will consume would hold its
+# delete forever (a stale status from before the restart once did, racily,
+# whenever the first run was stopped right after a restart relaunched).
+store_put "/pod-specs/pod-stale" "cmd=/bin/sleep 30;desired=deleted;grace=5"
+store_put "/pod-runtime/pod-stale" "kill_phase=0;kill_deadline=0;restarts=0;was_terminal=0"
+store_put "/sandboxes/pod-stale" "cmd=/bin/sleep 30;phase=start"
+store_put "/sandbox-status/pod-stale" "state=running"
+store_put "/sandbox-boot-of/pod-stale" "a-boot-before-this-one"
 # Run until every condition step 6 asserts holds, rather than for a fixed
 # time: SIGTERM, the sleeper's exit, the delete and each kill key's
 # consumption are a chain of store round trips, so how long the chain takes
@@ -151,6 +162,8 @@ settled() { # every assertion step 6 makes, as a predicate
     [ -z "$(store_last "/sandbox-kill/$uid")" ] || return 1
   done
   case "$(store_last /sandbox-status/pod-slp)" in state=killed*|state=destroyed*) ;; *) return 1 ;; esac
+  case "$(store_last /pod-lifecycle-status/pod-stale)" in phase=Terminating*) ;; *) return 1 ;; esac
+  case "$(store_last /sandboxes/pod-stale)" in *phase=delete*) ;; *) return 1 ;; esac
 }
 # Settled AND still settled: the delete runs as a sequence (the kill key
 # written, the grace deadline waited out, the key consumed, the sandbox
@@ -185,10 +198,106 @@ for uid in pod-al pod-slp; do
   [ "$(store_last "/sandbox-kill/$uid")" = "" ] \
     || fail "$uid kill key should be consumed, got '$(store_last "/sandbox-kill/$uid")'"
 done
+# The stale-boot Pod: deleted directly, and never sent a kill.
+case "$(store_last /pod-lifecycle-status/pod-stale)" in phase=Terminating*) ;;
+  *) fail "pod-stale should be Terminating, got '$(store_last /pod-lifecycle-status/pod-stale)'" ;; esac
+case "$(store_last /sandboxes/pod-stale)" in *phase=delete*) ;;
+  *) fail "pod-stale (running under another boot) should be deleted directly, got '$(store_last /sandboxes/pod-stale)'" ;; esac
+python3 - "$D/store.log" <<'PY2' || fail "pod-stale was sent a kill: a status from another boot is nothing live to signal"
+import struct, sys
+data = open(sys.argv[1], "rb").read(); p = 0
+while p + 15 <= len(data):
+    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+    k = data[p+15:p+15+kl]; p += 15 + kl + vl
+    if k == b"/sandbox-kill/pod-stale" and op == 1: sys.exit(1)
+PY2
+echo "   pod-stale: running under another boot -> deleted directly, never signalled"
 ST="$(store_last /sandbox-status/pod-slp)"
 case "$ST" in
-  state=killed*|state=destroyed*) echo "   pod-slp: $ST (SIGTERM delivered via /sandbox-kill/)";;
-  *) fail "pod-slp should be killed/destroyed after sig=term, got '$ST'";;
+  state=killed*|state=destroyed*) echo "   pod-slp: $ST (the last boot's process, deleted across the restart)";;
+  *) fail "pod-slp should be killed/destroyed, got '$ST'";;
 esac
+
+echo "== 7. a LIVE Pod deleted within its own boot: SIGTERM, then the delete =="
+# The deletion arrives while the runtime that started the Pod still runs: a
+# driver writes the spec over a remote_channel into a store_effect (the store
+# replays its log only at open, so a write between runs is a restart).
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+DRV_PORT="$(free_port)"
+python3 - "$GRAPH" "$D/live.yaml" "$DRV_PORT" <<'PY2'
+import sys
+src, dst, port = sys.argv[1], sys.argv[2], sys.argv[3]
+g = open(src).read()
+mods, wiring = g.split("\nwiring:\n", 1)
+mods = mods.replace("\nmodules:\n", "\nplatform:\n  net: {}\nmodules:\n", 1)
+mods += f"""
+  - name: drv
+    type: remote_channel
+    transport: net
+    role: listen
+    port: {port}
+    require_peer: 0
+    channels: "OctetStream:bytes:16384"
+  - name: drv_put
+    type: store_effect
+    key_prefix: "/pod-specs/"
+"""
+wiring = wiring.rstrip("\n") + """
+  - from: linux_net.net_out
+    to: drv.transport_in
+  - from: drv.transport_out
+    to: linux_net.net_in
+  - from: drv.ch0_rx
+    to: drv_put.request_in
+  - from: drv_put.response_out
+    to: drv.ch0
+"""
+open(dst, "w").write(mods + "\nwiring:\n" + wiring)
+PY2
+nc_build_workload "$ROOT" "$D/live.yaml" "$D/live.bin" "$D/live-modules.bin" >/dev/null \
+  || fail "the graph with the driver's channel did not build"
+store_put "/pod-specs/pod-grace" "cmd=/bin/sleep 30;desired=running;grace=5"
+FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 120 "$FLUXOR_RUNTIME" \
+  --config "$D/live.bin" --modules "$D/live-modules.bin" >"$D/run3.log" 2>&1 &
+RUN3=$!
+for _ in $(seq 150); do
+  case "$(store_last /pod-lifecycle-status/pod-grace)" in phase=Running*) break ;; esac
+  sleep 0.2
+done
+case "$(store_last /pod-lifecycle-status/pod-grace)" in phase=Running*) echo "   pod-grace: Running in this boot" ;;
+  *) kill "$RUN3" 2>/dev/null; fail "pod-grace never ran: '$(store_last /pod-lifecycle-status/pod-grace)'" ;; esac
+PYTHONPATH="$ROOT/scripts/support" python3 -B - "$DRV_PORT" <<'PY2' || { kill "$RUN3" 2>/dev/null; fail "the driver's delete was not stored"; }
+import struct, sys, fxrc
+s = fxrc.connect(int(sys.argv[1]), timeout=30)
+def field(n, v):
+    b = struct.pack("<q", v) if isinstance(v, int) else v.encode()
+    return bytes([n, 1 if isinstance(v, int) else 0]) + struct.pack("<H", len(b)) + b
+fields = [field(1, 1), field(2, 3), field(3, "pod-grace"),
+          field(4, "cmd=/bin/sleep 30;desired=deleted;grace=5")]
+s.sendall(bytes([len(fields)]) + b"".join(fields))
+buf = b""
+while len(buf) < 1:
+    buf += s.recv(4096)
+PY2
+graceful() {
+  case "$(store_last /pod-lifecycle-status/pod-grace)" in phase=Terminating*) ;; *) return 1 ;; esac
+  case "$(store_last /sandboxes/pod-grace)" in *phase=delete*) ;; *) return 1 ;; esac
+  case "$(store_last /sandbox-status/pod-grace)" in state=killed*|state=destroyed*) ;; *) return 1 ;; esac
+  [ -z "$(store_last /sandbox-kill/pod-grace)" ] || return 1
+}
+for _ in $(seq 150); do graceful && break; sleep 0.2; done
+kill "$RUN3" 2>/dev/null || true; wait "$RUN3" 2>/dev/null || true
+graceful || fail "pod-grace did not settle: lifecycle='$(store_last /pod-lifecycle-status/pod-grace)' sandbox='$(store_last /sandboxes/pod-grace)' status='$(store_last /sandbox-status/pod-grace)' kill='$(store_last /sandbox-kill/pod-grace)'"
+python3 - "$D/store.log" <<'PY2' || fail "pod-grace was not killed gracefully (no sig=term, or the sleeper did not die of it)"
+import struct, sys
+data = open(sys.argv[1], "rb").read(); p = 0; term = killed = False
+while p + 15 <= len(data):
+    rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+    k = data[p+15:p+15+kl]; v = data[p+15+kl:p+15+kl+vl]; p += 15 + kl + vl
+    if k == b"/sandbox-kill/pod-grace" and op == 1 and v.startswith(b"sig=term"): term = True
+    if k == b"/sandbox-status/pod-grace" and op == 1 and v.startswith(b"state=killed;code=15"): killed = True
+sys.exit(0 if term and killed else 1)
+PY2
+echo "   pod-grace: sig=term sent, the sleeper died of SIGTERM (code 15), the key consumed, the sandbox deleted"
 
 echo "== E2E green: decision→effect→oci + restartPolicy + backoff + kill-with-grace pin =="

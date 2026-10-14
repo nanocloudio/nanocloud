@@ -269,6 +269,57 @@ impl HcSlot {
     }
 }
 
+/// The transcoder's sink: the request's new buffer, grown on the heap.
+struct HcSink<'a, H: HcHeap> {
+    buf: &'a mut HcBytes,
+    heap: &'a mut H,
+    limit: usize,
+    full: bool,
+}
+
+impl<H: HcHeap> PbSink for HcSink<'_, H> {
+    fn put(&mut self, b: &[u8]) -> bool {
+        let ok = self.buf.push(self.heap, b, self.limit);
+        self.full |= !ok;
+        ok
+    }
+}
+
+/// The `name: value\r\n` lines of an exchange header block, each with its
+/// line end.
+fn hc_header_lines(h: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut at = 0usize;
+    core::iter::from_fn(move || {
+        if at >= h.len() {
+            return None;
+        }
+        let rest = h.get(at..)?;
+        let n = rest.windows(2).position(|w| w == b"\r\n").map(|i| i + 2).unwrap_or(rest.len());
+        at += n;
+        rest.get(..n)
+    })
+}
+
+/// Whether header line `line` is named `name` (case aside).
+fn hc_header_name_is(line: &[u8], name: &[u8]) -> bool {
+    line.len() > name.len()
+        && line.get(name.len()) == Some(&b':')
+        && line.get(..name.len()).is_some_and(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Whether the block's content type is `ct` (parameters aside).
+fn hc_content_type_is(h: &[u8], ct: &[u8]) -> bool {
+    hc_header_lines(h).any(|line| {
+        if !hc_header_name_is(line, b"content-type") {
+            return false;
+        }
+        let v = line.get(b"content-type:".len()..).unwrap_or(&[]);
+        let v = v.trim_ascii();
+        let v = v.split(|&c| c == b';').next().unwrap_or(&[]).trim_ascii();
+        v.eq_ignore_ascii_case(ct)
+    })
+}
+
 /// What a record the module is to write to the server stands for, so the
 /// desk commits it once the channel took it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -477,6 +528,9 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
 
     /// The request in slot `at` is whole: staged, or straight to the chain.
     fn whole<H: HcHeap>(&mut self, heap: &mut H, at: usize) {
+        if !self.transcode(heap, at) {
+            return;
+        }
         let s = &self.slots[at];
         let body = s.body().len();
         let inline = self.cfg.inline_max == 0 || body <= self.cfg.inline_max as usize;
@@ -497,6 +551,71 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         s.grant = 0;
         s.seq = seq;
         s.st = if inline { HC_READY } else { HC_STAGE };
+    }
+
+    /// A Kubernetes protobuf body (kubectl's typed generators send one) as
+    /// the JSON object it stands for, its content type `application/json`:
+    /// the chain reads JSON alone. False when the request was refused — 415
+    /// for a body that does not decode, 413 for one whose JSON passes the
+    /// bound, 503 when the heap cannot hold it.
+    fn transcode<H: HcHeap>(&mut self, heap: &mut H, at: usize) -> bool {
+        let old = self.slots[at].req;
+        let (t, h, p) = {
+            let s = &self.slots[at];
+            (s.target_len as usize, s.hdr_len as usize, s.peer_len as usize)
+        };
+        let all = old.bytes();
+        let headers = all.get(t..t + h).unwrap_or(&[]);
+        if !hc_content_type_is(headers, b"application/vnd.kubernetes.protobuf") {
+            return true;
+        }
+        let target = all.get(..t).unwrap_or(&[]);
+        let peer = all.get(t + h..t + h + p).unwrap_or(&[]);
+        let body = all.get(t + h + p..).unwrap_or(&[]);
+        // The JSON is larger than the protobuf it decodes (keys, base64):
+        // bounded at twice the body bound.
+        let limit = t + h + p + 64 + self.cfg.max_body as usize * 2;
+        let mut nb = HcBytes::EMPTY;
+        let mut new_h = 0usize;
+        let mut ok = nb.push(heap, target, limit);
+        for line in hc_header_lines(headers) {
+            let piece: &[u8] = if hc_header_name_is(line, b"content-type") {
+                b"content-type: application/json\r\n"
+            } else {
+                line
+            };
+            ok = ok && nb.push(heap, piece, limit);
+            new_h += piece.len();
+        }
+        ok = ok && nb.push(heap, peer, limit);
+        if !ok || new_h > u16::MAX as usize {
+            nb.release(heap);
+            self.refuse(heap, at, hx::status::BUSY);
+            return false;
+        }
+        let res = {
+            let mut sink = HcSink { buf: &mut nb, heap, limit, full: false };
+            pb_to_json(body, &mut sink).map(|()| sink.full)
+        };
+        match res {
+            Ok(_) => {
+                let mut old = old;
+                old.release(heap);
+                let s = &mut self.slots[at];
+                s.req = nb;
+                s.hdr_len = new_h as u16;
+                true
+            }
+            Err(e) => {
+                nb.release(heap);
+                let status = match e {
+                    PbErr::Full => hx::status::TOO_LARGE,
+                    _ => 415,
+                };
+                self.refuse(heap, at, status);
+                false
+            }
+        }
     }
 
     /// A slot whose body is owed to the store: `(slot, cid)`.

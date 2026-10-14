@@ -4,7 +4,9 @@
 # The node's lifecycle chain reports `phase=<phase>;pod=<ns>/<name>` under
 # /podstatus/<uid>, a prefix the node does not scope, so the record lands in
 # the plane's store as written; pod_status.uproc patches the Pod's
-# status.phase from it, which is what `kubectl get pods` shows. Two runs on
+# status.phase from it, which is what `kubectl get pods` shows — only when the
+# Pod there is the record's, by uid: records an earlier incarnation of a name
+# left behind patch nothing. Two runs on
 # one store: the first creates the Pods through the API; between the runs the
 # node's report is appended to the plane's durable log, as a worker's write
 # would arrive; the second run must serve the Pod as Running.
@@ -173,8 +175,18 @@ for i in 0 1; do
 done
 
 echo "== 6. the node reports web-0 Running; a restart replays it onto the Pod =="
+uid_of() { nc_store_get "$STORE" "/pods/default/$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["uid"])'; }
+UID0="$(uid_of web-0)"; UID1="$(uid_of web-1)"
+[ -n "$UID0" ] && [ -n "$UID1" ] || fail "the Pods carry no uid"
 kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""
-put_text "/podstatus/report-1" 'phase=Running;pod=default/web-0'
+# The node keys its report by the Pod's uid.
+put_text "/podstatus/$UID0" 'phase=Running;pod=default/web-0'
+# And what an EARLIER incarnation of each name left behind: a Pod deleted and
+# made again keeps its name, not its uid. These name web-0 and web-1 but are
+# not theirs, and must patch neither — the source replays every record on
+# any change, so a stale one would win on its turn.
+put_text "/podstatus/00000000-0000-0000-0000-00000000dead" 'phase=Failed;pod=default/web-0'
+put_text "/podstatus/00000000-0000-0000-0000-00000000beef" 'phase=Failed;pod=default/web-1'
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run2.log" 2>&1 &
 RUNTIME_PID=$!
@@ -188,5 +200,17 @@ case "$r" in 200\|*'"phase":"Running"'*) echo "   pod web-0: status.phase Runnin
   *) fail "web-0 did not reach Running through the API: ${r:0:200} store='$(nc_store_get "$STORE" /pods/default/web-0)'" ;; esac
 r="$(api GET /api/v1/namespaces/default/pods/web-1)"
 case "$r" in 200\|*'"phase":"Running"'*) fail "web-1 was never reported and must not be Running" ;; *) echo "   pod web-1: not Running (never reported)" ;; esac
+
+echo "== 7. an earlier incarnation's record patches no Pod of its name =="
+# Give the stale records every chance: another report (a change under the
+# prefix replays them all), then a settle.
+for _ in $(seq 10); do
+  sleep 1
+  r0="$(api GET /api/v1/namespaces/default/pods/web-0)"; r1="$(api GET /api/v1/namespaces/default/pods/web-1)"
+  case "$r0" in *'"phase":"Failed"'*) fail "web-0 took an earlier incarnation's Failed: ${r0:0:200}" ;; esac
+  case "$r1" in *'"phase":"Failed"'*) fail "web-1 took an earlier incarnation's Failed: ${r1:0:200}" ;; esac
+done
+case "$r0" in *'"phase":"Running"'*) echo "   web-0 stays Running, web-1 unreported: neither took a record that is not its own" ;;
+  *) fail "web-0 lost its own phase: ${r0:0:200}" ;; esac
 
 echo "== E2E green: a node's phase report patches the Pod object; kubectl sees the phase the node reports =="

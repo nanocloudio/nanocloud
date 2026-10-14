@@ -1,0 +1,76 @@
+// A deleted object's tombstone, at its end. store_doc leaves the object's
+// last state at /~tomb/<collection>/<ns>/<name> with a deadline, for a
+// watch's DELETED event; at the deadline the tomb goes:
+//
+//   ex     the tomb, due -> DELETE it, carrying what it was (its uid, its
+//          node) to the step after
+//   spec   a Pod's tomb gone -> DELETE /~node/<node>/pod-specs/<uid>
+//
+// A Pod's node spec (pod_specs.uproc) says `desired=deleted` while its tomb
+// lives — rewritten from the tomb, so a node catching up still reads the
+// delete. When the tomb is gone the spec goes too, and with it every record
+// the node keeps for that Pod (pod_project.uproc `prune`): nothing else ever
+// removes them, and a node's records would grow by every Pod it ran.
+module nanocloud.tomb {
+  message tb.Rec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<collection>/<ns>/<name>"
+    uid: string = 4;      // obj.metadata.uid
+    node: string = 5;     // obj.spec.nodeName
+    deadline: int = 50;   // ints = deadline (ms, monotonic)
+    now: int = 58;
+  }
+  message tb.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30;
+    c_uid: string = 31;
+    c_node: string = 32;
+  }
+  message tb.Gone {
+    cid: int = 1;
+    status: int = 2;
+    c_key: string = 30;
+    c_uid: string = 31;
+    c_node: string = 32;
+  }
+  message tb.Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+
+  decision expire(r: tb.Rec) -> tb.Act {
+    when r.deadline > 0 && r.now >= r.deadline ->
+      tb.Act { cid: r.seq, op: DELETE, key: r.key, c_key: r.key, c_uid: r.uid, c_node: r.node };
+    default ->
+      tb.Act { cid: r.seq, op: NOOP, key: "", c_key: "", c_uid: "", c_node: "" };
+  }
+  // A Pod's tomb, gone: its node spec goes with it. `has` guards the carry:
+  // another collection's tomb names no uid or node, and a `when` that read
+  // an absent field would fail closed rather than decide.
+  decision spec(g: tb.Gone) -> tb.Del {
+    when has(g.c_key) && g.c_key.startsWith("pods/") && has(g.c_uid) && g.c_uid != ""
+         && has(g.c_node) && g.c_node != "" ->
+      tb.Del { cid: g.cid, op: DELETE, key: g.c_node + "/pod-specs/" + g.c_uid };
+    default ->
+      tb.Del { cid: g.cid, op: NOOP, key: "" };
+  }
+
+  transformation pass(r: tb.Rec) -> tb.Rec {
+    tb.Rec { seq: r.seq, rev: r.rev, key: r.key, uid: r.uid, node: r.node,
+             deadline: r.deadline, now: r.now }
+  }
+  transformation pass_gone(g: tb.Gone) -> tb.Gone {
+    tb.Gone { cid: g.cid, status: g.status, c_key: g.c_key, c_uid: g.c_uid, c_node: g.c_node }
+  }
+  pipeline ex(r: tb.Rec) -> tb.Act { call x = pass(r); call y = expire(x); return y; }
+  pipeline spec_p(g: tb.Gone) -> tb.Del { call x = pass_gone(g); call y = spec(x); return y; }
+  entry ex = ex;
+  entry spec_p = spec_p;
+  provenance revision "tomb" toolchain "chronicle-authoring";
+}

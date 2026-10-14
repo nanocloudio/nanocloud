@@ -55,6 +55,15 @@ module nanocloud.podspecs {
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
                 p1: "node=", p2: p.node, p3: ";grace=", p4: p.grace,
                 p5: ";desired=deleted;cmd=", p6: p.cmd, p7: " ", p8: p.args };
+    // A Pod of a WORKLOAD IMAGE (runtimeClassName fluxor, its image an OCI
+    // reference — `repo[:tag]`, which a Graph's name never is): the node
+    // pulls it (`image=`) and runs it as modules it brought (`graph=` marks
+    // it module-backed; the pulled manifest, not a Graph, is its source).
+    when p.rtc == "fluxor" && (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) ->
+      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid,
+                p1: "node=", p2: p.node, p3: ";graph=", p4: p.image,
+                p5: ";image=", p6: p.image, p7: ";restart=", p8: p.restart,
+                p9: ";grace=0;desired=running;cmd=;pod=", p10: p.key };
     // A graph-backed Pod (runtimeClassName fluxor): its image names the
     // FLXA subgraph the node was given at /graphs/<image>; no process to
     // spawn, so no cmd.

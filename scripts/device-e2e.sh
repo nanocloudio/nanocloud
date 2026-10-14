@@ -105,6 +105,17 @@ CA="${IDENT##*;ca=}"
 [ -n "$CRT" ] && [ -n "$CA" ] || fail "identity missing crt/ca"
 [ "$(store_last /ca-cert)" = "$CA" ] || fail "/ca-cert is not the CA the identity chains to"
 [ -z "$(store_last /deviceidentities.nanocloud.io/default/bob)" ] || fail "bob has no key and must not be certified"
+# The Device itself carries its certificate: what a client reading its own
+# Device through the API (a node certifying its peer keys) is answered with.
+DEV="$(store_last /devices.nanocloud.io/default/alice)"
+python3 - "$DEV" "$CRT" "$CA" "$SPIFFE_ID" <<'PYS' || fail "alice's Device status does not carry her certificate: ${DEV:0:160}"
+import json, sys
+d, crt, ca, spiffe = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+st = d["status"]
+assert st["certificate"] == crt and st["ca"] == ca and st["spiffe"] == spiffe, st
+assert st["publicKey"] == d["spec"]["publicKey"], st
+assert d["spec"]["publicKey"], d
+PYS
 echo "   alice certified; /ca-cert published; bob (no key) left alone"
 b64u_to_pem "$CRT" "$D/leaf.pem"
 b64u_to_pem "$CA" "$D/ca.pem"
@@ -139,5 +150,24 @@ b64u_to_pem "$CA2" "$D/ca2.pem"
 [ "$(openssl x509 -in "$D/ca.pem" -noout -pubkey)" = "$(openssl x509 -in "$D/ca2.pem" -noout -pubkey)" ] \
   || fail "the CA key changed across a restart"
 echo "   alice not re-certified; carol's CA has the same key"
+
+echo "== 6. alice re-keys: the Device names a new key, and that key is certified =="
+openssl ecparam -name prime256v1 -genkey -noout -out "$D/alice2.key" 2>/dev/null
+PK2="$(openssl ec -in "$D/alice2.key" -pubout -outform DER 2>/dev/null | tail -c 65 | python3 -c 'import sys,base64; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).rstrip(b"=").decode())')"
+# A merge patch of spec.publicKey, as a holder's PATCH leaves it: the old
+# status stays until the new key is certified.
+store_put "/devices.nanocloud.io/default/alice" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["spec"]["publicKey"]=sys.argv[2]; print(json.dumps(d,separators=(",",":")))' "$(store_last /devices.nanocloud.io/default/alice)" "$PK2")"
+run 5
+DEV2="$(store_last /devices.nanocloud.io/default/alice)"
+CRT2="$(python3 -c 'import json,sys; st=json.loads(sys.argv[1])["status"]; assert st["publicKey"]==sys.argv[2], st; print(st["certificate"])' "$DEV2" "$PK2")" \
+  || fail "alice's Device status does not name her new key: ${DEV2:0:160}"
+b64u_to_pem "$CRT2" "$D/leaf2.pem"
+[ "$(openssl x509 -in "$D/leaf2.pem" -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum)" = \
+  "$(openssl ec -in "$D/alice2.key" -pubout -outform DER 2>/dev/null | sha256sum)" ] \
+  || fail "the re-issued leaf does not certify alice's new key"
+openssl verify -CAfile "$D/ca.pem" "$D/leaf2.pem" >/dev/null 2>&1 || fail "the re-issued leaf does not chain"
+IDENT2="$(store_last /deviceidentities.nanocloud.io/default/alice)"
+[ "${IDENT2#*;crt=}" != "${IDENT#*;crt=}" ] || fail "alice's identity record still holds the old certificate"
+echo "   the new key certified; the identity record and the Device's status carry it"
 
 echo "== E2E green: Device identities as params — certified by kagi under the node's vault root =="

@@ -98,22 +98,22 @@ modules:
     paths: "status.ready"
   - name: mark
     type: store_effect
-    decision: "${DEC_RDY}"
+    decision: {hex: "${DEC_RDY}"}
     key_prefix: "/ready-nodes/"
   # place: DaemonSets x ready Nodes
   - name: ds_source
     type: store_source
     prefix: "/daemonsets.apps/"
-    paths: "spec.template.spec.*"
+    paths: "spec.template.spec.*,metadata.uid"
     join: "/ready-nodes/"
     watch: "/ready-nodes/,/pods/"
   - name: exists
     type: store_effect
-    decision: "${DEC_PRB}"
+    decision: {hex: "${DEC_PRB}"}
     key_prefix: "/pods/"
   - name: apply
     type: store_effect
-    decision: "${DEC_MK}"
+    decision: {hex: "${DEC_MK}"}
     key_prefix: "/pods/"
   # prune: DaemonSet Pods on Nodes no longer ready
   - name: pods
@@ -123,11 +123,11 @@ modules:
     watch: "/ready-nodes/"
   - name: known
     type: store_effect
-    decision: "${DEC_ASK}"
+    decision: {hex: "${DEC_ASK}"}
     key_prefix: "/ready-nodes/"
   - name: collect
     type: store_effect
-    decision: "${DEC_PRN}"
+    decision: {hex: "${DEC_PRN}"}
     key_prefix: "/pods/"
 wiring:
   - from: nodes.status

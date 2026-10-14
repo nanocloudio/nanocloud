@@ -94,24 +94,24 @@ scheduler:
 modules:
   - name: store_source
     prefix: "/deployments.apps/"
-    paths: "spec,spec.replicas,spec.template.metadata.labels"
+    paths: "spec,spec.replicas,spec.template.metadata.labels,metadata.uid"
     hash: "spec.template"
   - name: current
     type: store_effect
-    decision: "${DEC_RD}"
+    decision: {hex: "${DEC_RD}"}
     key_prefix: "/replicasets.apps/"
     paths: "metadata.labels.pod-template-hash,spec"
   - name: history
     type: store_effect
-    decision: "${DEC_ARCH}"
+    decision: {hex: "${DEC_ARCH}"}
     key_prefix: "/controllerrevisions.apps/"
   - name: apply
     type: store_effect
-    decision: "${DEC_WR}"
+    decision: {hex: "${DEC_WR}"}
     key_prefix: "/replicasets.apps/"
   - name: events
     type: store_effect
-    decision: "${DEC_REC}"
+    decision: {hex: "${DEC_REC}"}
     key_prefix: "/events/"
 wiring:
   - from: store_source.status

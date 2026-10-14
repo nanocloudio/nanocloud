@@ -18,6 +18,7 @@ module nanocloud.job {
     tmpl: string = 31;
     ns: string = 34;
     name: string = 35;
+    ouid: string = 36;    // the Job's metadata.uid: its Pods' controller reference
     pod: string = 39;
   }
 
@@ -27,6 +28,7 @@ module nanocloud.job {
     key: string = 3;
     tmpl: string = 4;        // spec.template.spec
     completions: string = 5; // spec.completions as text; empty = not a Job
+    uid: string = 6;         // metadata.uid, the Pods' controller reference
     ord: int = 20;
     want: int = 22;
     selfkey: string = 24;
@@ -92,22 +94,22 @@ module nanocloud.job {
 
   decision probe(o: jb.Ord) -> jb.Probe {
     when o.completions == "" ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod } };
+      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
     when o.ord < o.want ->
-      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, ns: o.ns, name: o.name, pod: o.pod } };
+      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
     default ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod } };
+      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
   }
   decision launch(a: jb.Answer) -> jb.Create {
     when a.status == 404 && a.ctx.key != "" ->
       jb.Create { cid: a.cid, op: PUT, key: a.ctx.key,
-                  p1: "{\"metadata\":{\"name\":\"",
+                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
                   p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
                   p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"kind\":\"Job\",\"name\":\"",
+                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"name\":\"",
                   p6: a.ctx.name,
-                  p7: "\"}]},\"spec\":",
+                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":",
                   p8: a.ctx.tmpl,
                   p9: "}" };
     default ->

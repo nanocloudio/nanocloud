@@ -104,8 +104,9 @@ PY
 echo "== 1. build the sa-token graph =="
 nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
 
-echo "== 2. three requests: explicit, defaulted, and one naming no ServiceAccount =="
+echo "== 2. four requests: explicit, with a lifetime, defaulted, and one naming no ServiceAccount =="
 store_put "/token-req/req1" "ns=default;sa=builder;aud=nanocloud"
+store_put "/token-req/long" "ns=kube-system;sa=admin;aud=nanocloud;ttl=2592000"
 store_put "/token-req/req2" "sa=bare"
 store_put "/token-req/bad" "ns=team"
 run 5
@@ -115,15 +116,15 @@ KEY1="$(key_hex)"
 [ -n "$KEY1" ] || fail "/authn-keys/sa was not written"
 
 echo "== 4. each token verifies against THAT key, with the right claims =="
-check() { # check <id> <sub> <aud> <ns> <sa>
+check() { # check <id> <sub> <aud> <ns> <sa> [ttl]
   RESP="$(store_last "/token-resp/$1")"
   JWT="${RESP#token=}"
   [ "$JWT" != "$RESP" ] || fail "no token= in /token-resp/$1: '$RESP'"
-  python3 - "$JWT" "$KEY1" "$2" "$3" "$4" "$5" <<'PY' || fail "token $1 did not verify"
+  python3 - "$JWT" "$KEY1" "$2" "$3" "$4" "$5" "${6:-3600}" <<'PY' || fail "token $1 did not verify"
 import sys, base64, json
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives import hashes
-jwt, frame, sub, aud, ns, sa = sys.argv[1:7]
+jwt, frame, sub, aud, ns, sa, ttl = sys.argv[1:8]
 frame = bytes.fromhex(frame)
 # MSG_KEY_ADD: [type][len u16] then the record; the key is the trailing f16.
 assert frame[0] == 0x22, f"not a MSG_KEY_ADD: {frame[:3].hex()}"
@@ -142,12 +143,13 @@ assert pl["iss"] == "https://kubernetes.default.svc", pl
 assert pl["sub"] == sub, pl
 assert pl["aud"] == aud, pl
 assert pl["kubernetes.io"] == {"namespace": ns, "serviceaccount": {"name": sa}}, pl
-assert 0 < pl["exp"] - pl["iat"] <= 3600, pl
+assert pl["exp"] - pl["iat"] == int(ttl), pl
 print(f"   {sub}: signature verifies, aud={pl['aud']}, exp-iat={pl['exp']-pl['iat']}")
 PY
 }
 check req1 "system:serviceaccount:default:builder" nanocloud default builder
 check req2 "system:serviceaccount:default:bare" nanocloud default bare
+check long "system:serviceaccount:kube-system:admin" nanocloud kube-system admin 2592000
 
 echo "== 5. a request naming no ServiceAccount is answered, not left to time out =="
 [ "$(store_last /token-resp/bad)" = "error=mint-refused" ] || fail "bad: got '$(store_last /token-resp/bad)'"

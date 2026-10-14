@@ -93,7 +93,10 @@ hardware_targets = ["bcm2712", "linux"]
 # `unless = <prefix>` emits only objects whose SAME KEY under that prefix is
 # ABSENT — a request with no lease, a claim whose owner is gone. A filter like
 # `where`, applied to the count too, so "the first one still waiting" is
-# index 0. `empty = 1` (with `count`) sends ONE record when nothing qualified —
+# index 0. `differs = "<path>,<path>"` emits only objects whose two paths read
+# differently (absent reads empty): `spec.publicKey,status.publicKey` is "a key
+# not yet the one certified", so a holder that re-keys is certified again.
+# `empty = 1` (with `count`) sends ONE record when nothing qualified —
 # tail empty, 20 = 0, 22 = 0 — because "the set is empty" is a fact no
 # per-object record can carry. `ints` paths take `.` and `!<mod>` as well, and
 # land at 50..56 — seven at most, because 57 (the key remainder) and 58 (the
@@ -104,7 +107,17 @@ hardware_targets = ["bcm2712", "linux"]
 #
 # `label = <text>` stamps it at 48 on every record, the `empty` one too: what
 # the graph is to its decisions, which cannot hold a per-deployment literal — a
-# node graph's own name, so it can register and renew itself.
+# node graph's own name, so it can register and renew itself. `facts = <text>`
+# stamps it at 49 the same way: what the render knows of the node and no record
+# says (its labels, as JSON members — arch, os, the fluxor ABI).
+#
+# `join_fit = "<object path>:<prefix>:<joined path>"` narrows a `join_pick`
+# to the joined entries the object FITS: the object's selector (a JSON object
+# at <object path>; absent or `{}` fits all) is a subset of the labels at
+# <joined path> of `<prefix><entry name>` — a Pod's `spec.nodeSelector`
+# against a node's `metadata.labels`. An object no entry fits is not emitted
+# and takes no counted position (field 20): an unschedulable Pod is not
+# "the first unbound Pod" holding every Pod behind it.
 #
 # `now = 1` stamps the monotonic ms clock at 58 on every record of a scan.
 # `due = <path,…>` names fields holding deadlines in that clock: the earliest

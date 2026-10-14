@@ -24,6 +24,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 PORT=5391
+AUTH_PORT=5392   # the same images, behind a Bearer challenge
+REALM_PORT=5393  # that challenge's token realm — another authority
 
 . "$ROOT/scripts/fluxor-env.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -37,10 +39,12 @@ done
 
 D="$(mktemp -d /tmp/nc-imgfetch-XXXXXX)"
 REG_PID=""
+AUTH_PID=""
 RUNTIME_PID=""
 cleanup() {
   [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true
   [ -n "$REG_PID" ] && kill "$REG_PID" 2>/dev/null || true
+  [ -n "$AUTH_PID" ] && kill "$AUTH_PID" 2>/dev/null || true
   rm -rf "$D"
 }
 trap cleanup EXIT
@@ -291,4 +295,111 @@ done
 grep -q "206" "$D/reg.log" || grep -q "Range" "$D/reg.log" || true
 echo "   both blobs re-fetched in 4 KiB Range chunks, digests verified"
 
-echo "== E2E green: image pull as params (request -> index -> manifest -> config -> verified content-addressed cache; whole-blob + chunked Range) =="
+echo "== 9. a registry that wants a token: Bearer challenge -> its realm (another authority, Basic credentials from the store) -> the pull again; tokens expire mid-blob; chunked transfer coding =="
+# The registry answers 401 + `WWW-Authenticate: Bearer realm=…` to a request
+# without a live token; the realm hands out tokens that serve 6 requests, so
+# a 4 KiB-Range pull of the 100 KiB layer meets several expiries and must
+# refresh mid-blob. Manifests and tokens come chunked-coded, without a
+# Content-Length. The credentials are a store key's value, never config.
+python3 - "$D/reg" "$AUTH_PORT" "$REALM_PORT" >"$D/auth.log" 2>&1 <<'PY' &
+import base64, http.server, json, os, secrets, socketserver, sys, threading, urllib.parse
+d, port, realm_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+manifest = open(os.path.join(d, "manifest.json"), "rb").read()
+USES = 6
+tokens, lock = {}, threading.Lock()
+def log(m):
+    sys.stderr.write(m + "\n"); sys.stderr.flush()
+class Base(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def answer(self, status, body=b"", ctype="application/octet-stream", chunked=False, extra=()):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        for k, v in extra:
+            self.send_header(k, v)
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if chunked:
+            for i in range(0, len(body), 37):  # odd chunk sizes, an extension on one
+                part = body[i:i + 37]
+                ext = ";x=1" if i == 0 else ""
+                self.wfile.write(b"%x%s\r\n" % (len(part), ext.encode()) + part + b"\r\n")
+            self.wfile.write(b"0\r\nX-Trailer: t\r\n\r\n")
+        else:
+            self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+class Realm(Base):
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        auth = self.headers.get("Authorization", "")
+        ok = auth == "Basic " + base64.b64encode(b"puller:s3cret").decode()
+        log(f"TOKEN path={u.path} service={q.get('service')} scope={q.get('scope')} basic={'ok' if ok else 'no'}")
+        if u.path != "/token" or not ok or q.get("service") != ["stub-registry"] \
+                or q.get("scope") != ["repository:testapp:pull"]:
+            return self.answer(401, b"{}", "application/json")
+        t = secrets.token_urlsafe(900)  # ~1.2 KiB, a registry JWT's size
+        with lock:
+            tokens[t] = USES
+        self.answer(200, json.dumps({"token": t, "expires_in": 60}).encode(), "application/json", chunked=True)
+class Reg(Base):
+    def do_GET(self):
+        auth = self.headers.get("Authorization", "")
+        t = auth[7:] if auth.startswith("Bearer ") else ""
+        with lock:
+            left = tokens.get(t, 0)
+            if left > 0:
+                tokens[t] = left - 1
+        if left <= 0:
+            log(f"401 {self.path} token={'stale' if t else 'none'}")
+            ch = (f'Bearer realm="http://127.0.0.1:{realm_port}/token",'
+                  f'service="stub-registry",scope="repository:testapp:pull"')
+            return self.answer(401, b'{"errors":[{"code":"UNAUTHORIZED"}]}', "application/json",
+                               extra=[("WWW-Authenticate", ch)])
+        parts = self.path.strip("/").split("/")
+        log(f"200 {self.path} range={self.headers.get('Range')}")
+        if parts[-2] == "manifests":
+            return self.answer(200, manifest, "application/vnd.docker.distribution.manifest.v2+json", chunked=True)
+        body = open(os.path.join(d, parts[-1].split(":")[-1]), "rb").read()
+        rng = self.headers.get("Range")
+        if rng:
+            lo, _, hi = rng[6:].partition("-")
+            body = body[int(lo):int(hi) + 1]
+            return self.answer(206, body)
+        self.answer(200, body)
+class S(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+r = S(("127.0.0.1", realm_port), Realm)
+threading.Thread(target=r.serve_forever, daemon=True).start()
+with S(("127.0.0.1", port), Reg) as srv:
+    srv.serve_forever()
+PY
+AUTH_PID=$!
+for i in $(seq 1 40); do
+  python3 -c "import socket;socket.create_connection(('127.0.0.1',$AUTH_PORT),timeout=0.2).close()" 2>/dev/null && break
+  sleep 0.1
+done
+rm -f "$D/store.log" "$D/blobcache/"*
+sed -e "s#localhost:$PORT#localhost:$AUTH_PORT#" \
+    -e 's#credentials: "/registry-auth/registry.nanocloud.io"#credentials: "/registry-auth/stub"#' "$D/graph2.yaml" >"$D/graph3.yaml"
+grep -q 'credentials: "/registry-auth/stub"' "$D/graph3.yaml" || fail "the credentials splice did not apply"
+nc_build_workload "$ROOT" "$D/graph3.yaml" "$D/config3.bin" "$D/modules3.bin"
+wal_put "/registry-auth/stub" "puller:s3cret"
+wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
+run_until "$D/config3.bin" "$D/modules3.bin" testapp 60
+for dg in "$D1" "$D2"; do
+  got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
+  [ "$got" = "$dg" ] || fail "authenticated blob mismatch for $dg (sha=$got)"
+done
+[ "$(wal_last /image-config/testapp)" = "$want" ] || fail "authenticated image config: '$(wal_last /image-config/testapp)'"
+NT="$(grep -c "^TOKEN .*basic=ok" "$D/auth.log" || true)"
+NS="$(grep -c "^401 .*token=stale" "$D/auth.log" || true)"
+grep -q "^TOKEN .*basic=no" "$D/auth.log" && fail "a token request went without the store's credentials"
+[ "$NT" -ge 2 ] && [ "$NS" -ge 1 ] || { cat "$D/auth.log" | tail -20; fail "expected token refreshes after expiry (tokens=$NT stale=$NS)"; }
+echo "   pulled through the challenge: $NT token(s) from the realm, $NS expired mid-pull and refreshed; digests verified"
+
+echo "== E2E green: image pull as params (request -> index -> manifest -> config -> verified content-addressed cache; whole-blob + chunked Range; Bearer token auth) =="

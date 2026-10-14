@@ -1,0 +1,71 @@
+# Lattice as a workload image: a standalone key-value node speaking RESP —
+# redis_edge_anchor on the node's network through a lane of the Pod's own
+# (`net:0`), kv_request_router, the state machine with its disk store and
+# command log (`state_store: 1`, `command_log: 1`), and the TTL clock: lattice's
+# configs/single-minimal-disk-log.yaml, derived by scripts/support/to-workload.py.
+#
+# Durable without a volume: a workload's storage is rooted at its owner
+# (fluxor 812bdbe9 — $FLUXOR_OWNER_ROOT/<identity>/), which a node restart
+# keeps and only the workload's DESTROY removes. A Pod's identity is its UID,
+# so its data lives as long as the Pod: a power cut keeps it, a delete ends it.
+#
+#   fluxor build packaging/apps/lattice-kv.yaml --emit=workload -o <dir>
+#   fluxor publish workload <dir>     (registry.nanocloud.io/nanocloud/lattice-kv)
+target: linux
+tick_us: 1000
+modules: []
+wiring: []
+workloads:
+- modules:
+  - name: redis_edge_anchor
+    params:
+      listen_port: 6379
+    type: redis_edge_anchor
+  - name: kv_request_router
+    type: kv_request_router
+  - name: kv_state_worker
+    params:
+      state_store: 1
+      command_log: 1
+      # The store at the root of the Pod's own files (as on a board's FAT32):
+      # nothing pre-creates a `lattice/` directory inside a workload.
+      root_path: 1
+    type: kv_state_worker
+  - name: ttl_scheduler
+    params:
+      propose_wrap: 0
+    type: ttl_scheduler
+  wiring:
+  - from: net:0
+    to: redis_edge_anchor
+  - from: redis_edge_anchor
+    to: net:0
+  - from: redis_edge_anchor
+    from_port: 1
+    to: kv_request_router
+    to_port: 1
+  - from: kv_request_router
+    from_port: 4
+    to: redis_edge_anchor
+    to_port: 1
+  - from: kv_request_router
+    to: kv_state_worker
+  - from: kv_state_worker
+    to: kv_request_router
+    to_port: 7
+  - from: ttl_scheduler
+    from_port: 3
+    to: kv_state_worker
+  - from: ttl_scheduler
+    from_port: 3
+    to: ttl_scheduler
+  - from: kv_state_worker
+    from_port: 6
+    to: ttl_scheduler
+    to_port: 2
+  - from: kv_state_worker
+    from_port: 8
+    to: kv_state_worker
+  - from: ttl_scheduler
+    to: kv_state_worker
+    to_port: 4

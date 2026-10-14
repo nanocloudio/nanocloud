@@ -35,11 +35,10 @@ include!("../_shared/jsonq.rs");
 mod chron {
     include!("../../../target/fluxor/chronicle-common/vm_core.rs");
     include!("../../../target/fluxor/chronicle-common/pipeline_core.rs");
-    include!("../../../target/fluxor/chronicle-common/hex_core.rs");
+    include!("../../../target/fluxor/chronicle-common/blob_core.rs");
     include!("../../../target/fluxor/chronicle-common/lower_core.rs");
 }
-/// The filter pipeline: its IR hex as it arrives, and lowered.
-const FILT_HEX: usize = 4096;
+/// The filter pipeline: its IR container as it arrives, and lowered.
 const FILT_BUF: usize = 2048;
 /// Stages a filter may hold (the pipeline module's own bound).
 const FILT_STAGES: usize = 8;
@@ -252,12 +251,26 @@ struct State {
     /// unbound pod" is index 0 under `where = "spec.nodeName="`.
     where_: [u8; 96],
     where_len: u8,
+    /// `differs = "<path>,<path>"`: emit only objects whose two paths read
+    /// differently (absent reads empty) — "a key not yet the one certified":
+    /// `spec.publicKey,status.publicKey` asks again when a holder re-keys.
+    differs: [u8; 96],
+    differs_len: u8,
     /// `join_pick = "min:<path>"`: the join reduces to the ONE joined entry
     /// whose integer at <path> is least (ties: lowest key). An argmin is a fold
     /// over the joined set; it lives in the source for the same reason a count
     /// does, and the decision sees one record with the winner in it.
     join_pick: [u8; 64],
     join_pick_len: u8,
+    /// `join_fit = "<object path>:<prefix>:<joined path>"`: only a joined
+    /// entry the object FITS is picked — the object's selector at <object
+    /// path> (a JSON object of labels; absent or empty fits every entry) is
+    /// a subset of the labels at <joined path> of `<prefix><entry name>`.
+    /// A Pod's `spec.nodeSelector` against a node's `metadata.labels`. An
+    /// object no entry fits is not emitted, and does not take a counted
+    /// position: an unschedulable Pod holds no Pod behind it.
+    join_fit: [u8; 96],
+    join_fit_len: u8,
     /// `now = 1`: field 58 is the monotonic clock in ms, read once per scan,
     /// on every record — so a decision compares "now >= deadline" as two
     /// integers. Reading the clock makes this instance `wall_clock` class.
@@ -408,6 +421,11 @@ struct State {
     /// what the graph is to its decisions (a node's own name).
     label: [u8; 64],
     label_len: u8,
+    /// `facts = <text>`: stamped at 49 on every record beside `label` — what
+    /// the graph's render knows of the node it runs on (its labels, as JSON
+    /// members: arch, os, the fluxor ABI), which no store record says.
+    facts: [u8; 192],
+    facts_len: u8,
     /// `trace` param: a periodic counter line (`[store_source] trace`), for
     /// a source whose silence needs explaining. Off by default.
     trace: u8,
@@ -462,10 +480,12 @@ struct State {
     /// `ir_stages`/`stage_kinds`/`keep`: the filter (see `chron`). A record
     /// passes when the pipeline's output field `keep` is true; a filter that
     /// does not load fails CLOSED — nothing passes, and it is said so.
-    filt_hex: [u8; FILT_HEX],
-    filt_hex_len: u16,
-    filt_kinds_hex: [u8; 16],
-    filt_kinds_hex_len: u8,
+    /// `ir_stages` and `stage_kinds`, `blob` params arriving into
+    /// `filt_ir` and `filt_kinds_in_buf`.
+    filt_in: chron::BlobIn,
+    filt_ir: [u8; FILT_BUF],
+    kinds_in: chron::BlobIn,
+    filt_kinds_in_buf: [u8; FILT_STAGES],
     keep: u32,
     filt: [u8; FILT_BUF],
     filt_len: u16,
@@ -639,6 +659,13 @@ mod params_def {
                 if n > 0 { ptr_copy(s.where_.as_mut_ptr(), d, n); }
             };
 
+        46, differs, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 96 } else { len };
+                s.differs_len = n as u8;
+                if n > 0 { ptr_copy(s.differs.as_mut_ptr(), d, n); }
+            };
+
         21, join_pick, str, 0
             => |s, d, len| {
                 let n = if len > 64 { 64 } else { len };
@@ -709,23 +736,15 @@ mod params_def {
         41, stale_at_open, u32, 0
             => |s, d, len| { s.stale_at_open = super::p_u32(d, len, 0, 0); };
 
-        36, ir_stages, str_chunked, 0
-            => |s, d, len| {
-                let mut i = 0usize;
-                while i < len && (s.filt_hex_len as usize) < super::FILT_HEX {
-                    s.filt_hex[s.filt_hex_len as usize] = *d.add(i);
-                    s.filt_hex_len += 1;
-                    i += 1;
-                }
-                if i < len { s.filt_fault = 1; }
-            };
+        // `blob`: the filter's IR-stages container, its own bytes in chunks
+        // of at most 255, the first led by its whole length (chronicle
+        // blob_core).
+        36, ir_stages, blob, 0
+            => |s, d, len| { s.filt_in.take(&mut s.filt_ir, core::slice::from_raw_parts(d, len)); };
 
-        37, stage_kinds, str, 0
-            => |s, d, len| {
-                let n = if len > 16 { 16 } else { len };
-                s.filt_kinds_hex_len = n as u8;
-                if n > 0 { ptr_copy(s.filt_kinds_hex.as_mut_ptr(), d, n); }
-            };
+        // One byte per stage, parallel to `ir_stages` (a `blob` like it).
+        37, stage_kinds, blob, 0
+            => |s, d, len| { s.kinds_in.take(&mut s.filt_kinds_in_buf, core::slice::from_raw_parts(d, len)); };
 
         38, keep, u32, 99
             => |s, d, len| { s.keep = super::p_u32(d, len, 0, 99); };
@@ -746,6 +765,20 @@ mod params_def {
 
         45, trace, u8, 0
             => |s, d, len| { s.trace = super::p_u8(d, len, 0, 0); };
+
+        47, facts, str, 0
+            => |s, d, len| {
+                let n = if len > 192 { 0 } else { len };
+                s.facts_len = n as u8;
+                if n > 0 { ptr_copy(s.facts.as_mut_ptr(), d, n); }
+            };
+
+        48, join_fit, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 0 } else { len };
+                s.join_fit_len = n as u8;
+                if n > 0 { ptr_copy(s.join_fit.as_mut_ptr(), d, n); }
+            };
     }
 }
 
@@ -1214,6 +1247,13 @@ unsafe fn project(
     n += 1;
     if s.label_len > 0 {
         let Some(q) = put_field(out, p, 48, TY_BYTES, &s.label[..s.label_len as usize]) else {
+            return 0;
+        };
+        p = q;
+        n += 1;
+    }
+    if s.facts_len > 0 {
+        let Some(q) = put_field(out, p, 49, TY_BYTES, &s.facts[..s.facts_len as usize]) else {
             return 0;
         };
         p = q;
@@ -2427,6 +2467,9 @@ unsafe fn unless_ok(s: &State, sys: &SyscallTable, tail: &[u8]) -> bool {
 }
 
 fn where_ok(s: &State, value: &[u8]) -> bool {
+    if !differs_ok(s, value) {
+        return false;
+    }
     if s.where_len == 0 {
         return true;
     }
@@ -2443,6 +2486,28 @@ fn where_ok(s: &State, value: &[u8]) -> bool {
         j_path(value, &segs[..ns]).unwrap_or(&[])
     };
     got == &w[eq + 1..]
+}
+
+/// One path of `value`, flat or JSON; absent reads empty.
+fn path_value<'a>(s: &State, value: &'a [u8], path: &[u8]) -> &'a [u8] {
+    if s.flat != 0 {
+        return flat_field(value, path).unwrap_or(&[]);
+    }
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let ns = split_dots(path, &mut segs);
+    j_path(value, &segs[..ns]).unwrap_or(&[])
+}
+
+/// The `differs` filter: the two paths read differently.
+fn differs_ok(s: &State, value: &[u8]) -> bool {
+    if s.differs_len == 0 {
+        return true;
+    }
+    let d = &s.differs[..s.differs_len as usize];
+    let Some(c) = d.iter().position(|&b| b == b',') else {
+        return true;
+    };
+    path_value(s, value, &d[..c]) != path_value(s, value, &d[c + 1..])
 }
 
 /// What a scoped join is scoped TO: the object's whole tail (`join_scoped =
@@ -2577,7 +2642,48 @@ unsafe fn list_children(
 ///                              load measured from the facts themselves,
 ///                              not from a projection that lags them
 /// Ties go to the lowest key. None when the join is empty.
-unsafe fn join_argmin(s: &State, sys: &SyscallTable, tail: &[u8], out: &mut [u8]) -> Option<usize> {
+/// `join_fit`: whether the object `val` fits the joined entry `name`.
+unsafe fn join_fits(s: &State, sys: &SyscallTable, val: &[u8], name: &[u8]) -> bool {
+    if s.join_fit_len == 0 {
+        return true;
+    }
+    let spec = &s.join_fit[..s.join_fit_len as usize];
+    let mut it = spec.splitn(3, |&b| b == b':');
+    let (Some(opath), Some(prefix), Some(jpath)) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let ns = split_dots(opath, &mut segs);
+    // No selector, or an empty one, asks nothing of the entry.
+    let Some(sel) = j_sub(val, &segs[..ns]) else {
+        return true;
+    };
+    let inner = j_ws(sel, 1);
+    if inner < sel.len() && sel[inner] == b'}' {
+        return true;
+    }
+    let mut key = [0u8; MAX_KEY + MAX_PREFIX];
+    let kl = append_bytes(&mut key, 0, prefix);
+    let kl = append_bytes(&mut key, kl, name);
+    let mut v = [0u8; MAX_VALUE];
+    let Some(vl) = get_value(sys, &key[..kl], &mut v) else {
+        return false;
+    };
+    let mut jsegs: [&[u8]; 6] = [&[]; 6];
+    let jn = split_dots(jpath, &mut jsegs);
+    match j_sub(&v[..vl], &jsegs[..jn]) {
+        Some(labels) => j_obj_subset(sel, labels),
+        None => false,
+    }
+}
+
+unsafe fn join_argmin(
+    s: &State,
+    sys: &SyscallTable,
+    tail: &[u8],
+    val: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
     let jp = &s.join_pick[..s.join_pick_len as usize];
     let c1 = jp
         .iter()
@@ -2596,6 +2702,14 @@ unsafe fn join_argmin(s: &State, sys: &SyscallTable, tail: &[u8], out: &mut [u8]
         let Some(kl) = join_nth(s, sys, tail, i, &mut k) else {
             break;
         };
+        let last = match k[..kl].iter().rposition(|&b| b == b'/') {
+            Some(x) => &k[x + 1..kl],
+            None => &k[..kl],
+        };
+        if !join_fits(s, sys, val, last) {
+            i += 1;
+            continue;
+        }
         let measure = if mode == b"mincount" {
             // rest = "<prefix>:<path>"; the name is the entry's last segment.
             let c2 = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
@@ -2764,7 +2878,7 @@ unsafe fn count_page(s: &mut State) -> bool {
                 continue;
             }
         }
-        if s.where_len > 0 {
+        if s.where_len > 0 || s.differs_len > 0 {
             // The filter applies to the count too, or the index is a position
             // in a set the emit walk does not emit.
             let mut v = [0u8; MAX_VALUE];
@@ -3043,7 +3157,12 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             None
         };
         let joined = if s.join_len > 0 && span.is_none() {
-            if s.join_pick_len > 0 {
+            if s.join_pick_len > 0 && s.join_fit_len > 0 {
+                // A pick among the entries the object fits: none fits, no
+                // record.
+                let mut probe = [0u8; MAX_KEY];
+                Some(if join_argmin(s, sys, tail, &val[..vlen], &mut probe).is_some() { 1 } else { 0 })
+            } else if s.join_pick_len > 0 {
                 // A pick reduces the join to one record — or none, when the
                 // joined set is empty: there is nothing to choose.
                 Some(if join_count(s, sys, tail) > 0 { 1 } else { 0 })
@@ -3077,7 +3196,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             let mut segbuf = [0u8; MAX_KEY];
             let join = match joined {
                 Some(j) => match if s.join_pick_len > 0 {
-                    join_argmin(s, sys, tail, &mut segbuf)
+                    join_argmin(s, sys, tail, &val[..vlen], &mut segbuf)
                 } else {
                     join_nth(s, sys, tail, ord, &mut segbuf)
                 } {
@@ -3150,8 +3269,11 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             return wrote;
         }
         // Entry expanded whole; the next one starts its own expansion at 0.
+        // An object no joined entry fits takes no counted position.
         s.exp_off = 0;
-        s.list_idx += 1;
+        if !(s.join_fit_len > 0 && joined == Some(0)) {
+            s.list_idx += 1;
+        }
     }
 
     s.page_off = 0; // page delivered whole
@@ -3254,7 +3376,10 @@ pub unsafe extern "C" fn module_new(
         s.terms_max = 0;
         s.list_children_len = 0;
         s.where_len = 0;
+        s.differs_len = 0;
         s.join_pick_len = 0;
+        s.join_fit_len = 0;
+        s.facts_len = 0;
         s.now = 0;
         s.due_len = 0;
         s.related_len = 0;
@@ -3304,8 +3429,8 @@ pub unsafe extern "C" fn module_new(
         s.evh = core::ptr::null_mut();
         s.evh_cap = 0;
         s.ev_heap = 0;
-        s.filt_hex_len = 0;
-        s.filt_kinds_hex_len = 0;
+        s.filt_in = chron::BlobIn::new();
+        s.kinds_in = chron::BlobIn::new();
         s.keep = 99;
         s.filt_len = 0;
         s.filt_fault = 0;
@@ -4092,30 +4217,33 @@ unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> u
     }
 }
 
-/// Lower the filter pipeline once, at construction. A filter that does not
-/// decode, lower or scan leaves `filt_fault` set: every candidate is then
+/// Lower the filter pipeline once, at construction. A filter that arrived
+/// cut short, or does not lower or scan, leaves `filt_fault` set: every candidate is then
 /// refused, and the log says why — a selector that silently passed
 /// everything would be a leak, not a degradation.
 unsafe fn load_filter(s: &mut State) {
-    if s.filt_hex_len == 0 && s.filt_fault == 0 {
+    if !s.filt_in.given() && !s.kinds_in.given() && s.filt_fault == 0 {
         return;
     }
-    let mut ir = [0u8; FILT_BUF];
-    let mut kinds = [0u8; FILT_STAGES];
-    let nk = if s.filt_kinds_hex_len > 0 {
-        chron::hex_decode(
-            &s.filt_kinds_hex[..s.filt_kinds_hex_len as usize],
-            &mut kinds,
-        )
-        .unwrap_or(0)
+    // A program cut short or past its buffer is a different program: refused.
+    let nk = if s.kinds_in.given() {
+        match s.kinds_in.whole() {
+            Some(n) => n,
+            None => {
+                s.filt_fault = 1;
+                0
+            }
+        }
     } else {
         0
     };
+    let kinds = s.filt_kinds_in_buf;
     let lowered = if s.filt_fault != 0 {
         None
     } else {
-        chron::hex_decode(&s.filt_hex[..s.filt_hex_len as usize], &mut ir)
-            .and_then(|n| chron::lower_stages_kinded(&ir[..n], &kinds[..nk], &mut s.filt).ok())
+        s.filt_in.whole().and_then(|n| {
+            chron::lower_stages_kinded(&s.filt_ir[..n], &kinds[..nk], &mut s.filt).ok()
+        })
     };
     match lowered {
         Some(n) if chron::stage_count(&s.filt[..n]) <= FILT_STAGES => {

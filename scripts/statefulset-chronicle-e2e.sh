@@ -69,23 +69,23 @@ scheduler:
 modules:
   - name: store_source
     prefix: "/statefulsets.apps/"
-    paths: "spec.template.spec,spec.replicas"
+    paths: "spec.template.spec,spec.replicas,metadata.uid"
     expand: "spec.replicas"
     expand_tail: 2
     expand_over: "/pods/"
     watch: "/pods/"
   - name: nbget
     type: store_effect
-    decision: "${DEC_NB}"
+    decision: {hex: "${DEC_NB}"}
     key_prefix: "/pods/"
     paths: "status.ready"
   - name: selfget
     type: store_effect
-    decision: "${DEC_ASK}"
+    decision: {hex: "${DEC_ASK}"}
     key_prefix: "/pods/"
   - name: apply
     type: store_effect
-    decision: "${DEC_ACT}"
+    decision: {hex: "${DEC_ACT}"}
     key_prefix: "/pods/"
 wiring:
   - from: store_source.status

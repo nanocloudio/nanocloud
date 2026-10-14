@@ -18,7 +18,13 @@
 //
 // A status recorded under another boot describes a workload that no longer
 // exists — the node restarted — so the sandbox is created again, as a runtime
-// with an empty table would.
+// with an empty table would; and one being deleted is destroyed as asked (the
+// runtime answers `destroyed` for a workload it does not hold), so its status
+// settles instead of keeping the last boot's. Nothing is created for a Pod
+// whose spec says it is being deleted: at a restart the lifecycle's `delete`
+// and this chain's view of the last boot's `start` race, and the loser made a
+// deleted Pod run again. A sandbox with no Pod (`fluxor-sandbox-cli`) has no
+// spec, which `has` lets through.
 module nanocloud.sandbox {
 
   // The context each chain here carries across its effects: ONE nested
@@ -71,6 +77,7 @@ module nanocloud.sandbox {
     pfx: string = 90;      // /ipam-pool, its prefix length
     boot: string = 100;    // /sandbox-boot: this runtime's
     nvol: int = 110;       // /pod-specs/<id> volumes, counted
+    desired: string = 111; // /pod-specs/<id> desired: `deleted` once its Pod is
   }
   message Op {
     cid: int = 1;
@@ -80,6 +87,7 @@ module nanocloud.sandbox {
     a8: string = 8; a9: string = 9; a10: string = 10;
     rev: int = 11;
     a12: string = 12;
+    a13: string = 13;      // pack: a pulled workload image (/image-manifests/<pack>)
     ctx: Ctx = 254;
   }
   // A graph-backed sandbox (/metal-sandboxes/): the workload is the FLXA the
@@ -91,31 +99,36 @@ module nanocloud.sandbox {
     key: string = 3;
     phase: string = 4;
     graph: string = 5;
+    pack: string = 6;      // a workload image's pack (absent: a Graph's FLXA)
     st: string = 70;       // /sandbox-status/ state   (related, in order: 70, 80, 90)
     boot: string = 80;     // /sandbox-boot: this runtime's
     sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
+    desired: string = 100; // /pod-specs/<id> desired: `deleted` once its Pod is
   }
   decision mspec(s: MSpec) -> Op {
-    when s.phase == "delete" && s.st != "" && s.st != "destroyed" && s.sboot == s.boot ->
+    when s.phase == "delete" && s.st != "" && s.st != "destroyed" ->
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" ->
+         && s.boot != ""
+         && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, ctx: Ctx { tag: "" } };
+           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack, ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
       Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
       Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
   }
   decision spec(s: Spec) -> Op {
-    when s.phase == "delete" && s.st != "" && s.st != "destroyed" && s.sboot == s.boot ->
+    when s.phase == "delete" && s.st != "" && s.st != "destroyed" ->
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != "" ->
+         && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != ""
+         && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
            a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" && s.bound >= s.nvol && s.net != "own" ->
+         && s.boot != "" && s.bound >= s.nvol && s.net != "own"
+         && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
            a8: "", a9: "", a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
@@ -264,11 +277,11 @@ module nanocloud.sandbox {
   transformation t_spec(s: Spec) -> Spec {
     Spec { seq: s.seq, key: s.key, phase: s.phase, cmd: s.cmd, rootfs: s.rootfs, iso: s.iso,
            net: s.net, tasks: s.tasks, bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
-           lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol }
+           lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol, desired: s.desired }
   }
   transformation t_mspec(s: MSpec) -> MSpec {
-    MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph,
-            st: s.st, sboot: s.sboot, boot: s.boot }
+    MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph, pack: s.pack,
+            st: s.st, sboot: s.sboot, boot: s.boot, desired: s.desired }
   }
   transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }
   transformation t_tty(t: Tty) -> Tty {

@@ -104,26 +104,26 @@ modules:
     now: 1
   - name: depget
     type: store_effect
-    decision: "${DEC_RD}"
+    decision: {hex: "${DEC_RD}"}
     key_prefix: "/deployments.apps/"
     ints: "spec.replicas"
   - name: metget
     type: store_effect
-    decision: "${DEC_MT}"
+    decision: {hex: "${DEC_MT}"}
     key_prefix: "/hpa-metrics/"
     flat: 1
     ints: "cpu"
   - name: rec
     type: decision
     params:
-      decision: "${DEC_RC}"
+      decision: {hex: "${DEC_RC}"}
   - name: stab
     type: aggregation
     params:
-      ir_def: "${AGG}"
+      ir_def: {hex: "${AGG}"}
   - name: patch
     type: store_effect
-    decision: "${DEC_AP}"
+    decision: {hex: "${DEC_AP}"}
     key_prefix: "/deployments.apps/"
   # The synthetic metric.
   - name: synth
@@ -134,11 +134,11 @@ modules:
     due: "next"
   - name: synth_put
     type: store_effect
-    decision: "${DEC_SP}"
+    decision: {hex: "${DEC_SP}"}
     key_prefix: "/hpa-metrics/"
   - name: synth_adv
     type: store_effect
-    decision: "${DEC_SA}"
+    decision: {hex: "${DEC_SA}"}
     key_prefix: "/synth/"
 wiring:
   - from: hpas.status

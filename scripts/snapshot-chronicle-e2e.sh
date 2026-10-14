@@ -80,11 +80,11 @@ modules:
     paths: "status.readyToUse,spec.source.persistentVolumeClaimName"
   - name: contents
     type: store_effect
-    decision: "${DEC_CT}"
+    decision: {hex: "${DEC_CT}"}
     key_prefix: "/volumesnapshotcontents.snapshot.storage.k8s.io/"
   - name: status
     type: store_effect
-    decision: "${DEC_BD}"
+    decision: {hex: "${DEC_BD}"}
     key_prefix: "/volumesnapshots.snapshot.storage.k8s.io/"
 wiring:
   - from: snaps.status

@@ -99,7 +99,7 @@ modules:
     due: "deadline"
   - name: reap
     type: store_effect
-    decision: "${DEC_EX}"
+    decision: {hex: "${DEC_EX}"}
     domain: main
     key_prefix: "/leases/"
 wiring:

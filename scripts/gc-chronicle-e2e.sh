@@ -130,11 +130,11 @@ modules:
     watch: "/replicasets.apps/"
   - name: owner
     type: store_effect
-    decision: "${DEC_PROBE}"
+    decision: {hex: "${DEC_PROBE}"}
     key_prefix: "/replicasets.apps/"
   - name: collect
     type: store_effect
-    decision: "${DEC_SWEEP}"
+    decision: {hex: "${DEC_SWEEP}"}
     key_prefix: "/pods/"
   # B — the same two decisions over different prefixes. Nothing recompiled.
   - name: rs_source
@@ -144,11 +144,11 @@ modules:
     watch: "/deployments.apps/"
   - name: rs_owner
     type: store_effect
-    decision: "${DEC_PROBE}"
+    decision: {hex: "${DEC_PROBE}"}
     key_prefix: "/deployments.apps/"
   - name: rs_collect
     type: store_effect
-    decision: "${DEC_SWEEP}"
+    decision: {hex: "${DEC_SWEEP}"}
     key_prefix: "/replicasets.apps/"
   # C — the cap. count: 1 is the whole difference.
   - name: ev_source
@@ -157,7 +157,7 @@ modules:
     count: 1
   - name: ev_collect
     type: store_effect
-    decision: "${DEC_CAP}"
+    decision: {hex: "${DEC_CAP}"}
     key_prefix: "/events/"
   - name: dbg
     type: debug

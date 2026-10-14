@@ -92,11 +92,11 @@ modules:
     paths: "peer"
   - name: get
     type: store_effect
-    decision: "${DEC_ASK}"
+    decision: {hex: "${DEC_ASK}"}
     key_prefix: "/peer-ids/"
   - name: put
     type: store_effect
-    decision: "${DEC_VERDICT}"
+    decision: {hex: "${DEC_VERDICT}"}
     key_prefix: "/authn-resp/"
   - name: dbg
     type: debug

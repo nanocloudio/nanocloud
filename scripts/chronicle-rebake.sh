@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Recompile every `# chronicle-source: <uproc> <entry>` param in the given
-# graphs and rewrite the `decision:` line that follows it. The inverse of
+# graphs and rewrite the `decision: {hex: "…"}` line that follows it (a
+# program param is a `blob`, written as its inline hex entry). The inverse of
 # chronicle-param-drift-e2e.sh: that one refuses a stale param, this one
 # refreshes it. Run after editing a .uproc.
 set -euo pipefail
@@ -21,7 +22,7 @@ for i, l in enumerate(lines):
         if not fresh:
             print(f"FAIL: {r.group(1)} did not assemble"); sys.exit(1)
         for j in range(i + 1, min(i + 12, len(lines))):
-            d = re.match(r'(\s*decode:\s*")([0-9a-f]+)(".*)', lines[j])
+            d = re.match(r'(\s*decode:\s*\{hex:\s*")([0-9a-f]*)("\}.*)', lines[j])
             if d:
                 if d.group(2) != fresh:
                     lines[j] = d.group(1) + fresh + d.group(3); changed += 1
@@ -36,7 +37,7 @@ for i, l in enumerate(lines):
         if not fresh:
             print(f"FAIL: {a.group(1)} did not build"); sys.exit(1)
         for j in range(i + 1, min(i + 12, len(lines))):
-            d = re.match(r'(\s*ir_def:\s*")([0-9a-f]+)(".*)', lines[j])
+            d = re.match(r'(\s*ir_def:\s*\{hex:\s*")([0-9a-f]*)("\}.*)', lines[j])
             if d:
                 if d.group(2) != fresh:
                     lines[j] = d.group(1) + fresh + d.group(3); changed += 1
@@ -51,7 +52,7 @@ for i, l in enumerate(lines):
     # predicate.
     key = "decision"
     for j in range(i + 1, min(i + 12, len(lines))):
-        k = re.match(r'\s*(decision|ir_stages|count_where):\s*"', lines[j])
+        k = re.match(r'\s*(decision|ir_stages|count_where):\s*\{hex:', lines[j])
         if k:
             key = k.group(1)
             break
@@ -61,7 +62,7 @@ for i, l in enumerate(lines):
     if not fresh:
         print(f"FAIL: {m.group(1)} {m.group(2)} did not compile"); sys.exit(1)
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.match(r'(\s*' + key + r':\s*")([0-9a-f]+)(".*)', lines[j])
+        d = re.match(r'(\s*' + key + r':\s*\{hex:\s*")([0-9a-f]*)("\}.*)', lines[j])
         if d:
             if d.group(2) != fresh:
                 lines[j] = d.group(1) + fresh + d.group(3); changed += 1
@@ -70,13 +71,13 @@ for i, l in enumerate(lines):
                 kinds = subprocess.run(["bash", "-c", f'. "{root}/scripts/fluxor-env.sh"; . "{root}/scripts/chronicle-params.sh"; nc_stage_kinds "{root}/{m.group(1)}" "{m.group(2)}"'],
                                        capture_output=True, text=True).stdout.strip()
                 nxt = lines[j + 1] if j + 1 < len(lines) else ""
-                k = re.match(r'(\s*stage_kinds:\s*")([0-9a-f]*)(".*)', nxt)
+                k = re.match(r'(\s*stage_kinds:\s*\{hex:\s*")([0-9a-f]*)("\}.*)', nxt)
                 if kinds and k:
                     if k.group(2) != kinds:
                         lines[j + 1] = k.group(1) + kinds + k.group(3); changed += 1
                 elif kinds:
                     indent = re.match(r'(\s*)', lines[j]).group(1)
-                    lines.insert(j + 1, f'{indent}stage_kinds: "{kinds}"'); changed += 1
+                    lines.insert(j + 1, f'{indent}stage_kinds: {{hex: "{kinds}"}}'); changed += 1
                 elif k:
                     del lines[j + 1]; changed += 1
             break

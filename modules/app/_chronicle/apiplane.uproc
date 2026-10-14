@@ -9,7 +9,8 @@
 //
 //   kube_decode        request envelope -> Request record   (kube.rd, kube.uproc)
 //   kube_route         the path's shape -> resource, ns, name, key  (kube.uproc)
-//   admit    (here)    -> VerifyCall            credential out, request as carry
+//   admit              -> VerifyCall            credential out, request as carry
+//                      (apiplane_admit.uproc; discovery answered there)
 //   kagi_verify        <-> kagi token_verify    the signature check
 //   ident    (here)    -> AuthzCall             identity + ns + verb + resource
 //   rbac               ONE store probe of the grant index rbac_*.uproc maintains
@@ -58,6 +59,7 @@ module nanocloud.apiplane {
   enum OP_CREATE = 8;
   enum OP_REPLACE = 9;
   enum OP_EXISTS_ANY = 10;
+  enum OP_TAKE = 17;
 
   // kagi auth_wire verify_err
   enum V_OK = 0;
@@ -80,25 +82,15 @@ module nanocloud.apiplane {
   /// A distinct value rather than 200, because 200 is an ANSWER and this
   /// request has not been authorised yet: the authz stage must still run.
   enum PEER_OK = 1;
+  /// A JOIN: the bearer credential is a node's single-use join secret, not a
+  /// token, and the answer is whatever the node stored under it (node_pki:
+  /// the admin credential and the CA), TAKEN so the secret answers once.
+  /// Not authenticated by kagi and not authorized by RBAC: holding the
+  /// secret IS the authorization, and it is spent by the answer.
+  enum JOIN = 2;
 
   // ---- records ----
 
-  message Request {
-    cid: int = 1;
-    method: int = 2;
-    resource: string = 3;
-    namespace: string = 4;
-    name: string = 5;
-    body: string = 6;
-    key: string = 7;
-    credential: string = 8;
-    target: string = 9;
-    watch: int = 11;
-    // The verified mTLS peer, hex, from the request envelope's peer trailer.
-    // Empty on a plaintext connection.
-    peer: string = 12;
-    group: string = 13;    // the API group (kube.uproc route)
-  }
 
   // What authorization needs beyond the ten carried fields, riding the
   // reserved carry field (254) every connector echoes: the request's API group,
@@ -108,20 +100,6 @@ module nanocloud.apiplane {
     nonres: string = 2;
   }
 
-  message VerifyCall {
-    credential: string = 8;
-    c_cid: int = 30;
-    c_method: int = 31;
-    c_key: string = 32;
-    c_resource: string = 33;
-    c_name: string = 34;
-    c_body: string = 35;
-    c_namespace: string = 36;
-    c_verdict: int = 37;
-    c_answer: string = 38;
-    c_watch: int = 39;
-    ctx: ApiCtx = 254;
-  }
 
   message Verified {
     corr: int = 1;
@@ -286,136 +264,6 @@ module nanocloud.apiplane {
 
 
   // ---- stages ----
-
-  // Hand the credential to kagi and keep the request. No branch: an absent
-  // credential is NOT shortcut to a 401, so that "no credential" and "a
-  // credential that did not verify" reach the same refusal by the same path.
-  decision d_admit(r: Request) -> VerifyCall {
-    // DISCOVERY, answered here and gone. These documents are static and
-    // UNAUTHENTICATED — a client has to read them to know how to authenticate
-    // at all — so they take a verdict before the credential is looked at, and
-    // ride the same single path to the encoder as every other answer.
-    //
-    // Literals in a decision, which is exactly right: what /api/v1 says it
-    // contains is API surface, and API surface is data. `kube_decode` needs
-    // `passthrough = 1` for these to arrive at all.
-    when r.target == "/version" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"major\":\"1\",\"minor\":\"29\",\"gitVersion\":\"v1.29.0-nanocloud\"}", ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/api" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIVersions\",\"versions\":[\"v1\"]}", ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/apis" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIGroupList\",\"groups\":[{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}]},{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
-    // nanocloud.io/v1: a Graph is a module subgraph a bare-metal node runs as
-    // a Pod (spec.flxa, hex) — stored at /graphs.nanocloud.io/<name>, where the
-    // node's workload_effect reads it.
-    when r.target == "/apis/nanocloud.io/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"nanocloud.io/v1\",\"resources\":[{\"name\":\"graphs\",\"singularName\":\"graph\",\"namespaced\":false,\"kind\":\"Graph\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/api/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"v1\",\"resources\":[{\"name\":\"pods\",\"singularName\":\"pod\",\"namespaced\":true,\"shortNames\":[\"po\"],\"categories\":[\"all\"],\"kind\":\"Pod\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"pods/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Pod\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"pods/log\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Pod\",\"verbs\":[\"get\"]},{\"name\":\"services\",\"singularName\":\"service\",\"namespaced\":true,\"shortNames\":[\"svc\"],\"categories\":[\"all\"],\"kind\":\"Service\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"configmaps\",\"singularName\":\"configmap\",\"namespaced\":true,\"shortNames\":[\"cm\"],\"kind\":\"ConfigMap\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"secrets\",\"singularName\":\"secret\",\"namespaced\":true,\"kind\":\"Secret\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"serviceaccounts\",\"singularName\":\"serviceaccount\",\"namespaced\":true,\"shortNames\":[\"sa\"],\"kind\":\"ServiceAccount\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"endpoints\",\"singularName\":\"endpoints\",\"namespaced\":true,\"shortNames\":[\"ep\"],\"kind\":\"Endpoints\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"events\",\"singularName\":\"event\",\"namespaced\":true,\"shortNames\":[\"ev\"],\"kind\":\"Event\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"persistentvolumeclaims\",\"singularName\":\"persistentvolumeclaim\",\"namespaced\":true,\"shortNames\":[\"pvc\"],\"kind\":\"PersistentVolumeClaim\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"namespaces\",\"singularName\":\"namespace\",\"namespaced\":false,\"shortNames\":[\"ns\"],\"kind\":\"Namespace\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"nodes\",\"singularName\":\"node\",\"namespaced\":false,\"shortNames\":[\"no\"],\"kind\":\"Node\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"nodes/status\",\"singularName\":\"\",\"namespaced\":false,\"kind\":\"Node\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"persistentvolumes\",\"singularName\":\"persistentvolume\",\"namespaced\":false,\"shortNames\":[\"pv\"],\"kind\":\"PersistentVolume\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/apis/apps/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\",\"singularName\":\"deployment\",\"namespaced\":true,\"shortNames\":[\"deploy\"],\"categories\":[\"all\"],\"kind\":\"Deployment\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"deployments/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"deployments/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Deployment\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"replicasets\",\"singularName\":\"replicaset\",\"namespaced\":true,\"shortNames\":[\"rs\"],\"categories\":[\"all\"],\"kind\":\"ReplicaSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"replicasets/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"replicasets/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"ReplicaSet\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"statefulsets\",\"singularName\":\"statefulset\",\"namespaced\":true,\"shortNames\":[\"sts\"],\"categories\":[\"all\"],\"kind\":\"StatefulSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"statefulsets/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"statefulsets/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"StatefulSet\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"daemonsets\",\"singularName\":\"daemonset\",\"namespaced\":true,\"shortNames\":[\"ds\"],\"categories\":[\"all\"],\"kind\":\"DaemonSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
-
-    // OpenAPI v3: the root and one document per group-version. Each PATCH
-    // path names its kind (x-kubernetes-group-version-kind) and takes the
-    // `fieldValidation` query parameter — what kubectl checks to hand
-    // validation to the server instead of downloading schemas (it sends
-    // fieldValidation; this server accepts any known kind's fields). No
-    // /openapi/v2: a stub there answered JSON where kubectl asks for
-    // protobuf, and failed every validating apply. `/metrics` is a static
-    // liveness gauge; richer metrics ride fluxor's own telemetry.
-    when r.target == "/openapi/v3" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"paths\":{\"api/v1\":{\"serverRelativeURL\":\"/openapi/v3/api/v1\"},\"apis/apps/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/apps/v1\"},\"apis/nanocloud.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/nanocloud.io/v1\"}}}",
-                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/openapi/v3/api/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/api/v1/namespaces/{namespace}/pods/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Pod\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/services/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Service\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/configmaps/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ConfigMap\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/secrets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Secret\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/serviceaccounts/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ServiceAccount\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/endpoints/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Endpoints\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/events/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Event\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolumeClaim\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Namespace\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/nodes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Node\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/persistentvolumes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolume\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
-                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/openapi/v3/apis/nanocloud.io/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/nanocloud.io/v1/graphs/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"nanocloud.io\",\"version\":\"v1\",\"kind\":\"Graph\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
-                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-    when r.target == "/openapi/v3/apis/apps/v1" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200,
-                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/apps/v1/namespaces/{namespace}/deployments/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/replicasets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"ReplicaSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"StatefulSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/daemonsets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"DaemonSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
-                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-    // `/metrics` is guarded by RBAC's nonResourceURLs, as upstream: the
-    // request is authenticated, then probed as `~|get|~|/metrics|~`, and the
-    // document is answered only when that is granted (d_gate).
-    when r.target == "/metrics" ->
-      VerifyCall { credential: r.credential, c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: PENDING, c_answer: "", c_watch: 0,
-                   ctx: ApiCtx { group: "~", nonres: "/metrics" } };
-    when r.target == "/healthz" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 200, c_answer: "ok", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-
-    // A path that is neither a resource nor a document this server knows. Under
-    // `passthrough` it arrives here with an empty key, and answering 404 is the
-    // whole reason passthrough is safe: the frame's empty fields are never read
-    // as a resource.
-    when r.key == "" ->
-      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
-                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
-                   c_verdict: 404, c_answer: "not found", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
-
-    // An mTLS PEER is already authenticated: fluxor's `tls` validated the
-    // chain and proved key possession, and the envelope carries a peer only
-    // when both ran. Re-checking it against kagi would be checking a bearer token that
-    // does not exist, so the identity is taken here and the verify stage is
-    // skipped with an OK verdict — `PEER_OK` rather than PENDING, so `authz`
-    // authorises the peer's name instead of waiting for a token.
-    //
-    // The identity is `peer:<hex>`, distinct from a ServiceAccount's
-    // `system:serviceaccount:…` by construction: two authentication methods
-    // must not be able to produce the same subject string, or a binding
-    // written for one silently grants the other.
-    when r.peer != "" ->
-      VerifyCall {
-        credential: "", c_cid: r.cid, c_method: r.method, c_key: r.key,
-        c_resource: r.resource, c_name: r.name, c_body: r.body,
-        c_namespace: r.namespace, c_verdict: PEER_OK, c_answer: r.peer,
-        c_watch: r.watch, ctx: ApiCtx { group: r.group, nonres: "" } };
-
-    // The ordinary path: hand the credential to kagi and keep the request. No
-    // branch on an absent credential, so that "no credential" and "a credential
-    // that did not verify" reach the same refusal by the same path.
-    default ->
-      VerifyCall {
-        credential: r.credential,
-        c_cid: r.cid, c_method: r.method, c_key: r.key,
-        c_resource: r.resource, c_name: r.name, c_body: r.body,
-        c_namespace: r.namespace, c_verdict: PENDING, c_answer: "",
-        c_watch: r.watch, ctx: ApiCtx { group: r.group, nonres: "" } };
-  }
 
   // Normalise WHO the caller is, before the verb ladder runs.
   //
@@ -595,6 +443,12 @@ module nanocloud.apiplane {
   // rides the carry (`act` answers from the store's reply). A read registers
   // itself with the watch chain, which answers it.
   decision d_probe(a: Admitted) -> ActCall {
+    // The join secret is spent here: answered with what was stored under
+    // it, and deleted in the same store step (apiplane_reply `act` turns a
+    // miss into 401).
+    when a.c_verdict == JOIN ->
+      ActCall { cid: a.c_cid, op: OP_TAKE, key: a.c_key, key2: "", value: "",
+                c_cid: a.c_cid, c_status: 200, c_answer: "@stored", c_stream: 0, c_key: a.c_key, c_verb: "join" };
     when a.c_verdict != PENDING ->
       ActCall { cid: a.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
                 c_cid: a.c_cid, c_status: a.c_verdict, c_answer: a.c_reason, c_stream: 0, c_key: a.c_key, c_verb: a.c_verb };
@@ -632,6 +486,17 @@ module nanocloud.apiplane {
                 value: "{\"cid\":", value2: a.c_cid, value3: ",\"p\":\"", value4: a.c_key,
                 value5: "\",", value6: a.object.substring(1),
                 c_cid: a.c_cid, c_status: 0, c_answer: "", c_stream: 0, c_key: a.c_key, c_verb: a.c_verb };
+    // A TokenRequest (POST …/serviceaccounts/<name>/token) writes nothing:
+    // the ServiceAccount is read — a token for one that does not exist is
+    // NotFound (apiplane_reply `act`) — and the request rides the carry as
+    // `@mint<key> <body>` to the mint (apiplane_token.uproc), which signs it
+    // — the key in the answer because the step after the write carries no
+    // other field it could ride.
+    when a.c_method == M_POST && a.c_key.startsWith("/serviceaccounts/") && a.c_key.contains("#token") ->
+      ActCall { cid: a.c_cid, op: OP_GET, key: a.c_key.substring(0, a.c_key.indexOf("#")), key2: "", value: "",
+                c_cid: a.c_cid, c_status: 201,
+                c_answer: "@mint" + a.c_key.substring(0, a.c_key.indexOf("#")) + " " + a.object, c_stream: 0,
+                c_key: a.c_key.substring(0, a.c_key.indexOf("#")), c_verb: "token" };
     // A create: CREATE (the store refuses an existing object: AlreadyExists).
     // A STAGED body's name came from se_body and completes the key (empty for
     // an inline one, which kube_decode addressed already) — before the
@@ -679,12 +544,6 @@ module nanocloud.apiplane {
   // not a smaller record — the decision after it reads a field that is not
   // there and produces nothing at all, silently. This copy must grow with the
   // message.
-  transformation pass_req(r: Request) -> Request {
-    Request { cid: r.cid, method: r.method, resource: r.resource,
-              namespace: r.namespace, name: r.name, body: r.body,
-              key: r.key, credential: r.credential, target: r.target,
-              watch: r.watch, peer: r.peer }
-  }
   transformation pass_verified(v: Verified) -> Verified {
     Verified { corr: v.corr, status: v.status, subject: v.subject,
                c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
@@ -705,11 +564,6 @@ module nanocloud.apiplane {
   }
 
 
-  pipeline admit(r: Request) -> VerifyCall {
-    call x = pass_req(r);
-    call y = d_admit(x);
-    return y;
-  }
   pipeline ident(v: Verified) -> Verified {
     call x = pass_verified(v);
     call y = d_ident(x);
@@ -733,7 +587,6 @@ module nanocloud.apiplane {
 
 
 
-  entry admit = admit;
   entry ident = ident;
   entry authz = authz;
   entry gate = gate;

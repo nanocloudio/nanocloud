@@ -9,19 +9,82 @@
 # Run beside the scenario once the rig has power-cycled:
 #   bash scripts/rig-controlplane-driver.sh [ip]
 # Exit 0 only if every step held.
+#
+# The operator's credential is the node's own: the board announces a join
+# secret and its authority's key digest on its telemetry, and
+# scripts/rig-join.sh spends the secret for a kubeconfig that verifies the
+# API against that authority. After a power cycle the driver listens to the
+# board's telemetry itself (the run's capture has ended at its verdict) and
+# joins again with the new boot's secret — a board whose vault cannot
+# persist keys (no OTP device key) comes back under a new authority.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IP="${1:-${NANOCLOUD_RIG_IP:-192.168.1.9}}"
 NODE="${NANOCLOUD_RIG_NODE:-pi5-a}"
 KC="$ROOT/target/pi5/kubeconfig"
-fail() { echo "FAIL: $*"; exit 1; }
+RIG="${NANOCLOUD_RIG:-pi5-a}"
+RUNS="${FLUXOR_RIG_RUNS:-$HOME/.local/state/fluxor/labs/default/rigs/$RIG/runs}"
+JOIN_RE='\[join\] secret=[0-9a-f]\{32\} ca-sha256=[0-9a-f]\{64\}'
+LAST_JOIN=""
+LISTENER=""
+TLOG="$(mktemp /tmp/rig-telemetry.XXXXXX)"
+trap '[ -n "$LISTENER" ] && kill "$LISTENER" 2>/dev/null; rm -f "$TLOG"' EXIT
+# On failure the board's telemetry since the last power cycle is kept
+# (target/pi5/driver-telemetry.log): once the run has reached its verdict
+# this capture is the board's only account of what it did.
+fail() {
+  echo "FAIL: $*"
+  [ -s "$TLOG" ] && cp "$TLOG" "$ROOT/target/pi5/driver-telemetry.log" && echo "   telemetry kept: target/pi5/driver-telemetry.log"
+  exit 1
+}
 k() { kubectl --kubeconfig "$KC" --request-timeout=20s "$@"; }
 
-NANOCLOUD_RIG_IP="$IP" bash "$ROOT/scripts/rig-kubeconfig.sh" "$KC" 24 >/dev/null \
-  || fail "kubeconfig"
+# join <telemetry file>: the newest announcement there that is not the last
+# one spent, waited for, then spent for $KC.
+join() {
+  local line="" secret ca
+  for i in $(seq 120); do
+    line="$(grep -ao "$JOIN_RE" "$1" 2>/dev/null | tail -1)"
+    [ -n "$line" ] && [ "$line" != "$LAST_JOIN" ] && break
+    line=""
+    sleep 2
+  done
+  [ -n "$line" ] || fail "no new join announcement in $1 within 240 s"
+  LAST_JOIN="$line"
+  secret="$(sed 's/.*secret=\([0-9a-f]*\).*/\1/' <<<"$line")"
+  ca="$(sed 's/.*ca-sha256=\([0-9a-f]*\).*/\1/' <<<"$line")"
+  bash "$ROOT/scripts/rig-join.sh" "$secret" "$ca" "$IP:6443" "$KC" >/dev/null || fail "join"
+  echo "   joined: authority ${ca:0:16}…, kubeconfig $KC"
+}
 
-echo "== 0. the API answers (TLS, verified against the embedded certificate)"
+# The board's telemetry, captured here: once a run has reached its verdict
+# nothing else is listening.
+listen() {
+  [ -n "$LISTENER" ] && return
+  python3 -u - "$TLOG" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 6666))
+with open(sys.argv[1], "ab", buffering=0) as f:
+    while True:
+        f.write(s.recv(65535) + b"\n")
+PY
+  LISTENER=$!
+  sleep 0.5
+  kill -0 "$LISTENER" 2>/dev/null || fail "could not listen on udp :6666 (is a run still capturing?)"
+}
+
+echo "== 0. join: the node's own secret, its authority checked against its digest"
+if [ -n "${NANOCLOUD_JOIN:-}" ]; then
+  printf '[join] %s\n' "$NANOCLOUD_JOIN" >"$TLOG"   # "secret=… ca-sha256=…"
+  join "$TLOG"
+else
+  join "$(ls -td "$RUNS"/*/ | head -1)telemetry.monitor_udp.log"
+fi
+
+echo "== 0b. the API answers (TLS, verified against the node's authority)"
 for i in $(seq 120); do
   k get --raw /version >/tmp/rig-version.$$ 2>/dev/null && break
   sleep 2
@@ -75,20 +138,23 @@ k get deploy,rs,pods -o wide
 #    needs the rig's power backend (`fluxor rig power`), and it reboots the
 #    board under whatever scenario holds it.
 if [ "${NANOCLOUD_RIG_RESTART:-0}" = "1" ]; then
-  RIG="${NANOCLOUD_RIG:-pi5-a}"
   echo "== 4. power-cycle $RIG: the Deployment survives, the API is back within 60 s"
   before="$(k get deploy hello -o jsonpath='{.metadata.uid} {.spec.replicas} {.metadata.resourceVersion}')"
   [ -n "$before" ] || fail "could not read the Deployment before the restart"
+  listen
   fluxor rig power cycle --rig "$RIG" >/dev/null || fail "fluxor rig power cycle"
   t0=$(date +%s)
   back=""
+  # Back = serving TLS on :6443 again (anonymous /version); whom to trust is
+  # the join's question, asked next.
   for i in $(seq 90); do
     sleep 2
-    k get --raw /version >/dev/null 2>&1 && { back=$(( $(date +%s) - t0 )); break; }
+    curl -sk --max-time 3 "https://$IP:6443/version" >/dev/null 2>&1 && { back=$(( $(date +%s) - t0 )); break; }
   done
   [ -n "$back" ] || fail "the API did not come back within 180 s of the power cycle"
   echo "   API back after ${back} s"
   [ "$back" -le 60 ] || fail "the API took ${back} s to come back: the board replayed its log instead of resuming"
+  join "$TLOG"
   # The API answers /version before its store serves (as an apiserver does
   # while etcd catches up); the objects are read once the store is back.
   after=""
@@ -148,5 +214,121 @@ YAML
   done
   k get pod probe -o wide
   [ "${ph:-}" = "Running" ] || fail "pod probe is not Running on $NODE (phase='${ph:-}')"
+
+  # 6. A Deployment whose template names the Graph: its ReplicaSet's Pods
+  #    run as the bare Pod did, each owned through the chain kubectl follows.
+  echo "== 6. a Deployment of graph-backed Pods: both run, owned Deployment -> ReplicaSet -> Pod"
+  cat <<'YAML' | k apply -f - || fail "kubectl apply deployment probes"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probes
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: probes}
+  template:
+    metadata:
+      labels: {app: probes}
+    spec:
+      runtimeClassName: fluxor
+      containers:
+      - name: probe
+        image: probe
+YAML
+  probes_running() {
+    k get pods -l app=probes -o json 2>/dev/null | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(0); raise SystemExit
+print(sum(1 for p in d["items"] if p.get("status",{}).get("phase")=="Running" and p["metadata"].get("uid")))'
+  }
+  for i in $(seq 60); do n="$(probes_running)"; [ "${n:-0}" -ge 2 ] && break; sleep 2; done
+  k get deploy,rs,pods -l app=probes -o wide 2>/dev/null; k get deploy probes -o wide
+  [ "${n:-0}" -ge 2 ] || fail "deployment/probes: ${n:-0} of 2 Pods Running"
+  python3 - "$(k get deploy probes -o json)" "$(k get rs probes -o json)" "$(k get pods -l app=probes -o json)" <<'PY' || fail "the controller references are not a chain"
+import json, sys
+d, r, pods = (json.loads(x) for x in sys.argv[1:4])
+def ctl(o):
+    refs = [x for x in o["metadata"].get("ownerReferences", []) if x.get("controller")]
+    assert len(refs) == 1, refs
+    return refs[0]
+assert ctl(r)["uid"] == d["metadata"]["uid"], "replicaset's controller is not the deployment"
+for p in pods["items"]:
+    assert ctl(p)["uid"] == r["metadata"]["uid"], "a pod's controller is not the replicaset"
+print("   controller references: deployment -> replicaset -> %d pods" % len(pods["items"]))
+PY
+  if [ "${NANOCLOUD_RIG_RESTART:-0}" = "1" ]; then
+    echo "== 6b. power-cycle $RIG: the Deployment's Pods run again"
+    listen
+    fluxor rig power cycle --rig "$RIG" >/dev/null || fail "fluxor rig power cycle"
+    sleep 20
+    join "$TLOG"
+    for i in $(seq 90); do k get --raw /version >/dev/null 2>&1 && break; sleep 2; done
+    for i in $(seq 60); do n="$(probes_running)"; [ "${n:-0}" -ge 2 ] && break; sleep 2; done
+    [ "${n:-0}" -ge 2 ] || fail "after the power cycle deployment/probes has ${n:-0} of 2 Pods Running"
+    echo "   both Pods Running again after the power cycle"
+  fi
+fi
+# 7. The real applications as workload images (NANOCLOUD_RIG_APPS=1; the
+#    board carries the image plane: scripts/rig-render-controlplane.sh with
+#    NANOCLOUD_RIG_IMAGES=1). Each is pulled from registry.nanocloud.io
+#    (pushed there first: scripts/apps-publish.sh), runs as the modules it
+#    brought, serves on the board's address, and comes back after the power
+#    is cut.
+if [ "${NANOCLOUD_RIG_APPS:-0}" = "1" ]; then
+  APPS="${NANOCLOUD_RIG_APPS_LIST:-lattice-kv chronicle-http quantum-mqtt}"
+  echo "== 7. kubectl apply a Deployment per app: $APPS"
+  for app in $APPS; do
+    cat <<YAML | k apply -f - >/dev/null || fail "kubectl apply $app"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: $app}
+  template:
+    metadata:
+      labels: {app: $app}
+    spec:
+      runtimeClassName: fluxor
+      containers:
+      - name: $app
+        image: nanocloud/$app:1
+YAML
+  done
+  has_app() { case " $APPS " in *" $1 "*) return 0 ;; esac; return 1; }
+  apps_serving() {
+    { ! has_app lattice-kv || [ "$(redis-cli -h "$IP" -p 6379 PING 2>/dev/null)" = "PONG" ]; } \
+      && { ! has_app chronicle-http || curl -s -m 3 "http://$IP:8080/" | grep -q chronicle; } \
+      && { ! has_app quantum-mqtt || timeout 5 mosquitto_pub -h "$IP" -p 9090 -q 1 -t probe -m up >/dev/null 2>&1; }
+  }
+  apps_running() {
+    local app
+    for app in $APPS; do
+      [ "$(k get pods -l "app=$app" -o jsonpath='{.items[*].status.phase}' 2>/dev/null)" = "Running" ] || return 1
+    done
+  }
+  for i in $(seq 120); do apps_running && apps_serving && break; sleep 3; done
+  k get pods -o wide
+  apps_running || fail "not every app's Pod is Running"
+  apps_serving || fail "not every app answers on $IP (redis :6379, http :8080, mqtt :9090)"
+  has_app lattice-kv && echo "   lattice-kv SET/GET -> $(redis-cli -h "$IP" -p 6379 SET greeting hello) $(redis-cli -h "$IP" -p 6379 GET greeting)"
+  has_app chronicle-http && echo "   chronicle-http -> $(curl -s -m 3 "http://$IP:8080/" | head -c 40)…"
+  has_app quantum-mqtt && echo "   quantum-mqtt PUBLISH (QoS 1) acknowledged"
+  if [ "${NANOCLOUD_RIG_RESTART:-0}" = "1" ]; then
+    echo "== 7b. power-cycle $RIG: the apps are pulled, run and serve again"
+    listen
+    fluxor rig power cycle --rig "$RIG" >/dev/null || fail "fluxor rig power cycle"
+    sleep 20
+    join "$TLOG"
+    for i in $(seq 90); do k get --raw /version >/dev/null 2>&1 && break; sleep 2; done
+    for i in $(seq 120); do apps_running && apps_serving && break; sleep 3; done
+    apps_running && apps_serving || { k get pods -o wide; fail "the apps did not come back after the power cycle"; }
+    echo "   every app Running and serving again after the power cycle"
+  fi
 fi
 echo "PASS: kubectl drives the bare-metal control plane"

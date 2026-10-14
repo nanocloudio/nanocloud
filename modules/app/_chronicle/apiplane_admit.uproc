@@ -1,0 +1,302 @@
+// The first stage of the Kubernetes API request path (apiplane.uproc): the
+// request's credential out to kagi, the request as carry; and the answers
+// that need no credential — discovery, OpenAPI, the version, the join.
+//
+// Its own document because its discovery arms alone would take
+// apiplane.uproc past the rules one document holds (chronicle_cli: 48), and
+// two entries because discovery and OpenAPI together pass the 16 KiB one
+// compiled container holds: `admit` answers discovery and tags an OpenAPI
+// request, `oapi` (the next node) answers it.
+
+module nanocloud.apiplane_admit {
+
+  enum M_POST = 3;
+  enum PENDING = 0;
+  enum PEER_OK = 1;
+  enum JOIN = 2;
+
+  message Request {
+    cid: int = 1;
+    method: int = 2;
+    resource: string = 3;
+    namespace: string = 4;
+    name: string = 5;
+    body: string = 6;
+    key: string = 7;
+    credential: string = 8;
+    target: string = 9;
+    watch: int = 11;
+    // The verified mTLS peer, hex, from the request envelope's peer trailer.
+    // Empty on a plaintext connection.
+    peer: string = 12;
+    group: string = 13;    // the API group (kube.uproc route)
+  }
+
+  message ApiCtx {
+    group: string = 1;
+    nonres: string = 2;
+  }
+
+  message VerifyCall {
+    credential: string = 8;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+    ctx: ApiCtx = 254;
+  }
+
+
+  // Hand the credential to kagi and keep the request. No branch: an absent
+  // credential is NOT shortcut to a 401, so that "no credential" and "a
+  // credential that did not verify" reach the same refusal by the same path.
+  decision d_admit(r: Request) -> VerifyCall {
+    // DISCOVERY, answered here and gone. These documents are static and
+    // UNAUTHENTICATED — a client has to read them to know how to authenticate
+    // at all — so they take a verdict before the credential is looked at, and
+    // ride the same single path to the encoder as every other answer.
+    //
+    // Literals in a decision, which is exactly right: what /api/v1 says it
+    // contains is API surface, and API surface is data. `kube_decode` needs
+    // `passthrough = 1` for these to arrive at all.
+    when r.target == "/version" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"major\":\"1\",\"minor\":\"29\",\"gitVersion\":\"v1.29.0-nanocloud\"}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/api" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIVersions\",\"versions\":[\"v1\"]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIGroupList\",\"groups\":[{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}]},{\"name\":\"batch\",\"versions\":[{\"groupVersion\":\"batch/v1\",\"version\":\"v1\"}]},{\"name\":\"rbac.authorization.k8s.io\",\"versions\":[{\"groupVersion\":\"rbac.authorization.k8s.io/v1\",\"version\":\"v1\"}]},{\"name\":\"scheduling.k8s.io\",\"versions\":[{\"groupVersion\":\"scheduling.k8s.io/v1\",\"version\":\"v1\"}]},{\"name\":\"policy\",\"versions\":[{\"groupVersion\":\"policy/v1\",\"version\":\"v1\"}]},{\"name\":\"networking.k8s.io\",\"versions\":[{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}]},{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    // nanocloud.io/v1: a Graph is a module subgraph a bare-metal node runs as
+    // a Pod (spec.flxa, hex) — stored at /graphs.nanocloud.io/<name>, where the
+    // node's workload_effect reads it.
+    when r.target == "/apis/nanocloud.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"nanocloud.io/v1\",\"resources\":[{\"name\":\"graphs\",\"singularName\":\"graph\",\"namespaced\":false,\"kind\":\"Graph\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"devices\",\"singularName\":\"device\",\"namespaced\":true,\"kind\":\"Device\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"devices/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Device\",\"verbs\":[\"get\",\"patch\",\"update\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/api/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"v1\",\"resources\":[{\"name\":\"pods\",\"singularName\":\"pod\",\"namespaced\":true,\"shortNames\":[\"po\"],\"categories\":[\"all\"],\"kind\":\"Pod\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"pods/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Pod\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"pods/log\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Pod\",\"verbs\":[\"get\"]},{\"name\":\"services\",\"singularName\":\"service\",\"namespaced\":true,\"shortNames\":[\"svc\"],\"categories\":[\"all\"],\"kind\":\"Service\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"configmaps\",\"singularName\":\"configmap\",\"namespaced\":true,\"shortNames\":[\"cm\"],\"kind\":\"ConfigMap\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"secrets\",\"singularName\":\"secret\",\"namespaced\":true,\"kind\":\"Secret\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"serviceaccounts\",\"singularName\":\"serviceaccount\",\"namespaced\":true,\"shortNames\":[\"sa\"],\"kind\":\"ServiceAccount\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"serviceaccounts/token\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"authentication.k8s.io\",\"version\":\"v1\",\"kind\":\"TokenRequest\",\"verbs\":[\"create\"]},{\"name\":\"endpoints\",\"singularName\":\"endpoints\",\"namespaced\":true,\"shortNames\":[\"ep\"],\"kind\":\"Endpoints\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"events\",\"singularName\":\"event\",\"namespaced\":true,\"shortNames\":[\"ev\"],\"kind\":\"Event\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"persistentvolumeclaims\",\"singularName\":\"persistentvolumeclaim\",\"namespaced\":true,\"shortNames\":[\"pvc\"],\"kind\":\"PersistentVolumeClaim\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"namespaces\",\"singularName\":\"namespace\",\"namespaced\":false,\"shortNames\":[\"ns\"],\"kind\":\"Namespace\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"nodes\",\"singularName\":\"node\",\"namespaced\":false,\"shortNames\":[\"no\"],\"kind\":\"Node\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"nodes/status\",\"singularName\":\"\",\"namespaced\":false,\"kind\":\"Node\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"persistentvolumes\",\"singularName\":\"persistentvolume\",\"namespaced\":false,\"shortNames\":[\"pv\"],\"kind\":\"PersistentVolume\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"resourcequotas\",\"singularName\":\"resourcequota\",\"namespaced\":true,\"shortNames\":[\"quota\"],\"kind\":\"ResourceQuota\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"resourcequotas/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"ResourceQuota\",\"verbs\":[\"get\",\"patch\",\"update\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/apps/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\",\"singularName\":\"deployment\",\"namespaced\":true,\"shortNames\":[\"deploy\"],\"categories\":[\"all\"],\"kind\":\"Deployment\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"deployments/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"deployments/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Deployment\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"replicasets\",\"singularName\":\"replicaset\",\"namespaced\":true,\"shortNames\":[\"rs\"],\"categories\":[\"all\"],\"kind\":\"ReplicaSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"replicasets/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"replicasets/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"ReplicaSet\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"statefulsets\",\"singularName\":\"statefulset\",\"namespaced\":true,\"shortNames\":[\"sts\"],\"categories\":[\"all\"],\"kind\":\"StatefulSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"statefulsets/scale\",\"singularName\":\"\",\"namespaced\":true,\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"statefulsets/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"StatefulSet\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"daemonsets\",\"singularName\":\"daemonset\",\"namespaced\":true,\"shortNames\":[\"ds\"],\"categories\":[\"all\"],\"kind\":\"DaemonSet\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/batch/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"batch/v1\",\"resources\":[{\"name\":\"jobs\",\"singularName\":\"job\",\"namespaced\":true,\"categories\":[\"all\"],\"kind\":\"Job\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"jobs/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Job\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"cronjobs\",\"singularName\":\"cronjob\",\"namespaced\":true,\"shortNames\":[\"cj\"],\"categories\":[\"all\"],\"kind\":\"CronJob\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"cronjobs/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"CronJob\",\"verbs\":[\"get\",\"patch\",\"update\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/rbac.authorization.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"rbac.authorization.k8s.io/v1\",\"resources\":[{\"name\":\"clusterrolebindings\",\"singularName\":\"clusterrolebinding\",\"namespaced\":false,\"kind\":\"ClusterRoleBinding\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"clusterroles\",\"singularName\":\"clusterrole\",\"namespaced\":false,\"kind\":\"ClusterRole\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"rolebindings\",\"singularName\":\"rolebinding\",\"namespaced\":true,\"kind\":\"RoleBinding\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"roles\",\"singularName\":\"role\",\"namespaced\":true,\"kind\":\"Role\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/scheduling.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"scheduling.k8s.io/v1\",\"resources\":[{\"name\":\"priorityclasses\",\"singularName\":\"priorityclass\",\"namespaced\":false,\"shortNames\":[\"pc\"],\"kind\":\"PriorityClass\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/policy/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"policy/v1\",\"resources\":[{\"name\":\"poddisruptionbudgets\",\"singularName\":\"poddisruptionbudget\",\"namespaced\":true,\"shortNames\":[\"pdb\"],\"kind\":\"PodDisruptionBudget\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"poddisruptionbudgets/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"PodDisruptionBudget\",\"verbs\":[\"get\",\"patch\",\"update\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/networking.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"networking.k8s.io/v1\",\"resources\":[{\"name\":\"ingressclasses\",\"singularName\":\"ingressclass\",\"namespaced\":false,\"kind\":\"IngressClass\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"ingresses\",\"singularName\":\"ingress\",\"namespaced\":true,\"shortNames\":[\"ing\"],\"kind\":\"Ingress\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]},{\"name\":\"ingresses/status\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Ingress\",\"verbs\":[\"get\",\"patch\",\"update\"]},{\"name\":\"networkpolicies\",\"singularName\":\"networkpolicy\",\"namespaced\":true,\"shortNames\":[\"netpol\"],\"kind\":\"NetworkPolicy\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]}]}", ctx: ApiCtx { group: r.group, nonres: "" } };
+
+    // OpenAPI v3: answered by the `oapi` entry, the stage after this one —
+    // the documents would take this decision past the 16 KiB a container
+    // holds. Tagged here: verdict 200, the document's path in `c_key`.
+    when r.target.startsWith("/openapi/v3") ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: r.target,
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200, c_answer: "",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    // `/metrics` is a static liveness gauge; richer metrics ride fluxor's own
+    // telemetry.
+    when r.target == "/metrics" ->
+      VerifyCall { credential: r.credential, c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: PENDING, c_answer: "", c_watch: 0,
+                   ctx: ApiCtx { group: "~", nonres: "/metrics" } };
+    // The join exchange (`POST /apis/nanocloud.io/v1/join`, the secret as
+    // the bearer credential): see JOIN. Under `/apis/` because the HTTP
+    // front's route table is full. An absent credential takes `/join/`,
+    // which holds nothing.
+    when r.target == "/apis/nanocloud.io/v1/join" && r.method == M_POST ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "/join/" + r.credential,
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: JOIN, c_answer: "", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/healthz" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200, c_answer: "ok", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+
+    // A path that is neither a resource nor a document this server knows. Under
+    // `passthrough` it arrives here with an empty key, and answering 404 is the
+    // whole reason passthrough is safe: the frame's empty fields are never read
+    // as a resource.
+    when r.key == "" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 404, c_answer: "not found", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+
+    // An mTLS PEER is already authenticated: fluxor's `tls` validated the
+    // chain and proved key possession, and the envelope carries a peer only
+    // when both ran. Re-checking it against kagi would be checking a bearer token that
+    // does not exist, so the identity is taken here and the verify stage is
+    // skipped with an OK verdict — `PEER_OK` rather than PENDING, so `authz`
+    // authorises the peer's name instead of waiting for a token.
+    //
+    // The identity is `peer:<hex>`, distinct from a ServiceAccount's
+    // `system:serviceaccount:…` by construction: two authentication methods
+    // must not be able to produce the same subject string, or a binding
+    // written for one silently grants the other.
+    when r.peer != "" ->
+      VerifyCall {
+        credential: "", c_cid: r.cid, c_method: r.method, c_key: r.key,
+        c_resource: r.resource, c_name: r.name, c_body: r.body,
+        c_namespace: r.namespace, c_verdict: PEER_OK, c_answer: r.peer,
+        c_watch: r.watch, ctx: ApiCtx { group: r.group, nonres: "" } };
+
+    // The ordinary path: hand the credential to kagi and keep the request. No
+    // branch on an absent credential, so that "no credential" and "a credential
+    // that did not verify" reach the same refusal by the same path.
+    default ->
+      VerifyCall {
+        credential: r.credential,
+        c_cid: r.cid, c_method: r.method, c_key: r.key,
+        c_resource: r.resource, c_name: r.name, c_body: r.body,
+        c_namespace: r.namespace, c_verdict: PENDING, c_answer: "",
+        c_watch: r.watch, ctx: ApiCtx { group: r.group, nonres: "" } };
+  }
+
+  // OpenAPI v3, for the requests `admit` tagged (verdict 200, the path in
+  // `c_key`): the root and one document per group-version. Every other record
+  // passes as it came.
+  //
+  // Each PATCH path names its kind (x-kubernetes-group-version-kind) and
+  // takes the `fieldValidation` query parameter — what kubectl checks to hand
+  // validation to the server instead of downloading schemas (it sends
+  // fieldValidation; this server accepts any known kind's fields). No
+  // /openapi/v2: a stub there answered JSON where kubectl asks for protobuf,
+  // and failed every validating apply.
+  decision d_oapi(v: VerifyCall) -> VerifyCall {
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"paths\":{\"api/v1\":{\"serverRelativeURL\":\"/openapi/v3/api/v1\"},\"apis/apps/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/apps/v1\"},\"apis/nanocloud.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/nanocloud.io/v1\"},\"apis/batch/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/batch/v1\"},\"apis/rbac.authorization.k8s.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/rbac.authorization.k8s.io/v1\"},\"apis/scheduling.k8s.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/scheduling.k8s.io/v1\"},\"apis/policy/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/policy/v1\"},\"apis/networking.k8s.io/v1\":{\"serverRelativeURL\":\"/openapi/v3/apis/networking.k8s.io/v1\"}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/api/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/api/v1/namespaces/{namespace}/pods/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Pod\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/services/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Service\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/configmaps/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ConfigMap\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/secrets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Secret\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/serviceaccounts/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ServiceAccount\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/endpoints/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Endpoints\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/events/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Event\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolumeClaim\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Namespace\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/nodes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"Node\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/persistentvolumes/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"PersistentVolume\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/api/v1/namespaces/{namespace}/resourcequotas/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"\",\"version\":\"v1\",\"kind\":\"ResourceQuota\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/nanocloud.io/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/nanocloud.io/v1/graphs/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"nanocloud.io\",\"version\":\"v1\",\"kind\":\"Graph\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/nanocloud.io/v1/namespaces/{namespace}/devices/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"nanocloud.io\",\"version\":\"v1\",\"kind\":\"Device\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/apps/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/apps/v1/namespaces/{namespace}/deployments/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/replicasets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"ReplicaSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"StatefulSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/apps/v1/namespaces/{namespace}/daemonsets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"DaemonSet\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/batch/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/batch/v1/namespaces/{namespace}/jobs/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"batch\",\"version\":\"v1\",\"kind\":\"Job\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/batch/v1/namespaces/{namespace}/cronjobs/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"batch\",\"version\":\"v1\",\"kind\":\"CronJob\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/rbac.authorization.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"rbac.authorization.k8s.io\",\"version\":\"v1\",\"kind\":\"ClusterRoleBinding\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/rbac.authorization.k8s.io/v1/clusterroles/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"rbac.authorization.k8s.io\",\"version\":\"v1\",\"kind\":\"ClusterRole\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/rolebindings/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"rbac.authorization.k8s.io\",\"version\":\"v1\",\"kind\":\"RoleBinding\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/roles/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"rbac.authorization.k8s.io\",\"version\":\"v1\",\"kind\":\"Role\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/scheduling.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/scheduling.k8s.io/v1/priorityclasses/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"scheduling.k8s.io\",\"version\":\"v1\",\"kind\":\"PriorityClass\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/policy/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/policy/v1/namespaces/{namespace}/poddisruptionbudgets/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"policy\",\"version\":\"v1\",\"kind\":\"PodDisruptionBudget\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key == "/openapi/v3/apis/networking.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Kubernetes\",\"version\":\"v1\"},\"paths\":{\"/apis/networking.k8s.io/v1/ingressclasses/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"networking.k8s.io\",\"version\":\"v1\",\"kind\":\"IngressClass\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/networking.k8s.io/v1/namespaces/{namespace}/ingresses/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"networking.k8s.io\",\"version\":\"v1\",\"kind\":\"Ingress\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}},\"/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies/{name}\":{\"patch\":{\"x-kubernetes-group-version-kind\":{\"group\":\"networking.k8s.io\",\"version\":\"v1\",\"kind\":\"NetworkPolicy\"},\"parameters\":[{\"name\":\"fieldValidation\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+                   c_watch: 0, ctx: v.ctx };
+    when v.c_verdict == 200 && v.c_key.startsWith("/openapi/v3") ->
+      VerifyCall { credential: "", c_cid: v.c_cid, c_method: v.c_method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 404, c_answer: "not found", c_watch: 0, ctx: v.ctx };
+    default ->
+      VerifyCall { credential: v.credential, c_cid: v.c_cid, c_method: v.c_method,
+                   c_key: v.c_key, c_resource: v.c_resource, c_name: v.c_name,
+                   c_body: v.c_body, c_namespace: v.c_namespace,
+                   c_verdict: v.c_verdict, c_answer: v.c_answer,
+                   c_watch: v.c_watch, ctx: v.ctx };
+  }
+
+  transformation pass_vc(v: VerifyCall) -> VerifyCall {
+    VerifyCall { credential: v.credential, c_cid: v.c_cid, c_method: v.c_method,
+                 c_key: v.c_key, c_resource: v.c_resource, c_name: v.c_name,
+                 c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: v.c_verdict, c_answer: v.c_answer,
+                 c_watch: v.c_watch, ctx: v.ctx }
+  }
+
+  transformation pass_req(r: Request) -> Request {
+    Request { cid: r.cid, method: r.method, resource: r.resource,
+              namespace: r.namespace, name: r.name, body: r.body,
+              key: r.key, credential: r.credential, target: r.target,
+              watch: r.watch, peer: r.peer }
+  }
+
+  pipeline admit(r: Request) -> VerifyCall {
+    call x = pass_req(r);
+    call y = d_admit(x);
+    return y;
+  }
+
+  pipeline oapi(v: VerifyCall) -> VerifyCall {
+    call x = pass_vc(v);
+    call y = d_oapi(x);
+    return y;
+  }
+
+  entry admit = admit;
+  entry oapi = oapi;
+
+  provenance revision "apiplane-admit" toolchain "chronicle-authoring";
+}

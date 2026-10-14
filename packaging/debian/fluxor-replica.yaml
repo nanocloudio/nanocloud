@@ -55,31 +55,31 @@ modules:
 
   # ── The group: clustor's consensus and durability, every peer link under
   # mutual TLS. `nanocloud-graph.sh` renders this node's values from
-  # /etc/nanocloud.io/cluster.env and its PKI (/etc/nanocloud.io/pki):
-  # a server-mode `tls` carries the links this replica accepts, a
-  # client-mode one the links it dials; both accept only the anchors in
-  # trust.pem, and peer_router binds a replica only under its pinned key.
+  # /etc/nanocloud.io/cluster.env: a server-mode `tls` carries the links
+  # this replica accepts, a client-mode one the links it dials, and how a
+  # peer is trusted is the node's NANOCLOUD_PEER_TRUST —
+  #   pins       an operator's PKI (/etc/nanocloud.io/pki): both accept only
+  #              the anchors in trust.pem, and peer_router binds a replica
+  #              only under its pinned key;
+  #   authority  the cluster's own authority: each key is born in this
+  #              node's vault and certified as `…/replica-<id>.<role>`, the
+  #              authority that certified it is the anchor, and peer_router
+  #              binds a replica by that principal. No key is rendered.
   - name: peer_tls_server
     type: tls
     mode: 1
     verify_peer: 1
-    peer_auth: pinned
-    trust: "${file:__PKI__/trust.pem}"
-    cert_file: "__PKI__/peer.der"
-    key_file: "__PKI__/peer.key.der"
+__PEER_SERVER_TRUST__
   - name: peer_tls_client
     type: tls
     mode: 0
-    peer_auth: pinned
-    trust: "${file:__PKI__/trust.pem}"
-    cert_file: "__PKI__/peer.der"
-    key_file: "__PKI__/peer.key.der"
+__PEER_CLIENT_TRUST__
   - name: peer_router
     params:
       self_id: __REPLICA_ID__
       listen_port: __PEER_PORT__
       __PEERS__
-      require_identity: pinned
+      __PEER_POLICY__
       partitions: 1
   - name: gateway
     params:
@@ -115,6 +115,9 @@ modules:
   - name: operations
     params:
       __ADMIN_KEYS__
+  # Under `authority`, who certifies the link ends' keys (nanocloud-graph.sh
+  # renders them; nothing under `pins`).
+__PEER_PKI_MODULES__
 
 wiring:
   # ── The store's own loops, through the group's log ─────────────────
@@ -151,6 +154,10 @@ wiring:
     to: peer_router.tls_identity
   - from: peer_router.client_identity
     to: operations.identity
+  # A learner slot whose principal bound, admitted (peer_router `voters`).
+  - from: peer_router.learner_admin
+    to: operations.admin_requests
+__PEER_PKI_WIRING__
   - from: peer_router.peer_rx
     to: consensus.ack
     buffer_bytes: 16384
@@ -206,6 +213,11 @@ wiring:
     to: gateway.applied
   - from: durability.export_chunks
     to: consensus.snapshot_rx
+  # A lagging replica whose entries the log has retired asks for an
+  # install: the leader's durability answers with the store's portable
+  # copy, relayed to that replica alone.
+  - from: consensus.snapshot_request
+    to: durability.install_request
   - from: consensus.snapshot_import
     to: durability.import_chunks
   - from: durability.manifest_auth
@@ -244,3 +256,6 @@ wiring:
   - from: kv_state_worker_store.snapshot_export
     to: durability.app_snapshot_body
     rate: transaction
+  # A peer install is told to raft only once the store holds its state.
+  - from: kv_state_worker_store.install_ack_out
+    to: durability.app_install_ack

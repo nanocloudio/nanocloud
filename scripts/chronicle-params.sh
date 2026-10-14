@@ -9,7 +9,8 @@
 # every owner looks absent and a live-owned pod is collected — caught only by
 # an assertion specific enough to notice. Compiling here means the param is
 # always the source's.
-# The first `<field>: "<hex>"` of `<entry>`'s compiled graph, or nothing when it
+# The first `<field>: {hex: "<hex>"}` of `<entry>`'s compiled graph — a program
+# param is a `blob`, written as its inline hex entry — or nothing when it
 # does not compile. The whole document is read before it is searched: a reader
 # that stopped at the first match would leave the compiler writing to a closed
 # pipe, which under `pipefail` fails the caller however the match went.
@@ -17,7 +18,7 @@ _nc_graph_field() { # _nc_graph_field <uproc-path> <entry> <field>
   local hex out
   hex="$(python3 -c "import sys;print(open(sys.argv[1],'rb').read().hex())" "$1")"
   out="$(fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null)" || true
-  [[ "$out" =~ $3:\ \"([0-9a-f]+)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
+  [[ "$out" =~ $3:\ \{hex:\ \"([0-9a-f]+)\"\} ]] && printf '%s' "${BASH_REMATCH[1]}"
   return 0
 }
 

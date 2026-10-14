@@ -88,8 +88,17 @@ module nanocloud.podeffect {
   // The phase for the plane: /podstatus/<uid> is not a node-scoped prefix,
   // so a worker's write lands in the plane's store as is, where the pod
   // status chain (pod_status.uproc) patches the Pod it names.
+  //
+  // A deleted Pod's spec names no Pod (`pod=` is gone from it), so its
+  // phase is not reported — and its record is removed: a record left behind
+  // names a Pod by NAME, and the next Pod of that name is another
+  // incarnation. Delete-if-present, so the steps that follow cost a read.
+  // `has` guards both arms: a spec without `pod=` carries no `podkey`, and a
+  // `when` that read an absent field would fail closed rather than decide.
   decision report(s: pe.Step) -> pe.Act {
-    when s.ctx.podkey != "" ->
+    when s.ctx.pod == "Terminating" && (!has(s.ctx.podkey) || s.ctx.podkey == "") ->
+      pe.Act { cid: s.cid, op: DELETE, key: s.ctx.key, ctx: s.ctx };
+    when has(s.ctx.podkey) && s.ctx.podkey != "" ->
       pe.Act { cid: s.cid, op: PUT, key: s.ctx.key,
                v1: "phase=", v2: s.ctx.pod, v3: ";pod=" + s.ctx.podkey, ctx: s.ctx };
     default ->

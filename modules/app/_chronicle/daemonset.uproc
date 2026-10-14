@@ -24,6 +24,7 @@ module nanocloud.daemonset {
     node: string = 32;
     ns: string = 34;
     ds: string = 35;
+    ouid: string = 36;    // the DaemonSet's metadata.uid: its Pods' controller reference
     pod: string = 39;
   }
 
@@ -54,6 +55,7 @@ module nanocloud.daemonset {
     key: string = 3;      // "<ns>/<ds>"
     members: string = 4;  // spec.template.spec.* — the template's members,
                           // braces off, so nodeName can be spliced in
+    uid: string = 5;      // metadata.uid, the Pods' controller reference
     node: string = 21;    // the joined ready node
     podkey: string = 24;  // "<ns>/<ds>-<node>"
     podname: string = 26; // "<ds>-<node>"
@@ -90,7 +92,7 @@ module nanocloud.daemonset {
 
   decision probe(p: ds.Pair) -> ds.Probe {
     default ->
-      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey, ctx: Ctx { key: p.podkey, members: p.members, node: p.node, ns: p.ns, ds: p.ds, pod: p.podname } };
+      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey, ctx: Ctx { key: p.podkey, members: p.members, node: p.node, ns: p.ns, ds: p.ds, ouid: p.uid, pod: p.podname } };
   }
 
   // Create-if-absent, node-pinned: the template's members with nodeName
@@ -98,13 +100,13 @@ module nanocloud.daemonset {
   decision create(a: ds.Answer) -> ds.Create {
     when a.status == 404 && a.ctx.members == "" ->
       ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
-                  p1: "{\"metadata\":{\"name\":\"",
+                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
                   p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
                   p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
+                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"name\":\"",
                   p6: a.ctx.ds,
-                  p7: "\"}]},\"spec\":{\"nodeName\":\"",
+                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":{\"nodeName\":\"",
                   p8: a.ctx.node,
                   p9: "\"",
                   p10: "",
@@ -112,13 +114,13 @@ module nanocloud.daemonset {
                   p12: "}}" };
     when a.status == 404 ->
       ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
-                  p1: "{\"metadata\":{\"name\":\"",
+                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
                   p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
                   p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"kind\":\"DaemonSet\",\"name\":\"",
+                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"name\":\"",
                   p6: a.ctx.ds,
-                  p7: "\"}]},\"spec\":{\"nodeName\":\"",
+                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":{\"nodeName\":\"",
                   p8: a.ctx.node,
                   p9: "\",",
                   p10: a.ctx.members,

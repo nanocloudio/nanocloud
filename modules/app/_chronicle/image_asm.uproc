@@ -7,6 +7,8 @@
 //        state=ready|failed
 //   as2  after the job is written -> /image-rootfs/<n> state=assembling;
 //        after the verdict -> the job rewritten phase=delete
+// A workload image (`kind=workload`) is not assembled: once every layer is
+// cached, /image-rootfs/<n> is `path=pack:<n>;state=ready` at once.
 // The script and the two directories come from /config/image
 // (`script=;rootfs=;blobs=`) when it exists, else the packaged paths. A
 // `failed` record is terminal-visible; deleting it re-triggers.
@@ -33,6 +35,7 @@ module nanocloud.image_asm {
     seq: int = 1;
     key: string = 3;
     layers: string = 4;    // layers!argv — space-separated
+    kind: string = 5;      // `workload`: a fluxor workload image
     have: int = 22;        // /image-layer-ok/<n>-* present
     n: int = 50;
     st: string = 70;       // /image-rootfs/<n> state
@@ -53,6 +56,15 @@ module nanocloud.image_asm {
     ctx: Ctx = 254;
   }
   decision as1(a: As) -> Job {
+    // A workload image is not a filesystem: every layer cached is all it
+    // needs — the node stages it as a pack (workload_effect).
+    when has(a.kind) && a.kind == "workload" && a.st == "" && a.n > 0 && a.have >= a.n ->
+      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+            v1: "path=pack:", v2: a.key, v3: ";state=ready", v4: "", v5: "", v6: "",
+            v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+    when has(a.kind) && a.kind == "workload" ->
+      Job { cid: a.seq, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
     when a.st == "" && a.n > 0 && a.have >= a.n && a.script != "" ->
       Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
             v1: "cmd=/bin/sh ", v2: a.script, v3: " ", v4: a.root, v5: "/", v6: a.key,
@@ -102,7 +114,7 @@ module nanocloud.image_asm {
   }
 
   transformation t_as(a: As) -> As {
-    As { seq: a.seq, key: a.key, layers: a.layers, have: a.have, n: a.n, st: a.st, js: a.js,
+    As { seq: a.seq, key: a.key, layers: a.layers, kind: a.kind, have: a.have, n: a.n, st: a.st, js: a.js,
          jc: a.jc, script: a.script, root: a.root, blobs: a.blobs }
   }
   transformation t_did(d: Did) -> Did {

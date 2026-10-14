@@ -87,17 +87,17 @@ modules:
   - name: jobs
     type: store_source
     prefix: "/jobs.batch/"
-    paths: "spec.template.spec,spec.completions"
+    paths: "spec.template.spec,spec.completions,metadata.uid"
     expand: "spec.completions"
     expand_tail: 0
     watch: "/pods/"
   - name: exists
     type: store_effect
-    decision: "${DEC_PRB}"
+    decision: {hex: "${DEC_PRB}"}
     key_prefix: "/pods/"
   - name: apply
     type: store_effect
-    decision: "${DEC_MK}"
+    decision: {hex: "${DEC_MK}"}
     key_prefix: "/pods/"
   - name: pods
     type: store_source
@@ -105,7 +105,7 @@ modules:
     paths: "metadata.ownerReferences.0.kind,status.phase"
   - name: mark
     type: store_effect
-    decision: "${DEC_DN}"
+    decision: {hex: "${DEC_DN}"}
     key_prefix: "/job-done/"
   - name: jobstat
     type: store_source
@@ -116,7 +116,7 @@ modules:
     watch: "/job-done/"
   - name: write
     type: store_effect
-    decision: "${DEC_ST}"
+    decision: {hex: "${DEC_ST}"}
     key_prefix: "/job-status/"
 wiring:
   - from: jobs.status

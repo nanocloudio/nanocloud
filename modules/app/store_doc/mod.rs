@@ -51,11 +51,10 @@ mod dec {
     include!("../../../target/fluxor/chronicle-common/vm_core.rs");
     include!("../../../target/fluxor/chronicle-common/pipeline_core.rs");
     include!("../../../target/fluxor/chronicle-common/decision_core.rs");
-    include!("../../../target/fluxor/chronicle-common/hex_core.rs");
+    include!("../../../target/fluxor/chronicle-common/blob_core.rs");
 }
 
 const DEC_CONT: usize = dec::MAX_CONTAINER_BIN_FULL;
-const DEC_HEX: usize = 2 * DEC_CONT;
 
 /// `channel_peek` on a mailbox channel, which has no byte stream to peek.
 const CHAN_EINVAL: i32 = -22;
@@ -80,6 +79,9 @@ const TY_I64: u8 = 1;
 
 /// store_effect's op codes, the ones this node serves.
 const OP_NOOP: i64 = 0;
+/// A read of the object at the key: 200 with it, 404 when there is none (a
+/// TokenRequest's ServiceAccount, which must exist and is not written).
+const OP_GET: i64 = 1;
 const OP_PUT: i64 = 3;
 const OP_DELETE: i64 = 4;
 const OP_CREATE: i64 = 8;
@@ -88,6 +90,9 @@ const OP_PATCH_MERGE: i64 = 13;
 const OP_PATCH_JSON: i64 = 14;
 const OP_PATCH_SMP: i64 = 15;
 const OP_APPLY: i64 = 16;
+/// store_effect's TAKE: the value answered and deleted in one step,
+/// conditional on the revision read — a single-use claim (a join secret).
+const OP_TAKE: i64 = 17;
 
 /// One record frame.
 const BUF: usize = 8192;
@@ -111,7 +116,9 @@ const ARENA: usize = 2 * MSG_CAP + DOC_MAX + (1 << 20);
 /// A lost answer is a 503, never a writer stalled for good.
 const ANSWER_MS: u64 = 30_000;
 /// How long a deleted object's last state stays for a watch to carry.
-const TOMB_MS: u64 = 300_000;
+/// How long a deleted object's tomb stays (`tomb_ms`): a watch's DELETED
+/// event reads it, and a Pod's node spec lives as long (tomb.uproc).
+const TOMB_MS: u32 = 300_000;
 
 const PHASE_IDLE: u8 = 0;
 const PHASE_SEND: u8 = 1;
@@ -129,11 +136,13 @@ struct State {
     /// state for a watch's DELETED event (store_big's `tomb`).
     tomb: [u8; 48],
     tomb_len: u8,
+    tomb_ms: u32,
     /// `blob = <prefix>`: a body `sha256:<hex>` is the staged body there.
     blob: [u8; 48],
     blob_len: u8,
-    dec_hex: [u8; DEC_HEX],
-    dec_hex_len: u16,
+    /// The decision container, a `blob` param arriving straight into
+    /// `dec_cont`.
+    dec_in: dec::BlobIn,
     dec_cont: [u8; DEC_CONT],
     dec_len: u16,
     dec_buf: [u8; BUF],
@@ -524,6 +533,32 @@ impl State {
                 let ok = unsafe { done(put_value(&self.store(), key, &value[..vl])) };
                 return self.reply(if ok { 200 } else { 500 }, &[]);
             }
+            OP_GET => {
+                let mut got = [0u8; BUF];
+                // SAFETY: storage.object through the loader's table.
+                let read = unsafe { get_value(&self.store(), key, &mut got) };
+                return match read {
+                    Some(n) => self.reply(200, &got[..n]),
+                    None => self.reply(404, &[]),
+                };
+            }
+            OP_TAKE => {
+                let st = self.store();
+                let mut got = [0u8; BUF];
+                // SAFETY: storage.object through the loader's table.
+                let taken = unsafe {
+                    match (head(&st, key), get_value(&st, key, &mut got)) {
+                        (Some(at), Some(n)) if at > 0 => {
+                            (code(delete_cond(&st, key, PRE_ETAG, at)) == 0).then_some(n)
+                        }
+                        _ => None,
+                    }
+                };
+                return match taken {
+                    Some(n) => self.reply(200, &got[..n]),
+                    None => self.reply(404, &[]),
+                };
+            }
             OP_CREATE | OP_REPLACE | OP_PATCH_MERGE | OP_PATCH_JSON | OP_PATCH_SMP | OP_APPLY
             | OP_DELETE => {}
             _ => {
@@ -800,7 +835,7 @@ impl State {
         tk[tl..tl + kl].copy_from_slice(&self.key[..kl]);
         let mut digits = [0u8; 24];
         // SAFETY: the clock through the loader's table.
-        let deadline = unsafe { dev_millis(self.sys()) }.saturating_add(TOMB_MS);
+        let deadline = unsafe { dev_millis(self.sys()) }.saturating_add(self.tomb_ms as u64);
         let dl = dec(deadline as i64, &mut digits);
         // The request message is spent: the tomb is assembled there.
         let v = self.msg_buf();
@@ -887,6 +922,10 @@ mod params_def {
                 if n > 0 { ptr_copy(s.tomb.as_mut_ptr(), d, n); }
             };
 
+        // How long a tomb stays, ms (default TOMB_MS).
+        4, tomb_ms, u32, 300000
+            => |s, d, len| { s.tomb_ms = super::p_u32(d, len, 0, super::TOMB_MS); };
+
         3, blob, str, 0
             => |s, d, len| {
                 let n = if len > 48 { 48 } else { len };
@@ -894,18 +933,11 @@ mod params_def {
                 if n > 0 { ptr_copy(s.blob.as_mut_ptr(), d, n); }
             };
 
-        // `str_chunked`: a decision container is longer than one TLV entry,
-        // so each chunk APPENDS. An overflow is a fault, never a truncation.
-        15, decision, str_chunked, 0
-            => |s, d, len| {
-                let at = s.dec_hex_len as usize;
-                if at + len > super::DEC_HEX {
-                    s.dec_fault = 1;
-                } else {
-                    ptr_copy(s.dec_hex.as_mut_ptr().add(at), d, len);
-                    s.dec_hex_len = (at + len) as u16;
-                }
-            };
+        // `blob`: the container's own bytes, in chunks of at most 255, the
+        // first led by its whole length (chronicle blob_core). One cut short
+        // or past its buffer is a fault, never a truncation.
+        15, decision, blob, 0
+            => |s, d, len| { s.dec_in.take(&mut s.dec_cont, core::slice::from_raw_parts(d, len)); };
     }
 }
 
@@ -958,7 +990,7 @@ pub unsafe extern "C" fn module_new(
         s.out_len = 0;
         s.phase = PHASE_IDLE;
         s.corr = 0;
-        s.dec_hex_len = 0;
+        s.dec_in = dec::BlobIn::new();
         s.dec_len = 0;
         s.dec_fault = 0;
         s.key_prefix_len = 0;
@@ -968,8 +1000,8 @@ pub unsafe extern "C" fn module_new(
         s.reasm = wire::Reassembly::new();
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
-        if s.dec_hex_len > 0 && s.dec_fault == 0 {
-            match dec::hex_decode(&s.dec_hex[..s.dec_hex_len as usize], &mut s.dec_cont) {
+        if s.dec_in.given() {
+            match s.dec_in.whole() {
                 Some(n) if dec::scan_decision_container(&s.dec_cont[..n]).is_ok() => {
                     s.dec_len = n as u16;
                 }

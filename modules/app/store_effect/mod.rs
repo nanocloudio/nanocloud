@@ -45,15 +45,13 @@ mod dec {
     include!("../../../target/fluxor/chronicle-common/vm_core.rs");
     include!("../../../target/fluxor/chronicle-common/pipeline_core.rs");
     include!("../../../target/fluxor/chronicle-common/decision_core.rs");
-    include!("../../../target/fluxor/chronicle-common/hex_core.rs");
+    include!("../../../target/fluxor/chronicle-common/blob_core.rs");
 }
 
-/// The decision container, decoded, and the hex it arrives as — sized as
-/// Chronicle's own `decision` engine sizes them on a full-arena target.
+/// The decision container — sized as Chronicle's own `decision` engine sizes
+/// it on a full-arena target.
 const DEC_CONT: usize = dec::MAX_CONTAINER_BIN_FULL;
-const DEC_HEX: usize = 2 * DEC_CONT;
-/// `count_where`'s container, decoded as its hex arrives: a predicate over
-/// one child, a few comparisons. Small because some fifty instances carry it;
+/// `count_where`'s container: a predicate over one child, a few comparisons. Small because some fifty instances carry it;
 /// a larger one is refused at load, never truncated.
 const CW_CONT: usize = 2048;
 /// The field a `wall = 1` node's fused decision reads the wall clock from
@@ -145,6 +143,17 @@ const OP_PATCH_SMP: i64 = 15;
 /// Server-side apply (with `stamp`): an absent object is CREATED (stamped,
 /// answered 201), a present one merged strategically (200).
 const OP_APPLY: i64 = 16;
+/// Take: answer the object at `key` (200) and delete it in the same step,
+/// conditional on the revision it was read at — or 404 when it is absent or
+/// another taker moved it first. A single-use claim (a join secret) is one
+/// store step, so two callers presenting it cannot both be answered.
+const OP_TAKE: i64 = 17;
+/// One key's records under several collections, gone together: for each name
+/// in the value (comma-separated), delete-if-present `<key_prefix><name>/<key
+/// parts>`. A Pod's node-side records are keyed by its uid under a dozen
+/// collections; when its spec is gone they all go, in one step, and none is
+/// left for a chain to read as a Pod that still exists. Answers 200.
+const OP_DROP_EACH: i64 = 18;
 /// Request fields `echo` may carry through (see the param).
 const ECHO_MAX: usize = 8;
 
@@ -263,11 +272,11 @@ struct State {
     /// next stage still needs the request's own fields.
     echo: [u8; ECHO_MAX],
     echo_len: u8,
-    /// The fused decision (see `mod dec`): hex as received, the container it
-    /// decodes to, and the outcome frame it constructs. `dec_len == 0` = no
-    /// decision; the connector serves the request as it arrives.
-    dec_hex: [u8; DEC_HEX],
-    dec_hex_len: u16,
+    /// The fused decision (see `mod dec`): its container, a `blob` param
+    /// arriving straight into `dec_cont`, and the outcome frame it
+    /// constructs. `dec_len == 0` = no decision; the connector serves the
+    /// request as it arrives.
+    dec_in: dec::BlobIn,
     dec_cont: [u8; DEC_CONT],
     dec_len: u16,
     dec_buf: [u8; BUF],
@@ -278,12 +287,12 @@ struct State {
     dec_dropped: u32,
     dec_failed: u32,
     /// `count_where`: the decision OP_COUNT runs over each child (see
-    /// [`count_child`]); `cw_nib` holds a hex digit split across chunks
-    /// (0x10 | nibble). A container that does not decode, does not fit, or
-    /// does not scan is `cw_fault`, and every filtered COUNT answers 500.
+    /// [`count_child`]), a `blob` param arriving into `cw_cont`. A container
+    /// cut short, past its cap, or that does not scan is `cw_fault`, and
+    /// every filtered COUNT answers 500.
+    cw_in: dec::BlobIn,
     cw_cont: [u8; CW_CONT],
     cw_len: u16,
-    cw_nib: u8,
     cw_fault: u8,
     /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`].
     wall: u32,
@@ -1349,6 +1358,10 @@ unsafe fn create_stamped(
         let cap = value.len() + pl + 64;
         let wp = heap_alloc(sys, cap as u32);
         if wp.is_null() {
+            // A stamped write builds the object on the heap: a build without
+            // one (store_effect) can never stamp, and must say so.
+            let m = b"[store_effect] FAULT: a stamped write needs a heap - use store_stamped or store_big";
+            dev_log(sys, 1, m.as_ptr(), m.len());
             return (500, 0);
         }
         let work = core::slice::from_raw_parts_mut(wp, cap);
@@ -1585,10 +1598,11 @@ fn same_identity(a: &[u8], b: &[u8], sch: &[u8]) -> bool {
 
 /// store_big — this source built with `big` — takes a heap arena: a staged
 /// request body read whole to be written, or an object past a record read
-/// whole to be projected. store_effect takes none.
+/// whole to be projected. store_stamped (`stamp_heap`) takes a small one for
+/// the stamped writes of a controller's objects. store_effect takes none.
 #[allow(
     unexpected_cfgs,
-    reason = "`big` is store_big's feature; this file is also store_effect, whose build does not declare it"
+    reason = "`big` and `stamp_heap` are store_big's and store_stamped's features; this file is also store_effect, whose build declares neither"
 )]
 mod arena {
     #[cfg(feature = "big")]
@@ -1596,6 +1610,15 @@ mod arena {
     #[link_section = ".text.module_arena_size"]
     pub extern "C" fn module_arena_size() -> u32 {
         16 << 20
+    }
+    /// store_stamped: a controller's object stamped and kept on the heap —
+    /// the object, the stamp patch and the stored object it keeps from, at
+    /// the largest object a write carries, with room to spare.
+    #[cfg(feature = "stamp_heap")]
+    #[no_mangle]
+    #[link_section = ".text.module_arena_size"]
+    pub extern "C" fn module_arena_size() -> u32 {
+        512 << 10
     }
 }
 
@@ -1795,55 +1818,19 @@ mod params_def {
                 if n > 0 { ptr_copy(s.hash.as_mut_ptr(), d, n); }
             };
 
-        // `str_chunked`: a decision container is longer than one TLV entry,
-        // so each chunk APPENDS. An overflow is a fault, never a truncation —
-        // a truncated container decodes to a different policy.
-        15, decision, str_chunked, 0
-            => |s, d, len| {
-                let at = s.dec_hex_len as usize;
-                if at + len > super::DEC_HEX {
-                    s.dec_fault = 1;
-                } else {
-                    ptr_copy(s.dec_hex.as_mut_ptr().add(at), d, len);
-                    s.dec_hex_len = (at + len) as u16;
-                }
-            };
+        // `blob`: the container's own bytes, in chunks of at most 255, the
+        // first led by its whole length (chronicle blob_core). One cut short
+        // or past its buffer is a fault, never a truncation — a truncated
+        // container decodes to a different policy.
+        15, decision, blob, 0
+            => |s, d, len| { s.dec_in.take(&mut s.dec_cont, core::slice::from_raw_parts(d, len)); };
 
-        // The per-child decision OP_COUNT counts by: hex, chunked like
-        // `decision`, decoded as it arrives.
-        21, count_where, str_chunked, 0
-            => |s, d, len| { super::cw_append(s, core::slice::from_raw_parts(d, len)); };
+        // The per-child decision OP_COUNT counts by, a `blob` like `decision`.
+        21, count_where, blob, 0
+            => |s, d, len| { s.cw_in.take(&mut s.cw_cont, core::slice::from_raw_parts(d, len)); };
 
         22, wall, u32, 0
             => |s, d, len| { s.wall = super::p_u32(d, len, 0, 0); };
-    }
-}
-
-/// Decode one chunk of `count_where`'s hex into `cw_cont`, a digit split
-/// across chunks held in `cw_nib`.
-fn cw_append(s: &mut State, hex: &[u8]) {
-    for &c in hex {
-        let v = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => {
-                s.cw_fault = 1;
-                return;
-            }
-        };
-        if s.cw_nib == 0 {
-            s.cw_nib = 0x10 | v;
-            continue;
-        }
-        let at = s.cw_len as usize;
-        if at >= CW_CONT {
-            s.cw_fault = 1;
-            return;
-        }
-        s.cw_cont[at] = ((s.cw_nib & 0x0f) << 4) | v;
-        s.cw_len += 1;
-        s.cw_nib = 0;
     }
 }
 
@@ -1896,13 +1883,13 @@ pub unsafe extern "C" fn module_new(
         s.malformed = 0;
         s.unchanged = 0;
         s.paths_len = 0;
-        s.dec_hex_len = 0;
+        s.dec_in = dec::BlobIn::new();
         s.dec_len = 0;
         s.dec_fault = 0;
         s.dec_dropped = 0;
         s.dec_failed = 0;
+        s.cw_in = dec::BlobIn::new();
         s.cw_len = 0;
-        s.cw_nib = 0;
         s.cw_fault = 0;
         s.wall = 0;
         s.tomb_len = 0;
@@ -1913,19 +1900,21 @@ pub unsafe extern "C" fn module_new(
         s.schema_bad = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
-        if s.dec_hex_len > 0 && s.dec_fault == 0 {
-            match dec::hex_decode(&s.dec_hex[..s.dec_hex_len as usize], &mut s.dec_cont) {
+        if s.dec_in.given() {
+            match s.dec_in.whole() {
                 Some(n) if dec::scan_decision_container(&s.dec_cont[..n]).is_ok() => {
                     s.dec_len = n as u16;
                 }
                 _ => s.dec_fault = 1,
             }
         }
-        if s.cw_nib != 0
-            || (s.cw_len > 0
-                && dec::scan_decision_container(&s.cw_cont[..s.cw_len as usize]).is_err())
-        {
-            s.cw_fault = 1;
+        if s.cw_in.given() {
+            match s.cw_in.whole() {
+                Some(n) if dec::scan_decision_container(&s.cw_cont[..n]).is_ok() => {
+                    s.cw_len = n as u16;
+                }
+                _ => s.cw_fault = 1,
+            }
         }
         if s.cw_fault != 0 {
             let sys = &*(syscalls as *const SyscallTable);
@@ -2841,6 +2830,89 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         500
                     };
                     reply_projected(&mut out, cid, status, &[], carry, &proj)
+                }
+                OP_PUT if s.stamp != 0 && key.last() != Some(&b'/') && jp_kind(value) == b'{' => {
+                    // A controller's whole-object write under a schema is an
+                    // upsert that keeps the object's identity: created
+                    // stamped (its uid, creationTimestamp) when absent, and
+                    // carrying the stored object's `keep` paths when present.
+                    // A controller writes Pods and ReplicaSets straight to
+                    // the store, past the API's create; a plain PUT left them
+                    // without a uid, and a node keys a Pod's whole lifecycle
+                    // on it. Answered as a PUT is: 200 written, 204
+                    // unchanged, no body. A value that is not an object (a
+                    // controller's own bookkeeping record) is no object to
+                    // identify, and is written as any PUT is.
+                    let mut status = 0i64;
+                    if !exists(sys, key) {
+                        let mut fk = [0u8; MAX_KEY];
+                        let (st, _) =
+                            create_stamped(sys, key, value, &mut fk, None, rv_path, fw, false, sch);
+                        // 409: another writer created it first; it exists
+                        // now, so it is kept as a present one is.
+                        if st != 409 {
+                            status = st;
+                        }
+                    }
+                    if status == 0 {
+                        let kept = keep_identity(sys, key, value, fw, sch);
+                        let v: &[u8] = match kept {
+                            Some((_, d, n)) => core::slice::from_raw_parts(d, n),
+                            None => value,
+                        };
+                        let (ok, wrote) = put_guarded(sys, key, v);
+                        if let Some((p, _, _)) = kept {
+                            heap_free(sys, p);
+                        }
+                        if ok && !wrote {
+                            s.unchanged = s.unchanged.wrapping_add(1);
+                        }
+                        status = if !ok {
+                            500
+                        } else if wrote {
+                            200
+                        } else {
+                            204
+                        };
+                    }
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
+                }
+                OP_DROP_EACH => {
+                    let parts = full.get(pl..klen).unwrap_or(&[]);
+                    for name in value.split(|&b| b == b',') {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let mut k = [0u8; MAX_KEY];
+                        let mut kl = 0usize;
+                        for piece in [&full[..pl], name, b"/".as_slice(), parts] {
+                            for &b in piece {
+                                if let Some(slot) = k.get_mut(kl) {
+                                    *slot = b;
+                                    kl += 1;
+                                }
+                            }
+                        }
+                        let one = k.get(..kl).unwrap_or(&[]);
+                        let mut probe = [0u8; MAX_VALUE];
+                        if get_value(sys, one, &mut probe).is_some() {
+                            let _ = done(delete_value(sys, one));
+                        }
+                    }
+                    reply_projected(&mut out, cid, 200, &[], carry, &proj)
+                }
+                OP_TAKE => {
+                    let mut val = [0u8; MAX_VALUE];
+                    let taken = match (head(sys, key), get_value(sys, key, &mut val)) {
+                        (Some(at), Some(vlen)) if at > 0 => {
+                            (code(delete_cond(sys, key, PRE_ETAG, at)) == 0).then_some(vlen)
+                        }
+                        _ => None,
+                    };
+                    match taken {
+                        Some(vlen) => reply_projected(&mut out, cid, 200, &val[..vlen], carry, &proj),
+                        None => reply_projected(&mut out, cid, 404, &[], carry, &proj),
+                    }
                 }
                 OP_PUT => {
                     let (ok, wrote) = put_guarded(sys, key, value);

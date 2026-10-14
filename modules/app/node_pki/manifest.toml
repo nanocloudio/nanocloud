@@ -1,0 +1,135 @@
+name = "node_pki"
+version = "0.1.0"
+description = "A node's own PKI: certifies the API's vault-held TLS key through kagi, and mints the single-use join secret"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+timer_class = "wall_clock"
+
+# The node's certificate authority is kagi's `certificate_endpoint`, its key a
+# vault label opened on the node (`nanocloud.ca`, the root that also signs
+# ServiceAccount tokens). Nothing about it is minted at render time: a node
+# image carries no key and no certificate, and a node whose vault cannot
+# persist (no device key to seal under) mints a new authority every boot.
+#
+# CERTIFY. fluxor's `tls`, given an `identity_label`, opens its key in the
+# vault and asks for a certificate on `identity_req`
+# (`[0x5B][len:2 LE = 65][SEC1 point]`). This module asks the authority:
+#
+#   POST /pki/certificate {"subject","tenant","device","public_key","dns"}
+#
+# (`public_key` base64url; `dns` names the API — `dns_suffix` permitting) and
+# hands the answer's chain, leaf then authority, back on `identity_cert`
+# (`[0x5C][len:2 LE][leaf DER ‖ CA DER]`). tls asks again until it holds
+# one, and again near its expiry; every request is answered.
+#
+# JOIN (`join: 1`). Once the authority has answered — so the API is serving
+# under it — the node mints its operator's first credential and the secret
+# that releases it:
+#   1. stale /join/* secrets of an earlier boot are deleted;
+#   2. an admin token is asked of the ServiceAccount mint as any request is
+#      (/token-req/join-<id> = `ns=…;sa=…;aud=…;ttl=…`, answered at
+#      /token-resp/join-<id>), and both records are removed once read;
+#   3. /join/<secret> = {"token":"<JWT>","ca":"<base64url CA DER>"}, a
+#      128-bit secret from the CSPRNG;
+#   4. the secret is logged with the authority's key digest, the form an
+#      operator types or scans:
+#        [join] secret=<32 hex> ca-sha256=<sha256 of the CA's SPKI DER, hex>
+#      said again every 20 s until the secret is spent (a board's log is
+#      lossy), and `[node_pki] join hb …` every 5 s until it is published.
+# Before minting, the join DECLARES what its credentials mean, each object
+# written only if absent (an operator's edit is never undone): namespaces
+# default and kube-system, cluster-admin and its binding to the join's
+# ServiceAccount, and the worker slots' objects below.
+# `POST /apis/nanocloud.io/v1/join` with the secret as the bearer credential
+# answers that record and deletes it (store TAKE), so the secret buys the
+# credential once. The digest is what the operator checks the API's
+# presented authority against before trusting it — kubeadm's
+# `--discovery-token-ca-cert-hash`.
+#
+# WORKER SLOTS (`join_nodes: "1,2"`). The join also carries, per replica id
+# named, a bootstrap credential for ServiceAccount
+# kube-system/node-bootstrap-<id> — the record becomes
+# {"token","ca","nodes":{"<id>":"<JWT>"}}. The join declares that slot's
+# Devices (nanocloud-peers/replica-<id>.server and .client) and
+# binds node-bootstrap-<id> to patching and reading those two alone, so the
+# credential can certify that slot's keys and nothing else.
+#
+# REMOTE (`remote: <API path of a Device>`, `bearer: "${file:<the slot's
+# credential>}"` — a blob, from a file, never written into the graph). A
+# worker holds no authority: its identity is certified through the control
+# plane's API, over this module's exchange pair (wave's HTTP client in front of a `tls`
+# client trusting the joined authority). Each ask tls makes is answered
+# with a certificate issued for it:
+#   PATCH <remote>        {"spec":{"publicKey":"<b64url point>"}}
+#   PATCH <remote>/status {"status":{"publicKey":null}}  (certify it again)
+#   GET   <remote>        once a second, until status.publicKey is the point
+#                         and status.certificate is not the one the first
+#                         PATCH answered — then [leaf ‖ CA] to tls.
+# Never a stale certificate: tls renews at two thirds of the lifetime it is
+# handed, counted from when it takes it.
+
+[[ports]]
+name = "identity_req"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 1024
+
+[[ports]]
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "identity_cert"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+# Extra local identities (`id2_*`, `id3_*`: subject, tenant, device, dns),
+# each on its own pair: a plane certifies its API and both peer link ends
+# with one instance. Unwired and unset, they cost nothing.
+[[ports]]
+name = "identity_req_2"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 1024
+
+[[ports]]
+name = "identity_req_3"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 1024
+
+[[ports]]
+name = "identity_cert_2"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "identity_cert_3"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[observability]
+metrics = ["certified", "cert_refused", "joins_minted"]

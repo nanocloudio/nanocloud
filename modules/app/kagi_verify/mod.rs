@@ -52,6 +52,11 @@ const KEY_BUF: usize = 4096;
 const DEFAULT_KEY_PATH: &[u8] = b"/authn-keys/sa";
 /// Steps between key-fetch attempts while the key is absent.
 const KEY_RETRY_STEPS: u32 = 64;
+/// Steps between re-reads of a key already forwarded. The key changes when
+/// the mint's does — every boot of a node whose vault cannot keep keys, or
+/// once when a mint key replaces a seeded one — and a verifier that read it
+/// once would reject every token the new key signs.
+const KEY_REFRESH_STEPS: u32 = 4096;
 
 /// The status a reply carries when the verifier gave no typed answer: its
 /// exchange ended with a refusal status, an ABORT, or an answer that was not
@@ -110,6 +115,9 @@ struct State {
     /// absent for a while (the mint announces on ITS start), and retrying a
     /// store read every tick turns a normal startup race into a log flood.
     key_backoff: u32,
+    /// FNV-1a of the frame last forwarded, so an unchanged re-read sends
+    /// nothing.
+    key_hash: u32,
     audience: [u8; MAX_AUD],
     audience_len: u16,
     issuer: [u8; MAX_ISS],
@@ -331,6 +339,7 @@ pub unsafe extern "C" fn module_new(
         s.resolved = 0;
         s.key_published = 0;
         s.key_backoff = 0;
+        s.key_hash = 0;
         s.key_path_len = 0;
         s.call.reset();
         s.held_len = 0;
@@ -366,15 +375,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Until the key is out, nothing this module sends can be answered with
         // anything but ST_NO_KEY. Retried rather than resolved once: the issuer
         // publishes on its own start, which may be after ours.
-        if s.key_published == 0 {
-            if s.key_backoff == 0 {
-                publish_key(s, sys);
-                if s.key_published == 0 {
-                    s.key_backoff = KEY_RETRY_STEPS;
-                }
-            } else {
-                s.key_backoff -= 1;
-            }
+        // Then re-read every KEY_REFRESH_STEPS, forwarding a changed key:
+        // re-adding (issuer, profile, kid) replaces it in kagi's keyset.
+        if s.key_backoff == 0 {
+            publish_key(s, sys);
+            s.key_backoff = if s.key_published == 0 { KEY_RETRY_STEPS } else { KEY_REFRESH_STEPS };
+        } else {
+            s.key_backoff -= 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.request_out < 0 || s.response_in < 0 {
             return 0;
@@ -420,8 +427,16 @@ unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
         if n == 0 {
             return;
         }
+        let mut h: u32 = 0x811C_9DC5;
+        for &b in &key[..n] {
+            h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+        }
+        if s.key_published != 0 && h == s.key_hash {
+            return;
+        }
         if (sys.channel_write)(s.key_out, key.as_ptr(), n) > 0 {
             s.key_published = 1;
+            s.key_hash = h;
         }
     }
 }

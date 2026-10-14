@@ -24,6 +24,7 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/argv.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
 const WL_CREATE: u32 = 0x1A00;
 const WL_START: u32 = 0x1A01;
@@ -44,12 +45,63 @@ const CAPS_OP_PAUSE: u16 = 1 << 4;
 const SIG_TERM: u32 = 1;
 const SIG_KILL: u32 = 2;
 
-const WL_CREATE_HEADER: usize = 68;
+const WL_CREATE_HEADER: usize = 76;
+/// `storage_bytes` in the CREATE header: the workload's storage quota (its
+/// own files and store, rooted apart from every other owner's); 0 = none set.
+const STORAGE_BYTES_AT: usize = 68;
+/// The workload an identity names (a caller that lost its handle).
+const WL_LOOKUP: u32 = 0x1A12;
+const WL_EINPROGRESS: i32 = -36;
+const WL_EEXIST: i32 = -17;
+const WL_ENOENT: i32 = -2;
+/// `LOOKUP` answered, `DESTROY` by identity served (caps ops bit 5).
+const CAPS_OP_LOOKUP: u16 = 1 << 5;
+/// A CREATE the kernel says is live (`EEXIST`) but `LOOKUP` cannot find is
+/// asked again this many times before it is reported failed.
+const CREATE_EEXIST_RETRIES: u8 = 8;
 const POSTURE_SHARED: u8 = 0;
 /// A workload that is a module subgraph (an FLXA blob), realised by the
 /// kernel's fmod-graph backend — the only kind a bare-metal node runs.
 const SOURCE_FMOD_GRAPH: u8 = 0;
 const SOURCE_HOST_PROCESS: u8 = 1;
+/// A workload that brings its own modules: a pulled workload image (its
+/// FLXA layer, and one `.fmod` layer per module), staged by the kernel as
+/// the workload's code — each module admitted by its pin, the layer digest.
+const SOURCE_FMOD_PACK: u8 = 2;
+/// The pack reference ahead of the pins and the FLXA (`workload::pack_ref`).
+const PACK_REF: usize = 16;
+const PIN: usize = 32;
+/// FXMT, as `fluxor build` lays out a module table: a 16-byte header, a
+/// 16-byte entry per module, each module placed so its code (past the
+/// 80-byte header) starts on a 4 KiB boundary of the table.
+const FXMT_MAGIC: u32 = 0x544D_5846;
+const FXMT_VERSION: u8 = 1;
+const FXMT_HEADER: usize = 16;
+const FXMT_ENTRY: usize = 16;
+const FMOD_HEADER: usize = 80;
+const FMOD_NAME_AT: usize = 28;
+const FMOD_NAME_LEN: usize = 32;
+const CODE_ALIGN: usize = 4096;
+/// Layers of one workload image: its FLXA and up to 32 modules.
+const MAX_LAYERS: usize = 33;
+/// A pack is assembled in a grant from the kernel's elastic region, taken
+/// at the first pack and kept for every one after: grants are not freed one
+/// by one, so the node pays only when it runs a workload image, and only
+/// for the largest. A grant grows by doubling (the smaller one is not
+/// returned), so what it holds stays under twice the largest pack.
+const ELASTIC_ALLOC: u32 = 0x0C3F;
+const PACK_MIN: usize = 1 << 20;
+/// The kernel's pack pool: no larger pack could be staged.
+const PACK_MAX: usize = 16 << 20;
+/// One read per step: a provider (fat32 on metal) answers within its budget.
+const READ_CHUNK: usize = 64 * 1024;
+const MANIFESTS_PREFIX: &[u8] = b"/image-manifests/";
+const MAX_MANIFEST: usize = 4096;
+const MAX_DIR: usize = 96;
+const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
+const FS_CLOSE: u32 = 0x0903;
+const EAGAIN: i32 = -11;
 /// `storage.object`: the FLXA blob of a graph-backed workload is read from
 /// the Graph object (`graphs.nanocloud.io/v1`, `kubectl apply`'d to the
 /// plane and replicated to every node) at `/graphs.nanocloud.io/<name>`,
@@ -165,6 +217,46 @@ const TTY_EMPTY: Tty = Tty {
     stdin: [0; TTY_IN_CAP],
 };
 
+/// A workload image being read into a pack, a step at a time (a provider
+/// may answer EAGAIN): one at a time, and no other op is taken meanwhile —
+/// they wait in their channels, so none is lost or reordered behind it.
+#[repr(C)]
+struct Asm {
+    active: bool,
+    cid: i64,
+    req_len: u16,
+    req: [u8; REQ_BUF],
+    n: u8,
+    hex: [[u8; 64]; MAX_LAYERS],
+    size: [u32; MAX_LAYERS],
+    /// Where each layer lands in `buf`: the FLXA at the end of the CREATE
+    /// arg, each module at its place in the table.
+    at: [u32; MAX_LAYERS],
+    buf: *mut u8,
+    arg_len: u32,
+    pack_at: u32,
+    pack_len: u32,
+    cur: u8,
+    fd: i32,
+    got: u32,
+    hasher: Sha256,
+}
+
+/// A CREATE the kernel stages over several calls (`EINPROGRESS`): asked
+/// again each step with the same spec, byte for byte, until it answers the
+/// handle. The spec is the pack grant (a workload image) or `cbuf`. No other
+/// op is taken meanwhile, so the spec cannot change under it.
+#[repr(C)]
+struct Pend {
+    active: bool,
+    eexist: u8,
+    cid: i64,
+    req_len: u16,
+    req: [u8; REQ_BUF],
+    arg: *mut u8,
+    arg_len: u32,
+}
+
 #[repr(C)]
 struct State {
     /// The host-process companion class (0x1B: READ, EXEC) answered
@@ -207,6 +299,36 @@ struct State {
 
     req: [u8; REQ_BUF],
     ev: [u8; EV_BUF],
+
+    /// The elastic grant packs are assembled in (null until the first).
+    grant: *mut u8,
+    grant_len: usize,
+    /// The node's blob cache, where a pulled image's layers are files named
+    /// by their sha256.
+    blobs: [u8; MAX_DIR],
+    blobs_len: u8,
+    asm: Asm,
+    creating: Pend,
+    /// The spec of a graph or host workload's CREATE, held while staged.
+    cbuf: [u8; WL_CREATE_HEADER + MAX_SRC + MAX_OPTS],
+}
+
+mod params_def {
+    use super::p_u32;
+    use super::State;
+    use super::SCHEMA_MAX;
+    use super::MAX_DIR;
+
+    define_params! {
+        State;
+
+        1, blobs, str, 0
+            => |s, d, len| {
+                let n = if len > MAX_DIR { 0 } else { len };
+                s.blobs_len = n as u8;
+                if n > 0 { core::ptr::copy_nonoverlapping(d, s.blobs.as_mut_ptr(), n); }
+            };
+    }
 }
 
 // ---- record helpers ----
@@ -560,6 +682,412 @@ unsafe fn graph_source(sys: &SyscallTable, name: &[u8], out: &mut [u8]) -> Optio
     Some(n / 2)
 }
 
+/// A store value whole into `out`, or None (absent, or larger than `out`).
+unsafe fn store_get(sys: &SyscallTable, key: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut k = [0u8; 256];
+    if key.len() > k.len() {
+        return None;
+    }
+    k[..key.len()].copy_from_slice(key);
+    let h = (sys.provider_call)(-1, OBJ_GET, k.as_mut_ptr(), key.len());
+    if h < 0 {
+        return None;
+    }
+    let mut rg = [0u8; 20];
+    rg[8..12].copy_from_slice(&(out.len() as u32).to_le_bytes());
+    rg[12..20].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
+    let got = (sys.provider_call)(h, OBJ_RANGE_GET, rg.as_mut_ptr(), rg.len());
+    let mut z = [0u8; 1];
+    (sys.provider_call)(h, OBJ_CLOSE, z.as_mut_ptr(), 0);
+    (got >= 0 && (got as usize) < out.len()).then_some(got as usize)
+}
+
+/// The `name=` field of a flat `k=v;` record.
+fn flat_field<'a>(rec: &'a [u8], name: &[u8]) -> &'a [u8] {
+    for part in rec.split(|&c| c == b';') {
+        if part.len() > name.len() && part[name.len()] == b'=' && &part[..name.len()] == name {
+            return &part[name.len() + 1..];
+        }
+    }
+    &[]
+}
+
+fn hex_nib(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// The CREATE header's Tier-1 fields, shared by every source kind: identity,
+/// posture, kind, the task envelope, the section lengths, the net identity.
+/// False for an address that is not IPv4.
+unsafe fn create_header(
+    arg: &mut [u8],
+    kind: u8,
+    id: &[u8],
+    req: &[u8],
+    src_len: usize,
+    opts_len: usize,
+) -> bool {
+    let tasks = parse_u32(frame_bytes(req, 7));
+    let addr = frame_bytes(req, 8);
+    let prefix = parse_u32(frame_bytes(req, 9)).min(32) as u8;
+    for b in arg[..WL_CREATE_HEADER].iter_mut() {
+        *b = 0;
+    }
+    // A module workload's identity: the kernel allocates its owner by it,
+    // and an owner's resources — storage scoped by `mount`, a volume's grant
+    // — key on it. The first 16 bytes of sha256 of the sandbox id, which is
+    // the Pod's UID: the same for a re-offered CREATE of one Pod, distinct
+    // for every other. All zeros made every Pod one owner to anything keyed
+    // on it, and the kernel refuses them. A host process keeps the null
+    // identity: on Linux that is the system owner, and a non-null one must
+    // name an owner the boot plan allocated, which a Pod is not.
+    if kind != SOURCE_HOST_PROCESS {
+        let digest = sha256(id);
+        arg[..16].copy_from_slice(&digest[..16]);
+    }
+    arg[16] = POSTURE_SHARED;
+    arg[17] = kind;
+    arg[32..36].copy_from_slice(&tasks.to_le_bytes());
+    arg[40..42].copy_from_slice(&(src_len as u16).to_le_bytes());
+    arg[44..48].copy_from_slice(&(opts_len as u32).to_le_bytes());
+    // No storage quota of the Pod's own yet (ephemeral-storage): unlimited.
+    arg[STORAGE_BYTES_AT..STORAGE_BYTES_AT + 8].copy_from_slice(&0u64.to_le_bytes());
+    if !addr.is_empty() {
+        let Some(a) = parse_ipv4(addr) else {
+            return false;
+        };
+        arg[18] = NET_ISO_OWN;
+        arg[48] = NET_FAM_IPV4;
+        arg[49] = if prefix == 0 { 24 } else { prefix };
+        arg[52..56].copy_from_slice(&a);
+    }
+    true
+}
+
+/// A live workload's slot, taken for `handle` and reported created.
+unsafe fn seat(s: &mut State, handle: i32, cid: i64, id: &[u8], req: &[u8]) {
+    let sys = &*s.syscalls;
+    let Some(i) = s.sandboxes.iter().position(|sb| !sb.in_use) else {
+        let mut z = [0u8; 1];
+        (sys.provider_call)(handle, WL_DESTROY, z.as_mut_ptr(), 0);
+        emit(s, cid, EV_STATUS, id, b"failed", -12, &[], Some(req));
+        return;
+    };
+    let sb = &mut s.sandboxes[i];
+    *sb = SB_EMPTY;
+    sb.in_use = true;
+    sb.handle = handle;
+    sb.id_len = id.len() as u8;
+    sb.id[..id.len()].copy_from_slice(id);
+    emit(s, cid, EV_STATUS, id, b"created", 0, &[], Some(req));
+}
+
+/// A pulled workload image to its pack: the manifest's layers (field 13
+/// names it under /image-manifests/), laid out, then read a step at a time.
+/// `failed(-2)` for an image the node has not pulled whole, `-7` past the
+/// pack arena, `-22` for a manifest this cannot read.
+unsafe fn asm_begin(s: &mut State, req: &[u8], cid: i64, id: &[u8], name: &[u8]) {
+    let sys = &*s.syscalls;
+    let mut key = [0u8; MANIFESTS_PREFIX.len() + 128];
+    if name.len() > 128 || s.blobs_len == 0 {
+        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+        return;
+    }
+    key[..MANIFESTS_PREFIX.len()].copy_from_slice(MANIFESTS_PREFIX);
+    key[MANIFESTS_PREFIX.len()..MANIFESTS_PREFIX.len() + name.len()].copy_from_slice(name);
+    let mut rec = [0u8; MAX_MANIFEST];
+    let Some(rl) = store_get(sys, &key[..MANIFESTS_PREFIX.len() + name.len()], &mut rec) else {
+        emit(s, cid, EV_STATUS, id, b"failed", -2, &[], Some(req));
+        return;
+    };
+    let rec = &rec[..rl];
+    let a = &mut s.asm;
+    if flat_field(rec, b"kind") != b"workload" {
+        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+        return;
+    }
+    // Layer 0 is the FLXA, every other a module, in manifest order.
+    let mut n = 0usize;
+    let mut bad = false;
+    for h in flat_field(rec, b"layers").split(|&c| c == b',') {
+        if n == MAX_LAYERS || h.len() != 64 || h.iter().any(|&c| hex_nib(c).is_none()) {
+            bad = true;
+            break;
+        }
+        a.hex[n].copy_from_slice(h);
+        n += 1;
+    }
+    let mut m = 0usize;
+    for z in flat_field(rec, b"sizes").split(|&c| c == b',') {
+        if m == n {
+            bad = true;
+            break;
+        }
+        let v = parse_u32(z);
+        if v == 0 {
+            bad = true;
+            break;
+        }
+        a.size[m] = v;
+        m += 1;
+    }
+    if bad || n < 2 || m != n {
+        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+        return;
+    }
+    let mods = n - 1;
+    // The CREATE arg: header, pack reference, a pin per module, the FLXA.
+    let arg_len = WL_CREATE_HEADER + PACK_REF + PIN * mods + a.size[0] as usize;
+    a.at[0] = (WL_CREATE_HEADER + PACK_REF + PIN * mods) as u32;
+    let pack_at = arg_len.div_ceil(16) * 16;
+    let mut t = FXMT_HEADER + FXMT_ENTRY * mods;
+    for i in 1..n {
+        while (t + FMOD_HEADER) % CODE_ALIGN != 0 {
+            t += 1;
+        }
+        a.at[i] = (pack_at + t) as u32;
+        t += a.size[i] as usize;
+    }
+    let total = pack_at + t;
+    if total > PACK_MAX {
+        emit(s, cid, EV_STATUS, id, b"failed", -7, &[], Some(req));
+        return;
+    }
+    if total > s.grant_len {
+        let mut want = PACK_MIN;
+        while want < total {
+            want *= 2;
+        }
+        let mut arg = [0u8; 8];
+        arg[..4].copy_from_slice(&(want.min(PACK_MAX) as u32).to_le_bytes());
+        let got = (sys.provider_call)(-1, ELASTIC_ALLOC, arg.as_mut_ptr(), arg.len());
+        if got <= 0 || (got as usize) < total {
+            emit(s, cid, EV_STATUS, id, b"failed", -12, &[], Some(req));
+            return;
+        }
+        s.grant = u64::from_le_bytes(arg) as usize as *mut u8;
+        s.grant_len = got as usize;
+    }
+    let buf = s.grant;
+    core::ptr::write_bytes(buf, 0, total);
+    let a = &mut s.asm;
+    a.buf = buf;
+    a.arg_len = arg_len as u32;
+    a.pack_at = pack_at as u32;
+    a.pack_len = t as u32;
+    a.n = n as u8;
+    a.cur = 0;
+    a.fd = -1;
+    a.got = 0;
+    a.hasher = Sha256::new();
+    a.cid = cid;
+    a.req[..req.len()].copy_from_slice(req);
+    a.req_len = req.len() as u16;
+    a.active = true;
+}
+
+/// The pack is done (or failed): the heap block goes, the slot is free.
+unsafe fn asm_end(s: &mut State, rc: i64) {
+    let sys = &*s.syscalls;
+    if s.asm.fd >= 0 {
+        let mut z = [0u8; 4];
+        (sys.provider_call)(s.asm.fd, FS_CLOSE, z.as_mut_ptr(), 0);
+        s.asm.fd = -1;
+    }
+    s.asm.buf = core::ptr::null_mut();
+    s.asm.active = false;
+    if rc < 0 {
+        let mut req = [0u8; REQ_BUF];
+        let rl = s.asm.req_len as usize;
+        req[..rl].copy_from_slice(&s.asm.req[..rl]);
+        let id = frame_bytes(&req[..rl], 3);
+        let mut idb = [0u8; MAX_ID];
+        let il = id.len().min(MAX_ID);
+        idb[..il].copy_from_slice(&id[..il]);
+        emit(s, s.asm.cid, EV_STATUS, &idb[..il], b"failed", rc, &[], Some(&req[..rl]));
+    }
+}
+
+/// One read of the layer in hand; at the last layer's end, the CREATE.
+unsafe fn asm_step(s: &mut State) {
+    let sys = &*s.syscalls;
+    let a = &mut s.asm;
+    let i = a.cur as usize;
+    if a.fd < 0 {
+        let mut path = [0u8; MAX_DIR + 1 + 64];
+        let dl = s.blobs_len as usize;
+        path[..dl].copy_from_slice(&s.blobs[..dl]);
+        path[dl] = b'/';
+        path[dl + 1..dl + 65].copy_from_slice(&a.hex[i]);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), dl + 65);
+        if fd == EAGAIN {
+            return;
+        }
+        if fd < 0 {
+            asm_end(s, -2); // a layer the cache does not hold
+            return;
+        }
+        a.fd = fd;
+    }
+    let want = (a.size[i] - a.got) as usize;
+    let dst = a.buf.add(a.at[i] as usize + a.got as usize);
+    let n = (sys.provider_call)(a.fd, FS_READ, dst, want.min(READ_CHUNK));
+    if n == EAGAIN {
+        return;
+    }
+    if n <= 0 || n as usize > want {
+        asm_end(s, -5); // short, or longer than the manifest says
+        return;
+    }
+    a.hasher.update(core::slice::from_raw_parts(dst, n as usize));
+    a.got += n as u32;
+    if a.got < a.size[i] {
+        return;
+    }
+    let mut z = [0u8; 4];
+    (sys.provider_call)(a.fd, FS_CLOSE, z.as_mut_ptr(), 0);
+    a.fd = -1;
+    // The cache's bytes are the layer the manifest names, or nothing runs.
+    let h = core::mem::replace(&mut a.hasher, Sha256::new()).finalize();
+    const HX: &[u8; 16] = b"0123456789abcdef";
+    for (k, b) in h.iter().enumerate() {
+        if a.hex[i][2 * k] != HX[(b >> 4) as usize] || a.hex[i][2 * k + 1] != HX[(b & 15) as usize] {
+            asm_end(s, -74);
+            return;
+        }
+    }
+    a.got = 0;
+    a.cur += 1;
+    if (a.cur as usize) < a.n as usize {
+        return;
+    }
+    asm_create(s);
+}
+
+/// Every layer in: the module table's header and entries, the pins, the
+/// CREATE.
+unsafe fn asm_create(s: &mut State) {
+    let sys = &*s.syscalls;
+    let a = &s.asm;
+    let n = a.n as usize;
+    let mods = n - 1;
+    let buf = core::slice::from_raw_parts_mut(a.buf, a.pack_at as usize + a.pack_len as usize);
+    let (arg, pack) = buf.split_at_mut(a.pack_at as usize);
+    pack[0..4].copy_from_slice(&FXMT_MAGIC.to_le_bytes());
+    pack[4] = FXMT_VERSION;
+    pack[5] = mods as u8;
+    pack[6..8].copy_from_slice(&((a.pack_len & 0xFFFF) as u16).to_le_bytes());
+    pack[8..10].copy_from_slice(&((a.pack_len >> 16) as u16).to_le_bytes());
+    for i in 1..n {
+        let off = (a.at[i] - a.pack_at) as usize;
+        let fmod = &pack[off..off + a.size[i] as usize];
+        if fmod.len() < FMOD_HEADER {
+            asm_end(s, -22);
+            return;
+        }
+        let name = &fmod[FMOD_NAME_AT..FMOD_NAME_AT + FMOD_NAME_LEN];
+        let nl = name.iter().position(|&c| c == 0).unwrap_or(FMOD_NAME_LEN);
+        let hash = fnv1a32(&name[..nl]);
+        let mtype = fmod[6];
+        let e = FXMT_HEADER + FXMT_ENTRY * (i - 1);
+        pack[e..e + 4].copy_from_slice(&hash.to_le_bytes());
+        pack[e + 4..e + 8].copy_from_slice(&(off as u32).to_le_bytes());
+        pack[e + 8..e + 12].copy_from_slice(&a.size[i].to_le_bytes());
+        pack[e + 12] = mtype;
+    }
+    let src_len = a.arg_len as usize - WL_CREATE_HEADER;
+    let rl = a.req_len as usize;
+    let mut req = [0u8; REQ_BUF];
+    req[..rl].copy_from_slice(&a.req[..rl]);
+    let req = &req[..rl];
+    let id = frame_bytes(req, 3);
+    let mut idb = [0u8; MAX_ID];
+    let il = id.len().min(MAX_ID);
+    idb[..il].copy_from_slice(&id[..il]);
+    let id = &idb[..il];
+    if !create_header(arg, SOURCE_FMOD_PACK, id, req, src_len, 0) {
+        asm_end(s, -22);
+        return;
+    }
+    let r = WL_CREATE_HEADER;
+    arg[r..r + 8].copy_from_slice(&(pack.as_ptr() as u64).to_le_bytes());
+    arg[r + 8..r + 12].copy_from_slice(&s.asm.pack_len.to_le_bytes());
+    arg[r + 12..r + 14].copy_from_slice(&(mods as u16).to_le_bytes());
+    for i in 1..n {
+        let p = r + PACK_REF + PIN * (i - 1);
+        for k in 0..PIN {
+            let hx = &s.asm.hex[i];
+            arg[p + k] = (hex_nib(hx[2 * k]).unwrap_or(0) << 4) | hex_nib(hx[2 * k + 1]).unwrap_or(0);
+        }
+    }
+    let arg_ptr = arg.as_mut_ptr();
+    let arg_len = s.asm.arg_len;
+    let cid = s.asm.cid;
+    // The spec lives in the grant, which stays this workload's until its
+    // CREATE answers: the next pack waits behind the pending create.
+    asm_end(s, 0);
+    let _ = sys;
+    create_begin(s, cid, req, arg_ptr, arg_len);
+}
+
+/// Hold a CREATE's spec and ask it the first time.
+unsafe fn create_begin(s: &mut State, cid: i64, req: &[u8], arg: *mut u8, arg_len: u32) {
+    let p = &mut s.creating;
+    p.active = true;
+    p.eexist = 0;
+    p.cid = cid;
+    p.req[..req.len()].copy_from_slice(req);
+    p.req_len = req.len() as u16;
+    p.arg = arg;
+    p.arg_len = arg_len;
+    create_step(s);
+}
+
+/// Ask the pending CREATE again: the handle seats the workload; EINPROGRESS
+/// waits for the next step; EEXIST (a workload of this identity is live — a
+/// CREATE that completed while this module was faulted mid-call, or a
+/// restart of this module) adopts it by LOOKUP; anything else fails it.
+unsafe fn create_step(s: &mut State) {
+    let sys = &*s.syscalls;
+    let rc = (sys.provider_call)(-1, WL_CREATE, s.creating.arg, s.creating.arg_len as usize);
+    if rc == WL_EINPROGRESS {
+        return;
+    }
+    let mut handle = rc;
+    if rc == WL_EEXIST && s.caps_ops & CAPS_OP_LOOKUP != 0 {
+        let mut ident = [0u8; 16];
+        core::ptr::copy_nonoverlapping(s.creating.arg, ident.as_mut_ptr(), 16);
+        let h = (sys.provider_call)(-1, WL_LOOKUP, ident.as_mut_ptr(), ident.len());
+        if h >= 0 {
+            handle = h;
+        } else if h == WL_EINPROGRESS {
+            return; // still being staged: the same spec continues it
+        } else if s.creating.eexist < CREATE_EEXIST_RETRIES {
+            s.creating.eexist += 1;
+            return; // gone between the two calls: create again next step
+        }
+    }
+    let mut req = [0u8; REQ_BUF];
+    let rl = s.creating.req_len as usize;
+    req[..rl].copy_from_slice(&s.creating.req[..rl]);
+    let req = &req[..rl];
+    let id = frame_bytes(req, 3);
+    let mut idb = [0u8; MAX_ID];
+    let il = id.len().min(MAX_ID);
+    idb[..il].copy_from_slice(&id[..il]);
+    let cid = s.creating.cid;
+    s.creating.active = false;
+    if handle < 0 {
+        emit(s, cid, EV_STATUS, &idb[..il], b"failed", handle as i64, &[], Some(req));
+        return;
+    }
+    seat(s, handle, cid, &idb[..il], req);
+}
+
 // ---- ops ----
 
 unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
@@ -576,12 +1104,15 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
         emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
         return;
     }
+    // A pulled workload image: read into a pack over the next steps.
+    let pack = frame_bytes(req, 13);
+    if !pack.is_empty() {
+        asm_begin(s, req, cid, id, pack);
+        return;
+    }
     let cmd = frame_bytes(req, 4);
     let rootfs = frame_bytes(req, 5);
     let isolate = frame_bytes(req, 6) == b"1";
-    let tasks = parse_u32(frame_bytes(req, 7));
-    let addr = frame_bytes(req, 8);
-    let prefix = parse_u32(frame_bytes(req, 9)).min(32) as u8;
     let graph = frame_bytes(req, 12);
     let mut src = [0u8; MAX_SRC];
     let mut opts = [0u8; MAX_OPTS];
@@ -606,51 +1137,17 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
         };
         (sl, ol, SOURCE_HOST_PROCESS)
     };
-    let mut arg = [0u8; WL_CREATE_HEADER + MAX_SRC + MAX_OPTS];
-    arg[16] = POSTURE_SHARED;
-    arg[17] = kind;
-    arg[32..36].copy_from_slice(&tasks.to_le_bytes());
-    arg[40..42].copy_from_slice(&(sl as u16).to_le_bytes());
-    arg[44..48].copy_from_slice(&(ol as u32).to_le_bytes());
-    if !addr.is_empty() {
-        let Some(a) = parse_ipv4(addr) else {
-            emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
-            return;
-        };
-        arg[18] = NET_ISO_OWN;
-        arg[48] = NET_FAM_IPV4;
-        arg[49] = if prefix == 0 { 24 } else { prefix };
-        arg[52..56].copy_from_slice(&a);
+    // The spec is held in `cbuf` until the CREATE answers (it may stage).
+    let st = s as *mut State;
+    let arg = &mut (*st).cbuf;
+    if !create_header(arg, kind, id, req, sl, ol) {
+        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+        return;
     }
     arg[WL_CREATE_HEADER..WL_CREATE_HEADER + sl].copy_from_slice(&src[..sl]);
     arg[WL_CREATE_HEADER + sl..WL_CREATE_HEADER + sl + ol].copy_from_slice(&opts[..ol]);
-    let handle = (sys.provider_call)(-1, WL_CREATE, arg.as_mut_ptr(), WL_CREATE_HEADER + sl + ol);
-    if handle < 0 {
-        emit(
-            s,
-            cid,
-            EV_STATUS,
-            id,
-            b"failed",
-            handle as i64,
-            &[],
-            Some(req),
-        );
-        return;
-    }
-    let Some(i) = s.sandboxes.iter().position(|sb| !sb.in_use) else {
-        let mut z = [0u8; 1];
-        (sys.provider_call)(handle, WL_DESTROY, z.as_mut_ptr(), 0);
-        emit(s, cid, EV_STATUS, id, b"failed", -12, &[], Some(req));
-        return;
-    };
-    let sb = &mut s.sandboxes[i];
-    *sb = SB_EMPTY;
-    sb.in_use = true;
-    sb.handle = handle;
-    sb.id_len = id.len() as u8;
-    sb.id[..id.len()].copy_from_slice(id);
-    emit(s, cid, EV_STATUS, id, b"created", 0, &[], Some(req));
+    let _ = sys;
+    create_begin(s, cid, req, arg.as_mut_ptr(), (WL_CREATE_HEADER + sl + ol) as u32);
 }
 
 unsafe fn op(s: &mut State, req: &[u8]) {
@@ -677,11 +1174,24 @@ unsafe fn op(s: &mut State, req: &[u8]) {
             }
         }
         OP_DESTROY => {
+            // Idempotent: a workload this runtime does not hold — one from
+            // before a restart, which the restart ended — is destroyed
+            // already, and is answered so; otherwise its status would stay
+            // whatever the last boot recorded, and its delete never settle.
             if let Some(i) = slot {
                 (sys.provider_call)(s.sandboxes[i].handle, WL_DESTROY, z.as_mut_ptr(), 0);
                 s.sandboxes[i] = SB_EMPTY;
-                emit(s, cid, EV_STATUS, id, b"destroyed", 0, &[], Some(req));
+            } else if s.caps_ops & CAPS_OP_LOOKUP != 0 {
+                // No handle held: a workload of this identity may still be
+                // live or staged (this module faulted, or restarted, mid
+                // CREATE). Destroyed by identity, or nothing carries it.
+                let digest = sha256(id);
+                let mut ident = [0u8; 16];
+                ident.copy_from_slice(&digest[..16]);
+                let _ = (sys.provider_call)(-1, WL_DESTROY, ident.as_mut_ptr(), ident.len());
+                let _ = WL_ENOENT;
             }
+            emit(s, cid, EV_STATUS, id, b"destroyed", 0, &[], Some(req));
         }
         OP_SIGNAL => {
             let want: u8 = match frame_bytes(req, 4) {
@@ -1040,8 +1550,8 @@ pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -1071,6 +1581,15 @@ pub unsafe extern "C" fn module_new(
         s.exec_next = 0;
         s.pend_at = 0;
         s.pend_len = 0;
+        s.blobs_len = 0;
+        s.asm.active = false;
+        s.asm.buf = core::ptr::null_mut();
+        s.asm.fd = -1;
+        s.grant = core::ptr::null_mut();
+        s.grant_len = 0;
+        s.creating.active = false;
+        params_def::set_defaults(s);
+        params_def::parse_tlv(s, params, params_len);
         0
     }
 }
@@ -1122,6 +1641,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.booted == 0 {
             emit(s, 0, EV_BOOT, b"", b"", 0, &[], None);
             s.booted = 1;
+            return 0;
+        }
+        // A CREATE being staged is asked again; the rest wait their turn.
+        if s.creating.active {
+            if s.can_emit() {
+                create_step(s);
+            }
+            poll_sandboxes(s);
+            poll_ttys(s);
+            return 0;
+        }
+        // A pack being read takes the step's op: the rest wait their turn.
+        if s.asm.active {
+            if s.can_emit() {
+                asm_step(s);
+            }
+            poll_sandboxes(s);
+            poll_ttys(s);
             return 0;
         }
         // Ops, one per input per step, round-robin — then observation.

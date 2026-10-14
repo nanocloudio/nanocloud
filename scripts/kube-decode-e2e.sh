@@ -73,12 +73,12 @@ modules:
   - name: kube_decode
     type: pipeline
     params:
-      decode: "${KD_DECODE}"
-      ir_stages: "${KD_PASS}"
+      decode: {hex: "${KD_DECODE}"}
+      ir_stages: {hex: "${KD_PASS}"}
   - name: kube_route
     type: decision
     params:
-      decision: "${KD_ROUTE}"
+      decision: {hex: "${KD_ROUTE}"}
   - name: debug
     mode: 1        # plaintext: log the bytes verbatim, not a hash of them
 wiring:

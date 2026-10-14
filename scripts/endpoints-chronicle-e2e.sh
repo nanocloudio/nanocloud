@@ -92,13 +92,13 @@ modules:
     watch: "/pods/,/probe-status/"
   - name: probe
     type: store_effect
-    decision: "${DEC_AK}"
+    decision: {hex: "${DEC_AK}"}
     key_prefix: "/probe-status/"
     flat: 1
     paths: "ready"
   - name: slices
     type: store_effect
-    decision: "${DEC_SL}"
+    decision: {hex: "${DEC_SL}"}
     key_prefix: "/endpointslices/"
   - name: sl_source
     type: store_source
@@ -106,11 +106,11 @@ modules:
     watch: "/pods/"
   - name: podexists
     type: store_effect
-    decision: "${DEC_EX}"
+    decision: {hex: "${DEC_EX}"}
     key_prefix: "/pods/"
   - name: collect
     type: store_effect
-    decision: "${DEC_PR}"
+    decision: {hex: "${DEC_PR}"}
     key_prefix: "/endpointslices/"
   - name: svcs
     type: store_source
@@ -121,7 +121,7 @@ modules:
     watch: "/endpointslices/"
   - name: write
     type: store_effect
-    decision: "${DEC_DC}"
+    decision: {hex: "${DEC_DC}"}
     key_prefix: "/endpoints/"
 wiring:
   - from: pairs.status

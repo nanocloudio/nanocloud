@@ -59,7 +59,7 @@ const _: () = assert!(OUT <= admin::REQUEST_MAX);
 const CAP_PATH_MAX: usize = 255;
 
 /// The tag this module's dial carries through `tls`.
-const DIAL_TAG: u8 = 1;
+const DIAL_TAG: abi::contracts::net::net_proto::RequesterTag = 1;
 /// Before dialing again after the transport failed or the capability file
 /// could not be read.
 const RETRY_MS: u64 = 1_000;

@@ -146,17 +146,17 @@ modules:
   - name: kube_decode
     type: pipeline
     params:
-      decode: "${KD_DECODE}"
-      ir_stages: "${KD_PASS}"
+      decode: {hex: "${KD_DECODE}"}
+      ir_stages: {hex: "${KD_PASS}"}
   - name: kube_route
     type: decision
     params:
-      decision: "${KD_ROUTE}"
+      decision: {hex: "${KD_ROUTE}"}
   - name: admit
     type: decision
     params:
       # apiplane_auth.uproc 'admit': credential to field 8, request to carry 30..35.
-      decision: "${DEC_ADMIT}"
+      decision: {hex: "${DEC_ADMIT}"}
   - name: kagi_verify
     audience: "nanocloud"
     issuer: "https://kubernetes.default.svc"
@@ -166,15 +166,15 @@ modules:
     type: decision
     params:
       # apiplane_auth.uproc 'decide': verify_err -> HTTP status + body.
-      decision: "${DEC_DECIDE}"
+      decision: {hex: "${DEC_DECIDE}"}
   - name: enc_http
     type: pipeline
     params:
       # BYTE-IDENTICAL to the read path's encoder (apiserver-chronicle-e2e.sh).
       # The reply shape is the same three fields, so the response leg needed no
       # new bytecode and no new module.
-      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
-      encode: "01000201000000620401010002020000006202016001000060010010600200000001000203000000646202016010006170706c69636174696f6e2f6a736f6e01000203000000616a"
+      ir_stages: {hex: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"}
+      encode: {hex: "01000201000000620401010002020000006202016001000060010010600200000001000203000000646202016010006170706c69636174696f6e2f6a736f6e01000203000000616a"}
 wiring:
   - from: linux_net.net_out
     to: http.net_in

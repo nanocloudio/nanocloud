@@ -8,6 +8,14 @@ module nanocloud.apiplane_reply {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
+    // A minted token's expiry, RFC 3339 (`kagi_mint`); absent otherwise.
+    exp: string = 4;
+    // A TokenRequest's name, namespace, audience and lifetime, from the mint
+    // stage (apiplane_token.uproc); absent otherwise.
+    tk_name: string = 34;
+    tk_ns: string = 35;
+    tk_aud: string = 37;
+    tk_ttl: string = 38;
     c_cid: int = 30;
     c_status: int = 31;
     c_answer: string = 32;
@@ -44,6 +52,15 @@ module nanocloud.apiplane_reply {
   // apply that CREATED is 201; everything else was decided before the write
   // (and a refusal of it — 409, a patch's 400/422 — is `reply`'s).
   decision d_answer(w: Wrote) -> Acted {
+    // A join secret that answered nothing — never issued, or spent — is a
+    // credential that did not verify.
+    when w.c_verb == "join" && w.status != 200 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 401,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"join secret not recognised\"}", c_stream: 0, c_key: w.c_key };
+    // A TokenRequest for a ServiceAccount that does not exist.
+    when w.c_verb == "token" && w.status != 200 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 404,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404,\"message\":\"serviceaccount not found\"}", c_stream: 0, c_key: w.c_key };
     when w.c_verb == "delete" && w.status == 404 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 404,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}", c_stream: 0, c_key: w.c_key };
@@ -76,6 +93,16 @@ module nanocloud.apiplane_reply {
     // is chunked or close-delimited. That is what a Kubernetes watch is on
     // the wire.
     flags: int = 4;
+    // The body's further PARTS, which the encoder appends after `value` in
+    // order: a body built from pieces is joined on the wire, never in a
+    // decision, whose scratch is 512 bytes (a token alone is more). Empty for
+    // every answer that is one piece.
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
   }
 
   // The answer, already decided — except where the STORE overrules it: a
@@ -88,45 +115,84 @@ module nanocloud.apiplane_reply {
   // an exchange, so it answers no one. Every other cid may be a REAL
   // exchange: a stray answer there would reach whichever request holds it.
   decision d_reply(a: ActReply) -> Reply {
+    // An answer the shared issuer gave the store-driven token chain
+    // (sa_token.uproc), fanned here beside this chain's: it carries no reply
+    // at all, so nothing is sent.
+    when !has(a.c_status) ->
+      Reply { cid: 4294967295, status: 204, value: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
+              flags: 0 };
     when a.c_status == 0 ->
-      Reply { cid: 4294967295, status: 204, value: "", flags: 0 };
+      Reply { cid: 4294967295, status: 204, value: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", flags: 0 };
+    // A TokenRequest the mint signed (apiplane_token.uproc): its name,
+    // namespace, audience and lifetime ride the carry (34, 35, 37, 38), the
+    // token is `kagi_mint`'s field 3 (status 0) and its expiry field 4 —
+    // present only for a token it could read, so `has` is the test (a read of
+    // an absent field fails the decision, and every reply passes this rule).
+    when a.c_answer == "@mint:" && a.status == 0 && has(a.exp) ->
+      Reply { cid: a.c_cid, status: 201,
+              value: "{\"kind\":\"TokenRequest\",\"apiVersion\":\"authentication.k8s.io/v1\",\"metadata\":{\"name\":\"",
+              v2: a.tk_name,
+              v3: "\",\"namespace\":\"",
+              v4: a.tk_ns,
+              v5: "\"},\"spec\":{\"audiences\":[\"" + a.tk_aud + "\"],\"expirationSeconds\":" + a.tk_ttl + "},\"status\":{\"token\":\"",
+              v6: a.value,
+              v7: "\",\"expirationTimestamp\":\"" + a.exp + "\"}}",
+              flags: 0 };
+    when a.c_answer == "@mint:" ->
+      Reply { cid: a.c_cid, status: 500,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"InternalError\",\"code\":500,\"message\":\"the token could not be minted\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
+              flags: 0 };
+    // A TokenRequest on a plane with no mint: the subresource is not served.
+    when a.c_answer.startsWith("@mint") ->
+      Reply { cid: a.c_cid, status: 404,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404,\"message\":\"the server could not find the requested resource\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
+              flags: 0 };
     // The store refused a conditional write. A create that lost the race is
     // AlreadyExists; an update against a moved object is Conflict — the two
     // reasons `kubectl` distinguishes when it decides whether to re-read.
     when a.c_wstatus == 409 && a.c_status == 201 ->
       Reply { cid: a.c_cid, status: 409,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"AlreadyExists\",\"code\":409}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     when a.c_wstatus == 409 ->
       Reply { cid: a.c_cid, status: 409,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Conflict\",\"code\":409,\"message\":\"the object has been modified; please apply your changes to the latest version and try again\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     // A PATCH the store refused ("@stored" was to be the object).
     when a.c_answer == "@stored" && a.c_wstatus == 404 ->
       Reply { cid: a.c_cid, status: 404,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     when a.c_answer == "@stored" && a.c_wstatus == 400 ->
       Reply { cid: a.c_cid, status: 400,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"BadRequest\",\"code\":400,\"message\":\"the patch is not valid JSON of its type\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     when a.c_answer == "@stored" && a.c_wstatus == 422 ->
       Reply { cid: a.c_cid, status: 422,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Invalid\",\"code\":422,\"message\":\"the patch cannot be applied: a test failed, a path names nothing, or the result is another object\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     when a.c_answer == "@stored" && a.c_wstatus == 413 ->
       Reply { cid: a.c_cid, status: 413,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"RequestEntityTooLarge\",\"code\":413}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     when a.c_answer == "@stored" ->
       Reply { cid: a.c_cid, status: 500,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"InternalError\",\"code\":500}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
     default -> Reply { cid: a.c_cid, status: a.c_status, value: a.c_answer,
-                       flags: a.c_stream };
+                       v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", flags: a.c_stream };
   }
   transformation pass_areply(a: ActReply) -> ActReply {
-    ActReply { cid: a.cid, status: a.status, value: a.value,
+    ActReply { cid: a.cid, status: a.status, value: a.value, exp: a.exp,
                c_cid: a.c_cid, c_status: a.c_status, c_answer: a.c_answer,
                c_stream: a.c_stream, c_wstatus: a.c_wstatus }
   }
@@ -136,11 +202,12 @@ module nanocloud.apiplane_reply {
     return y;
   }
   // The encoder node's stage program: it rebuilds the Reply record so the
-  // `ser` program that follows sees every field. It must copy FOUR — the read
-  // path's copied three, and field 4 (the envelope flags) silently vanished
-  // when this chain started setting it.
+  // `ser` program that follows sees every field. It must copy them ALL — the
+  // read path's copied three, and field 4 (the envelope flags) silently
+  // vanished when this chain started setting it; the body's parts 5..10 too.
   transformation pass_reply(r: Reply) -> Reply {
-    Reply { cid: r.cid, status: r.status, value: r.value, flags: r.flags }
+    Reply { cid: r.cid, status: r.status, value: r.value, flags: r.flags,
+            v2: r.v2, v3: r.v3, v4: r.v4, v5: r.v5, v6: r.v6, v7: r.v7 }
   }
   pipeline encode(r: Reply) -> Reply {
     call x = pass_reply(r);

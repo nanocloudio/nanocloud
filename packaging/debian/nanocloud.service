@@ -30,6 +30,9 @@ EnvironmentFile=-/etc/nanocloud.io/seal.env
 WorkingDirectory=/var/lib/nanocloud.io/control-plane/store
 Environment=FLUXOR_PROJECT_ROOT=/usr/lib/nanocloud/fluxor
 Environment=FLUXOR_VAULT_DIR=/var/lib/nanocloud.io/control-plane/store/vault
+# Each Pod's own storage (its files and its store), rooted by its identity:
+# kept across restarts, removed only when its workload is destroyed.
+Environment=FLUXOR_OWNER_ROOT=/var/lib/nanocloud.io/owners
 # The store holds Secrets, minted tokens and (under vault/) the sealed keys,
 # and the store writes its files 0644: the DIRECTORY is what keeps them from
 # every other local user, so it is 0700 on every start — an upgrade from a
@@ -38,6 +41,7 @@ Environment=FLUXOR_VAULT_DIR=/var/lib/nanocloud.io/control-plane/store/vault
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/store
 ExecStartPre=/bin/chmod 0700 /var/lib/nanocloud.io/control-plane/store
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/store/lattice
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/owners
 RuntimeDirectory=nanocloud
 RuntimeDirectoryMode=0700
 ExecStartPre=/usr/lib/nanocloud/nanocloud-graph.sh /etc/nanocloud.io/fluxor /run/nanocloud/graph.yaml

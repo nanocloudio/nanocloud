@@ -27,6 +27,7 @@ module nanocloud.replicaset {
     gate: string = 38;
     pod: string = 39;
     labels: string = 40;  // the ReplicaSet's metadata.labels, an opaque subtree
+    ouid: string = 41;    // the ReplicaSet's metadata.uid: its Pods' controller reference
   }
   // carried by: rs.Act, rs.Applied
   message Ctx2 {
@@ -54,6 +55,7 @@ module nanocloud.replicaset {
                          // bare name where a store key wants "<ns>/".
     hash: string = 5;    // metadata.labels.pod-template-hash on the ReplicaSet
     labels: string = 6;  // metadata.labels, an opaque subtree: the pods' labels
+    uid: string = 7;     // metadata.uid, the Pods' controller reference
   }
 
   // Stage 1 asks about the PREDECESSOR, so the verdict can roll strictly in
@@ -159,13 +161,13 @@ module nanocloud.replicaset {
   // and let the answer's 204 stand for "ungated".
   decision ask_prev(o: rs.Ord) -> rs.PrevQ {
     when o.prevstr == "" && o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels, ouid: o.uid } };
     when o.prevstr == "" ->
-      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
+      rs.PrevQ { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels, ouid: o.uid } };
     when o.ord < o.want ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "1", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels, ouid: o.uid } };
     default ->
-      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels } };
+      rs.PrevQ { cid: o.seq, op: GET, key: o.prevkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, in: "", name: o.name, ns: o.ns, ord: o.ordstr, hash: o.hash, prev: o.prevstr, pod: o.pod, labels: o.labels, ouid: o.uid } };
   }
 
   // Stage 2: ask about THIS ordinal, carrying the predecessor verdict. The gate
@@ -173,11 +175,11 @@ module nanocloud.replicaset {
   // predecessor at all (status 204 from the NOOP above).
   decision probe(a: rs.PrevA) -> rs.Probe {
     when a.status == 204 ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels, ouid: a.ctx.ouid } };
     when a.phash == a.ctx.hash ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "1", pod: a.ctx.pod, labels: a.ctx.labels, ouid: a.ctx.ouid } };
     default ->
-      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "", pod: a.ctx.pod, labels: a.ctx.labels } };
+      rs.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: "", pod: a.ctx.pod, labels: a.ctx.labels, ouid: a.ctx.ouid } };
   }
 
   // Four cases, and only two act:
@@ -201,9 +203,9 @@ module nanocloud.replicaset {
                p4: a.ctx.ord,
                p5: "\",\"namespace\":\"",
                p6: a.ctx.ns,
-               p7: "\",\"ownerReferences\":[{\"kind\":\"ReplicaSet\",\"name\":\"",
+               p7: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"name\":\"",
                p8: a.ctx.name,
-               p9: "\"}],\"labels\":",
+               p9: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}],\"labels\":",
                p10: a.ctx.labels,
                p11: "},\"spec\":",
                p12: a.ctx.tmpl,
@@ -216,9 +218,9 @@ module nanocloud.replicaset {
                p4: a.ctx.ord,
                p5: "\",\"namespace\":\"",
                p6: a.ctx.ns,
-               p7: "\",\"ownerReferences\":[{\"kind\":\"ReplicaSet\",\"name\":\"",
+               p7: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"name\":\"",
                p8: a.ctx.name,
-               p9: "\"}],\"labels\":{\"pod-template-hash\":\"",
+               p9: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}],\"labels\":{\"pod-template-hash\":\"",
                p10: a.ctx.hash,
                p11: "\"}},\"spec\":",
                p12: a.ctx.tmpl,
@@ -284,11 +286,11 @@ module nanocloud.replicaset {
              selfkey: o.selfkey, prevkey: o.prevkey }
   }
   transformation pass_prev(a: rs.PrevA) -> rs.PrevA {
-    rs.PrevA { cid: a.cid, status: a.status, value: a.value, phash: a.phash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, prev: a.ctx.prev, pod: a.ctx.pod, labels: a.ctx.labels } }
+    rs.PrevA { cid: a.cid, status: a.status, value: a.value, phash: a.phash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, prev: a.ctx.prev, pod: a.ctx.pod, labels: a.ctx.labels, ouid: a.ctx.ouid } }
   }
   transformation pass_ans(a: rs.Answer) -> rs.Answer {
     rs.Answer { cid: a.cid, status: a.status, value: a.value,
-                myhash: a.myhash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: a.ctx.gate, pod: a.ctx.pod, labels: a.ctx.labels } }
+                myhash: a.myhash, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: a.ctx.in, name: a.ctx.name, ns: a.ctx.ns, ord: a.ctx.ord, hash: a.ctx.hash, gate: a.ctx.gate, pod: a.ctx.pod, labels: a.ctx.labels, ouid: a.ctx.ouid } }
   }
 
   transformation pass_applied(a: rs.Applied) -> rs.Applied {

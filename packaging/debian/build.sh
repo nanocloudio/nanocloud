@@ -110,6 +110,11 @@ install -Dm644 "${SCRIPT_DIR}/nanocloud-profile.sh"       "${STAGING_ROOT}/etc/p
 # when image_assembler projects an assembly job.
 install -Dm755 "${SCRIPT_DIR}/assemble-image.sh"          "${STAGING_ROOT}/usr/lib/nanocloud/assemble-image.sh"
 
+# The fluxor ABI this package's runtime and modules are built against: the
+# node's `nanocloud.io/fluxor-abi` label (nanocloud-graph.sh).
+mkdir -p "${STAGING_ROOT}/usr/share/nanocloud"
+sh "${REPO_ROOT}/scripts/fluxor-abi.sh" "${REPO_ROOT}" >"${STAGING_ROOT}/usr/share/nanocloud/fluxor-abi"
+
 # Dataplane system-service bundle sources (dns/edge/sandbox/webhook/route/
 # netpolicy/proxy) — postinst publishes these into the node's OCI store so the
 # node can run them as fluxor workloads.

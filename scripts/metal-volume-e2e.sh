@@ -158,6 +158,10 @@ put_text "/graphs.nanocloud.io/probe-vol" "{\"apiVersion\":\"nanocloud.io/v1\",\
 echo "== 4. render the node: the plane + the kubelet's graph-pod slice on one scoped store; pack the Pod's module types =="
 nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
+# A deleted object's tomb lives 3 s here, not 300: step 7 sees it end, and
+# with it every record the node kept for the Pod.
+sed -i '/^    # A delete leaves the object.s last state/{n;s|^    tomb: "/~tomb"$|&\n    tomb_ms: 3000|}' "$D/graph.yaml"
+[ "$(grep -c 'tomb_ms: 3000' "$D/graph.yaml")" = 1 ] || fail "the tomb TTL splice did not apply"
 python3 - "$D/graph.yaml" "$ROOT" node-1 <<'PY2' || fail "the splice did not apply"
 import re, sys
 out, root, node = sys.argv[1:4]
@@ -283,6 +287,34 @@ case "$r" in 404\|*) echo "   gone" ;; *) fail "the Pod did not go away: ${r:0:1
 # the next step of E3; until then a Pod recreated at once waits it out.
 sleep 8
 for u in $UIDS; do echo "   records of $u after the delete:"; dump_chain "$u"; done
+# Its phase record goes with it: the record names the Pod by NAME, and the
+# Pod made next (step 8) is the same name, another incarnation.
+for u in $UIDS; do
+  for _ in $(seq 30); do
+    [ -z "$(nc_store_get "$STORE" "/podstatus/$u" 2>/dev/null)" ] && break
+    sleep 1
+  done
+  [ -z "$(nc_store_get "$STORE" "/podstatus/$u" 2>/dev/null)" ] \
+    || fail "the deleted Pod's /podstatus/$u was left behind: $(nc_store_get "$STORE" "/podstatus/$u")"
+done
+echo "   the deleted Pod's phase record is gone"
+# Its tomb ends (3 s), the plane drops the node's spec, and the node drops
+# every record it kept for that uid: nothing else removes them, and a node's
+# records would otherwise grow by every Pod it ever ran.
+NODE_RECS="pod-specs metal-sandboxes sandbox-status sandbox-boot-of pod-runtime pod-lifecycle-status probe-status pod-resolved"
+left=""
+for u in $UIDS; do
+  for _ in $(seq 40); do
+    left=""
+    for c in $NODE_RECS; do
+      [ -n "$(nc_store_get "$STORE" "/~node/node-1/$c/$u" 2>/dev/null)" ] && left="$left $c"
+    done
+    [ -z "$left" ] && [ -z "$(nc_store_get "$STORE" "/~tomb/pods/default/probe-vol" 2>/dev/null)" ] && break
+    sleep 1
+  done
+  if [ -n "$left" ]; then dump_chain "$u"; fail "the deleted Pod's node records outlived its tomb:$left"; fi
+done
+echo "   its tomb ended, and the node's records of it went with it"
 
 echo "== 8. second life: the same volume, epoch 2 =="
 life 2

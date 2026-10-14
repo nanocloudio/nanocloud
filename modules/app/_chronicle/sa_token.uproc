@@ -1,6 +1,6 @@
 // ServiceAccount tokens as params: the k8s `serviceaccounts/token` surface.
 //
-// A request at /token-req/<id> (`ns=…;sa=…[;aud=…]`) with no /token-resp/<id>
+// A request at /token-req/<id> (`ns=…;sa=…[;aud=…][;ttl=…]`) with no /token-resp/<id>
 // yet is minted by kagi's `token_mint` through the `kagi_mint` connector, and
 // the token is written to /token-resp/<id> as `token=<JWT>`. The signing key is
 // a vault LABEL kagi opens and never exports; nothing here holds or sees it.
@@ -30,6 +30,7 @@ module nanocloud.sa_token {
     ns: string = 4;
     sa: string = 5;
     aud: string = 6;
+    ttl: string = 7;
   }
   message MintCall {        // kagi_mint's request record
     cid: int = 1;
@@ -38,6 +39,7 @@ module nanocloud.sa_token {
     s3: string = 42;
     s4: string = 43;
     aud: string = 44;
+    ttl: int = 46;            // seconds; 0 = the connector's `ttl` param
     ck: string = 47;
     j1: string = 48;
     j2: string = 49;
@@ -65,31 +67,46 @@ module nanocloud.sa_token {
   // subject is left empty, which the connector refuses (MALFORMED), and the
   // refusal is answered below like any other.
   decision mint(r: TokReq) -> MintCall {
+    // A lifetime is honoured on a request that names everything: the node's
+    // own admin credential (node_pki) asks for one longer than the default
+    // hour. `int` of a non-number fails the decision, so only a writer that
+    // owns its record sets it.
+    when r.sa != "" && r.ns != "" && r.aud != "" && r.ttl != "" ->
+      MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: r.ns,
+                 s3: ":", s4: r.sa, aud: r.aud, ck: "kubernetes.io",
+                 j1: "{\"namespace\":\"", j2: r.ns,
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}",
+                 ttl: int(r.ttl), ctx: Ctx { id: r.key } };
     when r.sa == "" ->
       MintCall { cid: r.seq, s1: "", s2: "", s3: "", s4: "", aud: "",
-                 ck: "", j1: "", j2: "", j3: "", j4: "", j5: "", ctx: Ctx { id: r.key } };
+                 ck: "", j1: "", j2: "", j3: "", j4: "", j5: "", ttl: 0, ctx: Ctx { id: r.key } };
     when r.ns == "" && r.aud == "" ->
       MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: "default",
                  s3: ":", s4: r.sa, aud: "nanocloud", ck: "kubernetes.io",
                  j1: "{\"namespace\":\"", j2: "default",
-                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ttl: 0, ctx: Ctx { id: r.key } };
     when r.ns == "" ->
       MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: "default",
                  s3: ":", s4: r.sa, aud: r.aud, ck: "kubernetes.io",
                  j1: "{\"namespace\":\"", j2: "default",
-                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ttl: 0, ctx: Ctx { id: r.key } };
     when r.aud == "" ->
       MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: r.ns,
                  s3: ":", s4: r.sa, aud: "nanocloud", ck: "kubernetes.io",
                  j1: "{\"namespace\":\"", j2: r.ns,
-                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ttl: 0, ctx: Ctx { id: r.key } };
     default ->
       MintCall { cid: r.seq, s1: "system:serviceaccount:", s2: r.ns,
                  s3: ":", s4: r.sa, aud: r.aud, ck: "kubernetes.io",
                  j1: "{\"namespace\":\"", j2: r.ns,
-                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ctx: Ctx { id: r.key } };
+                 j3: "\",\"serviceaccount\":{\"name\":\"", j4: r.sa, j5: "\"}}", ttl: 0, ctx: Ctx { id: r.key } };
   }
   decision store(m: Minted) -> RespPut {
+    // An answer the issuer gave the API's TokenRequest chain (apiplane_token,
+    // which shares this issuer and carries no context): that chain's, not
+    // this one's.
+    when !has(m.ctx) ->
+      RespPut { cid: m.cid, op: NOOP, key: "", v1: "", v2: "" };
     when m.status == 0 ->
       RespPut { cid: m.cid, op: PUT, key: m.ctx.id, v1: "token=", v2: m.token };
     default ->
@@ -97,7 +114,7 @@ module nanocloud.sa_token {
   }
 
   transformation pt(r: TokReq) -> TokReq {
-    TokReq { seq: r.seq, key: r.key, ns: r.ns, sa: r.sa, aud: r.aud }
+    TokReq { seq: r.seq, key: r.key, ns: r.ns, sa: r.sa, aud: r.aud, ttl: r.ttl }
   }
   transformation pm(m: Minted) -> Minted {
     Minted { cid: m.cid, status: m.status, token: m.token, ctx: m.ctx }

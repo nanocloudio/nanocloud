@@ -22,8 +22,10 @@ timer_class = "agnostic"
 #                fits a record), 30..39 carried
 # Ops: 8 CREATE, 9 REPLACE, 13 PATCH_MERGE, 14 PATCH_JSON, 15 PATCH_SMP
 # (the keyed merge), 16 APPLY, 4 DELETE — the document's; 3 PUT (a flat
-# record: the watch registration) and 0 NOOP stay the store's. Any other op
-# is refused 400.
+# record: the watch registration), 1 GET (the object at the key: a
+# TokenRequest's ServiceAccount, read and not written), 17 TAKE (a
+# single-use claim answered and deleted in one step, conditional on the
+# revision read: the join secret) and 0 NOOP stay the store's. Any other op is refused 400.
 # Key: `/<collection>/<namespace>/<name>` (or `/<collection>/<name>`), then
 # store_big's marks — `#<view>`, `@[+]<manager>`, `!` (views.rs). A create
 # states the id its key names (a namespace only, for a generated name).

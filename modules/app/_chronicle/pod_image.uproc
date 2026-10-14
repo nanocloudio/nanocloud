@@ -3,7 +3,8 @@
 //
 //   /pod-specs/<uid>  image=<repo>[:<tag>]        (the ask)
 //   /image-requests/<flat>  repo=..;tag=..        (the trigger; image_fetcher)
-//   /image-rootfs/<flat>    state=ready;path=..   (the assembler's answer)
+//   /image-rootfs/<flat>    state=ready;path=..   (the assembler's answer;
+//                           path=pack:<flat> for a workload image)
 //   /image-config/<flat>    entrypoint=..;cmd=..  (the OCI config)
 //   /pod-resolved/<uid>     rootfs=..;cmd=..      (what the project chain uses)
 //
@@ -119,6 +120,10 @@ module nanocloud.podimage {
   decision resolve(c: pi.Cfg) -> pi.Res {
     when c.ctx.rootfs == "" ->
       pi.Res { cid: c.cid, op: NOOP, key: "" };
+    // A workload image resolves to its pack (`pack:<flat>`): no argv, no
+    // rootfs — the project chain gives the metal sandbox its name.
+    when c.ctx.rootfs.startsWith("pack:") ->
+      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key, v1: "rootfs=", v2: c.ctx.rootfs };
     when c.ctx.cmd != "" ->
       pi.Res { cid: c.cid, op: PUT, key: c.ctx.key,
                v1: "rootfs=", v2: c.ctx.rootfs, v3: ";cmd=", v4: c.ctx.cmd };

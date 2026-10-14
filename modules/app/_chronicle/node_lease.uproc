@@ -28,7 +28,9 @@ module nanocloud.nodelease {
     ready: string = 4;    // status.ready
     hb: int = 50;         // status.heartbeat, the node's clock when it wrote
     total: int = 22;      // 0: no record yet (the source's `empty`)
+    labels: string = 5;   // metadata.labels, as stored
     label: string = 48;   // the node's name
+    facts: string = 49;   // its labels as the render knows them (JSON members)
     now: int = 58;
   }
   message nl.Put {
@@ -36,13 +38,26 @@ module nanocloud.nodelease {
     op: int = 2;
     key: string = 3;
     v1: string = 4;  v2: string = 5;  v3: string = 6;  v4: string = 7;
-    v5: string = 8;
+    v5: string = 8;  v6: string = 9;  v7: string = 10;
   }
   // Renew every 10 s; at once when there is no record, when the plane has
   // taken the node out of service, or when the clock is behind the heartbeat
-  // (the node restarted, its clock with it).
+  // (the node restarted, its clock with it). A node whose render knows its
+  // facts (arch, os, the fluxor ABI) carries them as its labels — what a
+  // Pod's nodeSelector is matched against — and renews at once when the
+  // stored labels are not them (a node upgraded to another ABI).
   decision renew(n: nl.Self) -> nl.Put {
     when n.label == "" ->
+      nl.Put { cid: n.seq, op: NOOP, key: "" };
+    when has(n.facts) && n.facts != ""
+         && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000
+             || !has(n.labels) || n.labels != "{" + n.facts + "}") ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
+               v3: "\",\"labels\":{", v4: n.facts,
+               v5: "}},\"status\":{\"ready\":true,\"heartbeat\":", v6: n.now,
+               v7: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}}" };
+    when has(n.facts) && n.facts != "" ->
       nl.Put { cid: n.seq, op: NOOP, key: "" };
     when n.total == 0 ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,

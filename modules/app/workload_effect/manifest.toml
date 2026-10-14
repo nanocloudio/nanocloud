@@ -25,13 +25,35 @@ hardware_targets = ["bcm2712", "linux"]
 #                 object /graphs.nanocloud.io/<graph> (spec.flxa, hex) — a
 #                 module subgraph of the node's own image, the only kind a
 #                 bare-metal node runs; cmd/rootfs/binds are then unused
+#                 13 pack: the workload is a PULLED WORKLOAD IMAGE, named
+#                 as its /image-manifests/<pack> record (`kind=workload`;
+#                 layers and sizes, the FLXA first, then one `.fmod` per
+#                 module). Its layers are read from the `blobs` cache over
+#                 the following steps (a provider may answer EAGAIN; no other
+#                 op is taken meanwhile), each re-verified against its
+#                 digest, laid out as an FXMT module table and created
+#                 SOURCE_FMOD_PACK, every module pinned by its layer digest —
+#                 the kernel stages it as the workload's own code. failed
+#                 -2 a layer or the manifest the node does not hold, -7 past
+#                 the kernel's 16 MiB pack pool (-12 when the elastic region
+#                 cannot grant the buffer it is assembled in), -74 a cached layer that is not its
+#                 digest, -22 a manifest that is not a workload image
 #                 7 tasks (decimal, the pids envelope)  8 addr (IPv4, own
 #                 netns when set)  9 prefix (decimal)  10 binds
 #                 (`<src>:<dst>[:ro]`, `,`-separated — the workload `mount`/
 #                 `bind` option)  → status created | failed(errno). An id
 #                 already live is not created twice: its status is re-reported
+#                 A CREATE the kernel stages over several calls
+#                 (EINPROGRESS) is asked again each step with the same spec
+#                 until it answers; no other op is taken meanwhile. One the
+#                 kernel says is already live (EEXIST: it completed while
+#                 this module faulted mid-call, or before a restart of this
+#                 module) is adopted through LOOKUP by identity, never
+#                 created twice
 #   op 2 START    → running
-#   op 3 DESTROY  → destroyed (an id with no workload: nothing)
+#   op 3 DESTROY  → destroyed (an id this module holds no handle for is
+#                 destroyed by identity: a workload it lost track of, or one
+#                 still being staged, is torn down rather than leaked)
 #   op 4 SIGNAL   4 `term` | `kill` — each level delivered once
 #   op 5 PAUSE / op 6 RESUME — each intent issued once
 #   op 7 EXEC     4 command, 11 the request's revision (i64) → exec event:
@@ -56,6 +78,8 @@ hardware_targets = ["bcm2712", "linux"]
 # `boot` is this process's identity: a status recorded under another boot
 # describes a workload that no longer exists (the node restarted), which is
 # how the chain knows to create it again.
+# Param `blobs`: the node's blob cache (the directory a pulled image's layers
+# land in, named by sha256). Without it a pack CREATE fails -22.
 timer_class = "agnostic"
 permissions = ["platform_raw"]
 
@@ -112,9 +136,16 @@ max_record = 8192
 requires_contract = "workload"
 access = "write"
 
-# The FLXA blob of a graph-backed workload, read from /graphs/<name>.
+# The FLXA blob of a graph-backed workload, read from /graphs/<name>; a
+# pulled workload image's manifest record.
 [[resources]]
 requires_contract = "storage.object"
+access = "read"
+
+# A pulled workload image's layers, in the blob cache (`blobs` param, the
+# directory http_fetch lands them in).
+[[resources]]
+requires_contract = "fs"
 access = "read"
 
 [observability]

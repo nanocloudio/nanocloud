@@ -3,16 +3,51 @@
 // <name>` under /podstatus/<uid> — a prefix the node does not scope, so the
 // record lands in the plane's store as written — and this patches the Pod
 // object's status.phase, which is what `kubectl get pods` shows.
+//
+// The record is keyed by the Pod's UID and names the Pod by its NAME, and a
+// name outlives an incarnation: delete a Pod and create another with the
+// same name, and the first one's record still names it. The source replays
+// every record under the prefix on any change, so a record left behind would
+// patch the new Pod with the old one's phase (a Pod that failed once named
+// every later Pod of its name Failed). Two things keep that from happening:
+//
+//   ask     /podstatus/<uid> -> GET /pods/<ns>/<name>, its metadata.uid
+//           projected, the record riding the carry
+//   status  the GET's answer -> PATCH status.phase ONLY when the Pod there
+//           is the record's: its uid is the record's key
+//   gone    /~tomb/pods/<ns>/<name> (a Pod deleted) -> DELETE
+//           /podstatus/<uid>, so a deleted Pod's records do not pile up
 module nanocloud.podstatus {
 
   enum NOOP = 0;
+  enum GET = 1;
+  enum DELETE = 4;
   enum PATCH = 5;
 
+  // pst_source: /podstatus/<uid>, flat.
   message st.Rec {
     seq: int = 1;
     key: string = 3;      // "<uid>"
     phase: string = 4;
     pod: string = 5;      // "<ns>/<name>"
+  }
+  // pst_get's request: the Pod, by name, and the record as carry.
+  message st.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_uid: string = 30;
+    c_phase: string = 31;
+    c_pod: string = 32;
+  }
+  // pst_get's answer: the store's status, the Pod's uid (`paths`), the carry.
+  message st.Got {
+    seq: int = 1;
+    status: int = 2;
+    uid: string = 40;
+    c_uid: string = 30;
+    c_phase: string = 31;
+    c_pod: string = 32;
   }
   message st.Op {
     cid: int = 1;
@@ -21,16 +56,55 @@ module nanocloud.podstatus {
     value: string = 4;
     path: string = 19;
   }
-  decision decide(r: st.Rec) -> st.Op {
-    when r.pod != "" && r.phase != "" ->
-      st.Op { cid: r.seq, op: PATCH, key: r.pod, value: "\"" + r.phase + "\"", path: "status.phase" };
-    default ->
-      st.Op { cid: r.seq, op: NOOP, key: "", value: "", path: "" };
+  // ps_tombs: a deleted Pod's last state.
+  message st.Tomb {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<name>"
+    uid: string = 4;      // obj.metadata.uid
+  }
+  message st.Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
   }
 
-  pipeline status(r: st.Rec) -> st.Op {
-    call x = decide(r);
+  decision d_ask(r: st.Rec) -> st.Ask {
+    when r.pod != "" && r.phase != "" ->
+      st.Ask { cid: r.seq, op: GET, key: r.pod, c_uid: r.key, c_phase: r.phase, c_pod: r.pod };
+    default ->
+      st.Ask { cid: r.seq, op: NOOP, key: "", c_uid: "", c_phase: "", c_pod: "" };
+  }
+
+  // A Pod that is not there, or not the record's, is not patched. `has` is
+  // the guard: a Pod read without a uid answers no field, and a `when` that
+  // read an absent field would fail closed rather than decide.
+  decision d_patch(g: st.Got) -> st.Op {
+    when g.status == 200 && has(g.uid) && g.uid == g.c_uid && g.c_pod != "" && g.c_phase != "" ->
+      st.Op { cid: g.seq, op: PATCH, key: g.c_pod, value: "\"" + g.c_phase + "\"", path: "status.phase" };
+    default ->
+      st.Op { cid: g.seq, op: NOOP, key: "", value: "", path: "" };
+  }
+
+  decision d_gone(t: st.Tomb) -> st.Del {
+    when t.uid != "" ->
+      st.Del { cid: t.seq, op: DELETE, key: t.uid };
+    default ->
+      st.Del { cid: t.seq, op: NOOP, key: "" };
+  }
+
+  pipeline ask(r: st.Rec) -> st.Ask {
+    call x = d_ask(r);
     return x;
   }
+  pipeline status(g: st.Got) -> st.Op {
+    call x = d_patch(g);
+    return x;
+  }
+  pipeline gone(t: st.Tomb) -> st.Del {
+    call x = d_gone(t);
+    return x;
+  }
+  entry ask = ask;
   entry status = status;
+  entry gone = gone;
 }

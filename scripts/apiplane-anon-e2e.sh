@@ -137,7 +137,7 @@ g = g.replace("""  - name: admit
     type: decision""", """  - name: anon
     type: decision
     params:
-      decision: "%s"
+      decision: {hex: "%s"}
 
   - name: admit
     type: decision""" % param)

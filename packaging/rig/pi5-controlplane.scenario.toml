@@ -8,7 +8,9 @@
 #
 # Pass rules here are the board's own account: the store came up serving on
 # its disk, its consumers were held until it did (the contract-readiness
-# gate), trusted time anchored, and the seeds landed.
+# gate), trusted time anchored, the API's vault key was certified on the
+# board, and the node announced the join secret its operator spends
+# (scripts/rig-join.sh, which the driver runs).
 
 name = "pi5_controlplane"
 target = "pi5"
@@ -35,6 +37,16 @@ regex = "\\[kvw\\] store serving: Ready"
 [[pass]]
 source = "telemetry.monitor_udp"
 regex = "\\[sntp\\] hb synced=1 .* cls=3 flags=3"
+
+# The node is its own PKI: the API serves under a certificate its authority
+# issued on the board, and the operator's join secret is announced.
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[node_pki\\] certificate issued"
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "\\[join\\] secret=[0-9a-f]{32} ca-sha256=[0-9a-f]{64}"
 
 # The node renewed its own lease after the operator's objects were applied:
 # a store write path that works end to end, long after boot.

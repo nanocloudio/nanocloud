@@ -202,4 +202,41 @@ if [ "$phase" != "Running" ]; then
   grep -a "\[live\]\|owners=\|workload" "$D/run.log" | tail -3 | cut -c1-120
   fail "the Pod never reached Running (phase='${phase:-}')"
 fi
-echo "== E2E green: on one node-scoped store, the plane's Pod became the node's subgraph and its phase came back =="
+echo "== 6. a Deployment whose template names the Graph: its ReplicaSet's Pods run too =="
+DEP='{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"probes","namespace":"default"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"probes"}},"template":{"metadata":{"labels":{"app":"probes"}},"spec":{"runtimeClassName":"fluxor","containers":[{"name":"probe","image":"probe"}]}}}}'
+r="$(api POST /apis/apps/v1/namespaces/default/deployments "$DEP")"
+case "$r" in 20[01]\|*) echo "   POST deployments -> ${r%%|*}" ;; *) fail "POST deployment: ${r:0:200}" ;; esac
+running=0
+for _ in $(seq 120); do
+  r="$(api GET '/api/v1/namespaces/default/pods?labelSelector=app%3Dprobes')"
+  running="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); print(sum(1 for p in d.get("items",[]) if p.get("status",{}).get("phase")=="Running" and p.get("metadata",{}).get("uid")))
+except Exception: print(0)' 2>/dev/null)"
+  [ "${running:-0}" -ge 2 ] && break
+  sleep 1
+done
+echo "   Running Pods of deployment/probes, each with a uid: ${running:-0} of 2"
+[ "${running:-0}" -ge 2 ] || { printf '%s\n' "${r#*|}" | head -c 600; echo; fail "the Deployment's Pods did not all reach Running"; }
+# The chain of controller references kubectl follows (describe, rollout):
+# Deployment uid -> its ReplicaSet's controller ref; ReplicaSet uid -> each
+# Pod's. Every object parses as JSON.
+DJ="$(api GET /apis/apps/v1/namespaces/default/deployments/probes)"
+RJ="$(api GET /apis/apps/v1/namespaces/default/replicasets/probes)"
+PJ="$(api GET '/api/v1/namespaces/default/pods?labelSelector=app%3Dprobes')"
+python3 - "${DJ#*|}" "${RJ#*|}" "${PJ#*|}" <<'PY' || fail "the Deployment's controller references are not a chain"
+import json, sys
+d, r, pods = (json.loads(x) for x in sys.argv[1:4])
+def ctl(o):
+    refs = [x for x in o["metadata"].get("ownerReferences", []) if x.get("controller")]
+    assert len(refs) == 1, f"{o['metadata']['name']}: controller refs {refs}"
+    return refs[0]
+x = ctl(r)
+assert (x["kind"], x["name"], x["uid"], x["apiVersion"]) == ("Deployment", "probes", d["metadata"]["uid"], "apps/v1"), x
+for p in pods["items"]:
+    y = ctl(p)
+    assert (y["kind"], y["uid"], y["apiVersion"]) == ("ReplicaSet", r["metadata"]["uid"], "apps/v1"), y
+    assert p.get("kind") == "Pod" and p["metadata"].get("uid"), p["metadata"]
+print("   controller references: deployment", d["metadata"]["uid"][:8], "-> replicaset", r["metadata"]["uid"][:8], "->", len(pods["items"]), "pods")
+PY
+echo "== E2E green: on one node-scoped store, the plane's Pod became the node's subgraph and its phase came back, and a Deployment's Pods ran the same way =="

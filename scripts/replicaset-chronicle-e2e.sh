@@ -91,7 +91,7 @@ scheduler:
 modules:
   - name: store_source
     prefix: "/replicasets.apps/"
-    paths: "spec.template.spec,metadata.labels.pod-template-hash,metadata.labels"
+    paths: "spec.template.spec,metadata.labels.pod-template-hash,metadata.labels,metadata.uid"
     expand: "spec.replicas"
     expand_tail: 4
     # ...and past the highest EXISTING child, whatever the count: a surplus far
@@ -103,26 +103,26 @@ modules:
   # Stage 1 — the PREDECESSOR, so a rollout proceeds strictly in ordinal order.
   - name: prevget
     type: store_effect
-    decision: "${DEC_PREV}"
+    decision: {hex: "${DEC_PREV}"}
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 2 — THIS ordinal, carrying the predecessor verdict.
   - name: selfget
     type: store_effect
-    decision: "${DEC_ASK}"
+    decision: {hex: "${DEC_ASK}"}
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 3 — create, delete, roll, or nothing.
   - name: apply
     type: store_effect
-    decision: "${DEC_ACT}"
+    decision: {hex: "${DEC_ACT}"}
     key_prefix: "/pods/"
   # Stage 4 — record what stage 3 did. The write's own reply carries the tag,
   # so the event is decided from the effect that produced it, not guessed from
   # a second read of the store.
   - name: events
     type: store_effect
-    decision: "${DEC_REC}"
+    decision: {hex: "${DEC_REC}"}
     key_prefix: "/events/"
 wiring:
   - from: store_source.status

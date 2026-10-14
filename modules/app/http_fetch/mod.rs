@@ -19,8 +19,8 @@ use core::ffi::c_void;
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::contracts::net::net_proto::{
-    write_connect_to, Target, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    REQUESTER_TAG_NONE,
+    connected_parts, error_parts, write_connect_to, Target, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
+    CONNECT_TO_MAX, REQUESTER_TAG_NONE,
 };
 use abi::SyscallTable;
 
@@ -31,6 +31,7 @@ include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonq.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 
 const OBJ_PUT: u32 = 0x1420;
 const OBJ_GET: u32 = 0x1421;
@@ -84,7 +85,12 @@ const NET_BUF_SIZE: usize = 3 + 2 + 8192;
 const HDR_BUF_SIZE: usize = 2048;
 /// A JSON answer (a manifest, an index, an image config).
 const BODY_BUF_SIZE: usize = 32768;
-const TX_BUF_SIZE: usize = 1024;
+/// A bearer token held between requests (a registry's JWT is ~1–3 KiB).
+const TOKEN_MAX: usize = 4096;
+/// The request line and headers, a token among them.
+const TX_BUF_SIZE: usize = 1024 + TOKEN_MAX;
+/// `user:password` read from the `credentials` key.
+const MAX_CRED: usize = 256;
 /// One answer to one query.
 const ANSWER: usize = 2048;
 const MAX_QUERIES: u8 = 8;
@@ -95,6 +101,21 @@ const BACKOFF_INIT_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 30_000;
 /// Transport attempts before a request is answered 0.
 const MAX_ATTEMPTS: u8 = 6;
+/// A file provider that answers "not yet" (fat32 on metal, mid-flush):
+/// the open is asked again this long after, not counted as a failure.
+const FS_EAGAIN: i32 = -11;
+const OPEN_RETRY_MS: u64 = 20;
+
+/// Which request is on the wire: the record's, or a token from the realm the
+/// origin's Bearer challenge named.
+const LEG_OBJECT: u8 = 0;
+const LEG_TOKEN: u8 = 1;
+
+// The chunked transfer coding, byte by byte.
+const CK_SIZE: u8 = 0;
+const CK_DATA: u8 = 1;
+const CK_CRLF: u8 = 2;
+const CK_TRAILER: u8 = 3;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
@@ -124,6 +145,9 @@ struct State {
     dir_len: u8,
     chunk_bytes: u32,
     boot_delay_ms: u32,
+    /// The store key whose value is `user:password` for the token realm.
+    credentials: [u8; MAX_KEY],
+    credentials_len: u16,
 
     phase: Phase,
     inflight: u8,
@@ -157,6 +181,29 @@ struct State {
     tx_len: u16,
     tx_sent: u16,
 
+    /// Bearer auth: the leg on the wire, whether this request has had its
+    /// one token fetch (re-armed by every 2xx), the token, and the realm of
+    /// the last challenge (its authority, port, and path with the query).
+    leg: u8,
+    auth_tried: u8,
+    challenged: u8,
+    token_len: u16,
+    token: [u8; TOKEN_MAX],
+    realm_auth: [u8; MAX_AUTHORITY],
+    realm_auth_len: u8,
+    realm_port: u16,
+    realm_path: [u8; MAX_PATH],
+    realm_path_len: u16,
+
+    /// The chunked transfer coding: on, its state, the chunk's bytes left,
+    /// the size line's digits, past an extension, a trailer line's length.
+    chunked: u8,
+    ck_state: u8,
+    ck_left: u64,
+    ck_digits: u8,
+    ck_ext: u8,
+    ck_line: u8,
+
     hdr_buf: [u8; HDR_BUF_SIZE],
     body: [u8; BODY_BUF_SIZE],
     tx_buf: [u8; TX_BUF_SIZE],
@@ -169,7 +216,7 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::{MAX_AUTHORITY, MAX_DIR};
+    use super::{MAX_AUTHORITY, MAX_DIR, MAX_KEY};
 
     define_params! {
         State;
@@ -193,6 +240,13 @@ mod params_def {
 
         4, boot_delay_ms, u32, 0
             => |s, d, len| { s.boot_delay_ms = p_u32(d, len, 0, 0); };
+
+        5, credentials, str, 0
+            => |s, d, len| {
+                let n = if len > MAX_KEY { 0 } else { len };
+                s.credentials_len = n as u16;
+                if n > 0 { ptr_copy(s.credentials.as_mut_ptr(), d, n); }
+            };
     }
 }
 
@@ -478,7 +532,67 @@ unsafe fn begin(s: &mut State) {
     s.tx_len = 0;
     s.tx_sent = 0;
     s.conn_present = 0;
+    s.challenged = 0;
+    s.chunked = 0;
+    s.ck_state = CK_SIZE;
+    s.ck_left = 0;
+    s.ck_digits = 0;
+    s.ck_ext = 0;
+    s.ck_line = 0;
     s.phase = Phase::Connecting;
+}
+
+/// Start the held request again from what it has: a Range file from its
+/// position, anything else from nothing (its file truncated). False when
+/// the file cannot be reopened — answered 507.
+/// Open the held request's file afresh (unlinked first). `Some(true)`
+/// opened; `Some(false)` the provider is not ready, and the open is asked
+/// again after `OPEN_RETRY_MS`; `None` it refused, answered 507.
+unsafe fn open_file(s: &mut State) -> Option<bool> {
+    let sys = &*s.syscalls;
+    let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
+    let pl = file_path(s, &mut path);
+    let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl);
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
+    if fd == FS_EAGAIN {
+        s.file_fd = -1;
+        s.backoff_ms = OPEN_RETRY_MS;
+        s.state_start_ms = dev_millis(sys);
+        s.phase = Phase::Backoff;
+        return Some(false);
+    }
+    if fd < 0 {
+        log(s, 1, b"[http_fetch] cannot create the file");
+        reply(s, 507);
+        return None;
+    }
+    s.file_fd = fd;
+    Some(true)
+}
+
+unsafe fn restart(s: &mut State) -> bool {
+    // A file the provider was not ready to create: created now, from nothing.
+    if s.sink == SINK_FILE as u8 && s.file_fd < 0 {
+        s.hasher = Sha256::new();
+        s.body_fill = 0;
+        s.body_received = 0;
+        s.pos = 0;
+        return open_file(s) == Some(true);
+    }
+    if ranged(s) {
+        s.body_received = s.pos;
+        s.body_fill = 0;
+        return true;
+    }
+    s.hasher = Sha256::new();
+    s.body_fill = 0;
+    s.body_received = 0;
+    s.pos = 0;
+    if s.sink == SINK_FILE as u8 {
+        close_file(s, false);
+        return open_file(s) == Some(true);
+    }
+    true
 }
 
 /// Whether the held request is a Range request (a chunked file).
@@ -487,29 +601,158 @@ fn ranged(s: &State) -> bool {
 }
 
 unsafe fn build_request(s: &mut State) -> usize {
-    let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
-    let mut path = [0u8; MAX_PATH];
-    let pl = join(h, 3, 6, &mut path).unwrap_or(0);
-    let accept = frame_bytes(h, 7);
-    let mut buf = [0u8; TX_BUF_SIZE];
-    let mut o = append(&mut buf, 0, b"GET ");
-    o = append(&mut buf, o, &path[..pl]);
-    o = append(&mut buf, o, b" HTTP/1.1\r\nHost: ");
-    o = append(&mut buf, o, authority(s));
-    if !accept.is_empty() && accept.len() <= MAX_ACCEPT {
-        o = append(&mut buf, o, b"\r\nAccept: ");
-        o = append(&mut buf, o, accept);
+    let sys = &*s.syscalls;
+    // `tx_buf` is written while the request's parts are read from `s`.
+    let st = s as *mut State;
+    let tx = &mut (*st).tx_buf;
+    let mut o;
+    if s.leg == LEG_TOKEN {
+        let path = core::slice::from_raw_parts(s.realm_path.as_ptr(), s.realm_path_len as usize);
+        let host = core::slice::from_raw_parts(s.realm_auth.as_ptr(), s.realm_auth_len as usize);
+        o = append(tx, 0, b"GET ");
+        o = append(tx, o, path);
+        o = append(tx, o, b" HTTP/1.1\r\nHost: ");
+        o = append(tx, o, host);
+        o = append(tx, o, b"\r\nAccept: application/json");
+        // The realm's credentials, when the deployment gave a key for them;
+        // without, the token asked for is an anonymous one.
+        if s.credentials_len > 0 {
+            let key = core::slice::from_raw_parts(s.credentials.as_ptr(), s.credentials_len as usize);
+            let mut cred = [0u8; MAX_CRED];
+            if let Some(n) = get_value_live(sys, key, &mut cred) {
+                let mut b = [0u8; MAX_CRED.div_ceil(3) * 4];
+                if let Some(bn) = b64_encode(&cred[..n], &mut b) {
+                    o = append(tx, o, b"\r\nAuthorization: Basic ");
+                    o = append(tx, o, &b[..bn]);
+                }
+            }
+        }
+    } else {
+        let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
+        let mut path = [0u8; MAX_PATH];
+        let pl = join(h, 3, 6, &mut path).unwrap_or(0);
+        let accept = frame_bytes(h, 7);
+        o = append(tx, 0, b"GET ");
+        o = append(tx, o, &path[..pl]);
+        o = append(tx, o, b" HTTP/1.1\r\nHost: ");
+        o = append(tx, o, authority(&*st));
+        if !accept.is_empty() && accept.len() <= MAX_ACCEPT {
+            o = append(tx, o, b"\r\nAccept: ");
+            o = append(tx, o, accept);
+        }
+        if s.token_len > 0 {
+            o = append(tx, o, b"\r\nAuthorization: Bearer ");
+            o = append(tx, o, core::slice::from_raw_parts(s.token.as_ptr(), s.token_len as usize));
+        }
+        if ranged(s) {
+            let end = (s.pos + s.chunk_bytes as u64).min(s.size) - 1;
+            o = append(tx, o, b"\r\nRange: bytes=");
+            o = write_dec(tx, o, s.pos);
+            o = append(tx, o, b"-");
+            o = write_dec(tx, o, end);
+        }
     }
-    if ranged(s) {
-        let end = (s.pos + s.chunk_bytes as u64).min(s.size) - 1;
-        o = append(&mut buf, o, b"\r\nRange: bytes=");
-        o = write_dec(&mut buf, o, s.pos);
-        o = append(&mut buf, o, b"-");
-        o = write_dec(&mut buf, o, end);
+    append(tx, o, b"\r\nConnection: close\r\n\r\n")
+}
+
+/// `%`-encode a query value: everything but the unreserved set and `:`,
+/// `/` (a registry scope is `repository:<name>:pull`).
+fn query_enc(out: &mut [u8], mut at: usize, v: &[u8]) -> usize {
+    const H: &[u8; 16] = b"0123456789ABCDEF";
+    for &c in v {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b':' | b'/') {
+            at = append(out, at, core::slice::from_ref(&c));
+        } else {
+            at = append(out, at, &[b'%', H[(c >> 4) as usize], H[(c & 15) as usize]]);
+        }
     }
-    o = append(&mut buf, o, b"\r\nConnection: close\r\n\r\n");
-    s.tx_buf[..o].copy_from_slice(&buf[..o]);
-    o
+    at
+}
+
+/// `<sep><key>=<value>` onto a query, when there is a value.
+fn query_param(out: &mut [u8], at: usize, sep: &mut u8, key: &[u8], val: Option<&[u8]>) -> usize {
+    let Some(val) = val else {
+        return at;
+    };
+    let mut o = append(out, at, core::slice::from_ref(sep));
+    o = append(out, o, key);
+    o = append(out, o, b"=");
+    *sep = b'&';
+    query_enc(out, o, val)
+}
+
+/// One `key="value"` of a challenge's parameters (RFC 7235 auth-params).
+fn auth_param<'a>(params: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut rest = params;
+    loop {
+        while let Some((&c, r)) = rest.split_first() {
+            if c == b' ' || c == b',' {
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        let eq = rest.iter().position(|&c| c == b'=')?;
+        let name = &rest[..eq];
+        let mut v = &rest[eq + 1..];
+        let value;
+        if v.first() == Some(&b'"') {
+            v = &v[1..];
+            let close = v.iter().position(|&c| c == b'"')?;
+            value = &v[..close];
+            rest = &v[close + 1..];
+        } else {
+            let end = v.iter().position(|&c| c == b',').unwrap_or(v.len());
+            value = &v[..end];
+            rest = &v[end..];
+        }
+        if name.eq_ignore_ascii_case(key) {
+            return Some(value);
+        }
+    }
+}
+
+/// A Bearer challenge: where its realm is, and the token request for it
+/// (`<realm path>?service=<service>&scope=<scope>`). False when it is not
+/// one this connector can answer (another scheme, a realm it cannot dial).
+fn take_challenge(s: &mut State, v: &[u8]) -> bool {
+    if v.len() < 7 || !v[..7].eq_ignore_ascii_case(b"Bearer ") {
+        return false;
+    }
+    let params = &v[7..];
+    let Some(realm) = auth_param(params, b"realm") else {
+        return false;
+    };
+    let (rest, port) = if realm.len() > 8 && realm[..8].eq_ignore_ascii_case(b"https://") {
+        (&realm[8..], 443u16)
+    } else if realm.len() > 7 && realm[..7].eq_ignore_ascii_case(b"http://") {
+        (&realm[7..], 80u16)
+    } else {
+        return false;
+    };
+    let slash = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
+    let host = &rest[..slash];
+    let path: &[u8] = if slash < rest.len() { &rest[slash..] } else { b"/" };
+    if host.is_empty() || host.len() > MAX_AUTHORITY {
+        return false;
+    }
+    let Some((_, p)) = Target::parse(host) else {
+        return false;
+    };
+    s.realm_auth[..host.len()].copy_from_slice(host);
+    s.realm_auth_len = host.len() as u8;
+    s.realm_port = p.unwrap_or(port);
+    let mut o = append(&mut s.realm_path, 0, path);
+    let mut sep = if path.iter().any(|&c| c == b'?') { b'&' } else { b'?' };
+    // service, then scope — two calls, not a loop over an array of byte
+    // strings (unrelocated in a PIC module's .rodata).
+    o = query_param(&mut s.realm_path, o, &mut sep, b"service", auth_param(params, b"service"));
+    o = query_param(&mut s.realm_path, o, &mut sep, b"scope", auth_param(params, b"scope"));
+    if o == s.realm_path.len() {
+        return false; // did not fit: a cut query asks for another token
+    }
+    s.realm_path_len = o as u16;
+    true
 }
 
 unsafe fn flush_tx(s: &mut State) -> bool {
@@ -538,7 +781,8 @@ unsafe fn flush_tx(s: &mut State) -> bool {
 }
 
 /// Read the status line and headers. Returns false for a response this
-/// connector cannot take (chunked, no length) — answered, not retried.
+/// connector cannot take (another transfer coding, no length) — answered,
+/// not retried. A 401's Bearer challenge is kept for the token leg.
 unsafe fn parse_header(s: &mut State, end: usize) -> bool {
     let h = core::slice::from_raw_parts(s.hdr_buf.as_ptr(), end);
     s.status = if h.len() > 12 {
@@ -563,12 +807,23 @@ unsafe fn parse_header(s: &mut State, end: usize) -> bool {
                 cl = Some(x);
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            return false;
+            if !v.eq_ignore_ascii_case(b"chunked") {
+                return false;
+            }
+            s.chunked = 1;
+        } else if name.eq_ignore_ascii_case(b"www-authenticate") {
+            if s.status == 401 && s.leg == LEG_OBJECT && s.challenged == 0 {
+                s.challenged = take_challenge(s, v) as u8;
+            }
         } else if name.eq_ignore_ascii_case(b"content-type") {
             let n = v.len().min(s.ctype.len());
             s.ctype[..n].copy_from_slice(&v[..n]);
             s.ctype_len = n as u8;
         }
+    }
+    if s.chunked == 1 {
+        s.content_length = 0; // known when the last chunk is
+        return true;
     }
     let Some(cl) = cl else {
         return false;
@@ -581,8 +836,13 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
     }
-    s.hasher.update(data);
-    if s.sink == SINK_FILE as u8 && s.status / 100 == 2 {
+    // Only the object's own bytes are the object: a refusal's body, or a
+    // token's, is neither hashed nor written.
+    let object = s.leg == LEG_OBJECT && s.status / 100 == 2;
+    if object {
+        s.hasher.update(data);
+    }
+    if s.sink == SINK_FILE as u8 && object {
         let sys = &*s.syscalls;
         let mut off = 0usize;
         while off < data.len() {
@@ -616,6 +876,48 @@ unsafe fn body_done(s: &mut State) {
     close_conn(s);
     s.attempts = 0;
     s.backoff_ms = 0;
+    if s.leg == LEG_TOKEN {
+        // The realm's answer: its token (`token`, or OAuth's
+        // `access_token`), and the object asked for again with it. No token
+        // answers the object's own refusal.
+        s.leg = LEG_OBJECT;
+        let body = core::slice::from_raw_parts(s.body.as_ptr(), s.body_fill as usize);
+        let tok = if s.status == 200 {
+            // `jq_plain` builds its path on the stack: a literal array of
+            // byte strings would sit unrelocated in a PIC module's .rodata.
+            jq_plain(body, b"token")
+                .filter(|t| !t.is_empty())
+                .or_else(|| jq_plain(body, b"access_token"))
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+        if tok.is_empty() || tok.len() > TOKEN_MAX || tok.iter().any(|&c| c <= b' ' || c >= 0x7f) {
+            log(s, 1, b"[http_fetch] the realm gave no token");
+            s.body_fill = 0;
+            reply(s, 401);
+            return;
+        }
+        let n = tok.len();
+        // `tok` is a view of `body`: copied, not borrowed, into the token.
+        core::ptr::copy_nonoverlapping(tok.as_ptr(), s.token.as_mut_ptr(), n);
+        s.token_len = n as u16;
+        if restart(s) {
+            begin(s);
+        }
+        return;
+    }
+    if s.status == 401 && s.challenged == 1 && s.auth_tried == 0 {
+        // The origin wants a token (none held, or the held one is spent or
+        // for another scope): one fetch from the realm it named, then the
+        // request again.
+        s.auth_tried = 1;
+        s.token_len = 0;
+        s.leg = LEG_TOKEN;
+        s.body_fill = 0;
+        begin(s);
+        return;
+    }
     let ok = if ranged(s) { 206 } else { 200 };
     if s.status != ok && !(s.status == 200 && ranged(s) && s.pos == s.content_length) {
         // An HTTP refusal is final; its body (if any) is not the object.
@@ -624,6 +926,8 @@ unsafe fn body_done(s: &mut State) {
         reply(s, st);
         return;
     }
+    // A token that served is good for another refresh when it expires.
+    s.auth_tried = 0;
     if ranged(s) && s.pos < s.size {
         begin(s);
         return;
@@ -647,6 +951,100 @@ unsafe fn body_done(s: &mut State) {
     reply(s, 200);
 }
 
+/// Transfer-coded bytes: each chunk's data to `body_bytes`. Ok(true) once the
+/// last chunk and its trailer are in; Err(status) on a malformed coding (502)
+/// or a body the sink refused (507).
+unsafe fn dechunk(s: &mut State, mut data: &[u8]) -> Result<bool, u16> {
+    while let Some(&c) = data.first() {
+        match s.ck_state {
+            CK_SIZE => {
+                data = &data[1..];
+                if c == b'\n' {
+                    if s.ck_digits == 0 {
+                        return Err(502);
+                    }
+                    s.ck_state = if s.ck_left == 0 { CK_TRAILER } else { CK_DATA };
+                    s.ck_line = 0;
+                } else if s.ck_ext == 0 {
+                    let v = match c {
+                        b'0'..=b'9' => c - b'0',
+                        b'a'..=b'f' => c - b'a' + 10,
+                        b'A'..=b'F' => c - b'A' + 10,
+                        b';' | b'\r' | b' ' | b'\t' => {
+                            s.ck_ext = 1;
+                            continue;
+                        }
+                        _ => return Err(502),
+                    };
+                    if s.ck_digits == 15 {
+                        return Err(502);
+                    }
+                    s.ck_left = s.ck_left * 16 + v as u64;
+                    s.ck_digits += 1;
+                }
+            }
+            CK_DATA => {
+                let n = (data.len() as u64).min(s.ck_left) as usize;
+                if !body_bytes(s, &data[..n]) {
+                    return Err(507);
+                }
+                s.ck_left -= n as u64;
+                data = &data[n..];
+                if s.ck_left == 0 {
+                    s.ck_state = CK_CRLF;
+                }
+            }
+            CK_CRLF => {
+                data = &data[1..];
+                if c == b'\n' {
+                    s.ck_state = CK_SIZE;
+                    s.ck_digits = 0;
+                    s.ck_ext = 0;
+                } else if c != b'\r' {
+                    return Err(502);
+                }
+            }
+            _ => {
+                data = &data[1..];
+                if c == b'\n' {
+                    if s.ck_line == 0 {
+                        return Ok(true);
+                    }
+                    s.ck_line = 0;
+                } else if c != b'\r' {
+                    s.ck_line = 1;
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Response body bytes off the wire, framed by Content-Length or the chunked
+/// coding; the response done when its framing says so.
+unsafe fn body_in(s: &mut State, data: &[u8]) {
+    if s.chunked == 1 {
+        match dechunk(s, data) {
+            Ok(true) => {
+                s.content_length = s.body_received_in_response();
+                body_done(s);
+            }
+            Ok(false) => {}
+            Err(st) => reply(s, st),
+        }
+        return;
+    }
+    let left = s.content_length - s.body_received_in_response();
+    let take = (data.len() as u64).min(left) as usize;
+    if !body_bytes(s, &data[..take]) {
+        reply(s, 507);
+        return;
+    }
+    if s.body_received_in_response() >= s.content_length {
+        body_done(s);
+    }
+}
+
 unsafe fn pump_net(s: &mut State) -> bool {
     let sys = &*s.syscalls;
     let poll = (sys.channel_poll)(s.net_in, POLL_IN);
@@ -662,13 +1060,9 @@ unsafe fn pump_net(s: &mut State) -> bool {
     match msg_type {
         NET_MSG_CONNECTED => {
             if s.phase == Phase::WaitConnect && payload_len >= 2 {
-                let tag = if payload_len >= 3 {
-                    payload[2]
-                } else {
-                    REQUESTER_TAG_NONE
-                };
+                let (cid, tag) = connected_parts(payload);
                 if tag == REQUESTER_TAG_NONE || tag == dev_requester_tag(sys) {
-                    s.conn_id = u16::from_le_bytes([payload[0], payload[1]]);
+                    s.conn_id = cid;
                     s.conn_present = 1;
                     s.tx_len = build_request(s) as u16;
                     s.tx_sent = 0;
@@ -710,23 +1104,13 @@ unsafe fn pump_net(s: &mut State) -> bool {
                 let el = s.hdr_fill as usize - (end + 4);
                 early[..el].copy_from_slice(&s.hdr_buf[end + 4..s.hdr_fill as usize]);
                 data = &data[n..];
-                let limit = s.content_length;
-                let take = (el as u64).min(limit) as usize;
-                if !body_bytes(s, &early[..take]) {
-                    reply(s, 507);
+                body_in(s, &early[..el]);
+                if s.phase != Phase::RecvBody || data.is_empty() {
                     return true;
                 }
             }
             if s.phase == Phase::RecvBody {
-                let left = s.content_length - (s.body_received_in_response());
-                let take = (data.len() as u64).min(left) as usize;
-                if !body_bytes(s, &data[..take]) {
-                    reply(s, 507);
-                    return true;
-                }
-                if s.body_received_in_response() >= s.content_length {
-                    body_done(s);
-                }
+                body_in(s, data);
             }
         }
         NET_MSG_CLOSED => {
@@ -741,15 +1125,19 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_ERROR => {
-            let cid = if payload_len >= 2 {
-                u16::from_le_bytes([payload[0], payload[1]])
+            if payload_len < 3 {
+                return true;
+            }
+            // A tagged error is a connect-phase failure, attributed by its
+            // tag alone (its conn_id means nothing there); an untagged one
+            // is an established connection's, by conn_id.
+            let (cid, _errno, tag) = error_parts(payload);
+            let ours = if tag != REQUESTER_TAG_NONE {
+                s.phase == Phase::WaitConnect && tag == dev_requester_tag(sys)
             } else {
-                0
+                s.conn_present == 1 && cid == s.conn_id
             };
-            let stale = payload_len >= 2 && cid == s.prev_conn_id && cid != s.conn_id;
-            if (s.conn_present == 1 && cid == s.conn_id)
-                || (s.phase == Phase::WaitConnect && !stale)
-            {
+            if ours {
                 transport_failed(s, b"[http_fetch] net error");
             }
         }
@@ -798,6 +1186,8 @@ unsafe fn admit(s: &mut State) {
     }
     s.sink = sink as u8;
     s.inflight = 1;
+    s.leg = LEG_OBJECT;
+    s.auth_tried = 0;
     s.attempts = 0;
     s.backoff_ms = 0;
     s.body_fill = 0;
@@ -826,14 +1216,12 @@ unsafe fn admit(s: &mut State) {
             reply(s, 400);
             return;
         }
-        let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl);
-        let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
-        if fd < 0 {
-            log(s, 1, b"[http_fetch] cannot create the file");
-            reply(s, 507);
-            return;
+        // Not ready yet: asked again shortly (Backoff → restart); refused:
+        // answered by open_file.
+        match open_file(s) {
+            Some(true) => {}
+            _ => return,
         }
-        s.file_fd = fd;
     }
     begin(s);
 }
@@ -889,6 +1277,9 @@ pub unsafe extern "C" fn module_new(
         s.authority_len = 0;
         s.authority_over = 0;
         s.dir_len = 0;
+        s.credentials_len = 0;
+        s.token_len = 0;
+        s.leg = LEG_OBJECT;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         if s.authority_over == 1 || s.authority_len == 0 {
@@ -942,11 +1333,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             Phase::Connecting => {
                 let mut payload = [0u8; CONNECT_TO_MAX];
-                let n = match Target::parse(authority(s)) {
+                let (dial, port) = if s.leg == LEG_TOKEN {
+                    (&s.realm_auth[..s.realm_auth_len as usize], s.realm_port)
+                } else {
+                    (authority(s), s.port)
+                };
+                let n = match Target::parse(dial) {
                     Some((target, _)) => write_connect_to(
                         &mut payload,
                         SOCK_TYPE_STREAM,
-                        s.port,
+                        port,
                         &target,
                         Some(dev_requester_tag(sys)),
                     ),
@@ -988,27 +1384,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             Phase::Backoff => {
                 if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms {
                     // A retried file starts again from what is on disk: the
-                    // Range position when chunked, else from nothing.
-                    if !ranged(s) {
-                        s.hasher = Sha256::new();
+                    // Range position when chunked, else from nothing. A
+                    // token leg is asked again as it was.
+                    if s.leg == LEG_TOKEN {
                         s.body_fill = 0;
-                        s.body_received = 0;
-                        s.pos = 0;
-                        if s.sink == SINK_FILE as u8 {
-                            let sys = &*s.syscalls;
-                            close_file(s, false);
-                            let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
-                            let pl = file_path(s, &mut path);
-                            let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl);
-                            let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
-                            if fd < 0 {
-                                reply(s, 507);
-                                return 0;
-                            }
-                            s.file_fd = fd;
-                        }
-                    } else {
-                        s.body_received = s.pos;
+                    } else if !restart(s) {
+                        return 0;
                     }
                     begin(s);
                 }

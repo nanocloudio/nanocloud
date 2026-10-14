@@ -24,6 +24,8 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 include!("../_shared/store.rs");
+include!("../_shared/k8s_proto_schema.rs");
+include!("../_shared/k8s_proto.rs");
 include!("../_shared/http_chain.rs");
 
 const PORT_INPUT: u8 = 0;

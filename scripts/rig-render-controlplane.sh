@@ -5,7 +5,8 @@
 #
 #   rig-render-controlplane.sh [out.yaml]     (default: target/pi5/render/pi5-controlplane.yaml)
 #
-# What changes on metal, and nothing else:
+# What changes on metal, and nothing else (the HPA chain stays off: its
+# metrics are another graph's, which a board does not run):
 #   - target pi5; the platform's net stack (rp1_gem -> ip) replaces linux_net,
 #     and the debug stack reports over UDP;
 #   - the API listens on :6443 through `tls` (no host_tcp);
@@ -24,57 +25,58 @@
 #     are judged against trusted time;
 #   - this node registers itself and keeps its lease (node_lease.uproc `renew`,
 #     as a worker does): a k3s-style single node is server and agent;
-#   - the operator's first credential is SEEDED (store_seed): a dev
-#     ServiceAccount verification key at /authn-keys/sa and a cluster-admin
-#     binding for kube-system/admin. The node's own token mint announces under
-#     /authn-keys/node meanwhile. This is the M1 stand-in for the join-token
-#     bootstrap (M3), which replaces both.
-#
-# Keys live in target/pi5/pki and are kept across renders, so a kubeconfig
-# (scripts/rig-kubeconfig.sh) stays valid across rebuilds. Certificate files
-# are read by `fluxor build` and embedded; the board reads no file.
+#   - the node is its own PKI (node_pki): the API's TLS key is born in the
+#     board's vault (`identity_label`) and certified on the board by kagi's
+#     authority (`nanocloud.ca`, the key that also signs ServiceAccount
+#     tokens), and the operator's first credential is minted there and
+#     released once by a join secret the node logs with its authority's key
+#     digest (scripts/rig-join.sh). The image carries no API key, no API
+#     certificate and no ServiceAccount key; what is seeded is policy — the
+#     namespaces and a cluster-admin binding for kube-system/admin;
+#   - the store's peer links are trusted by that same authority
+#     (NANOCLOUD_PEER_TRUST=authority): each link end's key is born in the
+#     vault and certified as …/replica-<id>.server / .client, and peers bind
+#     by those principals. No peer key is rendered either. A worker's slot
+#     is declared by address (NANOCLOUD_RIG_PEERS, "id=host:port ...", or
+#     the file target/pi5/render/peers): node_pki declares its Devices
+#     (nanocloud-peers/replica-<id>.server, .client) and a ServiceAccount,
+#     node-bootstrap-<id>, that may patch and read those two alone, and the
+#     join hands the operator that ServiceAccount's credential (rig-join.sh
+#     writes it as node-<id>.token). The worker is certified through the API
+#     with it, and admitted as a learner once its principal binds
+#     (scripts/node-join-e2e.sh; NC_PLANE=<board> runs its worker half here).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/target/pi5/render/pi5-controlplane.yaml}"
 NODE="${NANOCLOUD_RIG_NODE:-pi5-a}"
-IP="${NANOCLOUD_RIG_IP:-192.168.1.9}"
-PKI="$ROOT/target/pi5/pki"
+PKI="$ROOT/target/pi5/pki"   # no longer read: nothing is rendered from it
 WORK="$(dirname "$OUT")"
-mkdir -p "$WORK" "$PKI"
+mkdir -p "$WORK"
+# The rig build renders without the caller's environment, so the group's
+# peers are also a file beside the render (`target/pi5/render/peers`, one
+# "id=host:port ..." line), as the pod plane's switch is.
+PEERS="${NANOCLOUD_RIG_PEERS:-$(cat "$WORK/peers" 2>/dev/null || echo 0=127.0.0.1:7450)}"
 
-# ── Keys: the peer PKI and the API certificate (with this node's address as a
-# SAN, so a client can verify it by IP), and the dev ServiceAccount key.
-if [ ! -f "$PKI/pki/peer.der" ]; then
-  # shellcheck source=scripts/fluxor-env.sh
-  . "$ROOT/scripts/fluxor-env.sh"
-  nc_node_pki "$PKI" >/dev/null 2>&1
-fi
-if [ ! -f "$PKI/api.der" ]; then
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$PKI/api.key.pem" -out "$PKI/api.pem" -days 3650 -subj "/CN=nanocloud" \
-    -addext "subjectAltName=IP:$IP,DNS:$NODE,DNS:nanocloud,DNS:kubernetes.default.svc" \
-    -addext "basicConstraints=critical,CA:FALSE" \
-    -addext "extendedKeyUsage=serverAuth" 2>/dev/null
-  openssl x509 -in "$PKI/api.pem" -outform DER -out "$PKI/api.der"
-  openssl ec -in "$PKI/api.key.pem" -outform DER -out "$PKI/api.key.der" 2>/dev/null
-fi
-[ -f "$PKI/sa.key.pem" ] || openssl ecparam -name prime256v1 -genkey -noout -out "$PKI/sa.key.pem" 2>/dev/null
-
-# ── The shipped template, rendered as the E2Es render it (one voter).
-NANOCLOUD_CLUSTER_ENV=/nonexistent NANOCLOUD_PKI="$PKI/pki" NANOCLOUD_NODE_NAME="$NODE" \
-  NANOCLOUD_PEER_PORT=7450 NANOCLOUD_PEERS="0=127.0.0.1:7450" \
+# ── The shipped template, rendered as the E2Es render it (one voter), with
+# the cluster's own authority behind the peer links.
+NANOCLOUD_CLUSTER_ENV=/nonexistent NANOCLOUD_PEER_TRUST=authority NANOCLOUD_NODE_NAME="$NODE" \
+  NANOCLOUD_PEER_PORT=7450 NANOCLOUD_PEERS="$PEERS" \
   NANOCLOUD_REPLICA_FRAGMENT="$ROOT/packaging/debian/fluxor-replica.yaml" \
   sh "$ROOT/packaging/debian/nanocloud-graph.sh" \
   "$ROOT/packaging/debian/fluxor-controlplane.yaml" "$WORK/cp.linux.yaml"
 
 # ── Onto metal.
-python3 - "$WORK/cp.linux.yaml" "$OUT" "$ROOT" "$PKI" "$NODE" "${NANOCLOUD_RIG_KEY_AFTER_MS:-120000}" <<'PY'
-import binascii, json, os, re, struct, sys
-from cryptography.hazmat.primitives import serialization
+# The registry's CA (public: the cluster's certificate, never its key), as
+# DER for the image plane's tls client.
+REGISTRY_CA="${NANOCLOUD_RIG_REGISTRY_CA:-/var/lib/nanocloud.io/secure_assets/ca.crt}"
+if [ -r "$REGISTRY_CA" ]; then
+  openssl x509 -in "$REGISTRY_CA" -outform DER -out "$WORK/registry-ca.der"
+fi
+NANOCLOUD_RIG_PEERS="$PEERS" python3 - "$WORK/cp.linux.yaml" "$OUT" "$ROOT" "$PKI" "$NODE" <<'PY'
+import json, os, re, sys
 
 src, out, root, pki, node = sys.argv[1:6]
-key_after_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 0
 g = open(src).read()
 
 # Module types that call the store, from their manifests.
@@ -103,8 +105,10 @@ sub_re(r"^platform:\n(?:  .*\n|  #.*\n)*?    write_buf_kib: \d+\n",
        "platform:\n  net: {}\n  debug:\n    to: net\n    monitor: true\n")
 sub("    host_tcp: 1\n", "")
 sub("    port: 7443\n", "    port: 6443\n")
-sub('cert_file: "/etc/nanocloud.io/certs/server.der"', f'cert_file: "{pki}/api.der"')
-sub('key_file: "/etc/nanocloud.io/certs/server.key.der"', f'key_file: "{pki}/api.key.der"')
+# The API's identity is the board's: a vault key, certified by node_pki
+# (rendered so by NANOCLOUD_PEER_TRUST=authority, with the join).
+if g.count('    identity_label: "nanocloud.api"\n') != 1 or "  - name: node_pki\n" not in g:
+    sys.exit("render: the API's identity is not the vault's, or no node_pki certifies it")
 sub_re(r"^(\s+- from: |\s+to: )linux_net\.", r"\1ip.", count=g.count("linux_net."))
 
 # The store and the log on the board's disk, at the FAT32 root.
@@ -133,6 +137,15 @@ podplane = (os.environ.get("NANOCLOUD_RIG_PODPLANE", "0") == "1"
 # (`node.cap`). The render then packs the Pod's module types and writes the
 # capability onto the board's FAT32 root at bring-up (fat32_seed, the path
 # the FLXA names) and seeds the Graph object `probe-vol`.
+# Pods of workload images (`NANOCLOUD_RIG_IMAGES=1`, or `.images` beside the
+# render): the image plane runs on the board — http_fetch through a `tls`
+# client that authenticates the registry as registry.nanocloud.io by the
+# cluster's CA, image.uproc/image_asm.uproc, the pod plane's resolution
+# chain (pod_image.uproc) — and its blob cache is the FAT32's /blobs.
+images = podplane and (os.environ.get("NANOCLOUD_RIG_IMAGES", "0") == "1"
+                       or os.path.exists(os.path.join(work, ".images")))
+registry = os.environ.get("NANOCLOUD_RIG_REGISTRY", "192.168.1.10:5000")
+ca_der = os.path.join(work, "registry-ca.der")
 volume_dir = os.path.join(work, "volume")
 volume = podplane and os.path.exists(os.path.join(volume_dir, "flxa.hex"))
 # The pod plane's writes (sandbox phases, pod runtime) land on the same
@@ -142,7 +155,7 @@ volume = podplane and os.path.exists(os.path.join(volume_dir, "flxa.hex"))
 # so the store's per-write cost has to fall (a run-block cache; the plan's
 # A4) before the pod plane runs on this board.
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
-          "/volume-binds/,/image-,/volume-ops/")
+          "/volume-binds/,/image-,/volume-ops/,/blobs/,/fetch-q/")
 if podplane:
     sub('      scope: ""\n      scoped: ""\n',
         f'      scope: "{node}"\n      scoped: "{SCOPED}"\n')
@@ -156,43 +169,24 @@ sub("  - name: durability\n    params:\n",
     "  - name: durability\n" + deadline +
     "    params:\n      root_path: 1\n      segment_bytes: 8192\n")
 
-# The node's own mint announces apart from the seeded dev key (M1 only).
-sub('    announce_path: "/authn-keys/sa"\n', '    announce_path: "/authn-keys/node"\n')
-
-# The dev ServiceAccount key, as kagi's key frame (kagi_verify's wire).
-key = serialization.load_pem_private_key(open(f"{pki}/sa.key.pem", "rb").read(), None)
-pub = key.public_key().public_bytes(serialization.Encoding.X962,
-                                    serialization.PublicFormat.UncompressedPoint)
-f8 = lambda b: bytes([len(b)]) + b
-f16 = lambda b: struct.pack("<H", len(b)) + b
-body = (f8(b"https://kubernetes.default.svc") + struct.pack("<H", 1) + f8(b"sa-1")
-        + struct.pack("<H", 1) + bytes([1]) + bytes([0x01]) + struct.pack("<I", 1)
-        + struct.pack("<Q", 0) + struct.pack("<Q", 0) + f16(pub))
-frame = binascii.hexlify(bytes([0x22]) + struct.pack("<H", len(body)) + body).decode()
-
 js = lambda o: json.dumps(json.dumps(o, separators=(",", ":")))
-rbac = "rbac.authorization.k8s.io/v1"
-seeds = [
-    ("seed_sa_key", "/authn-keys/sa", None, frame),
-    ("seed_ns_default", "/namespaces/default",
-     {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}}, None),
-    ("seed_ns_system", "/namespaces/kube-system",
-     {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "kube-system"}}, None),
-    ("seed_admin_role", "/clusterroles/cluster-admin",
-     {"apiVersion": rbac, "kind": "ClusterRole", "metadata": {"name": "cluster-admin"},
-      "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]},
-                {"nonResourceURLs": ["*"], "verbs": ["*"]}]}, None),
-    ("seed_admin_binding", "/clusterrolebindings/nanocloud-admin",
-     {"apiVersion": rbac, "kind": "ClusterRoleBinding", "metadata": {"name": "nanocloud-admin"},
-      "subjects": [{"kind": "ServiceAccount", "name": "admin", "namespace": "kube-system"}],
-      "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole",
-                  "name": "cluster-admin"}}, None),
-]
-
+# The namespaces, who the joined admin is, and each worker slot (its
+# Devices and the one credential that may give them keys) are node_pki's to
+# declare: the join writes them once, if absent, beside the credentials it
+# mints — no module spent per key on a board seated near its module ceiling.
+seeds = []
 # This node's lease, as a worker keeps it (fluxor-worker.yaml).
 worker = open(f"{root}/packaging/debian/fluxor-worker.yaml").read()
 m = re.search(r"(  - name: nl_self\n.*?)\nwiring:\n", worker, re.S)
-lease = m.group(1).replace("__NODE_NAME__", node).rstrip("\n") + "\n"
+# Its labels: a Pi 5 (arm64) running fluxor on the metal, not Linux; the ABI
+# its image is built against.
+import subprocess
+abi = subprocess.run(["sh", f"{root}/scripts/fluxor-abi.sh", root], capture_output=True,
+                     text=True, check=True).stdout.strip()
+facts = (f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"fluxor",'
+         f'"kubernetes.io/hostname":"{node}","nanocloud.io/fluxor-abi":"{abi}"')
+lease = (m.group(1).replace("__NODE_NAME__", node).replace("__NODE_FACTS__", facts)
+         .rstrip("\n") + "\n")
 
 # The board's disk FIRST, as lattice's own pi5 graphs declare it: the store
 # opens its disk at construction, and a store constructed before its FS
@@ -211,26 +205,12 @@ extra = [
     '      server0: "0xA29FC801"\n      server1: "0xA29FC87B"\n'
     '      server2: "0xD8EF2300"\n      server3: "0xD8EF2304"\n'
     "      quorum: 2\n      boot_delay_ms: 15000\n",
-    "  # ── M1 bootstrap seeds (replaced by the join-token flow, M3) ──────────\n",
 ]
-import subprocess
-flxa = subprocess.check_output(["python3", f"{root}/scripts/support/flxa.py", "churn_probe:1=0"]).decode().strip()
-if podplane:
-    seeds.append(("seed_graph_probe", "/graphs.nanocloud.io/probe",
-                  {"apiVersion": "nanocloud.io/v1", "kind": "Graph", "metadata": {"name": "probe"},
-                   "spec": {"flxa": flxa}}, None))
-# The volume Pod's Graph (~2.4 KiB with its TLS material) is past what one
-# store_seed holds (1 KiB): it is applied through the API, as an operator
-# applies it (the E3 driver), not seeded.
+# The Graphs the Pods name are applied through the API, as an operator
+# applies them (the driver's `probe`, the E3 driver's `probe-vol`), not
+# seeded: a seed is a module, and the board sits near its module ceiling.
 for name, k, obj, hexval in seeds:
     v = f"      value_hex: \"{hexval}\"\n" if hexval else f"      value: {js(obj)}\n"
-    # The key changes what the graph does (it arms token verification), so
-    # it lands only once the board's telemetry is up — 120 s by default, past
-    # DHCP — and its effect is observed rather than happening in the dark.
-    # NANOCLOUD_RIG_KEY_AFTER_MS overrides when rendering by hand (the rig
-    # build does not pass the environment through).
-    if name == "seed_sa_key" and key_after_ms:
-        v += f"      after_ms: {key_after_ms}\n"
     extra.append(f"  - name: {name}\n    type: store_seed\n    params:\n      key: \"{k}\"\n{v}")
 extra.append("  # ── This node's lease (node_lease.uproc renew) ───────────────────────\n")
 extra.append(lease)
@@ -248,7 +228,7 @@ if volume:
 kube = open(f"{root}/packaging/debian/fluxor-podlifecycle.yaml").read()
 kube_mods = kube[kube.index("modules:\n") + len("modules:\n"):kube.index("\nwiring:")]
 kube_wire = kube[kube.index("wiring:\n") + len("wiring:\n"):]
-KEEP_PREFIX = ("pj_", "pl_", "pr_")
+KEEP_PREFIX = ("pj_", "pl_", "pr_") + (("pi_",) if images else ())
 KEEP = {"wl", "sb_mspec", "sb_mspecd", "sb_sig", "sb_sigd", "sb_pause", "sb_paused",
         "sb_ev", "sb_evout"}
 def kept(name):
@@ -269,9 +249,35 @@ kube_edges = "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs
                      if kept(a.split(".")[0]) and kept(b.split(".")[0]))
 if podplane:
     extra.append("  # ── The pod plane: packaging/debian/fluxor-podlifecycle.yaml, its graph-pod slice ──\n")
-    extra.append("".join(kept_mods).rstrip("\n") + "\n")
+    pod = "".join(kept_mods).rstrip("\n") + "\n"
+    if images:
+        pod = pod.replace('    blobs: "/var/lib/nanocloud.io/image/blobs"\n', '    blobs: "/blobs"\n')
+    extra.append(pod)
 else:
     kube_edges = ""
+if images:
+    pull = open(f"{root}/packaging/debian/fluxor-imagepull.yaml").read()
+    pull_mods = pull[pull.index("modules:\n") + len("modules:\n"):pull.index("\nwiring:")]
+    pull_mods = (pull_mods.replace('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"')
+                 .replace('dir: "/var/lib/nanocloud.io/image/blobs"', 'dir: "/blobs"'))
+    extra.append("  # ── The image plane: packaging/debian/fluxor-imagepull.yaml, behind tls ──\n")
+    extra.append(pull_mods.rstrip("\n") + "\n")
+    extra.append("  - name: fetch_tls\n    type: tls\n    mode: 0\n    alpn_h1_only: 1\n"
+                 "    peer_auth: 2\n    trust: \"${file:" + ca_der + "}\"\n"
+                 "    verify_hostname: \"registry.nanocloud.io\"\n")
+    for line in pull[pull.index("wiring:\n") + len("wiring:\n"):].split("\n  - from: "):
+        line = line.strip()
+        if not line:
+            continue
+        line = line if line.startswith("- from: ") else "- from: " + line
+        if "linux_net." in line:
+            continue  # fetch's net pair: through fetch_tls below
+        kube_edges += "  " + line.rstrip("\n") + "\n"
+    kube_edges += ("  - from: ip.net_out\n    to: fetch_tls.cipher_in\n"
+                   "  - from: fetch_tls.cipher_out\n    to: ip.net_in\n"
+                   "  - from: fetch_tls.clear_out\n    to: fetch.net_in\n"
+                   "  - from: fetch.net_out\n    to: fetch_tls.clear_in\n")
+    consumers.add("http_fetch")
 
 edges = [kube_edges,
          "  - from: nvme.blocks\n    to: fat32.blocks\n",
@@ -281,6 +287,10 @@ for name, *_ in seeds:
     edges.append(f"  - from: {name}.status\n    to: {name}.changes\n")
 consumers.add("store_seed")
 consumers.update({"tls", "token_verify"})
+# The node's authority and its ServiceAccount mint sign (and, on a vault
+# that cannot keep keys, generate) P-256 keys in a step: past 2 ms on this
+# board, and a terminated certificate_endpoint never certifies the API.
+consumers.update({"certificate_endpoint", "token_mint"})
 # The API's front: an HTTP/2 connection's setup (kubectl's first request)
 # crossed the 2 ms default once on this board, and a terminated http never
 # answers again — the API looked dead with every module behind it healthy.
@@ -306,6 +316,20 @@ def with_deadline(m):
     return head + deadline + rest[len(head):]
 mods = re.sub(r"^  - name: (\S+)\n(?:(?!  - name: ).*\n)*", with_deadline, mods, flags=re.M)
 
+# Not on metal: the HorizontalPodAutoscaler chain (hp_*). It scales on
+# /hpa-metrics/, which the autoscale graph's metrics pipeline writes — and
+# that graph does not run on a board — so here it would only seat six of the
+# kernel's 255 module slots that graph-backed Pods need.
+NOT_ON_METAL = ("hp_",)
+def on_metal(name):
+    return not name.startswith(NOT_ON_METAL)
+mods = "".join(b for b in re.split(r"(?m)^(?=  - name: )", mods)
+               if not b.startswith("  - name: ") or on_metal(b.split()[2]))
+wired = re.split(r"(?m)^(?=  - from: )", wiring)
+def edge_on_metal(e):
+    m = re.match(r"  - from: (\S+?)\.\S+\n    to: (\S+?)\.", e)
+    return not m or (on_metal(m.group(1)) and on_metal(m.group(2)))
+wiring = "".join(e for e in wired if edge_on_metal(e))
 g = mods + "\nwiring:\n" + wiring.rstrip("\n") + "\n" + "".join(edges)
 # Modules a workload may be staged with: resolved by type hash against this
 # image, so they are packed without being instantiated. `probe` is the

@@ -17,6 +17,8 @@ module nanocloud.podproject {
   // carried by: pp.Art, pp.Made, pp.Ask, pp.Known
   message Ctx {
     key: string = 30;
+    st: string = 31;      // prune: the sandbox's state (absent: none)
+    metal: string = 32;   // prune: its graph, when it is a metal sandbox
   }
 
   message pp.Spec {
@@ -29,6 +31,7 @@ module nanocloud.podproject {
     net: string = 7;
     tasks: string = 8;
     graph: string = 9;
+    image: string = 10;       // a workload image's reference (pulled)
     res_rootfs: string = 70;  // related /pod-resolved/
     res_cmd: string = 71;
   }
@@ -50,6 +53,8 @@ module nanocloud.podproject {
     seq: int = 1;
     rev: int = 2;
     key: string = 3;
+    st: string = 70;      // /sandbox-status/<uid> state
+    metal: string = 80;   // /metal-sandboxes/<uid> graph
   }
   message pp.Ask {
     cid: int = 1;
@@ -68,10 +73,12 @@ module nanocloud.podproject {
     op: int = 2;
     key: string = 3;
     v1: string = 4;
+    k2: string = 17;
   }
 
   enum NOOP = 0;
   enum EXISTS = 2;
+  enum DROP_EACH = 18;
   enum PUT = 3;
   enum DELETE = 4;
   enum MERGE = 6;
@@ -96,6 +103,16 @@ module nanocloud.podproject {
                p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
   }
   decision metal(s: pp.Spec) -> pp.Art {
+    // A workload image: no sandbox until its pull resolved to a pack — the
+    // Pod is Pending meanwhile — then the sandbox names it.
+    when s.graph != "" && has(s.image) && s.image != "" && has(s.res_rootfs)
+         && s.res_rootfs.startsWith("pack:") ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "graph=", p2: s.graph, p3: ";pack=", p4: s.res_rootfs.substring(5),
+               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+    when s.graph != "" && has(s.image) && s.image != "" ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
+               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
     when s.graph != "" ->
       pp.Art { cid: s.seq, op: MERGE, key: s.key,
                p1: "graph=", p2: s.graph, p3: "", p4: "",
@@ -112,24 +129,38 @@ module nanocloud.podproject {
   }
 
   decision ask(r: pp.Rt) -> pp.Ask {
-    default -> pp.Ask { cid: r.seq, op: EXISTS, key: r.key, ctx: Ctx { key: r.key } };
+    default -> pp.Ask { cid: r.seq, op: EXISTS, key: r.key, ctx: Ctx { key: r.key, st: r.st, metal: r.metal } };
   }
+  // A Pod whose spec is gone (its tomb expired at the plane): every record
+  // the node keeps for it, by uid, goes — in one step, so none is left for a
+  // chain to read as a Pod that still exists. But not while its sandbox may
+  // still run: a node that was away for the Pod's whole deletion catches up
+  // to a spec that is simply gone, never one that said `deleted`, and its
+  // workload would be orphaned. So a live sandbox is asked to delete first;
+  // the records go once it is destroyed (the source watches its status).
   decision prune(k: pp.Known) -> pp.Act {
+    when k.status == 404 && has(k.ctx.st) && k.ctx.st != "" && k.ctx.st != "exited" && k.ctx.st != "failed"
+         && k.ctx.st != "killed" && k.ctx.st != "destroyed" && has(k.ctx.metal) && k.ctx.metal != "" ->
+      pp.Act { cid: k.cid, op: MERGE, key: "metal-sandboxes/", k2: k.ctx.key, v1: "phase=delete" };
+    when k.status == 404 && has(k.ctx.st) && k.ctx.st != "" && k.ctx.st != "exited" && k.ctx.st != "failed"
+         && k.ctx.st != "killed" && k.ctx.st != "destroyed" ->
+      pp.Act { cid: k.cid, op: MERGE, key: "sandboxes/", k2: k.ctx.key, v1: "phase=delete" };
     when k.status == 404 ->
-      pp.Act { cid: k.cid, op: DELETE, key: k.ctx.key, v1: "" };
+      pp.Act { cid: k.cid, op: DROP_EACH, key: k.ctx.key, k2: "",
+               v1: "pod-runtime,sandboxes,metal-sandboxes,sandbox-status,sandbox-boot-of,sandbox-logs,sandbox-kill,sandbox-pause,pod-lifecycle-status,probe-status,probe-rt-l,probe-rt-r,pod-resolved" };
     default ->
-      pp.Act { cid: k.cid, op: NOOP, key: "", v1: "" };
+      pp.Act { cid: k.cid, op: NOOP, key: "", k2: "", v1: "" };
   }
 
   transformation pass_spec(s: pp.Spec) -> pp.Spec {
     pp.Spec { seq: s.seq, rev: s.rev, key: s.key, cmd: s.cmd, rootfs: s.rootfs,
-              iso: s.iso, net: s.net, tasks: s.tasks, graph: s.graph,
+              iso: s.iso, net: s.net, tasks: s.tasks, graph: s.graph, image: s.image,
               res_rootfs: s.res_rootfs, res_cmd: s.res_cmd }
   }
   transformation pass_made(m: pp.Made) -> pp.Made {
     pp.Made { cid: m.cid, status: m.status, value: m.value, ctx: m.ctx }
   }
-  transformation pass_rt(r: pp.Rt) -> pp.Rt { pp.Rt { seq: r.seq, rev: r.rev, key: r.key } }
+  transformation pass_rt(r: pp.Rt) -> pp.Rt { pp.Rt { seq: r.seq, rev: r.rev, key: r.key, st: r.st, metal: r.metal } }
   transformation pass_known(k: pp.Known) -> pp.Known {
     pp.Known { cid: k.cid, status: k.status, value: k.value, ctx: k.ctx }
   }

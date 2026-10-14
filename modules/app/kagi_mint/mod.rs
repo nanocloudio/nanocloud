@@ -377,7 +377,93 @@ fn put_field(out: &mut [u8], at: usize, number: u8, ty: u8, payload: &[u8]) -> O
     Some(at + 4 + payload.len())
 }
 
-/// The reply record: correlation, status, token, then the carry echoed.
+/// The value of a base64url digit; `None` for anything else.
+fn b64url(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// The token's `exp` (seconds since the epoch), read back out of the JWS the
+/// mint signed: its payload segment, base64url-decoded, then the number after
+/// `"exp":`. `None` when the token is not one this can read.
+fn jwt_exp(token: &[u8]) -> Option<u64> {
+    let mut seg = token.splitn(3, |&c| c == b'.');
+    seg.next()?;
+    let payload = seg.next()?;
+    let mut json = [0u8; 2048];
+    let (mut n, mut acc, mut bits) = (0usize, 0u32, 0u32);
+    for &c in payload {
+        acc = (acc << 6) | b64url(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            *json.get_mut(n)? = (acc >> bits) as u8;
+            n += 1;
+            acc &= (1 << bits) - 1;
+        }
+    }
+    let json = json.get(..n)?;
+    let key = b"\"exp\":";
+    let at = json.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut v = 0u64;
+    let mut digits = 0;
+    for &c in json.get(at..)? {
+        match c {
+            b' ' if digits == 0 => {}
+            b'0'..=b'9' => {
+                v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+                digits += 1;
+            }
+            _ => break,
+        }
+    }
+    (digits > 0).then_some(v)
+}
+
+/// Seconds since the epoch as RFC 3339 UTC, `YYYY-MM-DDTHH:MM:SSZ` — the
+/// `expirationTimestamp` a TokenRequest answers with. Days to a civil date by
+/// the era method (proleptic Gregorian).
+fn rfc3339(secs: u64, out: &mut [u8; 20]) {
+    let days = secs / 86400;
+    let sod = secs % 86400;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let parts: [(usize, u64, usize); 6] = [
+        (0, y % 10_000, 4),
+        (5, m, 2),
+        (8, d, 2),
+        (11, sod / 3600, 2),
+        (14, sod / 60 % 60, 2),
+        (17, sod % 60, 2),
+    ];
+    *out = *b"0000-00-00T00:00:00Z";
+    for (at, mut v, w) in parts {
+        let mut i = w;
+        while i > 0 {
+            i -= 1;
+            if let Some(b) = out.get_mut(at + i) {
+                *b = b'0' + (v % 10) as u8;
+            }
+            v /= 10;
+        }
+    }
+}
+
+/// The reply record: correlation, status, token, the token's expiry (when it
+/// can be read), then the carry echoed.
 fn build_reply(out: &mut [u8], held: &[u8], status: u8, token: &[u8]) -> usize {
     let cid = match frame_field(held, 1) {
         Some((TY_I64, b)) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
@@ -399,6 +485,11 @@ fn build_reply(out: &mut [u8], held: &[u8], status: u8, token: &[u8]) -> usize {
     field!(put_field(out, p, 1, TY_I64, &cid.to_le_bytes()));
     field!(put_field(out, p, 2, TY_I64, &(status as i64).to_le_bytes()));
     field!(put_field(out, p, 3, TY_BYTES, token));
+    let mut exp = [0u8; 20];
+    if let Some(secs) = jwt_exp(token) {
+        rfc3339(secs, &mut exp);
+        field!(put_field(out, p, 4, TY_BYTES, &exp));
+    }
     for f in (CARRY_LO..=CARRY_HI).chain(core::iter::once(CARRY_FIELD)) {
         if let Some((ty, v)) = frame_field(held, f) {
             field!(put_field(out, p, f, ty, v));

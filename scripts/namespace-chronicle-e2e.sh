@@ -87,7 +87,7 @@ modules:
     join_scoped: 1
   - name: collect
     type: store_effect
-    decision: "${DEC_SW}"
+    decision: {hex: "${DEC_SW}"}
   - name: namespaces
     type: store_source
     prefix: "/namespaces/"
@@ -97,7 +97,7 @@ modules:
     watch: "${PREFIXES}"
   - name: remove
     type: store_effect
-    decision: "${DEC_FIN}"
+    decision: {hex: "${DEC_FIN}"}
     key_prefix: "/namespaces/"
 wiring:
   - from: objects.status

@@ -20,10 +20,12 @@ node serves the Kubernetes API.
   refusal answers: each is a chain of generic Chronicle engines carrying params
   compiled from `modules/app/_chronicle/*.uproc`. No `.fmod` holds what a
   Deployment is, or what a Kubernetes path names.
-- **Kubernetes-shaped API.** `kubectl` talks to it directly: `core/v1`,
-  `apps/v1` and `nanocloud.io/v1` discovery documents,
-  list/get/create/update/delete, and `?watch=true` watches fenced on the
-  store's own revisions.
+- **Kubernetes-shaped API.** `kubectl` talks to it directly: discovery for
+  `core/v1`, `apps/v1`, `batch/v1`, `rbac.authorization.k8s.io/v1`,
+  `scheduling.k8s.io/v1`, `policy/v1`, `networking.k8s.io/v1` and
+  `nanocloud.io/v1`, list/get/create/update/delete, `?watch=true` watches
+  fenced on the store's own revisions, and `kubectl create`'s typed
+  generators, which send protobuf.
 - **One store, replicated.** Control-plane state lives in fluxor's
   `storage.object` / `storage.namespace` contracts — versioned keyed bytes with
   compare-and-swap, prefix listing and change subscriptions — served by
@@ -107,6 +109,49 @@ sudo nanocloud-cluster add-node 1       # replica 1 joins, by the operator key
 The worker registers itself in `/nodes/`, renews its lease, and is scheduled
 onto once ready.
 
+### Under the cluster's own authority
+
+With `NANOCLOUD_PEER_TRUST=authority` in `cluster.env` no key is provisioned
+at all: every TLS key (the API's, each peer link end's) is born in the node's
+vault and certified by the control plane's own authority (kagi's
+`certificate_endpoint`, under the vault key `nanocloud.ca`). The bare-metal
+control plane runs this way (`scripts/rig-render-controlplane.sh`).
+
+The control plane announces a single-use join secret beside its authority's
+key digest; the operator trades it for a kubeconfig and, for each worker slot
+(every replica in `NANOCLOUD_PEERS` past the voters), that slot's bootstrap
+credential:
+
+```bash
+# from the node's log: [join] secret=<hex> ca-sha256=<hex>
+scripts/rig-join.sh <secret> <ca-sha256> <host:port> <dir>/kubeconfig
+# -> <dir>/kubeconfig, <dir>/ca.der, <dir>/node-<id>.token
+```
+
+A slot's credential may patch and read that slot's two Devices
+(`nanocloud-peers/replica-<id>.server`, `.client`) and nothing else. On the
+worker, put `ca.der` and `node-<id>.token` in `/etc/nanocloud.io/pki` as
+`plane-ca.der` and `node.token`, and set `NANOCLOUD_ROLE=node`,
+`NANOCLOUD_PEER_TRUST=authority` and `NANOCLOUD_PLANE_API=<host:port>`: its
+link ends' keys are certified through the API (the Device names the key, the
+control plane's device chain certifies it, the worker reads the certificate
+back), and the control plane adds it as a learner once its principal binds —
+no `add-node`. `scripts/node-join-e2e.sh` runs the whole of it on one host;
+`NC_PLANE=<ip>` runs its worker half against a board.
+
+The CLI applet is this node's replica run offline (the service stopped).
+Under authority it carries the node's authority itself — the same vault key
+certifies the same principals — so give it the service's vault, as root:
+
+```bash
+sudo sh -c '. /etc/nanocloud.io/seal.env; export FLUXOR_SEAL_KEY \
+  FLUXOR_VAULT_DIR=/var/lib/nanocloud.io/control-plane/store/vault; \
+  cd /var/lib/nanocloud.io/control-plane/store && nanocloud get namespaces'
+```
+
+Without the seal key its keys are its own and unsealed for the run: fine
+for a single-voter plane, refused by the peers of a larger one.
+
 ## Using it
 
 ```bash
@@ -145,9 +190,14 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 
 | Group | Resources |
 | ----- | --------- |
-| core/v1 | pods (+ `pods/log`, `pods/status`), services, endpoints, configmaps, secrets, serviceaccounts, events, persistentvolumeclaims, persistentvolumes, namespaces, nodes |
+| core/v1 | pods (+ `pods/log`, `pods/status`), services, endpoints, configmaps, secrets, serviceaccounts (+ `serviceaccounts/token`), events, persistentvolumeclaims, persistentvolumes, namespaces, nodes, resourcequotas |
 | apps/v1 | deployments, replicasets, statefulsets, daemonsets |
-| nanocloud.io/v1 | graphs |
+| batch/v1 | jobs, cronjobs |
+| rbac.authorization.k8s.io/v1 | roles, clusterroles, rolebindings, clusterrolebindings |
+| scheduling.k8s.io/v1 | priorityclasses |
+| policy/v1 | poddisruptionbudgets |
+| networking.k8s.io/v1 | ingresses, ingressclasses, networkpolicies |
+| nanocloud.io/v1 | graphs, devices |
 
 Those are what the discovery documents advertise. Path resolution is generic —
 the rules read a path's *shape*, not a list of kinds — so an object of any
@@ -166,7 +216,20 @@ too: a policy read and a live-object COUNT through `store_effect`, then a
 decision. No node on the path holds Kubernetes meaning in compiled code.
 
 Discovery documents (`/api`, `/apis`, `/api/v1`, `/apis/<group>/<version>`),
-`/version` and `/openapi/` are literals in a decision — the API surface is data.
+`/version` and `/openapi/v3` are literals in decisions — the API surface is
+data (`apiplane_admit.uproc`: `admit` answers discovery, and `oapi`, the node
+after it, the OpenAPI documents, because together they pass the 16 KiB one
+compiled decision holds).
+
+A body sent as `application/vnd.kubernetes.protobuf` — what `kubectl create
+configmap|secret|deployment|job|role|…` sends, with no JSON fallback — is
+transcoded to the JSON object it stands for at the ingress (`http_chain`,
+`_shared/k8s_proto.rs`), against a schema generated from Kubernetes'
+`generated.proto` and Go types (`scripts/support/k8s_proto_schema.py`); the
+chain never sees protobuf. `kubectl create token` (a TokenRequest on
+`serviceaccounts/<name>/token`) is signed by the plane's one issuer — the same
+`token_mint` and vault key the store-driven tokens use — and answered with the
+token and its `expirationTimestamp` (`apiplane_token.uproc`).
 Namespaced paths (`/apis/<group>/<v>/namespaces/<ns>/<resource>[/<name>]`) and
 cluster-scoped paths resolve through the same rules; a grouped resource is keyed
 group-qualified (`deployments.apps`) so it never collides with a same-named

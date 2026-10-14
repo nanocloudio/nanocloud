@@ -11,7 +11,13 @@
 //   id    PUT /deviceidentities.nanocloud.io/<ns>/<name> =
 //         "spiffe=…;crt=<b64url DER>;ca=<b64url DER>"
 //   ca    PUT /ca-cert = the CA certificate (b64url DER), for `nanocloud ca`
-// A Device without a key is not certified: there is nothing to certify.
+//   st    from the same answer: the Device's own status, merged —
+//         {"status":{"spiffe","publicKey","certificate","ca"}} — what a client
+//         reading its Device through the API (a node certifying its peer
+//         keys) is answered; `publicKey` is the key certified
+// A Device without a key is not certified: there is nothing to certify. One
+// whose spec names a key other than status.publicKey is certified (again):
+// the holder re-keyed.
 module nanocloud.device {
 
   // The context each chain here carries across its effects: ONE nested
@@ -22,9 +28,11 @@ module nanocloud.device {
   message Ctx {
     key: string = 30;
     ca: string = 31;
+    pk: string = 32;
   }
   enum NOOP = 0;
   enum PUT = 3;
+  enum PATCH_MERGE = 13;
   enum POST = 3;
 
   message dv.Dev {
@@ -64,6 +72,13 @@ module nanocloud.device {
     status: int = 2;
     ctx: Ctx = 254;
   }
+  message dv.Status {       // store_big: PATCH_MERGE the Device itself
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12;
+  }
   message dv.Ca {
     cid: int = 1;
     op: int = 2;
@@ -74,12 +89,12 @@ module nanocloud.device {
   decision cert(d: dv.Dev) -> dv.Call {
     when d.pk == "" ->
       dv.Call { cid: d.seq, method: NOOP, path: "",
-                b1: "", b2: "", b3: "", b4: "", b5: "", b6: "", b7: "", b8: "", b9: "", ctx: Ctx { key: d.key } };
+                b1: "", b2: "", b3: "", b4: "", b5: "", b6: "", b7: "", b8: "", b9: "", ctx: Ctx { key: d.key, pk: "" } };
     default ->
       dv.Call { cid: d.seq, method: POST, path: "/pki/certificate",
                 b1: "{\"subject\":\"CN=device:", b2: d.name, b3: "\",\"tenant\":\"", b4: d.ns,
                 b5: "\",\"device\":\"", b6: d.name, b7: "\",\"public_key\":\"", b8: d.pk,
-                b9: "\"}", ctx: Ctx { key: d.key } };
+                b9: "\"}", ctx: Ctx { key: d.key, pk: d.pk } };
   }
   decision id(i: dv.Issued) -> dv.Id {
     when i.status == 200 && i.crt != "" ->
@@ -88,6 +103,17 @@ module nanocloud.device {
     default ->
       dv.Id { cid: i.cid, op: NOOP, key: "",
               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", ctx: Ctx { ca: "" } };
+  }
+  decision st(i: dv.Issued) -> dv.Status {
+    when i.status == 200 && i.crt != "" ->
+      dv.Status { cid: i.cid, op: PATCH_MERGE, key: i.ctx.key,
+                  v1: "{\"status\":{\"spiffe\":\"", v2: i.spiffe,
+                  v3: "\",\"publicKey\":\"", v4: i.ctx.pk,
+                  v5: "\",\"certificate\":\"", v6: i.crt,
+                  v7: "\",\"ca\":\"", v8: i.ca, v9: "\"}}" };
+    default ->
+      dv.Status { cid: i.cid, op: NOOP, key: "",
+                  v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "" };
   }
   decision ca(r: dv.IdDone) -> dv.Ca {
     when r.status >= 200 && r.status < 300 && r.ctx.ca != "" ->
@@ -107,6 +133,8 @@ module nanocloud.device {
   pipeline cap(r: dv.IdDone) -> dv.Ca { call x = pass_done(r); call y = ca(x); return y; }
   entry rq = rq;
   entry idn = idn;
+  pipeline sts(i: dv.Issued) -> dv.Status { call x = pass_issued(i); call y = st(x); return y; }
   entry cap = cap;
+  entry sts = sts;
   provenance revision "device-identity" toolchain "chronicle-authoring";
 }

@@ -160,6 +160,7 @@ nc_render_graph() {
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   base=$((23000 + ($$ % 500) * 2))
   NANOCLOUD_CLUSTER_ENV=/nonexistent NANOCLOUD_PKI="$dir/pki" NANOCLOUD_NODE_NAME=node-a \
+    NANOCLOUD_FLUXOR_ABI="$(sh "$root/scripts/fluxor-abi.sh" "$root")" \
     NANOCLOUD_PEER_PORT="$base" NANOCLOUD_PEERS="0=127.0.0.1:$base" \
     NANOCLOUD_REPLICA_FRAGMENT="$root/packaging/debian/fluxor-replica.yaml" \
     sh "$root/packaging/debian/nanocloud-graph.sh" "$template" "$out.rendered" || return 1

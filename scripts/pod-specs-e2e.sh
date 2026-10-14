@@ -90,7 +90,7 @@ modules:
     paths: "metadata.uid,spec.nodeName,spec.containers.0.command!jargv,spec.containers.0.args!jargv,spec.containers.0.image,spec.restartPolicy!lower,spec.terminationGracePeriodSeconds,metadata.deletionTimestamp,spec.runtimeClassName"
   - name: ps_spec
     type: store_effect
-    decision: "${DEC_SPEC}"
+    decision: {hex: "${DEC_SPEC}"}
     key_prefix: "/~node/"
   - name: ps_tombs
     type: store_source
@@ -98,7 +98,7 @@ modules:
     paths: "obj.metadata.uid,obj.spec.nodeName,obj.spec.runtimeClassName,obj.spec.containers.0.image"
   - name: ps_gone
     type: store_effect
-    decision: "${DEC_GONE}"
+    decision: {hex: "${DEC_GONE}"}
     key_prefix: "/~node/"
 wiring:
   - from: ps_pods.status

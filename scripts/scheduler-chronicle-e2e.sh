@@ -88,7 +88,7 @@ modules:
     paths: "status.ready"
   - name: mark
     type: store_effect
-    decision: "$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
+    decision: {hex: "$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"}
     key_prefix: "/ready-nodes/"
   # bind: the first unbound pod, the least-loaded ready node
   - name: unbound
@@ -98,14 +98,15 @@ modules:
     count: 1
     join: "/ready-nodes/"
     join_pick: "mincount:/pods/:spec.nodeName"
-    watch: "/ready-nodes/"
+    join_fit: "spec.nodeSelector:/nodes/:metadata.labels"
+    watch: "/ready-nodes/,/nodes/"
   - name: patch
     type: store_effect
-    decision: "${DEC_BD}"
+    decision: {hex: "${DEC_BD}"}
     key_prefix: "/pods/"
   - name: events
     type: store_effect
-    decision: "${DEC_RC}"
+    decision: {hex: "${DEC_RC}"}
     key_prefix: "/events/"
 wiring:
   - from: nodes.status
@@ -166,4 +167,19 @@ N1=0; N2=0; for p in b c d e; do case "$(node_of pod-$p)" in node-1) N1=$((N1+1)
 [ "$N1" = 2 ] && [ "$N2" = 2 ] || fail "after a delete the spread should be 2/2 again: node-1=$N1 node-2=$N2"
 echo "   pod-e -> $E; spread 2/2 again"
 
-echo "== E2E green: the scheduler as params — an argmin join, one bind per pass, a spread that emerges =="
+echo "== 3. nodeSelector: a Pod lands only on a node whose labels it names; one that fits no node waits, and holds nobody behind it =="
+store_put "/nodes/node-1" '{"metadata":{"name":"node-1","labels":{"kubernetes.io/arch":"arm64","nanocloud.io/fluxor-abi":"d1579ff4"}},"status":{"ready":true}}'
+store_put "/nodes/node-2" '{"metadata":{"name":"node-2","labels":{"kubernetes.io/arch":"amd64","nanocloud.io/fluxor-abi":"d1579ff4"}},"status":{"ready":true}}'
+# pod-0 sorts first among the unbound: an ABI no node has.
+store_put "/pods/default/pod-0" '{"metadata":{"name":"pod-0"},"spec":{"nodeSelector":{"nanocloud.io/fluxor-abi":"00000000"},"containers":[{"image":"x"}]}}'
+store_put "/pods/default/pod-f" '{"metadata":{"name":"pod-f"},"spec":{"nodeSelector":{"kubernetes.io/arch":"amd64"},"containers":[{"image":"x"}]}}'
+store_put "/pods/default/pod-g" '{"metadata":{"name":"pod-g"},"spec":{"nodeSelector":{"kubernetes.io/arch":"arm64","nanocloud.io/fluxor-abi":"d1579ff4"},"containers":[{"image":"x"}]}}'
+store_put "/pods/default/pod-h" '{"metadata":{"name":"pod-h"},"spec":{"nodeSelector":{},"containers":[{"image":"x"}]}}'
+run 10
+[ -z "$(node_of pod-0)" ] || fail "pod-0 names an ABI no node has, and was bound to $(node_of pod-0)"
+[ "$(node_of pod-f)" = "node-2" ] || fail "pod-f selects amd64 (node-2), bound to '$(node_of pod-f)'"
+[ "$(node_of pod-g)" = "node-1" ] || fail "pod-g selects arm64 + the ABI (node-1), bound to '$(node_of pod-g)'"
+[ -n "$(node_of pod-h)" ] || fail "pod-h has an empty selector: any node fits, yet it is unbound"
+echo "   pod-0 unbound (no node has its ABI); pod-f -> node-2, pod-g -> node-1, pod-h -> $(node_of pod-h)"
+
+echo "== E2E green: the scheduler as params — an argmin join, one bind per pass, a spread that emerges, nodeSelector fit =="
