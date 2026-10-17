@@ -9,8 +9,10 @@ blob from `/graphs/<name>` as hex; this writes it, in the layout
     magic "FLXA" (4)  version u16 = 1  reserved u16  owner_uid (16, zero: the
     kernel copies the CREATE header's identity in)  state_cap u32  buffer_cap
     u32  module_count u8  edge_count u8
-    module: type_hash u32 (FNV-1a of the type name)  domain u8  params_len
-            u16  params (the SDK TLV: FE 01 [len LE16] [tag len value]... FF 00)
+    module: type_hash u32 (FNV-1a of the type name)  domain u8
+            step_deadline_us u32  step_deadline_burst_us u32  fault_policy u8
+            (zeros: the node's default budget, skip)  params_len u16  params
+            (the SDK TLV: FE 01 [len LE16] [tag len value]... FF 00)
     edge:   from (kind u8, index u16, port u8)  to (kind u8, index u16,
             port u8)  bytes u32
 
@@ -72,7 +74,7 @@ def module(spec: str) -> bytes:
             v, is_ext = value(val)
             (ext if is_ext else entries).append((int(tag), v))
     p = params_tlv(entries, ext) if entries or ext else b""
-    return struct.pack(">IBH", type_hash(name), 0, len(p)) + p
+    return struct.pack(">IBIIBH", type_hash(name), 0, 0, 0, 0, len(p)) + p
 
 
 def edge(frm: str, to: str, nbytes: int) -> bytes:

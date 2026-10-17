@@ -31,6 +31,14 @@ workloads:
       # nothing pre-creates a `lattice/` directory inside a workload.
       root_path: 1
     type: kv_state_worker
+    # Its store's provider calls are synchronous: on a board's FAT32 over
+    # NVMe one call can take longer than the node's 2 ms default step (the
+    # first recovery did, and the guard ended the module). The budget the
+    # plane's own store callers hold, which the node admits a workload up to
+    # 16 of its ticks; `tolerate` keeps an overrun to this module.
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: tolerate
   - name: ttl_scheduler
     params:
       propose_wrap: 0

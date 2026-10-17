@@ -207,11 +207,16 @@ fn decimal(v: u64, out: &mut [u8; 20]) -> usize {
     n
 }
 
-/// One module: `[name_hash BE][domain][params_len BE][params]`. The params
+/// One module: `[name_hash BE][domain][step_deadline_us BE][burst_us BE]
+/// [fault_policy][params_len BE][params]`. The step budget is the node's
+/// default (zeros, `skip`): a volume's modules run within it. The params
 /// length is patched once they are written.
 fn module(o: &mut Out<'_>, name: &[u8], params: impl FnOnce(&mut Out<'_>)) {
     o.be32(type_hash(name));
     o.u8(0);
+    o.be32(0); // step_deadline_us: the node's default
+    o.be32(0); // step_deadline_burst_us: deadline x the burst multiplier
+    o.u8(0); // fault_policy: skip
     let len_at = o.n;
     o.be16(0);
     let start = o.n;
