@@ -145,10 +145,11 @@ put_text "/nodes/node-1" '{"apiVersion":"v1","kind":"Node","metadata":{"name":"n
 printf 'localhost' > "$D/hostname"
 # tls: client, peer_auth ca_dns, the clock unchecked (a test CA's 2-day
 # certificates); its DER material as extended entries. loam_volume: root,
-# path, lease, block size, this node's capability, the gate.
+# path, lease, block size, the gate, this node's capability chains (an
+# extended entry: the subgraph has no files of its own to read them from).
 FLXA="$(python3 "$ROOT/scripts/support/flxa.py" \
   "tls:1=0,11=2,12=1,10=f:$D/node.der,11=f:$D/node.key.der,12=f:$D/ca.der,13=f:$D/hostname" \
-  "loam_volume:1=s:nanocloud,2=s:/default/volumes/probe,3=u32:5000,4=u32:4096,7=s:$D/node.cap,8=s:127.0.0.1:$LOAM_PORT" \
+  "loam_volume:1=s:nanocloud,2=s:/default/volumes/probe,3=u32:5000,4=u32:4096,8=s:127.0.0.1:$LOAM_PORT,20=f:$D/node.cap" \
   "stateful_probe" \
   --edge 0:0:0 3:0:0 0 --edge 3:0:0 0:0:0 0 \
   --edge 0:0:1 0:1:0 131072 --edge 0:1:1 0:0:1 131072 \

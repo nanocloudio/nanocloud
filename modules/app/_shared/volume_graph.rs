@@ -45,8 +45,10 @@ pub struct VolumeGraph<'a> {
     pub owner_uid: [u8; 16],
     /// Admitted module-state bytes (0 = unlimited).
     pub state_cap: u32,
-    /// Loam: the admin gate's `host:port` to dial, the capability file whose
-    /// chains the volume presents to it, the name its certificate must carry
+    /// Loam: the admin gate's `host:port` to dial, the capability chains
+    /// (the text of the node's capability file, one per line) the volume
+    /// presents to it — handed over, since a workload reads none of the
+    /// node's files — the name its certificate must carry
     /// (empty to check the dialled host), the trust anchors (DER), and the
     /// node's certificate and key (DER; the key PKCS#8). The gate binds the
     /// writer lease to this certificate, so the node's lease ops run under
@@ -290,9 +292,9 @@ pub fn encode(g: &VolumeGraph<'_>, out: &mut [u8]) -> Option<usize> {
             let n = decimal(g.fence, &mut d);
             p.entry(6, &d[..n]);
         }
-        p.entry(7, g.capability);
         p.entry(8, g.loam_authority);
         p.end();
+        p.ext(20, g.capability); // capability_chains
     });
     module(&mut o, b"crypt_block", |o| {
         let mut p = Params::begin(o);

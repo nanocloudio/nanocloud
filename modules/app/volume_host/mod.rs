@@ -70,7 +70,17 @@ const MAX_INST: usize = 4;
 const MAX_CLAIM: usize = 128;
 const MAX_CRED: usize = 4096;
 const MAX_LABEL: usize = 64;
-const FLXA_CAP: usize = 3 * MAX_CRED + 2048;
+/// The node's capability file, read whole (one `fxcap1.` chain per line):
+/// as much as loam_volume takes, its `CAP_FILE_MAX` — eight chains
+/// (`MAX_SESSION_GRANTS`) of at most 1375 bytes (`MAX_TEXT_LEN`) and a newline.
+const CAP_TEXT_MAX: usize = 8 * (1375 + 1);
+const FLXA_CAP: usize = 3 * MAX_CRED + CAP_TEXT_MAX + 2048;
+const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
+const FS_CLOSE: u32 = 0x0903;
+const FS_EAGAIN: i32 = -11;
+const WL_EINPROGRESS: i32 = -36;
+const WL_EEXIST: i32 = -17;
 const STATUS_LEN: usize = 40;
 const CMD: usize = 256;
 /// The storage-key endpoint's path, on the HTTP client's pinned authority.
@@ -231,6 +241,8 @@ struct State {
     loam_authority_len: u8,
     loam_capability: [u8; 255],
     loam_capability_len: u8,
+    /// Its chains, as last read for an attach.
+    cap_text: [u8; CAP_TEXT_MAX],
     issuer: [u8; sk::MAX_ID],
     issuer_len: u8,
     device: [u8; sk::MAX_ID],
@@ -359,6 +371,47 @@ mod params_def {
         24, loam_capability, str, 0
             => |s, d, len| { super::set_str(&mut s.loam_capability, &mut s.loam_capability_len, d, len); };
     }
+}
+
+/// The node's capability file into `cap_text`: its length; `Err(true)` when
+/// the file system answers "not yet" (asked again with the attach),
+/// `Err(false)` when it is missing, empty or larger than `CAP_TEXT_MAX`.
+unsafe fn read_capability(s: &mut State, sys: &SyscallTable) -> Result<usize, bool> {
+    let mut path = [0u8; 256];
+    let pl = s.loam_capability_len as usize;
+    path[..pl].copy_from_slice(&s.loam_capability[..pl]);
+    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), pl);
+    if fd == FS_EAGAIN {
+        return Err(true);
+    }
+    if fd < 0 {
+        return Err(false);
+    }
+    let mut filled = 0usize;
+    let mut again = false;
+    while filled < CAP_TEXT_MAX {
+        let n = (sys.provider_call)(fd, FS_READ, s.cap_text.as_mut_ptr().add(filled), CAP_TEXT_MAX - filled);
+        if n == FS_EAGAIN {
+            again = true;
+            break;
+        }
+        if n <= 0 {
+            break;
+        }
+        filled += n as usize;
+    }
+    // One byte past the ceiling: a file that has it is refused, not cut.
+    let mut probe = [0u8; 1];
+    let over = !again && filled == CAP_TEXT_MAX && (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), 1) > 0;
+    let mut z = [0u8; 4];
+    (sys.provider_call)(fd, FS_CLOSE, z.as_mut_ptr(), 0);
+    if again {
+        return Err(true);
+    }
+    if over || filled == 0 {
+        return Err(false);
+    }
+    Ok(filled)
 }
 
 unsafe fn set_str(dst: &mut [u8], dst_len: &mut u8, d: *const u8, len: usize) {
@@ -986,11 +1039,27 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
     let mut g = [0u8; 2];
     g.copy_from_slice(&gen.to_le_bytes());
     let owner = digest16(&[b"volume_host:", claim, b":", &g]);
+    // The capability's chains, read now (a rotated file holds from the next
+    // attach on) and handed to the subgraph: it cannot read the file itself.
+    let cap_len = match read_capability(s, sys) {
+        Ok(n) => n,
+        Err(true) => {
+            answer(s, sys, Outcome::Unavailable); // the file system: not yet
+            return;
+        }
+        Err(false) => {
+            log(sys, 1, b"[volume_host] the Loam capability file cannot be read, or is empty or too large");
+            answer(s, sys, Outcome::Failed);
+            return;
+        }
+    };
+    let st = s as *mut State;
+    let cap_text: &[u8] = &(&(*st).cap_text)[..cap_len];
     let graph = VolumeGraph {
         owner_uid: owner,
         state_cap: 0,
         loam_authority: &s.loam_authority[..s.loam_authority_len as usize],
-        capability: &s.loam_capability[..s.loam_capability_len as usize],
+        capability: cap_text,
         verify_hostname: &s.verify_hostname[..s.verify_hostname_len as usize],
         trust_der: &s.trust[..s.trust_len as usize],
         cert_der: &s.cert[..s.cert_len as usize],
@@ -1008,7 +1077,7 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
         nbd_port: (s.nbd_port_base as u16).wrapping_add(slot as u16),
         export: &[],
     };
-    // [header 68][FLXA]
+    // [header][FLXA]
     let hdr = wl::CREATE_HEADER_SIZE;
     let Some(n) = encode(&graph, &mut s.flxa[hdr..]) else {
         answer(s, sys, Outcome::Failed);
@@ -1021,7 +1090,24 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
     h[17] = wl::SOURCE_FMOD_GRAPH;
     h[18] = wl::NET_ISO_SHARED;
     h[40..42].copy_from_slice(&(n as u16).to_le_bytes());
-    let handle = (sys.provider_call)(-1, wl::CREATE, s.flxa.as_mut_ptr(), hdr + n);
+    // A graph backend stages the subgraph over several calls (EINPROGRESS):
+    // the same spec is asked again until it answers; four modules are one
+    // batch. An identity still held (EEXIST: an attach of this generation
+    // that never finished) is destroyed by identity and asked once more.
+    let mut handle = -1;
+    for _ in 0..2 {
+        for _ in 0..16 {
+            handle = (sys.provider_call)(-1, wl::CREATE, s.flxa.as_mut_ptr(), hdr + n);
+            if handle != WL_EINPROGRESS {
+                break;
+            }
+        }
+        if handle != WL_EEXIST {
+            break;
+        }
+        let mut id = owner;
+        (sys.provider_call)(-1, wl::DESTROY, id.as_mut_ptr(), id.len());
+    }
     if handle < 0 {
         log(
             sys,
