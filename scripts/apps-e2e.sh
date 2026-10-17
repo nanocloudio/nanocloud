@@ -7,19 +7,27 @@
 #                    its own storage root (packaging/apps/lattice-kv.yaml)
 #   chronicle-http   a Chronicle pipeline behind wave's http        (packaging/apps/chronicle-http.yaml)
 #   quantum-mqtt     quantum's MQTT broker, its examples/linux/minimal.yaml as a
-#                    workload (scripts/support/to-workload.py; durability volatile —
-#                    a Pod has no storage of its own yet; without its admin plane,
+#                    workload (scripts/support/to-workload.py), its WAL and raft
+#                    metadata in its own storage root; without its admin plane,
 #                    `operations` + `http`: operations holds the node's `monitor`
-#                    privilege, which the kernel refuses a tenant)
+#                    privilege, which the kernel refuses a tenant
 #
 # Each image is built with `fluxor build --emit=workload` and served by a
 # registry stub as `fluxor publish workload` lays it out. Each Deployment's
 # Pod is pulled, staged as the modules it brought, reaches Running and
 # answers on its port. Then the power is cut — the runtime killed outright,
 # no drain — and the node boots again from the same store: the Pods come
-# back Running and answer again.
+# back Running and answer again, with their data: what lattice-kv SET and the
+# message quantum-mqtt retained before the cut are there after it.
 #
-# PASS = every app Running and serving, before and after the power cut.
+# Then (with the stub) the registry goes away and the power is cut again: a
+# node that holds an image — its blobs, the digest its reference resolved to
+# — needs no registry to run it (imagePullPolicy IfNotPresent, the default
+# for a tag that is not :latest), so every Pod comes back from the node's
+# cache, with its data.
+#
+# PASS = every app Running and serving, before and after each power cut, and
+# lattice-kv's and quantum-mqtt's data surviving them.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -82,8 +90,7 @@ has_app chronicle-http && wn_publish chronicle-http "$D/chronicle-http.yaml"
 if has_app quantum-mqtt; then
 mkdir -p "$QROOT/target/nanocloud-apps"
 python3 -B "$ROOT/scripts/support/to-workload.py" "$QROOT/examples/linux/minimal.yaml" \
-  "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" --variant durability=volatile --drop operations --drop http \
-  --param consensus.durability_mode=2 --param consensus.persist_meta=0 \
+  "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" --drop operations --drop http \
   "$QROOT/modules" "$QROOT/../clustor/modules" "$QROOT/../wave/modules" 2>"$D/to-workload.log" \
   || { cat "$D/to-workload.log"; fail "quantum's graph did not convert"; }
 wn_publish quantum-mqtt "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" "$QROOT"
@@ -195,24 +202,79 @@ echo "== 4. the Pods pull, run and serve =="
 settle "after apply"
 has_app lattice-kv && echo "   lattice-kv:     PING -> PONG; SET -> $(redis-cli -p "$KV_PORT" SET greeting hello); GET -> $(redis-cli -p "$KV_PORT" GET greeting)"
 has_app chronicle-http && echo "   chronicle-http: GET / -> $(curl -s -m 2 "http://127.0.0.1:$HTTP_PORT/" | head -c 60)…"
-has_app quantum-mqtt && echo "   quantum-mqtt:   PUBLISH (QoS 1) on :$MQTT_PORT -> acknowledged"
-k get pods 2>&1 | sed 's/^/   /'
-
-echo "== 5. the power is cut: the runtime killed outright, then the node boots again =="
-kill -9 "$RUNTIME_PID"
-wait "$RUNTIME_PID" 2>/dev/null || true
-RUNTIME_PID=""
-serving && fail "still serving with the node down: the test is not measuring the node"
-boot
-settle "after the power cut"
-echo "   every app Running and serving again"
-# lattice keeps its data in its own storage root, which the restart kept and
-# the Pod (same identity) reopened: what was SET before the cut is still there.
-if has_app lattice-kv; then
-  got="$(redis-cli -p "$KV_PORT" GET greeting 2>/dev/null)"
-  [ "$got" = "hello" ] || fail "lattice-kv lost its data across the power cut: GET greeting -> '$got'"
-  echo "   lattice-kv: GET greeting -> $got (written before the cut)"
+if has_app quantum-mqtt; then
+  echo "   quantum-mqtt:   PUBLISH (QoS 1) on :$MQTT_PORT -> acknowledged"
+  # A retained message: the broker acknowledges a QoS 1 PUBLISH once it is
+  # committed to its WAL, and a new subscriber is handed the retained one.
+  timeout 10 mosquitto_pub -h 127.0.0.1 -p "$MQTT_PORT" -q 1 -r -t nc/retained -m kept \
+    || fail "quantum-mqtt did not acknowledge a retained PUBLISH"
+  got="$(timeout 15 mosquitto_sub -h 127.0.0.1 -p "$MQTT_PORT" -q 1 -t nc/retained -C 1 -W 10 2>/dev/null || true)"
+  [ "$got" = "kept" ] || fail "quantum-mqtt did not deliver its retained message: '$got'"
+  echo "   quantum-mqtt:   retained PUBLISH nc/retained=kept -> a new subscriber gets '$got'"
 fi
 k get pods 2>&1 | sed 's/^/   /'
 
-echo "== E2E green: $APPS as workload images — kubectl Deployments pulled, run, serving, and back after a power cut =="
+cut() { # cut: the power cut — the runtime killed outright, no drain
+  kill -9 "$RUNTIME_PID"
+  wait "$RUNTIME_PID" 2>/dev/null || true
+  RUNTIME_PID=""
+  serving && fail "still serving with the node down: the test is not measuring the node"
+  return 0
+}
+survived() { # survived <when>: the data written before the first cut is there
+  # lattice keeps its data in its own storage root, which the restart kept
+  # and the Pod (same identity) reopened: what was SET before the cut.
+  if has_app lattice-kv; then
+    got="$(redis-cli -p "$KV_PORT" GET greeting 2>/dev/null)"
+    [ "$got" = "hello" ] || fail "lattice-kv lost its data $1: GET greeting -> '$got'"
+    echo "   lattice-kv: GET greeting -> $got (written before the first cut)"
+  fi
+  # quantum's broker keeps its WAL and raft metadata in its own storage root
+  # too: the retained message published before the cut is replayed from the
+  # WAL and handed to a subscriber that arrives after it.
+  if has_app quantum-mqtt; then
+    got=""
+    for _ in $(seq 10); do
+      got="$(timeout 15 mosquitto_sub -h 127.0.0.1 -p "$MQTT_PORT" -q 1 -t nc/retained -C 1 -W 5 2>/dev/null || true)"
+      [ "$got" = "kept" ] && break
+      sleep 2
+    done
+    [ "$got" = "kept" ] || fail "quantum-mqtt lost its retained message $1: '$got'"
+    echo "   quantum-mqtt: SUBSCRIBE nc/retained -> $got (retained before the first cut)"
+  fi
+  k get pods 2>&1 | sed 's/^/   /'
+}
+
+echo "== 5. the power is cut: the runtime killed outright, then the node boots again =="
+asked=""
+[ -z "$REAL_REGISTRY" ] && asked="$(wc -l <"$D/reg.log")"
+cut
+boot
+settle "after the power cut"
+echo "   every app Running and serving again"
+# IfNotPresent (a tag that is not :latest): what the node holds is what it
+# runs, so the restart asked the registry for nothing.
+if [ -n "$asked" ]; then
+  [ "$(wc -l <"$D/reg.log")" = "$asked" ] \
+    || { tail -n +"$((asked + 1))" "$D/reg.log" | sed 's/^/   /'; fail "the restart asked the registry again for an image the node holds"; }
+  echo "   the registry was asked for nothing: the node ran what it holds"
+fi
+survived "across the power cut"
+
+# The registry is not the node's to need: what it pulled is in its blob cache
+# with the digest each reference resolved to, and a tag that is not :latest is
+# IfNotPresent — so the node brings its Pods back from what it holds.
+if [ -z "$REAL_REGISTRY" ]; then
+echo "== 6. the registry goes away, the power is cut again: the Pods come back from the node's cache =="
+kill "$REG_PID" 2>/dev/null || true
+wait "$REG_PID" 2>/dev/null || true
+REG_PID=""
+curl -s -m 2 "http://127.0.0.1:$REG_PORT/v2/" >/dev/null && fail "the registry stub still answers"
+cut
+boot
+settle "after a power cut with the registry down"
+echo "   every app Running and serving again, the registry unreachable"
+survived "across a power cut with the registry down"
+fi
+
+echo "== E2E green: $APPS as workload images — kubectl Deployments pulled, run, serving, and back after a power cut, with the registry and without =="

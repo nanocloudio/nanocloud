@@ -9,10 +9,12 @@ EnvironmentFile=-/etc/default/nanocloud
 # FLUXOR_SEAL_KEY, generated once by postinst: the key the vault seals its keys
 # (the `nanocloud.ca` signing root among them) under, so they survive a restart.
 EnvironmentFile=-/etc/nanocloud.io/seal.env
-# The control plane is a fluxor graph of PIC fmods — the apiserver (api_ingress),
-# the API pipeline (authn/rbac/admission/core_api/…), and every reconciler. There
-# is no host binary. `fluxor run` resolves the graph's modules from the project
-# root (FLUXOR_PROJECT_ROOT).
+# The node is a fluxor graph: the API (http + tls in front of the API plane's
+# Chronicle pipelines — authentication, RBAC, admission, the object store —
+# packaging/debian/fluxor-controlplane.yaml), every controller as params, the
+# replicated store, and, where the node runs Pods, the kubelet's chains, its
+# image pull and its sandbox runtime. There is no host binary. `fluxor run`
+# resolves the graph's modules from the project root (FLUXOR_PROJECT_ROOT).
 #
 # The graph is this node's, rendered at each start from its template by role
 # (/etc/nanocloud.io/cluster.env: the control plane, a voter of the

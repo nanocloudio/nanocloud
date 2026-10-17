@@ -28,6 +28,8 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/store.rs");
 include!("../_shared/json.rs");
 include!("../_shared/pathmod.rs");
+include!("../_shared/jsonq.rs");
+include!("../_shared/moment.rs");
 include!("../_shared/jsonpatch.rs");
 include!("../_shared/views.rs");
 include!("../_shared/fieldset.rs");
@@ -57,6 +59,10 @@ const CW_CONT: usize = 2048;
 /// The field a `wall = 1` node's fused decision reads the wall clock from
 /// (Unix ms): outside the projections (40..59) and the carry (30..39).
 const WALL_FIELD: u8 = 60;
+/// `wall = 2` adds, at this field, the moment now as text a record keeps:
+/// Unix ms when the clock is trusted, else `m<mono ms>@<boot>`
+/// (`_shared/moment.rs`) — never a 1970 stamp from a clock not yet set.
+const MOMENT_FIELD: u8 = 62;
 
 /// `channel_peek` on a mailbox channel, which has no byte stream to peek.
 const CHAN_EINVAL: i32 = -22;
@@ -294,7 +300,8 @@ struct State {
     cw_cont: [u8; CW_CONT],
     cw_len: u16,
     cw_fault: u8,
-    /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`].
+    /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`];
+    /// `wall = 2` also the recordable moment at [`MOMENT_FIELD`].
     wall: u32,
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
@@ -311,6 +318,9 @@ struct State {
     journal: Journal,
     held_n: u32,
     held_req: u32,
+    /// The held record's TAKE nonce ([`take_value`]): drawn when the record
+    /// is first served, kept while it is held.
+    take_nonce: [u8; 16],
 }
 
 /// Read one field out of a Chronicle v1 record frame:
@@ -614,23 +624,43 @@ fn reply_projected_from(
             // bytes on the way back that it read on the way in. `j_path`
             // reads scalars and would hand back a subtree cut at its first
             // comma: `{"replicas":5` — which is what a rollout archived once.
+            // `a[k=v].b` SELECTS (and `a[].b` collects) as store_source's
+            // `paths` do (`_shared/jsonq.rs`), the modifier applied to the
+            // element: a Pod read for its readiness asks for
+            // `status.conditions[type=Ready].status`, a Node for its
+            // `status.addresses[type=InternalIP].address`.
+            #[allow(
+                clippy::manual_contains,
+                reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+            )]
+            let query = !flat && one.iter().any(|&c| c == b'[');
+            let whole = one;
             let (one, modifier) = split_mod(one);
             let mut segs: [&[u8]; 6] = [&[]; 6];
             let ns = split_dots(one, &mut segs);
-            let got = if flat {
-                flat_field(value, one).unwrap_or(&[])
-            } else {
-                j_sub(value, &segs[..ns])
-                    .or_else(|| j_path(value, &segs[..ns]))
-                    .unwrap_or(&[])
-            };
             let mut modbuf = [0u8; 512];
-            let got = match modifier {
-                Some(m) => {
-                    let n = apply_mod(m, got, &mut modbuf);
-                    &modbuf[..n]
+            let got: &[u8] = if query {
+                match jq(value, whole, &mut modbuf) {
+                    Some(n) => modbuf.get(..n).unwrap_or(&[]),
+                    // Too long is refused, never cut: the one entry nothing
+                    // names.
+                    None => b"-",
                 }
-                None => got,
+            } else {
+                let got = if flat {
+                    flat_field(value, one).unwrap_or(&[])
+                } else {
+                    j_sub(value, &segs[..ns])
+                        .or_else(|| j_path(value, &segs[..ns]))
+                        .unwrap_or(&[])
+                };
+                match modifier {
+                    Some(m) => {
+                        let n = apply_mod(m, got, &mut modbuf);
+                        &modbuf[..n]
+                    }
+                    None => got,
+                }
             };
             let Some(q) = put_field(out, p, fno, TY_BYTES, got) else {
                 return n0;
@@ -761,6 +791,13 @@ fn parse_wild(s: &mut State, d: *const u8, len: usize) {
 /// outcome into `dec_buf`. None when the policy constructed nothing (a
 /// deliberate drop) or failed (counted); the record is then not served.
 unsafe fn decide(s: &mut State, n: usize) -> Option<usize> {
+    // `wall = 2`: the moment now as a record can keep it (_shared/moment.rs).
+    let mut moment = [0u8; 64];
+    let ml = if s.wall == 2 {
+        mo_now(&*s.syscalls, &mut moment)
+    } else {
+        0
+    };
     let mut fields = [dec::Field {
         number: 0,
         value: dec::Value::Null,
@@ -781,6 +818,17 @@ unsafe fn decide(s: &mut State, n: usize) -> Option<usize> {
         fields[nf] = dec::Field {
             number: u32::from(WALL_FIELD),
             value: dec::Value::Int(dev_unix_millis(&*s.syscalls) as i64),
+        };
+        nf += 1;
+    }
+    if s.wall == 2 {
+        if nf == fields.len() {
+            s.dec_failed = s.dec_failed.wrapping_add(1);
+            return None;
+        }
+        fields[nf] = dec::Field {
+            number: u32::from(MOMENT_FIELD),
+            value: dec::Value::Bytes(moment.get(..ml).unwrap_or(&[])),
         };
         nf += 1;
     }
@@ -1036,6 +1084,13 @@ unsafe fn patch_object(
                     } else if let Some(d) = dry.as_deref_mut() {
                         // A dry run: the result, answered, never written.
                         dry_answer(doc, rev, rv_path, d)
+                    } else if doc == cur {
+                        // A patch that changes nothing writes nothing:
+                        // upstream answers it and leaves the resourceVersion
+                        // where it was. A chain that re-asserts a status on
+                        // every pass then spends no revision, and no watcher
+                        // is woken, when nothing moved.
+                        200
                     } else {
                         match code(put_cond(sys, key, doc, PRE_ETAG, rev)) {
                             0 => 200,
@@ -2080,9 +2135,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // VM computes numbers (a deadline, a replica count, a backoff) and
         // cannot render one; joining bytes is already this connector's job,
         // and a number is bytes once someone writes it down.
+        // 80..=99 continue the range, joined after 16, for a record of more
+        // parts than thirteen (a Pod's node ask: its argv, env, limits).
         let mut vbuf = [0u8; MAX_VALUE];
         let mut vlen = 0usize;
-        for f in 4u8..=16 {
+        for f in (4u8..=16).chain(80u8..=99) {
             match frame_field(req, f) {
                 Some((TY_BYTES, part)) => {
                     let n = part.len().min(MAX_VALUE - vlen);
@@ -2902,16 +2959,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     reply_projected(&mut out, cid, 200, &[], carry, &proj)
                 }
                 OP_TAKE => {
+                    // 200 with the value, taken by this request alone; 404
+                    // only when it is not there. A take not decided this
+                    // step holds the record (below), and one that could not
+                    // be decided is 503, never "missing".
+                    if !waiting {
+                        s.take_nonce = take_nonce(sys.table(), cid as u64);
+                    }
                     let mut val = [0u8; MAX_VALUE];
-                    let taken = match (head(sys, key), get_value(sys, key, &mut val)) {
-                        (Some(at), Some(vlen)) if at > 0 => {
-                            (code(delete_cond(sys, key, PRE_ETAG, at)) == 0).then_some(vlen)
+                    let mut scratch = [0u8; MAX_VALUE];
+                    match take_value(sys, key, &s.take_nonce, &mut val, &mut scratch) {
+                        Took::Taken(vlen) => reply_projected(
+                            &mut out,
+                            cid,
+                            200,
+                            val.get(..vlen).unwrap_or(&[]),
+                            carry,
+                            &proj,
+                        ),
+                        Took::Absent => reply_projected(&mut out, cid, 404, &[], carry, &proj),
+                        Took::Waiting | Took::Failed => {
+                            reply_projected(&mut out, cid, 503, &[], carry, &proj)
                         }
-                        _ => None,
-                    };
-                    match taken {
-                        Some(vlen) => reply_projected(&mut out, cid, 200, &val[..vlen], carry, &proj),
-                        None => reply_projected(&mut out, cid, 404, &[], carry, &proj),
                     }
                 }
                 OP_PUT => {

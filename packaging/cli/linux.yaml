@@ -1,5 +1,5 @@
 # The nanocloud CLI as a fluxor cli-applet: one PIC module
-# (nanocloud_cli) dispatches subcommands (status, get, help) over the cli host
+# (nanocloud_cli) dispatches the nanocloud subcommands (its manifest lists them) over the cli host
 # surface. Install + run: `fluxor exec nanocloud -- <cmd>` (busybox: `nanocloud <cmd>`).
 #
 # The applet reads and writes the control-plane store directly: it runs as

@@ -111,7 +111,7 @@ module nanocloud.daemonset {
                   p9: "\"",
                   p10: "",
                   p11: "",
-                  p12: "}}" };
+                  p12: "},\"status\":{\"phase\":\"Pending\"}}" };
     when a.status == 404 ->
       ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
                   p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
@@ -125,7 +125,7 @@ module nanocloud.daemonset {
                   p9: "\",",
                   p10: a.ctx.members,
                   p11: "",
-                  p12: "}}" };
+                  p12: "},\"status\":{\"phase\":\"Pending\"}}" };
     default ->
       ds.Create { cid: a.cid, op: NOOP, key: "" };
   }

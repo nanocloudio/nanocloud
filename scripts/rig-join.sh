@@ -58,12 +58,18 @@ GOT="$(openssl x509 -in "$W/ca.pem" -pubkey -noout | openssl pkey -pubin -outfor
 openssl verify -CAfile "$W/ca.pem" -verify_hostname "$NAME" "$W/leaf.pem" >/dev/null 2>&1 \
   || fail "the API's certificate does not verify for $NAME under its authority"
 
-# ── 3. the secret, spent
-ANS="$(curl -sS --max-time 20 --cacert "$W/ca.pem" --resolve "$NAME:$PORT:$HOST" \
-  -X POST --data '' -H "Authorization: Bearer $SECRET" \
-  -w '\n%{http_code}' "https://$NAME:$PORT/apis/nanocloud.io/v1/join")" || fail "the join request failed"
-CODE="${ANS##*$'\n'}"
-BODY="${ANS%$'\n'*}"
+# ── 3. the secret, spent. A 503 is a store that has not decided yet (the
+# node just booted and its store is recovering): the secret is not spent,
+# so it is presented again; only a 401 says the node does not know it.
+for _ in $(seq 30); do
+  ANS="$(curl -sS --max-time 20 --cacert "$W/ca.pem" --resolve "$NAME:$PORT:$HOST" \
+    -X POST --data '' -H "Authorization: Bearer $SECRET" \
+    -w '\n%{http_code}' "https://$NAME:$PORT/apis/nanocloud.io/v1/join")" || fail "the join request failed"
+  CODE="${ANS##*$'\n'}"
+  BODY="${ANS%$'\n'*}"
+  [ "$CODE" = "503" ] || break
+  sleep 2
+done
 [ "$CODE" = "200" ] || fail "the node refused the secret ($CODE): $BODY"
 
 # ── 4. the kubeconfig

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Live E2E: a graph-backed Pod runs as a module subgraph of the node's own
-# image — the only kind of Pod a bare-metal node runs.
+# image — one of the two kinds of Pod a bare-metal node runs (the other a
+# pulled workload image, whose modules it brings: workload-image-e2e.sh).
 #
 # A Pod with `runtimeClassName: fluxor` is asked of its node as
 # `/pod-specs/<uid> = graph=<name>;…` (pod_specs); pod_project lands it on

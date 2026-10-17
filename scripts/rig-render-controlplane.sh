@@ -155,7 +155,7 @@ volume = podplane and os.path.exists(os.path.join(volume_dir, "flxa.hex"))
 # so the store's per-write cost has to fall (a run-block cache; the plan's
 # A4) before the pod plane runs on this board.
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
-          "/volume-binds/,/image-,/volume-ops/,/blobs/,/fetch-q/")
+          "/volume-binds/,/image-,/volume-ops/")
 if podplane:
     sub('      scope: ""\n      scoped: ""\n',
         f'      scope: "{node}"\n      scoped: "{SCOPED}"\n')
@@ -185,8 +185,11 @@ abi = subprocess.run(["sh", f"{root}/scripts/fluxor-abi.sh", root], capture_outp
                      text=True, check=True).stdout.strip()
 facts = (f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"fluxor",'
          f'"kubernetes.io/hostname":"{node}","nanocloud.io/fluxor-abi":"{abi}"')
+# Its address: the board's (status.addresses InternalIP, hence its Pods'
+# hostIP/podIP), the one the driver and the render's peer address use.
+board_ip = os.environ.get("NANOCLOUD_RIG_IP", "192.168.1.9")
 lease = (m.group(1).replace("__NODE_NAME__", node).replace("__NODE_FACTS__", facts)
-         .rstrip("\n") + "\n")
+         .replace("__NODE_ADDRESS__", board_ip).rstrip("\n") + "\n")
 
 # The board's disk FIRST, as lattice's own pi5 graphs declare it: the store
 # opens its disk at construction, and a store constructed before its FS

@@ -1,61 +1,162 @@
-// A Pod's phase, from the node that runs it. The node's lifecycle chain
-// reports `phase=<Pending|Running|Succeeded|Failed|Terminating>;pod=<ns>/
-// <name>` under /podstatus/<uid> — a prefix the node does not scope, so the
-// record lands in the plane's store as written — and this patches the Pod
-// object's status.phase, which is what `kubectl get pods` shows.
+// A Pod's status, from the node that runs it. The node's status chain
+// (pod_report.uproc) reports under /podstatus/<uid> — a prefix the node does
+// not scope, so the record lands in the plane's store as written —
+//
+//   phase pod rst ready started cr crr st why msg code tr tf
+//   lcode lwhy ltr ltf t0 trdy digest
+//
+// (moments as the node's wall clock in Unix ms, rendered by the sources'
+// `!jts` as RFC 3339 JSON strings — or null, for a moment the node could not
+// yet stamp truthfully, its clock not trusted), and this writes it onto the Pod object as Kubernetes
+// states it: status.phase, startTime, hostIP(s), podIP(s), the conditions
+// PodScheduled, Initialized, ContainersReady and Ready, and the container's
+// status — name, image, imageID, ready, started, restartCount, state and
+// lastState. What `kubectl get pods` prints (READY, STATUS, RESTARTS), what
+// `kubectl wait --for=condition=Ready` waits on, what a ReplicaSet counts as
+// ready and an Endpoints slice selects by, are those fields.
 //
 // The record is keyed by the Pod's UID and names the Pod by its NAME, and a
 // name outlives an incarnation: delete a Pod and create another with the
-// same name, and the first one's record still names it. The source replays
+// same name, and the first one's record still names it. The sources replay
 // every record under the prefix on any change, so a record left behind would
-// patch the new Pod with the old one's phase (a Pod that failed once named
-// every later Pod of its name Failed). Two things keep that from happening:
+// patch the new Pod with the old one's status. Each write is therefore
+// conditional on the Pod there being the record's — its uid the record's
+// key. Two chains, each carrying only what its write needs (a carried
+// context is built in the decision's 512-byte scratch):
 //
-//   ask     /podstatus/<uid> -> GET /pods/<ns>/<name>, its metadata.uid
-//           projected, the record riding the carry
-//   status  the GET's answer -> PATCH status.phase ONLY when the Pod there
-//           is the record's: its uid is the record's key
+//   status  /podstatus/<uid> -> GET /pods/<ns>/<name> (its uid, nodeName) ->
+//           ONLY for the record's Pod: GET /nodes/<nodeName> (its
+//           InternalIP, the Pod's hostIP) -> a merge patch of status:
+//           phase, startTime, the addresses, the conditions (RFC 7386: what
+//           it does not name it keeps — a Pod written without a status gets
+//           one)
+//   cs      /podstatus/<uid> (and any Pod changing: the status above may
+//           be what gives the Pod its `status`) -> a JSON Patch: `test` the
+//           uid, `add` status.containerStatuses, `copy` the container's name
+//           and image from its spec. A Pod not the record's fails the test
+//           (422) and is left as it is
 //   gone    /~tomb/pods/<ns>/<name> (a Pod deleted) -> DELETE
 //           /podstatus/<uid>, so a deleted Pod's records do not pile up
+//
+// A patch that changes nothing writes nothing — so a replay of a settled
+// Pod spends no revision and wakes no watcher.
+//
+// podIP: the Pod's own address when it has one (/ipam-lease/<uid>: a
+// sandbox on its own network); otherwise the node's. A host-process
+// sandbox without its own network and a graph-backed (pack) Pod share the
+// node's network today — a Pod listening on a port listens on the node's
+// address — so, as for a hostNetwork Pod upstream, its podIP IS its hostIP,
+// and a Service's endpoints reach it there. A node that advertises no
+// address gives its Pods neither.
 module nanocloud.podstatus {
 
   enum NOOP = 0;
   enum GET = 1;
   enum DELETE = 4;
-  enum PATCH = 5;
+  enum PATCH_MERGE = 13;
+  enum PATCH_JSON = 14;
 
-  // pst_source: /podstatus/<uid>, flat.
+  // The status chain's context: what its merge patch writes.
+  // carried by: st.Ask, st.Got, st.Look, st.Node
+  message Ctx {
+    uid: string = 30;
+    phase: string = 31;
+    pod: string = 32;
+    t0: string = 33;
+    cr: string = 34;
+    crr: string = 35;
+    trdy: string = 36;
+    lease: string = 37;   // /ipam-lease/<uid>: the Pod's own address
+    ok: string = 38;      // "1": the Pod read is the record's
+  }
+
+  // pst_source: /podstatus/<uid>, flat, the Pod's own address beside it.
   message st.Rec {
     seq: int = 1;
     key: string = 3;      // "<uid>"
     phase: string = 4;
     pod: string = 5;      // "<ns>/<name>"
+    cr: string = 6;
+    crr: string = 7;
+    t0: string = 8;       // !jts: a JSON time, or null
+    trdy: string = 9;     // !jts
+    lease: string = 70;
   }
-  // pst_get's request: the Pod, by name, and the record as carry.
   message st.Ask {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    c_uid: string = 30;
-    c_phase: string = 31;
-    c_pod: string = 32;
+    ctx: Ctx = 254;
   }
-  // pst_get's answer: the store's status, the Pod's uid (`paths`), the carry.
+  // pst_get's answer: the Pod's uid and node.
   message st.Got {
-    seq: int = 1;
+    cid: int = 1;
     status: int = 2;
     uid: string = 40;
-    c_uid: string = 30;
-    c_phase: string = 31;
-    c_pod: string = 32;
+    node: string = 41;
+    ctx: Ctx = 254;
   }
-  message st.Op {
+  message st.Look {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    value: string = 4;
-    path: string = 19;
+    ctx: Ctx = 254;
   }
+  // pst_node's answer: the node's InternalIP.
+  message st.Node {
+    cid: int = 1;
+    status: int = 2;
+    host: string = 40;
+    ctx: Ctx = 254;
+  }
+  message st.Patch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;   v2: string = 5;   v3: string = 6;   v4: string = 7;
+    v5: string = 8;   v6: string = 9;   v7: string = 10;  v8: string = 11;
+    v9: string = 12;  v10: string = 13; v11: string = 14; v12: string = 15;
+    v13: string = 16; v14: string = 80; v15: string = 81; v16: string = 82;
+    v17: string = 83; v18: string = 84; v19: string = 85; v20: string = 86;
+    v21: string = 87; v22: string = 88; v23: string = 89; v24: string = 90;
+    v25: string = 91; v26: string = 92; v27: string = 93; v28: string = 94;
+    v29: string = 95;
+  }
+
+  // pst_csrc: /podstatus/<uid>, flat — the container's fields.
+  message st.CsRec {
+    seq: int = 1;
+    key: string = 3;      // "<uid>"
+    pod: string = 4;
+    rst: string = 5;
+    ready: string = 6;    // true|false
+    started: string = 7;  // true|false
+    st: string = 8;       // running|terminated|waiting
+    why: string = 9;
+    msg: string = 10;
+    code: string = 11;
+    digest: string = 12;
+    tr: string = 13;      // !jts
+    tf: string = 14;      // !jts
+    lcode: string = 15;
+    lwhy: string = 16;
+    ltr: string = 17;     // !jts
+    ltf: string = 18;     // !jts
+  }
+  message st.Cs {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;   v2: string = 5;   v3: string = 6;   v4: string = 7;
+    v5: string = 8;   v6: string = 9;   v7: string = 10;  v8: string = 11;
+    v9: string = 12;  v10: string = 13; v11: string = 14; v12: string = 15;
+    v13: string = 16; v14: string = 80; v15: string = 81; v16: string = 82;
+    v17: string = 83; v18: string = 84; v19: string = 85; v20: string = 86;
+    v21: string = 87; v22: string = 88; v23: string = 89; v24: string = 90;
+    v25: string = 91; v26: string = 92; v27: string = 93; v28: string = 94;
+    v29: string = 95;
+  }
+
   // ps_tombs: a deleted Pod's last state.
   message st.Tomb {
     seq: int = 1;
@@ -69,20 +170,184 @@ module nanocloud.podstatus {
   }
 
   decision d_ask(r: st.Rec) -> st.Ask {
-    when r.pod != "" && r.phase != "" ->
-      st.Ask { cid: r.seq, op: GET, key: r.pod, c_uid: r.key, c_phase: r.phase, c_pod: r.pod };
+    when r.pod != "" && r.phase != "" && r.t0 != "" ->
+      st.Ask { cid: r.seq, op: GET, key: r.pod,
+               ctx: Ctx { uid: r.key, phase: r.phase, pod: r.pod, t0: r.t0, cr: r.cr, crr: r.crr,
+                          trdy: r.trdy, lease: r.lease, ok: "" } };
     default ->
-      st.Ask { cid: r.seq, op: NOOP, key: "", c_uid: "", c_phase: "", c_pod: "" };
+      st.Ask { cid: r.seq, op: NOOP, key: "", ctx: Ctx { uid: r.key, ok: "" } };
   }
 
   // A Pod that is not there, or not the record's, is not patched. `has` is
   // the guard: a Pod read without a uid answers no field, and a `when` that
   // read an absent field would fail closed rather than decide.
-  decision d_patch(g: st.Got) -> st.Op {
-    when g.status == 200 && has(g.uid) && g.uid == g.c_uid && g.c_pod != "" && g.c_phase != "" ->
-      st.Op { cid: g.seq, op: PATCH, key: g.c_pod, value: "\"" + g.c_phase + "\"", path: "status.phase" };
+  decision d_node(g: st.Got) -> st.Look {
+    when g.status == 200 && has(g.uid) && g.uid == g.ctx.uid && has(g.node) && g.node != "" ->
+      st.Look { cid: g.cid, op: GET, key: g.node,
+                ctx: Ctx { uid: g.ctx.uid, phase: g.ctx.phase, pod: g.ctx.pod, t0: g.ctx.t0, cr: g.ctx.cr,
+                           crr: g.ctx.crr, trdy: g.ctx.trdy, lease: g.ctx.lease, ok: "1" } };
     default ->
-      st.Op { cid: g.seq, op: NOOP, key: "", value: "", path: "" };
+      st.Look { cid: g.cid, op: NOOP, key: "", ctx: Ctx { uid: g.ctx.uid, ok: "" } };
+  }
+
+  // status: phase, startTime, the addresses and the conditions. A condition
+  // that is True carries an empty reason, which a client reads as none; a
+  // time the node does not know yet is null.
+  decision d_patch(n: st.Node) -> st.Patch {
+    when n.ctx.ok == "1" && n.status == 200 && has(n.host) && n.host != "" && n.ctx.lease != "" ->
+      st.Patch { cid: n.cid, op: PATCH_MERGE, key: n.ctx.pod,
+                 v1: "{\"status\":{\"phase\":\"", v2: n.ctx.phase, v3: "\",\"startTime\":", v4: n.ctx.t0,
+                 v5: ",\"hostIP\":\"", v6: n.host, v7: "\",\"hostIPs\":[{\"ip\":\"", v8: n.host,
+                 v9: "\"}],\"podIP\":\"", v10: n.ctx.lease, v11: "\",\"podIPs\":[{\"ip\":\"", v12: n.ctx.lease,
+                 v13: "\"}],\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastTransitionTime\":", v14: n.ctx.t0,
+                 v15: "},{\"type\":\"Initialized\",\"status\":\"True\",\"lastTransitionTime\":", v16: n.ctx.t0,
+                 v17: "},{\"type\":\"ContainersReady\",\"status\":\"", v18: n.ctx.cr, v19: "\",\"reason\":\"", v20: n.ctx.crr,
+                 v21: "\",\"lastTransitionTime\":", v22: n.ctx.trdy,
+                 v23: "},{\"type\":\"Ready\",\"status\":\"", v24: n.ctx.cr, v25: "\",\"reason\":\"", v26: n.ctx.crr,
+                 v27: "\",\"lastTransitionTime\":", v28: n.ctx.trdy, v29: "}]}}" };
+    when n.ctx.ok == "1" && n.status == 200 && has(n.host) && n.host != "" ->
+      st.Patch { cid: n.cid, op: PATCH_MERGE, key: n.ctx.pod,
+                 v1: "{\"status\":{\"phase\":\"", v2: n.ctx.phase, v3: "\",\"startTime\":", v4: n.ctx.t0,
+                 v5: ",\"hostIP\":\"", v6: n.host, v7: "\",\"hostIPs\":[{\"ip\":\"", v8: n.host,
+                 v9: "\"}],\"podIP\":\"", v10: n.host, v11: "\",\"podIPs\":[{\"ip\":\"", v12: n.host,
+                 v13: "\"}],\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastTransitionTime\":", v14: n.ctx.t0,
+                 v15: "},{\"type\":\"Initialized\",\"status\":\"True\",\"lastTransitionTime\":", v16: n.ctx.t0,
+                 v17: "},{\"type\":\"ContainersReady\",\"status\":\"", v18: n.ctx.cr, v19: "\",\"reason\":\"", v20: n.ctx.crr,
+                 v21: "\",\"lastTransitionTime\":", v22: n.ctx.trdy,
+                 v23: "},{\"type\":\"Ready\",\"status\":\"", v24: n.ctx.cr, v25: "\",\"reason\":\"", v26: n.ctx.crr,
+                 v27: "\",\"lastTransitionTime\":", v28: n.ctx.trdy, v29: "}]}}" };
+    when n.ctx.ok == "1" && n.ctx.lease != "" ->
+      st.Patch { cid: n.cid, op: PATCH_MERGE, key: n.ctx.pod,
+                 v1: "{\"status\":{\"phase\":\"", v2: n.ctx.phase, v3: "\",\"startTime\":", v4: n.ctx.t0,
+                 v9: ",\"podIP\":\"", v10: n.ctx.lease, v11: "\",\"podIPs\":[{\"ip\":\"", v12: n.ctx.lease,
+                 v13: "\"}],\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastTransitionTime\":", v14: n.ctx.t0,
+                 v15: "},{\"type\":\"Initialized\",\"status\":\"True\",\"lastTransitionTime\":", v16: n.ctx.t0,
+                 v17: "},{\"type\":\"ContainersReady\",\"status\":\"", v18: n.ctx.cr, v19: "\",\"reason\":\"", v20: n.ctx.crr,
+                 v21: "\",\"lastTransitionTime\":", v22: n.ctx.trdy,
+                 v23: "},{\"type\":\"Ready\",\"status\":\"", v24: n.ctx.cr, v25: "\",\"reason\":\"", v26: n.ctx.crr,
+                 v27: "\",\"lastTransitionTime\":", v28: n.ctx.trdy, v29: "}]}}" };
+    when n.ctx.ok == "1" ->
+      st.Patch { cid: n.cid, op: PATCH_MERGE, key: n.ctx.pod,
+                 v1: "{\"status\":{\"phase\":\"", v2: n.ctx.phase, v3: "\",\"startTime\":", v4: n.ctx.t0,
+                 v13: ",\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastTransitionTime\":", v14: n.ctx.t0,
+                 v15: "},{\"type\":\"Initialized\",\"status\":\"True\",\"lastTransitionTime\":", v16: n.ctx.t0,
+                 v17: "},{\"type\":\"ContainersReady\",\"status\":\"", v18: n.ctx.cr, v19: "\",\"reason\":\"", v20: n.ctx.crr,
+                 v21: "\",\"lastTransitionTime\":", v22: n.ctx.trdy,
+                 v23: "},{\"type\":\"Ready\",\"status\":\"", v24: n.ctx.cr, v25: "\",\"reason\":\"", v26: n.ctx.crr,
+                 v27: "\",\"lastTransitionTime\":", v28: n.ctx.trdy, v29: "}]}}" };
+    default ->
+      st.Patch { cid: n.cid, op: NOOP, key: "" };
+  }
+
+  // The container's status, from the record as it stands: its state, its
+  // last state when it has one, the digest it runs as imageID; its name and
+  // image copied from the spec in the same patch.
+  decision d_cs(r: st.CsRec) -> st.Cs {
+    when r.pod != "" && r.st == "running" && r.lcode != "" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"running\":{\"startedAt\":", v12: r.tr,
+                 v13: "}},\"lastState\":{\"terminated\":{\"exitCode\":", v14: r.lcode, v15: ",\"reason\":\"",
+                 v16: r.lwhy, v17: "\",\"startedAt\":", v18: r.ltr,
+                 v19: ",\"finishedAt\":", v20: r.ltf, v21: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "running" && r.lcode != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"running\":{\"startedAt\":",
+                 v10: r.tr, v11: "}},\"lastState\":{\"terminated\":{\"exitCode\":", v12: r.lcode,
+                 v13: ",\"reason\":\"", v14: r.lwhy, v15: "\",\"startedAt\":",
+                 v16: r.ltr, v17: ",\"finishedAt\":", v18: r.ltf,
+                 v19: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "running" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"running\":{\"startedAt\":", v12: r.tr,
+                 v13: "}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "running" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"running\":{\"startedAt\":",
+                 v10: r.tr, v11: "}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "terminated" && r.lcode != "" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"terminated\":{\"exitCode\":", v12: r.code,
+                 v13: ",\"reason\":\"", v14: r.why, v15: "\",\"startedAt\":",
+                 v16: r.tr, v17: ",\"finishedAt\":", v18: r.tf,
+                 v19: "}},\"lastState\":{\"terminated\":{\"exitCode\":", v20: r.lcode, v21: ",\"reason\":\"",
+                 v22: r.lwhy, v23: "\",\"startedAt\":", v24: r.ltr,
+                 v25: ",\"finishedAt\":", v26: r.ltf, v27: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "terminated" && r.lcode != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"terminated\":{\"exitCode\":",
+                 v10: r.code, v11: ",\"reason\":\"", v12: r.why,
+                 v13: "\",\"startedAt\":", v14: r.tr, v15: ",\"finishedAt\":",
+                 v16: r.tf, v17: "}},\"lastState\":{\"terminated\":{\"exitCode\":", v18: r.lcode,
+                 v19: ",\"reason\":\"", v20: r.lwhy, v21: "\",\"startedAt\":",
+                 v22: r.ltr, v23: ",\"finishedAt\":", v24: r.ltf,
+                 v25: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "terminated" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"terminated\":{\"exitCode\":", v12: r.code,
+                 v13: ",\"reason\":\"", v14: r.why, v15: "\",\"startedAt\":",
+                 v16: r.tr, v17: ",\"finishedAt\":", v18: r.tf,
+                 v19: "}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "terminated" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"terminated\":{\"exitCode\":",
+                 v10: r.code, v11: ",\"reason\":\"", v12: r.why,
+                 v13: "\",\"startedAt\":", v14: r.tr, v15: ",\"finishedAt\":",
+                 v16: r.tf, v17: "}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "waiting" && r.lcode != "" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"waiting\":{\"reason\":\"", v12: r.why,
+                 v13: "\",\"message\":\"", v14: r.msg, v15: "\"}},\"lastState\":{\"terminated\":{\"exitCode\":",
+                 v16: r.lcode, v17: ",\"reason\":\"", v18: r.lwhy,
+                 v19: "\",\"startedAt\":", v20: r.ltr, v21: ",\"finishedAt\":",
+                 v22: r.ltf, v23: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "waiting" && r.lcode != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"waiting\":{\"reason\":\"",
+                 v10: r.why, v11: "\",\"message\":\"", v12: r.msg,
+                 v13: "\"}},\"lastState\":{\"terminated\":{\"exitCode\":", v14: r.lcode, v15: ",\"reason\":\"",
+                 v16: r.lwhy, v17: "\",\"startedAt\":", v18: r.ltr,
+                 v19: ",\"finishedAt\":", v20: r.ltf, v21: "}}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "waiting" && r.digest != "" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"sha256:",
+                 v4: r.digest, v5: "\",\"ready\":", v6: r.ready,
+                 v7: ",\"started\":", v8: r.started, v9: ",\"restartCount\":",
+                 v10: r.rst, v11: ",\"state\":{\"waiting\":{\"reason\":\"", v12: r.why,
+                 v13: "\",\"message\":\"", v14: r.msg, v15: "\"}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    when r.pod != "" && r.st == "waiting" ->
+      st.Cs { cid: r.seq, op: PATCH_JSON, key: r.pod,
+                 v1: "[{\"op\":\"test\",\"path\":\"/metadata/uid\",\"value\":\"", v2: r.key, v3: "\"},{\"op\":\"add\",\"path\":\"/status/containerStatuses\",\"value\":[{\"imageID\":\"\",\"ready\":",
+                 v4: r.ready, v5: ",\"started\":", v6: r.started,
+                 v7: ",\"restartCount\":", v8: r.rst, v9: ",\"state\":{\"waiting\":{\"reason\":\"",
+                 v10: r.why, v11: "\",\"message\":\"", v12: r.msg,
+                 v13: "\"}},\"lastState\":{}}]},{\"op\":\"copy\",\"from\":\"/spec/containers/0/name\",\"path\":\"/status/containerStatuses/0/name\"},{\"op\":\"copy\",\"from\":\"/spec/containers/0/image\",\"path\":\"/status/containerStatuses/0/image\"}]" };
+    default ->
+      st.Cs { cid: r.seq, op: NOOP, key: "" };
   }
 
   decision d_gone(t: st.Tomb) -> st.Del {
@@ -96,8 +361,16 @@ module nanocloud.podstatus {
     call x = d_ask(r);
     return x;
   }
-  pipeline status(g: st.Got) -> st.Op {
-    call x = d_patch(g);
+  pipeline node(g: st.Got) -> st.Look {
+    call x = d_node(g);
+    return x;
+  }
+  pipeline status(n: st.Node) -> st.Patch {
+    call x = d_patch(n);
+    return x;
+  }
+  pipeline cs(r: st.CsRec) -> st.Cs {
+    call x = d_cs(r);
     return x;
   }
   pipeline gone(t: st.Tomb) -> st.Del {
@@ -105,6 +378,8 @@ module nanocloud.podstatus {
     return x;
   }
   entry ask = ask;
+  entry node = node;
   entry status = status;
+  entry cs = cs;
   entry gone = gone;
 }

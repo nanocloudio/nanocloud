@@ -45,8 +45,10 @@ pub struct VolumeGraph<'a> {
     pub owner_uid: [u8; 16],
     /// Admitted module-state bytes (0 = unlimited).
     pub state_cap: u32,
-    /// Loam: the admin gate's `host:port` to dial, the capability file whose
-    /// chains the volume presents to it, the name its certificate must carry
+    /// Loam: the admin gate's `host:port` to dial, the capability chains
+    /// (the text of the node's capability file, one per line) the volume
+    /// presents to it — handed over, since a workload reads none of the
+    /// node's files — the name its certificate must carry
     /// (empty to check the dialled host), the trust anchors (DER), and the
     /// node's certificate and key (DER; the key PKCS#8). The gate binds the
     /// writer lease to this certificate, so the node's lease ops run under
@@ -205,11 +207,16 @@ fn decimal(v: u64, out: &mut [u8; 20]) -> usize {
     n
 }
 
-/// One module: `[name_hash BE][domain][params_len BE][params]`. The params
+/// One module: `[name_hash BE][domain][step_deadline_us BE][burst_us BE]
+/// [fault_policy][params_len BE][params]`. The step budget is the node's
+/// default (zeros, `skip`): a volume's modules run within it. The params
 /// length is patched once they are written.
 fn module(o: &mut Out<'_>, name: &[u8], params: impl FnOnce(&mut Out<'_>)) {
     o.be32(type_hash(name));
     o.u8(0);
+    o.be32(0); // step_deadline_us: the node's default
+    o.be32(0); // step_deadline_burst_us: deadline x the burst multiplier
+    o.u8(0); // fault_policy: skip
     let len_at = o.n;
     o.be16(0);
     let start = o.n;
@@ -290,9 +297,9 @@ pub fn encode(g: &VolumeGraph<'_>, out: &mut [u8]) -> Option<usize> {
             let n = decimal(g.fence, &mut d);
             p.entry(6, &d[..n]);
         }
-        p.entry(7, g.capability);
         p.entry(8, g.loam_authority);
         p.end();
+        p.ext(20, g.capability); // capability_chains
     });
     module(&mut o, b"crypt_block", |o| {
         let mut p = Params::begin(o);

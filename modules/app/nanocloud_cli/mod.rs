@@ -60,7 +60,6 @@ const MAX_VALUE: usize = 4096;
 // Buffers live on the PIC module's (small) stack, so they stay modest and are
 // never nested at full size — an over-large `out` + a nested `raw` overflows.
 const MAX_KEY: usize = 128;
-const LIST_BUF: usize = 1024;
 const OUT_BUF: usize = 2048;
 const ARGV_BUF: usize = 1024;
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
@@ -208,6 +207,8 @@ struct State {
     tty_pending: [u8; 512],
     /// `watch`: hash of the last emitted listing (emit again only on change).
     watch_hash: u32,
+    /// `bundle export`: lines said by earlier serves of the command.
+    export_sent: u32,
     /// `bundle apply`: stdin bundle accumulated until EOF, then applied.
     bundle_len: u16,
     bundle_buf: [u8; BUNDLE_BUF],
@@ -227,6 +228,8 @@ struct State {
     finish_len: [u8; FINISH_KEYS],
     finish_code: i32,
     finishing: u8,
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 /// Keys a finishing command removes.
@@ -234,69 +237,16 @@ const FINISH_KEYS: usize = 3;
 
 // ---- store ----
 
-/// storage.namespace LIST into `raw`; returns bytes written, or 0. Entries are
-/// `[name_len:u8][kind:u8][name]`, closed by a `[0xFF][0xFF][cursor_len:u8]`
-/// trailer — read them with `list_entry`, never by testing `name_len` alone.
-unsafe fn ns_list(sys: &SyscallTable, prefix: &[u8], raw: &mut [u8]) -> usize {
-    let mut larg = [0u8; MAX_KEY + 32];
-    if 2 + prefix.len() + 2 + 8 + 4 + 8 + 2 > larg.len() {
-        return 0;
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    larg[p..p + 2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    larg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    larg[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
-    p += 2;
-    larg[p..p + 8].copy_from_slice(&(raw.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    larg[p..p + 4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-    p += 4;
-    larg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    larg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p);
-    if n < 0 {
-        0
-    } else {
-        n as usize
-    }
-}
-
-unsafe fn count_prefix(sys: &SyscallTable, prefix: &[u8]) -> u32 {
-    let mut raw = [0u8; LIST_BUF];
-    let n = ns_list(sys, prefix, &mut raw);
-    let mut rp = 0usize;
+/// Keys under `prefix`, counted over every page. A page the store has not
+/// answered yet (`EAGAIN`) leaves the count short, and the pass waiting
+/// ([`Store::waiting`]): the command is served again and answers then.
+unsafe fn count_prefix(sys: &Store, prefix: &[u8]) -> u32 {
+    let mut walk = ListWalk::new(prefix);
     let mut count = 0u32;
-    while let Some((_, next)) = list_entry(&raw[..n], rp) {
-        rp = next;
+    while walk.next(sys).is_some() {
         count += 1;
     }
     count
-}
-
-/// The entry at `rp` in a LIST page, and the offset just past it; `None` at
-/// the trailing record or the end of the page.
-///
-/// BOTH sentinel bytes decide the trailer. A name of exactly 255 bytes makes
-/// `name_len` 0xFF as well, so testing that byte alone ends the listing one
-/// entry early and loses every entry after it; `kind` never takes the value
-/// 0xFF. One reader for every walk below, so the rule is stated once.
-fn list_entry(page: &[u8], rp: usize) -> Option<(&[u8], usize)> {
-    if rp >= page.len() {
-        return None;
-    }
-    let nl = page[rp] as usize;
-    if nl == 0xFF && rp + 1 < page.len() && page[rp + 1] == 0xFF {
-        return None;
-    }
-    if rp + 2 + nl > page.len() {
-        return None;
-    }
-    Some((&page[rp + 2..rp + 2 + nl], rp + 2 + nl))
 }
 
 /// Build a full store key `<prefix><subpath>` into `buf`; returns its length
@@ -419,22 +369,14 @@ unsafe fn cmd_volume(sys: &Store, out: &mut [u8]) -> usize {
 }
 
 /// List the final path segment of every key under `prefix`, one per line.
-unsafe fn list_names_into(
-    sys: &SyscallTable,
-    prefix: &[u8],
-    out: &mut [u8],
-    mut p: usize,
-) -> usize {
-    let mut raw = [0u8; LIST_BUF];
-    let n = ns_list(sys, prefix, &mut raw);
-    let mut rp = 0usize;
+unsafe fn list_names_into(sys: &Store, prefix: &[u8], out: &mut [u8], mut p: usize) -> usize {
+    let mut walk = ListWalk::new(prefix);
     let mut any = false;
-    while let Some((key, next)) = list_entry(&raw[..n], rp) {
+    while let Some(key) = walk.next(sys) {
         p = append(out, p, b"  ");
         p = append(out, p, last_seg(key));
         p = append(out, p, b"\n");
         any = true;
-        rp = next;
     }
     if !any {
         p = append(out, p, b"  (none)\n");
@@ -566,27 +508,42 @@ unsafe fn cmd_rollout_undo(sys: &Store, subpath: &[u8], out: &mut [u8]) -> (usiz
 
 /// Emit `key\tvalue\n` for every object under `prefix`, written directly to the
 /// stdout channel (a full-cluster dump exceeds the fixed out buffer).
-unsafe fn export_prefix(sys: &Store, out_chan: i32, prefix: &[u8]) {
-    let mut raw = [0u8; LIST_BUF];
-    let n = ns_list(sys, prefix, &mut raw);
-    let mut rp = 0usize;
-    while let Some((key, next)) = list_entry(&raw[..n], rp) {
+///
+/// The lines go out as the command is served, so a command served again (a
+/// read the store had not answered, `EAGAIN`) must not say them twice: the
+/// serve replays its reads as first seen, so its lines come in the same
+/// order, and the first `*sent` of them were said by an earlier serve.
+/// `line` counts this serve's.
+unsafe fn export_prefix(sys: &Store, out_chan: i32, prefix: &[u8], line: &mut u32, sent: &mut u32) {
+    let mut walk = ListWalk::new(prefix);
+    while let Some(k) = walk.next(sys) {
+        let mut key = [0u8; MAX_KEY];
+        let kl = k.len().min(MAX_KEY);
+        key[..kl].copy_from_slice(&k[..kl]);
         let mut val = [0u8; MAX_VALUE];
-        if let Some(vlen) = get_value(sys, key, &mut val) {
+        let got = get_value(sys, &key[..kl], &mut val);
+        if sys.waiting() {
+            return;
+        }
+        if let Some(vlen) = got {
+            *line += 1;
+            if *line <= *sent {
+                continue;
+            }
+            *sent = *line;
             if out_chan >= 0 {
-                let _ = (sys.channel_write)(out_chan, key.as_ptr(), key.len());
+                let _ = (sys.channel_write)(out_chan, key.as_ptr(), kl);
                 let _ = (sys.channel_write)(out_chan, b"\t".as_ptr(), 1);
                 let _ = (sys.channel_write)(out_chan, val.as_ptr(), vlen);
                 let _ = (sys.channel_write)(out_chan, b"\n".as_ptr(), 1);
             }
         }
-        rp = next;
     }
 }
 
 /// `bundle export` — dump every object across all resource types as
 /// `<store-key>\t<json>` lines, streamed to stdout (a restorable snapshot).
-unsafe fn cmd_export(s: &State, sys: &Store) {
+unsafe fn cmd_export(s: &mut State, sys: &Store) {
     let prefixes: [&[u8]; 17] = [
         NAMESPACES_PREFIX,
         NODES_PREFIX,
@@ -606,8 +563,9 @@ unsafe fn cmd_export(s: &State, sys: &Store) {
         VOLUMESNAPSHOTS_PREFIX,
         DEVICES_PREFIX,
     ];
+    let mut line = 0u32;
     for prefix in prefixes {
-        export_prefix(sys, s.out_chan, prefix);
+        export_prefix(sys, s.out_chan, prefix, &mut line, &mut s.export_sent);
     }
 }
 
@@ -632,24 +590,29 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
         s.done = 1;
         return STEP_DONE;
     };
-    let mut raw = [0u8; LIST_BUF];
-    let n = ns_list(sys, prefix, &mut raw);
-    let h = fnv1a(&raw[..n]);
-    if h != s.watch_hash {
+    // The listing's hash over every page first: a page the store has not
+    // answered yet (`EAGAIN`) says nothing this step, rather than a short
+    // listing as a change.
+    let st = Store::plain(sys, &s.nag);
+    let mut walk = ListWalk::new(prefix);
+    let mut h = 0x811c_9dc5u32;
+    while let Some(key) = walk.next(&st) {
+        h = (h ^ key_hash(key)).wrapping_mul(0x0100_0193);
+    }
+    if !st.waiting() && h != s.watch_hash {
         s.watch_hash = h;
         if s.out_chan >= 0 {
             let hdr = b"---- ";
             let _ = (sys.channel_write)(s.out_chan, hdr.as_ptr(), hdr.len());
             let _ = (sys.channel_write)(s.out_chan, res.as_ptr(), res.len());
             let _ = (sys.channel_write)(s.out_chan, b" ----\n".as_ptr(), 6);
-            let mut rp = 0usize;
             let mut any = false;
-            while let Some((key, next)) = list_entry(&raw[..n], rp) {
+            let mut walk = ListWalk::new(prefix);
+            while let Some(key) = walk.next(&st) {
                 let name = last_seg(key);
                 let _ = (sys.channel_write)(s.out_chan, name.as_ptr(), name.len());
                 let _ = (sys.channel_write)(s.out_chan, b"\n".as_ptr(), 1);
                 any = true;
-                rp = next;
             }
             if !any {
                 let e = b"(none)\n";
@@ -770,17 +733,14 @@ unsafe fn cmd_get(sys: &Store, resource: &[u8], out: &mut [u8]) -> (usize, i32) 
         p = append(out, p, b"'\n");
         return (p, 1);
     };
-    let mut raw = [0u8; LIST_BUF];
-    let n = ns_list(sys, prefix, &mut raw);
+    let mut walk = ListWalk::new(prefix);
     let mut p = 0usize;
-    let mut rp = 0usize;
     let mut any = false;
-    while let Some((key, next)) = list_entry(&raw[..n], rp) {
+    while let Some(key) = walk.next(sys) {
         let name = last_seg(key);
         p = append(out, p, name);
         p = append(out, p, b"\n");
         any = true;
-        rp = next;
     }
     if !any {
         p = append(out, p, b"(none)\n");
@@ -923,7 +883,7 @@ fn status_is_terminal(doc: &[u8]) -> bool {
 /// the sandbox status is terminal (or the step backstop trips). Returns the
 /// module_step result (0 = keep streaming, STEP_DONE = finished).
 unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
@@ -939,6 +899,10 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
     } else {
         get_value(&st, &key[..klen], &mut val).unwrap_or(0)
     };
+    if st.waiting() {
+        // Not answered yet (`EAGAIN`): not an empty log — asked next step.
+        return 0;
+    }
     let off = (s.stream_off as usize).min(vlen);
     if vlen > off && s.out_chan >= 0 {
         let _ = (sys.channel_write)(s.out_chan, val[off..vlen].as_ptr(), vlen - off);
@@ -1008,7 +972,7 @@ fn parse_int(b: &[u8]) -> i32 {
 /// exit code, and finish. Times out (exit 1) if no runner answers — the node
 /// graph (with the sandbox runtime) probably isn't running.
 unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
@@ -1025,7 +989,13 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let ol = build_exec_key(EXEC_OUTPUT_PREFIX, id, &mut okey);
             let mut oval = [0u8; MAX_VALUE];
             if ol != 0 {
-                if let Some(olen) = get_value(&st, &okey[..ol], &mut oval) {
+                let got = get_value(&st, &okey[..ol], &mut oval);
+                if st.waiting() {
+                    // The output not answered yet: the result is read
+                    // again next step, and nothing is removed unsaid.
+                    return 0;
+                }
+                if let Some(olen) = got {
                     if olen > 0 && s.out_chan >= 0 {
                         let _ = (sys.channel_write)(s.out_chan, oval.as_ptr(), olen);
                     }
@@ -1064,16 +1034,19 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
 /// How long a command waits for the store to answer.
 const STORE_READY_WAIT_MS: u64 = 30_000;
 
-/// Whether the store answers a read: anything but ask-again (a GET of the
-/// root, absent or not, or no store in this directory at all).
-unsafe fn store_answers(sys: &SyscallTable) -> bool {
+/// Whether the store answers a read: a GET of the root found, or answered
+/// absent as the contract answers absence (`ENXIO`/`ENOENT`). Ask-again —
+/// or any other refusal, which is undecided too ([`refused`]) — is not an
+/// answer: the command waits for one, then says the store never came up.
+unsafe fn store_answers(sys: &SyscallTable, nag: &ReadNag) -> bool {
     let mut key = *b"/";
     let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), key.len());
     if h >= 0 {
         let mut carg = [0u8; 4];
         (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+        return true;
     }
-    h != ERR_EAGAIN
+    matches!(refusal::<()>(sys, nag, b"GET", b"/", h), Got::Absent)
 }
 
 /// Owe the removal of `key` before the command exits.
@@ -1091,7 +1064,7 @@ fn owe_removal(s: &mut State, key: &[u8]) {
 /// A command that has answered: its owed removals asked again until the
 /// store decides each, then its exit code.
 unsafe fn finish_step(s: &mut State, sys: &SyscallTable) -> i32 {
-    let store = Store::plain(sys);
+    let store = Store::plain(sys, &s.nag);
     for i in 0..FINISH_KEYS {
         if s.finishing & (1 << i) != 0 {
             let k = &s.finish[i][..s.finish_len[i] as usize];
@@ -1146,7 +1119,7 @@ fn status_code(v: &[u8]) -> i32 {
 /// `/tty/<id>/cli/in`, emits new PTY output from `/tty/<id>/cli/out`, and finishes
 /// when the session status is terminal (exiting with the shell's code).
 unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
     let mut idbuf = [0u8; 96];
@@ -1169,6 +1142,8 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     if s.tty_pending_len > 0 {
         let mut inkey = [0u8; MAX_KEY];
         let ik = build_tty_key(id, b"in", &mut inkey);
+        // A probe not answered yet (`EAGAIN`) leaves `st` waiting, and the
+        // write after it answers `Pending` unasked: owed, asked next step.
         if ik != 0 && (s.tty_in_owed != 0 || !exists(&st, &inkey[..ik])) {
             let pl = s.tty_pending_len as usize;
             match put_value(&st, &inkey[..ik], &s.tty_pending[..pl]) {
@@ -1189,6 +1164,9 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     } else {
         0
     };
+    if st.waiting() {
+        return 0; // asked next step; the output is not empty
+    }
     let off = (s.stream_off as usize).min(olen);
     if olen > off && s.out_chan >= 0 {
         let _ = (sys.channel_write)(s.out_chan, oval[off..olen].as_ptr(), olen - off);
@@ -1223,7 +1201,7 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
 /// appears, emit the token, delete the request/response, and exit. Times out
 /// (exit 1) if no mint answers.
 unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let mut rval = [0u8; MAX_VALUE];
     if let Some(n) = get_value(&st, TOKEN_RESP_KEY, &mut rval) {
@@ -1557,7 +1535,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // read answers ask-again, which a one-shot command would take for
         // absent. A command runs once it answers, or says it never did.
         if s.store_ready == 0 {
-            if !store_answers(sys) {
+            if !store_answers(sys, &s.nag) {
                 let now = dev_millis(sys);
                 if s.store_wait_from == 0 {
                     s.store_wait_from = now.max(1);
@@ -1600,6 +1578,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let alen = if an > 0 { an as usize } else { 0 };
             s.argv_len = alen as u16;
             s.journal.reset();
+            s.export_sent = 0;
             alen
         };
         let mut arec = [0u8; ARGV_BUF];

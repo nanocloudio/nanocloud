@@ -78,7 +78,8 @@ modules:
     type: store_effect
     decision: {hex: "${DEC_NB}"}
     key_prefix: "/pods/"
-    paths: "status.ready"
+    # the neighbour's readiness: its Ready condition
+    paths: "status.conditions[type=Ready].status"
   - name: selfget
     type: store_effect
     decision: {hex: "${DEC_ASK}"}
@@ -111,7 +112,7 @@ run() { # run <seconds>
 present() { [ -n "$(store_last "$1")" ]; }
 absent()  { [ -z "$(store_last "$1")" ]; }
 mark_ready() { # mark_ready <ordinal> — what the kubelet would write
-  store_put "/pods/default/db-$1" '{"metadata":{"name":"db-'$1'","namespace":"default","ownerReferences":[{"kind":"StatefulSet","name":"db"}]},"spec":{"containers":[{"name":"db","image":"postgres"}]},"status":{"ready":true}}'
+  store_put "/pods/default/db-$1" '{"metadata":{"name":"db-'$1'","namespace":"default","ownerReferences":[{"kind":"StatefulSet","name":"db"}]},"spec":{"containers":[{"name":"db","image":"postgres"}]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 }
 STS='{"metadata":{"name":"db","namespace":"default"},"spec":{"replicas":3,"template":{"spec":{"containers":[{"name":"db","image":"postgres"}]}}}}'
 

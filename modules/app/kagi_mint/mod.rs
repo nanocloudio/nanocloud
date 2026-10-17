@@ -131,6 +131,8 @@ struct State {
 
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -677,7 +679,7 @@ unsafe fn ask_announcement(s: &mut State, sys: &SyscallTable) {
     let mut p = [0u8; MAX_PARAM];
     p[..path.len()].copy_from_slice(path);
     let a = put_value(
-        &Store::plain(sys),
+        &Store::plain(sys, &s.nag),
         &p[..path.len()],
         &s.ann[..s.ann_len as usize],
     );

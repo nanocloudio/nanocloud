@@ -99,12 +99,39 @@ const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const RESPONSE_TIMEOUT_MS: u64 = 30_000;
 const BACKOFF_INIT_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 30_000;
-/// Transport attempts before a request is answered 0.
+/// Transport attempts before a request is answered 0, once the origin has
+/// answered some of it (a transfer cut off mid-way resumes from what it has).
 const MAX_ATTEMPTS: u8 = 6;
-/// A file provider that answers "not yet" (fat32 on metal, mid-flush):
-/// the open is asked again this long after, not counted as a failure.
+/// The same, while the origin has answered nothing of it at all (no
+/// connection, no TLS session, no response header): it is answered 0 after
+/// one retry, so the chain that asked decides — and backs off, and says so
+/// (an image pull's ImagePullBackOff) — instead of this connector holding
+/// every request behind it on an origin that is not there.
+const MAX_CONNECT_ATTEMPTS: u8 = 2;
+/// The fs provider never waits on its device inside a call. `EAGAIN`: not
+/// now, nothing moved, ask again. `EINPROGRESS`: taken, not yet decided;
+/// the byte-identical request is asked again and a later answer decides.
+/// Neither is a failure: the file's steps (`FileStep`) resume where they
+/// stopped, asked again this long after.
 const FS_EAGAIN: i32 = -11;
+const FS_EINPROGRESS: i32 = -36;
 const OPEN_RETRY_MS: u64 = 20;
+/// Body bytes the file provider has not taken yet (a WRITE answered short or
+/// `EAGAIN`): at most one network frame's, plus the header buffer's early
+/// bytes. The network is not read again until they are written.
+const SPILL_SIZE: usize = 8192 + HDR_BUF_SIZE;
+
+// Where opening the held request's file stands; each step is asked again
+// until it decides, then the next runs.
+const FO_IDLE: u8 = 0;
+const FO_MKDIR: u8 = 1;
+const FO_UNLINK: u8 = 2;
+const FO_CREATE: u8 = 3;
+
+/// An answer that is not a decision yet: asked again on a later step.
+fn fs_pending(r: i32) -> bool {
+    r == FS_EAGAIN || r == FS_EINPROGRESS
+}
 
 /// Which request is on the wire: the record's, or a token from the realm the
 /// origin's Bearer challenge named.
@@ -126,6 +153,12 @@ enum Phase {
     RecvHeader = 3,
     RecvBody = 4,
     Backoff = 5,
+    /// The body is in and verified: its spilled bytes written, then FSYNC
+    /// asked until it decides, then answered.
+    Fsync = 6,
+    /// An answer that discards the request's file: UNLINK asked until it
+    /// decides, then `final_status` answered.
+    Discard = 7,
 }
 
 #[repr(C)]
@@ -151,6 +184,9 @@ struct State {
 
     phase: Phase,
     inflight: u8,
+    /// The held record's "already there" probe was not answered yet
+    /// (`EAGAIN`): it is admitted again, from the record held, next step.
+    probe_owed: u8,
     attempts: u8,
     conn_id: u16,
     prev_conn_id: u16,
@@ -166,6 +202,15 @@ struct State {
     pos: u64,
     file_fd: i32,
     hasher: Sha256,
+    /// `dir` exists (its MKDIR decided); the file's open, mid-way (`FO_*`).
+    dir_made: u8,
+    file_step: u8,
+    /// The answer a discarding reply gives once its UNLINK decides.
+    final_status: u16,
+    /// Body bytes taken off the wire but not yet by the file provider:
+    /// `spill[spill_off..spill_len]`, written before anything else.
+    spill_off: u32,
+    spill_len: u32,
 
     status: u16,
     hdr_fill: u32,
@@ -209,6 +254,9 @@ struct State {
     tx_buf: [u8; TX_BUF_SIZE],
     net_buf: [u8; NET_BUF_SIZE],
     out_buf: [u8; REQ_BUF],
+    spill: [u8; SPILL_SIZE],
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -418,34 +466,117 @@ unsafe fn close_conn(s: &mut State) {
     }
 }
 
-unsafe fn close_file(s: &mut State, discard: bool) {
+/// Release the file's FD and drop what it had not taken. CLOSE never waits
+/// and reports no writeback: a file that must be durable is fenced (FSYNC)
+/// before this.
+unsafe fn close_file(s: &mut State) {
     let sys = &*s.syscalls;
     if s.file_fd >= 0 {
         let mut z = [0u8; 4];
         (sys.provider_call)(s.file_fd, FS_CLOSE, z.as_mut_ptr(), 0);
         s.file_fd = -1;
     }
-    if discard {
-        let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
-        let n = file_path(s, &mut path);
-        if n > 0 {
-            let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n);
+    s.spill_off = 0;
+    s.spill_len = 0;
+}
+
+/// Write `data` through the file's FD while bytes move: what moved, which
+/// may be short (the provider answered `EAGAIN`: nothing more now); `None`
+/// on a refusal. Bounded: every turn moves at least one byte.
+unsafe fn write_some(s: &State, data: *const u8, len: usize) -> Option<usize> {
+    let sys = &*s.syscalls;
+    let mut off = 0usize;
+    while off < len {
+        let wrote = (sys.provider_call)(s.file_fd, FS_WRITE, data.add(off) as *mut u8, len - off);
+        if fs_pending(wrote) {
+            break;
         }
+        if wrote <= 0 {
+            return None;
+        }
+        off += (wrote as usize).min(len - off);
     }
+    Some(off)
+}
+
+/// Write what the provider had not taken. `Some(true)` once it is all
+/// written; `None` on a refusal.
+unsafe fn drain_spill(s: &mut State) -> Option<bool> {
+    let off = s.spill_off as usize;
+    let end = (s.spill_len as usize).min(SPILL_SIZE);
+    if off >= end {
+        s.spill_off = 0;
+        s.spill_len = 0;
+        return Some(true);
+    }
+    let moved = write_some(s, s.spill.as_ptr().add(off), end - off)?;
+    if off + moved >= end {
+        s.spill_off = 0;
+        s.spill_len = 0;
+        return Some(true);
+    }
+    s.spill_off = (off + moved) as u32;
+    Some(false)
 }
 
 /// Answer the held request and free the slot.
 unsafe fn reply(s: &mut State, status: u16) {
-    let sys = &*s.syscalls;
     close_conn(s);
     // Only a file THIS request created is discarded: a skipped request (304)
     // or one refused before its file was opened must not unlink what an
-    // earlier request landed and verified.
+    // earlier request landed and verified. The UNLINK is asked until it
+    // decides (`Phase::Discard`) before the answer goes.
     if s.sink == SINK_FILE as u8 && s.file_fd >= 0 {
-        close_file(s, status != 200);
+        close_file(s);
+        if status != 200 {
+            s.final_status = status;
+            s.phase = Phase::Discard;
+            return;
+        }
     }
+    answer(s, status);
+}
+
+/// `Phase::Discard`: the discarded file's UNLINK, asked again until it
+/// decides; then the answer.
+unsafe fn discard_step(s: &mut State) {
+    let sys = &*s.syscalls;
+    let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
+    let n = file_path(s, &mut path);
+    if n > 0 && fs_pending((sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n)) {
+        return;
+    }
+    answer(s, s.final_status);
+}
+
+/// `Phase::Fsync`: the file's bytes durable before it is answered 200.
+/// FSYNC is asked again, unchanged, until it decides.
+unsafe fn fsync_step(s: &mut State) {
+    if s.spill_len != 0 {
+        return; // written first (module_step drains it)
+    }
+    let sys = &*s.syscalls;
+    let mut z = [0u8; 4];
+    let r = (sys.provider_call)(s.file_fd, FS_FSYNC, z.as_mut_ptr(), 0);
+    if fs_pending(r) {
+        return;
+    }
+    reply(s, if r < 0 { 500 } else { 200 });
+}
+
+/// The outcome record for the held request; the slot freed.
+unsafe fn answer(s: &mut State, status: u16) {
+    let sys = &*s.syscalls;
     let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
     let body = core::slice::from_raw_parts(s.body.as_ptr(), s.body_fill as usize);
+    // The answer's own digest, for a body answered whole: what a tag
+    // resolved to, so a chain keys the content by it.
+    let sha = hasher_hex(&s.hasher);
+    let sha_len = if status == 200 && s.sink == SINK_REPLY as u8 {
+        sha.len()
+    } else {
+        0
+    };
     let out = &mut s.out_buf;
     let mut p = 1usize;
     let mut n = 0u8;
@@ -482,6 +613,7 @@ unsafe fn reply(s: &mut State, status: u16) {
         TY_BYTES,
         &s.ctype[..s.ctype_len as usize]
     ));
+    field!(put_field(out, p, 5, TY_BYTES, &sha[..sha_len]));
     // Every answer field, always — empty when not asked or not answered: a
     // decision reading a field the record lacks produces nothing at all.
     for q in 0..MAX_QUERIES {
@@ -511,7 +643,12 @@ unsafe fn transport_failed(s: &mut State, why: &[u8]) {
     log(s, 1, why);
     close_conn(s);
     s.attempts += 1;
-    if s.attempts >= MAX_ATTEMPTS {
+    let cap = if s.status == 0 && s.body_received == 0 {
+        MAX_CONNECT_ATTEMPTS
+    } else {
+        MAX_ATTEMPTS
+    };
+    if s.attempts >= cap {
         reply(s, 0);
         return;
     }
@@ -542,25 +679,46 @@ unsafe fn begin(s: &mut State) {
     s.phase = Phase::Connecting;
 }
 
-/// Start the held request again from what it has: a Range file from its
-/// position, anything else from nothing (its file truncated). False when
-/// the file cannot be reopened — answered 507.
-/// Open the held request's file afresh (unlinked first). `Some(true)`
-/// opened; `Some(false)` the provider is not ready, and the open is asked
-/// again after `OPEN_RETRY_MS`; `None` it refused, answered 507.
+/// Open the held request's file afresh: `dir` made (once), the file
+/// unlinked, then created. Each step is asked again until it decides, and
+/// the sequence resumes at the step that had not, never from the start.
+/// `Some(true)` opened; `Some(false)` a step has not decided yet, and the
+/// open resumes after `OPEN_RETRY_MS`; `None` it refused, answered 507.
 unsafe fn open_file(s: &mut State) -> Option<bool> {
     let sys = &*s.syscalls;
+    s.file_fd = -1;
+    if s.file_step == FO_IDLE {
+        s.file_step = if s.dir_len > 0 && s.dir_made == 0 {
+            FO_MKDIR
+        } else {
+            FO_UNLINK
+        };
+    }
+    if s.file_step == FO_MKDIR {
+        let mut dir = [0u8; MAX_DIR];
+        let dl = (s.dir_len as usize).min(MAX_DIR);
+        dir[..dl].copy_from_slice(&s.dir[..dl]);
+        if fs_pending((sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dl)) {
+            return open_later(s);
+        }
+        // Made, or there already; a refusal is the create's to report.
+        s.dir_made = 1;
+        s.file_step = FO_UNLINK;
+    }
     let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
     let pl = file_path(s, &mut path);
-    let _ = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
-    if fd == FS_EAGAIN {
-        s.file_fd = -1;
-        s.backoff_ms = OPEN_RETRY_MS;
-        s.state_start_ms = dev_millis(sys);
-        s.phase = Phase::Backoff;
-        return Some(false);
+    if s.file_step == FO_UNLINK {
+        if fs_pending((sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl)) {
+            return open_later(s);
+        }
+        // Gone, or never there.
+        s.file_step = FO_CREATE;
     }
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
+    if fs_pending(fd) {
+        return open_later(s);
+    }
+    s.file_step = FO_IDLE;
     if fd < 0 {
         log(s, 1, b"[http_fetch] cannot create the file");
         reply(s, 507);
@@ -570,6 +728,17 @@ unsafe fn open_file(s: &mut State) -> Option<bool> {
     Some(true)
 }
 
+/// A file step that has not decided: resumed after `OPEN_RETRY_MS`.
+unsafe fn open_later(s: &mut State) -> Option<bool> {
+    s.backoff_ms = OPEN_RETRY_MS;
+    s.state_start_ms = dev_millis(&*s.syscalls);
+    s.phase = Phase::Backoff;
+    Some(false)
+}
+
+/// Start the held request again from what it has: a Range file from its
+/// position, anything else from nothing (its file truncated). False when
+/// the file is not open yet (resumed later) or cannot be (answered 507).
 unsafe fn restart(s: &mut State) -> bool {
     // A file the provider was not ready to create: created now, from nothing.
     if s.sink == SINK_FILE as u8 && s.file_fd < 0 {
@@ -589,7 +758,7 @@ unsafe fn restart(s: &mut State) -> bool {
     s.body_received = 0;
     s.pos = 0;
     if s.sink == SINK_FILE as u8 {
-        close_file(s, false);
+        close_file(s);
         return open_file(s) == Some(true);
     }
     true
@@ -617,14 +786,21 @@ unsafe fn build_request(s: &mut State) -> usize {
         // The realm's credentials, when the deployment gave a key for them;
         // without, the token asked for is an anonymous one.
         if s.credentials_len > 0 {
-            let key = core::slice::from_raw_parts(s.credentials.as_ptr(), s.credentials_len as usize);
+            let key =
+                core::slice::from_raw_parts(s.credentials.as_ptr(), s.credentials_len as usize);
             let mut cred = [0u8; MAX_CRED];
-            if let Some(n) = get_value_live(sys, key, &mut cred) {
-                let mut b = [0u8; MAX_CRED.div_ceil(3) * 4];
-                if let Some(bn) = b64_encode(&cred[..n], &mut b) {
-                    o = append(tx, o, b"\r\nAuthorization: Basic ");
-                    o = append(tx, o, &b[..bn]);
+            match get_value_live(sys, &(*st).nag, key, &mut cred) {
+                Got::Found(n) => {
+                    let mut b = [0u8; MAX_CRED.div_ceil(3) * 4];
+                    if let Some(bn) = b64_encode(&cred[..n], &mut b) {
+                        o = append(tx, o, b"\r\nAuthorization: Basic ");
+                        o = append(tx, o, &b[..bn]);
+                    }
                 }
+                // Not answered yet (`EAGAIN`): no request, rather than an
+                // anonymous one — the caller asks the leg again shortly.
+                Got::Pending => return 0,
+                Got::Absent => {}
             }
         }
     } else {
@@ -642,7 +818,11 @@ unsafe fn build_request(s: &mut State) -> usize {
         }
         if s.token_len > 0 {
             o = append(tx, o, b"\r\nAuthorization: Bearer ");
-            o = append(tx, o, core::slice::from_raw_parts(s.token.as_ptr(), s.token_len as usize));
+            o = append(
+                tx,
+                o,
+                core::slice::from_raw_parts(s.token.as_ptr(), s.token_len as usize),
+            );
         }
         if ranged(s) {
             let end = (s.pos + s.chunk_bytes as u64).min(s.size) - 1;
@@ -732,7 +912,11 @@ fn take_challenge(s: &mut State, v: &[u8]) -> bool {
     };
     let slash = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
     let host = &rest[..slash];
-    let path: &[u8] = if slash < rest.len() { &rest[slash..] } else { b"/" };
+    let path: &[u8] = if slash < rest.len() {
+        &rest[slash..]
+    } else {
+        b"/"
+    };
     if host.is_empty() || host.len() > MAX_AUTHORITY {
         return false;
     }
@@ -743,11 +927,27 @@ fn take_challenge(s: &mut State, v: &[u8]) -> bool {
     s.realm_auth_len = host.len() as u8;
     s.realm_port = p.unwrap_or(port);
     let mut o = append(&mut s.realm_path, 0, path);
-    let mut sep = if path.iter().any(|&c| c == b'?') { b'&' } else { b'?' };
+    let mut sep = if path.iter().all(|&c| c != b'?') {
+        b'?'
+    } else {
+        b'&'
+    };
     // service, then scope — two calls, not a loop over an array of byte
     // strings (unrelocated in a PIC module's .rodata).
-    o = query_param(&mut s.realm_path, o, &mut sep, b"service", auth_param(params, b"service"));
-    o = query_param(&mut s.realm_path, o, &mut sep, b"scope", auth_param(params, b"scope"));
+    o = query_param(
+        &mut s.realm_path,
+        o,
+        &mut sep,
+        b"service",
+        auth_param(params, b"service"),
+    );
+    o = query_param(
+        &mut s.realm_path,
+        o,
+        &mut sep,
+        b"scope",
+        auth_param(params, b"scope"),
+    );
     if o == s.realm_path.len() {
         return false; // did not fit: a cut query asks for another token
     }
@@ -843,19 +1043,27 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
         s.hasher.update(data);
     }
     if s.sink == SINK_FILE as u8 && object {
-        let sys = &*s.syscalls;
-        let mut off = 0usize;
-        while off < data.len() {
-            let wrote = (sys.provider_call)(
-                s.file_fd,
-                FS_WRITE,
-                data.as_ptr().add(off) as *mut u8,
-                data.len() - off,
-            );
-            if wrote <= 0 {
+        // Written while the provider takes bytes; the rest spilled, in
+        // order, behind anything spilled before, and written on later steps.
+        let moved = if s.spill_len == 0 {
+            match write_some(s, data.as_ptr(), data.len()) {
+                Some(m) => m,
+                None => return false,
+            }
+        } else {
+            0
+        };
+        let rest = data.get(moved..).unwrap_or(&[]);
+        if !rest.is_empty() {
+            let at = s.spill_len as usize;
+            let Some(dst) = s.spill.get_mut(at..at + rest.len()) else {
+                return false;
+            };
+            if s.spill_off != 0 {
                 return false;
             }
-            off += wrote as usize;
+            core::ptr::copy_nonoverlapping(rest.as_ptr(), dst.as_mut_ptr(), rest.len());
+            s.spill_len = (at + rest.len()) as u32;
         }
         s.pos += data.len() as u64;
     } else {
@@ -872,7 +1080,6 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
 
 /// The response body is complete: verify and answer, or chain the next chunk.
 unsafe fn body_done(s: &mut State) {
-    let sys = &*s.syscalls;
     close_conn(s);
     s.attempts = 0;
     s.backoff_ms = 0;
@@ -942,11 +1149,10 @@ unsafe fn body_done(s: &mut State) {
         return;
     }
     if s.sink == SINK_FILE as u8 {
-        let mut z = [0u8; 4];
-        if (sys.provider_call)(s.file_fd, FS_FSYNC, z.as_mut_ptr(), 0) < 0 {
-            reply(s, 500);
-            return;
-        }
+        // Durable before it is answered: FSYNC decides, over later steps.
+        s.phase = Phase::Fsync;
+        fsync_step(s);
+        return;
     }
     reply(s, 200);
 }
@@ -1067,6 +1273,15 @@ unsafe fn pump_net(s: &mut State) -> bool {
                     s.tx_len = build_request(s) as u16;
                     s.tx_sent = 0;
                     s.state_start_ms = dev_millis(sys);
+                    if s.tx_len == 0 {
+                        // The credentials' read was not answered yet: the
+                        // leg is asked again after a short backoff, which
+                        // spends no attempt.
+                        close_conn(s);
+                        s.backoff_ms = BACKOFF_INIT_MS;
+                        s.phase = Phase::Backoff;
+                        return true;
+                    }
                     s.phase = Phase::RecvHeader;
                     let _ = flush_tx(s);
                 }
@@ -1156,6 +1371,11 @@ impl State {
 /// Take one record: skip it, or start its transfer.
 unsafe fn admit(s: &mut State) {
     let sys = &*s.syscalls;
+    if s.probe_owed != 0 {
+        s.probe_owed = 0;
+        start(s);
+        return;
+    }
     let poll = (sys.channel_poll)(s.request_in, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
@@ -1179,6 +1399,12 @@ unsafe fn admit(s: &mut State) {
         return;
     }
     s.held_len = n as u16;
+    start(s);
+}
+
+/// Start the transfer of the held record (or skip it).
+unsafe fn start(s: &mut State) {
+    let sys = &*s.syscalls;
     let sink = frame_i64(held(s), 2).unwrap_or(0);
     if sink != SINK_REPLY && sink != SINK_FILE {
         s.held_len = 0;
@@ -1197,15 +1423,28 @@ unsafe fn admit(s: &mut State) {
     s.ctype_len = 0;
     s.size = frame_i64(held(s), 13).unwrap_or(0).max(0) as u64;
     s.hasher = Sha256::new();
+    s.file_step = FO_IDLE;
+    s.spill_off = 0;
+    s.spill_len = 0;
     // Already there: answered without a byte on the wire.
     let mut k = [0u8; MAX_KEY];
     let (a, b) = (frame_bytes(held(s), 12), frame_bytes(held(s), 22));
     if !a.is_empty() && a.len() + b.len() <= MAX_KEY {
         k[..a.len()].copy_from_slice(a);
         k[a.len()..a.len() + b.len()].copy_from_slice(b);
-        if head_rev(sys, &k[..a.len() + b.len()]).is_some() {
-            reply(s, 304);
-            return;
+        match head_rev(sys, &s.nag, &k[..a.len() + b.len()]) {
+            Got::Found(_) => {
+                reply(s, 304);
+                return;
+            }
+            Got::Pending => {
+                // Not answered yet: the record stays held and is admitted
+                // again next step — not fetched again over a blob it has.
+                s.inflight = 0;
+                s.probe_owed = 1;
+                return;
+            }
+            Got::Absent => {}
         }
     }
     if s.sink == SINK_FILE as u8 {
@@ -1273,6 +1512,10 @@ pub unsafe extern "C" fn module_new(
         s.inflight = 0;
         s.conn_present = 0;
         s.file_fd = -1;
+        s.dir_made = 0;
+        s.file_step = FO_IDLE;
+        s.spill_off = 0;
+        s.spill_len = 0;
         s.held_len = 0;
         s.authority_len = 0;
         s.authority_over = 0;
@@ -1310,19 +1553,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.resolved == 0 {
             s.request_in = dev_channel_port(sys, PORT_INPUT, 1);
             s.response_out = dev_channel_port(sys, PORT_OUTPUT, 1);
-            if s.dir_len > 0 {
-                let mut dir = [0u8; MAX_DIR];
-                let dl = s.dir_len as usize;
-                dir[..dl].copy_from_slice(&s.dir[..dl]);
-                let _ = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dl);
-            }
             s.resolved = 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.net_in < 0 || s.net_out < 0 {
             return 0;
         }
+        // Body bytes the file provider had not taken go first; the wire is
+        // not read again until they are written, and its timers do not run
+        // while it waits on the file.
+        if s.spill_len != 0 {
+            match drain_spill(s) {
+                None => reply(s, 507),
+                Some(true) => {}
+                Some(false) => {
+                    if matches!(
+                        s.phase,
+                        Phase::WaitConnect | Phase::RecvHeader | Phase::RecvBody
+                    ) {
+                        s.state_start_ms = dev_millis(sys);
+                    }
+                }
+            }
+        }
         let mut drained = 0;
-        while drained < 64 && pump_net(s) {
+        while drained < 64 && s.spill_len == 0 && pump_net(s) {
             drained += 1;
         }
         match s.phase {
@@ -1381,6 +1635,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     transport_failed(s, b"[http_fetch] response timeout");
                 }
             }
+            Phase::Fsync => fsync_step(s),
+            Phase::Discard => discard_step(s),
             Phase::Backoff => {
                 if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms {
                     // A retried file starts again from what is on disk: the

@@ -2,7 +2,8 @@
 # Live E2E for image pull as params (packaging/debian/fluxor-imagepull.yaml):
 # image.uproc over the http_fetch connector — request → manifest (through an
 # index when the tag names one) → config → every layer a sha256-verified file
-# in the content-addressed cache, each marked in /blobs/.
+# in the content-addressed cache, each marked in /image-blobs/ — everything
+# keyed by the manifest's digest, which the tag resolved to.
 #
 # The fetcher is given a NAME authority (localhost:<port>), so its dial travels
 # as an AF_NAME CMD_CONNECT_TO record the network provider resolves, and the
@@ -12,12 +13,13 @@
 # manifest (2 layers), its blobs and config, and an OCI index for the tag
 # `multi` whose arm64/linux entry names that manifest by digest.
 #
-#   /image-requests/<name>  = "repo=<repo>;tag=<tag>"
-#   /image-index/<name>     = "digest=sha256:<hex64>"          (an index answered)
-#   /image-manifests/<name> = "repo=..;layers=<hex64>,..;sizes=<n>,..;config=<hex64>;configsize=<n>;n=<count>"
-#   /image-config/<name>    = "entrypoint=..;cmd=..;env=..;workdir=..;user=.."
-#   /blobs/<hex64>          = "size=<n>"
-#   /image-layer-ok/<name>-<i>                                  (layer i is cached)
+#   /image-requests/<rk>    = "reg=;repo=<repo>;tag=<tag>;pin="
+#   /image-index/<rk>       = "digest=sha256:<hex64>"          (an index answered)
+#   /image-digests/<rk>     = "digest=<m>"  (<m>: the manifest's digest) | "refused=…"
+#   /image-manifests/<m>    = "repo=..;layers=<hex64>,..;sizes=<n>,..;config=<hex64>;configsize=<n>;n=<count>"
+#   /image-config/<m>       = "entrypoint=..;cmd=..;env=..;workdir=..;user=.."
+#   /image-blobs/<hex64>    = "size=<n>"
+#   /image-layer-ok/<m>-<i>                                     (layer i is cached)
 #   <dir>/<hex64>           = the verified bytes
 set -euo pipefail
 
@@ -142,7 +144,7 @@ echo "   layers: $D1 (100K), $D2 (tiny); config: $DCFG ($NCFG B)"
 
 echo "== 2. start the registry stub (:$PORT) =="
 # Registry stub: GET /v2/<repo>/manifests/<tag> and /v2/<repo>/blobs/sha256:<hex>,
-# Content-Length framing, Connection: close (what image_fetcher speaks).
+# Content-Length framing, Connection: close (what http_fetch speaks).
 python3 - "$D/reg" "$PORT" >"$D/reg.log" 2>&1 <<'PY' &
 import http.server, os, socketserver, sys
 d, port = sys.argv[1], int(sys.argv[2])
@@ -208,11 +210,13 @@ echo "== 3. the packaged image-pull graph, pointed at the stub and a temp cache 
 sed -e "s#registry.nanocloud.io:5000#localhost:$PORT#" -e "s#/var/lib/nanocloud.io/image/blobs#$D/blobcache#" \
   "$ROOT/packaging/debian/fluxor-imagepull.yaml" >"$D/graph.yaml"
 
-settle() { # settle <name> <seconds> — every layer cached and marked
-  local i
+dig_of() { wal_last "/image-digests/$1" | sed -n 's/^digest=//p'; }
+settle() { # settle <rk> <seconds> — resolved, every layer cached and marked
+  local i m
   for i in $(seq 1 $(( $2 * 4 ))); do
-    if [ -n "$(wal_last "/image-layer-ok/$1-0")" ] && [ -n "$(wal_last "/image-layer-ok/$1-1")" ] \
-       && [ -n "$(wal_last "/image-config/$1")" ]; then return 0; fi
+    m="$(dig_of "$1")"
+    if [ -n "$m" ] && [ -n "$(wal_last "/image-layer-ok/$m-0")" ] && [ -n "$(wal_last "/image-layer-ok/$m-1")" ] \
+       && [ -n "$(wal_last "/image-config/$m")" ]; then return 0; fi
     kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early"
     sleep 0.25
   done
@@ -221,7 +225,7 @@ settle() { # settle <name> <seconds> — every layer cached and marked
 run_until() { # run_until <config> <modules> <name> <seconds>
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$1" --modules "$2" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
-  settle "$3" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$3 never settled: manifest '$(wal_last "/image-manifests/$3")'"; }
+  settle "$3" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$3 never settled: digest '$(wal_last "/image-digests/$3")'"; }
   sleep 1
   kill "$RUNTIME_PID" 2>/dev/null || true
   wait "$RUNTIME_PID" 2>/dev/null || true
@@ -230,41 +234,57 @@ run_until() { # run_until <config> <modules> <name> <seconds>
 
 echo "== 4. build config + module table; seed the image request =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
-wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
+wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
 
 echo "== 5. run the graph until every layer is cached =="
-run_until "$D/config.bin" "$D/modules.bin" testapp 20
+run_until "$D/config.bin" "$D/modules.bin" testapp+latest 20
 
 echo "== 6. verify the settled state =="
-man="$(wal_last "/image-manifests/testapp")"
+MD="$(cat "$D/reg/mdigest.txt")"
+[ "$(wal_last /image-digests/testapp+latest)" = "digest=$MD" ] \
+  || fail "the tag did not resolve to the manifest's digest: '$(wal_last /image-digests/testapp+latest)'"
+echo "   testapp:latest -> digest ${MD:0:12}… (the body's own sha256)"
+man="$(wal_last "/image-manifests/$MD")"
 [ "$man" = "repo=testapp;layers=$D1,$D2;sizes=102400,18;config=$DCFG;configsize=$NCFG;n=2" ] \
   || fail "manifest record wrong: got '$man'"
 echo "   manifest: $man"
 # The config blob is fetched + digest-verified like a layer, but lands as the
 # runtime contract in the store - NOT in the blob cache.
-cfg="$(wal_last "/image-config/testapp")"
+cfg="$(wal_last "/image-config/$MD")"
 want="entrypoint=/bin/sh,-c;cmd=echo hi;env=PATH=/usr/bin;workdir=;user="
 [ "$cfg" = "$want" ] || fail "image config wrong: got '$cfg' want '$want'"
 [ -f "$D/blobcache/$DCFG" ] && fail "config blob wrongly cached as a layer"
-[ -z "$(wal_last "/blobs/$DCFG")" ] || fail "config blob wrongly marked in /blobs/"
+[ -z "$(wal_last "/image-blobs/$DCFG")" ] || fail "config blob wrongly marked in /image-blobs/"
 echo "   image config: $cfg"
 for dg in "$D1" "$D2"; do
   [ -f "$D/blobcache/$dg" ] || fail "blob file missing: $dg"
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "blob content mismatch for $dg (sha=$got)"
   cmp -s "$D/blobcache/$dg" "$D/reg/$dg" || fail "blob bytes differ from registry copy: $dg"
-  mk="$(wal_last "/blobs/$dg")"
+  mk="$(wal_last "/image-blobs/$dg")"
   case "$mk" in size=*) : ;; *) fail "blob marker missing for $dg: got '$mk'" ;; esac
   echo "   blob $dg: file + marker ($mk) ok"
 done
 N1="$(grep -c "blobs/sha256:$D1" "$D/reg.log" || true)"
 
 echo "== 7. a tag that names an INDEX: the arm64/linux entry, fetched by digest; cached layers not re-fetched =="
-wal_put "/image-requests/multi" "repo=testapp;tag=multi"
-run_until "$D/config.bin" "$D/modules.bin" multi 20
-MD="$(cat "$D/reg/mdigest.txt")"
-[ "$(wal_last /image-index/multi)" = "digest=sha256:$MD" ] || fail "index: '$(wal_last /image-index/multi)'"
-case "$(wal_last /image-manifests/multi)" in "repo=testapp;layers=$D1,$D2;"*) : ;; *) fail "multi manifest: '$(wal_last /image-manifests/multi)'" ;; esac
+wal_put "/image-requests/testapp+multi" "reg=;repo=testapp;tag=multi;pin="
+# A digest pin: fetched by that digest and verified against it.
+wal_put "/image-requests/testapp@$MD" "reg=;repo=testapp;tag=;pin=sha256:$MD"
+# Another registry than this node's: refused, never asked of this one.
+wal_put "/image-requests/other.example+5000~testapp+v1" "reg=other.example:5000;repo=testapp;tag=v1;pin="
+run_until "$D/config.bin" "$D/modules.bin" testapp+multi 20
+[ "$(wal_last /image-index/testapp+multi)" = "digest=sha256:$MD" ] || fail "index: '$(wal_last /image-index/testapp+multi)'"
+[ "$(dig_of testapp+multi)" = "$MD" ] || fail "multi resolved to '$(wal_last /image-digests/testapp+multi)'"
+[ "$(dig_of "testapp@$MD")" = "$MD" ] || fail "pinned digest: '$(wal_last "/image-digests/testapp@$MD")'"
+grep -q "GET /v2/testapp/manifests/sha256:$MD " "$D/reg.log" || fail "the pin was not fetched by digest"
+case "$(wal_last /image-digests/other.example+5000~testapp+v1)" in
+  "refused=registry other.example:5000 is not this node's registry localhost:$PORT"*) : ;;
+  *) fail "foreign registry: '$(wal_last /image-digests/other.example+5000~testapp+v1)'" ;;
+esac
+grep -q "manifests/v1" "$D/reg.log" && fail "a foreign reference was pulled from this registry"
+echo "   foreign registry refused: $(wal_last /image-digests/other.example+5000~testapp+v1 | cut -c1-80)…"
+echo "   pin sha256:${MD:0:12}… fetched by digest and verified"
 [ "$(grep -c "blobs/sha256:$D1" "$D/reg.log" || true)" = "$N1" ] || fail "a cached layer was fetched again"
 [ -z "$(python3 - "$D/store.log" <<'PY'
 import struct, sys
@@ -273,7 +293,7 @@ while p + 15 <= len(data):
     rev, op, kl, vl = struct.unpack("<QBHI", data[p:p+15])
     if p + 15 + kl + vl > len(data): break
     k = data[p+15:p+15+kl]
-    if k.startswith(b"/fetch-q/"):
+    if k.startswith(b"/image-fetch-q/"):
         if op == 1: live[k] = 1
         else: live.pop(k, None)
     p += 15 + kl + vl
@@ -286,8 +306,8 @@ echo "== 8. chunked-Range pass (chunk_bytes=4096 — the constrained-bearer post
 rm -f "$D/store.log" "$D/blobcache/"*
 sed 's/chunk_bytes: 0/chunk_bytes: 4096/' "$D/graph.yaml" >"$D/graph2.yaml"
 nc_build_workload "$ROOT" "$D/graph2.yaml" "$D/config2.bin" "$D/modules2.bin"
-wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
-run_until "$D/config2.bin" "$D/modules2.bin" testapp 30
+wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
+run_until "$D/config2.bin" "$D/modules2.bin" testapp+latest 30
 for dg in "$D1" "$D2"; do
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "chunked blob mismatch for $dg (sha=$got)"
@@ -389,13 +409,13 @@ sed -e "s#localhost:$PORT#localhost:$AUTH_PORT#" \
 grep -q 'credentials: "/registry-auth/stub"' "$D/graph3.yaml" || fail "the credentials splice did not apply"
 nc_build_workload "$ROOT" "$D/graph3.yaml" "$D/config3.bin" "$D/modules3.bin"
 wal_put "/registry-auth/stub" "puller:s3cret"
-wal_put "/image-requests/testapp" "repo=testapp;tag=latest"
-run_until "$D/config3.bin" "$D/modules3.bin" testapp 60
+wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
+run_until "$D/config3.bin" "$D/modules3.bin" testapp+latest 60
 for dg in "$D1" "$D2"; do
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "authenticated blob mismatch for $dg (sha=$got)"
 done
-[ "$(wal_last /image-config/testapp)" = "$want" ] || fail "authenticated image config: '$(wal_last /image-config/testapp)'"
+[ "$(wal_last /image-config/$MD)" = "$want" ] || fail "authenticated image config: '$(wal_last /image-config/$MD)'"
 NT="$(grep -c "^TOKEN .*basic=ok" "$D/auth.log" || true)"
 NS="$(grep -c "^401 .*token=stale" "$D/auth.log" || true)"
 grep -q "^TOKEN .*basic=no" "$D/auth.log" && fail "a token request went without the store's credentials"

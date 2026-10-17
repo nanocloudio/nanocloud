@@ -92,6 +92,8 @@ struct State {
     desk: HcDesk<SLOTS>,
     buf: [u8; HC_ENV_MAX],
     out: [u8; HC_ENV_MAX],
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -317,7 +319,7 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
         key[kl..kl + part.len()].copy_from_slice(part);
         kl += part.len();
     }
-    let store = Store::plain(sys);
+    let store = Store::plain(sys, &s.nag);
     let answer = if s.stage_step == 0 {
         let Some(body) = s.desk.stage_body(at, cid) else {
             // Aborted while it waited for the store: nothing is owed.

@@ -21,19 +21,31 @@ module nanocloud.podproject {
     metal: string = 32;   // prune: its graph, when it is a metal sandbox
   }
 
+  // /pod-specs/<uid>: the spec's fields (pj_source/pj_msource `paths`, in
+  // order) and what pod_image resolved its image to (`related`).
   message pp.Spec {
     seq: int = 1;
     rev: int = 2;
     key: string = 3;      // uid
-    cmd: string = 4;
+    cmd: string = 4;      // the container's command (argv)
     rootfs: string = 5;
     iso: string = 6;
     net: string = 7;
     tasks: string = 8;
     graph: string = 9;
     image: string = 10;       // a workload image's reference (pulled)
+    args: string = 11;        // the container's args (argv)
+    env: string = 12;         // the container's env (NAME=VALUE,… escaped)
+    workdir: string = 13;     // the container's workingDir (escaped)
+    cpu: string = 14;         // limits: millicores
+    mem: string = 15;         //         bytes
+    eph: string = 16;         //         ephemeral-storage bytes
+    pod: string = 17;         // "<ns>/<name>"
     res_rootfs: string = 70;  // related /pod-resolved/
-    res_cmd: string = 71;
+    res_cmd: string = 71;     //   the argv, command/args against the image's
+    res_env: string = 72;     //   the image's Env
+    res_wd: string = 73;      //   its WorkingDir
+    res_user: string = 74;    //   its User
   }
   message pp.Art {
     cid: int = 1;
@@ -41,6 +53,11 @@ module nanocloud.podproject {
     key: string = 3;
     p1: string = 4; p2: string = 5; p3: string = 6; p4: string = 7;
     p5: string = 8; p6: string = 9; p7: string = 10; p8: string = 11;
+    p9: string = 12; p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    p14: string = 80; p15: string = 81; p16: string = 82; p17: string = 83;
+    p18: string = 84; p19: string = 85; p20: string = 86; p21: string = 87;
+    p22: string = 88; p23: string = 89; p24: string = 90;
     ctx: Ctx = 254;
   }
   message pp.Made {
@@ -83,25 +100,51 @@ module nanocloud.podproject {
   enum DELETE = 4;
   enum MERGE = 6;
 
-  // A container pod: the explicit spec wins, the resolved image fills in.
-  // Absent parts contribute nothing to the join, so one branch serves a pod
-  // with a rootfs and one without.
+  // A container Pod's sandbox. Of an IMAGE (`image=`, no explicit rootfs): nothing
+  // until pod_image resolved it — the Pod is Pending meanwhile, and nothing
+  // of it runs on the node's own root — then the image's rootfs, the argv
+  // composed by the Kubernetes rules (pod_image), isolated (`iso=1`: the
+  // image's root is the process's root only in a mount namespace of its
+  // own). Its environment is the image's Env then the container's, a later
+  // entry overriding an earlier of its name (`env=`, joined; workload_effect
+  // composes it); `host=` the Pod's name (HOSTNAME); `wd=` the container's
+  // workingDir and `iwd=` the image's, the first that is set winning; `user=`
+  // the image's User; `cpu=`/`mem=`/`eph=` the container's limits.
+  // A Pod with no image (a host process, or an explicit rootfs): its command
+  // and args as one argv, its own env, no user.
   decision artifact(s: pp.Spec) -> pp.Art {
     when s.graph != "" ->
-      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when s.image != "" && s.rootfs == "" && has(s.res_cmd) && s.res_cmd != "" && has(s.res_rootfs)
+         && s.res_rootfs != "" && !s.res_rootfs.startsWith("pack:") ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "cmd=", p2: s.res_cmd, p3: ";rootfs=", p4: s.res_rootfs,
+               p5: ";iso=1;env=", p6: s.res_env, p7: ",", p8: s.env,
+               p9: ";host=", p10: s.pod.substring(s.pod.indexOf("/") + 1),
+               p11: ";wd=", p12: s.workdir, p13: ";iwd=", p14: s.res_wd,
+               p15: ";user=", p16: s.res_user, p17: ";cpu=", p18: s.cpu,
+               p19: ";mem=", p20: s.mem, p21: ";eph=", p22: s.eph, ctx: Ctx { key: s.key } };
+    when s.image != "" && s.rootfs == "" ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when s.cmd != "" && s.args != "" ->
+      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+               p1: "cmd=", p2: s.cmd, p3: " ", p4: s.args, p5: ";rootfs=", p6: s.rootfs,
+               p7: ";iso=", p8: s.iso, p9: ";env=", p10: s.env,
+               p11: ";host=", p12: s.pod.substring(s.pod.indexOf("/") + 1),
+               p13: ";wd=", p14: s.workdir, p15: ";iwd=;user=;cpu=", p16: s.cpu,
+               p17: ";mem=", p18: s.mem, p19: ";eph=", p20: s.eph, ctx: Ctx { key: s.key } };
     when s.cmd != "" ->
       pp.Art { cid: s.seq, op: MERGE, key: s.key,
                p1: "cmd=", p2: s.cmd, p3: ";rootfs=", p4: s.rootfs,
-               p5: ";iso=", p6: s.iso, p7: "", p8: "", ctx: Ctx { key: s.key } };
-    when s.res_cmd != "" ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
-               p1: "cmd=", p2: s.res_cmd, p3: ";rootfs=", p4: s.res_rootfs,
-               p5: ";iso=", p6: s.iso, p7: "", p8: "", ctx: Ctx { key: s.key } };
+               p5: ";iso=", p6: s.iso, p7: ";env=", p8: s.env,
+               p9: ";host=", p10: s.pod.substring(s.pod.indexOf("/") + 1),
+               p11: ";wd=", p12: s.workdir, p13: ";iwd=;user=;cpu=", p14: s.cpu,
+               p15: ";mem=", p16: s.mem, p17: ";eph=", p18: s.eph, ctx: Ctx { key: s.key } };
     default ->
-      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }
+  // A graph-backed Pod's sandbox, with the same limits (the CREATE header is
+  // one for every kind of workload).
   decision metal(s: pp.Spec) -> pp.Art {
     // A workload image: no sandbox until its pull resolved to a pack — the
     // Pod is Pending meanwhile — then the sandbox names it.
@@ -109,17 +152,16 @@ module nanocloud.podproject {
          && s.res_rootfs.startsWith("pack:") ->
       pp.Art { cid: s.seq, op: MERGE, key: s.key,
                p1: "graph=", p2: s.graph, p3: ";pack=", p4: s.res_rootfs.substring(5),
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+               p5: ";cpu=", p6: s.cpu, p7: ";mem=", p8: s.mem, p9: ";eph=", p10: s.eph,
+               ctx: Ctx { key: s.key } };
     when s.graph != "" && has(s.image) && s.image != "" ->
-      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     when s.graph != "" ->
       pp.Art { cid: s.seq, op: MERGE, key: s.key,
-               p1: "graph=", p2: s.graph, p3: "", p4: "",
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+               p1: "graph=", p2: s.graph, p3: ";cpu=", p4: s.cpu, p5: ";mem=", p6: s.mem,
+               p7: ";eph=", p8: s.eph, ctx: Ctx { key: s.key } };
     default ->
-      pp.Art { cid: s.seq, op: NOOP, key: "", p1: "", p2: "", p3: "", p4: "",
-               p5: "", p6: "", p7: "", p8: "", ctx: Ctx { key: s.key } };
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }
   // The runtime record the lifecycle chain runs on. Create-if-absent: it is
   // the pod's memory, and recreating it would forget a kill in flight.
@@ -147,7 +189,7 @@ module nanocloud.podproject {
       pp.Act { cid: k.cid, op: MERGE, key: "sandboxes/", k2: k.ctx.key, v1: "phase=delete" };
     when k.status == 404 ->
       pp.Act { cid: k.cid, op: DROP_EACH, key: k.ctx.key, k2: "",
-               v1: "pod-runtime,sandboxes,metal-sandboxes,sandbox-status,sandbox-boot-of,sandbox-logs,sandbox-kill,sandbox-pause,pod-lifecycle-status,probe-status,probe-rt-l,probe-rt-r,pod-resolved" };
+               v1: "pod-runtime,sandboxes,metal-sandboxes,sandbox-status,sandbox-boot-of,sandbox-logs,sandbox-kill,sandbox-pause,pod-lifecycle-status,probe-status,probe-rt-l,probe-rt-r,pod-resolved,pod-cond,pod-wait,pod-probes,image-requests,image-digests,image-index,image-pull-failed" };
     default ->
       pp.Act { cid: k.cid, op: NOOP, key: "", k2: "", v1: "" };
   }
@@ -155,7 +197,9 @@ module nanocloud.podproject {
   transformation pass_spec(s: pp.Spec) -> pp.Spec {
     pp.Spec { seq: s.seq, rev: s.rev, key: s.key, cmd: s.cmd, rootfs: s.rootfs,
               iso: s.iso, net: s.net, tasks: s.tasks, graph: s.graph, image: s.image,
-              res_rootfs: s.res_rootfs, res_cmd: s.res_cmd }
+              args: s.args, env: s.env, workdir: s.workdir, cpu: s.cpu, mem: s.mem,
+              eph: s.eph, pod: s.pod, res_rootfs: s.res_rootfs, res_cmd: s.res_cmd,
+              res_env: s.res_env, res_wd: s.res_wd, res_user: s.res_user }
   }
   transformation pass_made(m: pp.Made) -> pp.Made {
     pp.Made { cid: m.cid, status: m.status, value: m.value, ctx: m.ctx }

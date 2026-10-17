@@ -9,6 +9,8 @@ module nanocloud.gc {
     rev: int = 2;
     key: string = 3;     // "<ns>/<name>" — the tail below /pods/
     owner: string = 4;   // metadata.ownerReferences.0.name
+    kind: string = 5;    // metadata.ownerReferences.0.kind
+    want: string = 48;   // the kind this sweep probes for (the source's `label`)
     ns: string = 28;     // the key's namespace segment; the document may carry none
   }
 
@@ -57,10 +59,13 @@ module nanocloud.gc {
   // the HIGHEST (total - KEEP) keys survive, the lowest go.
   enum KEEP = 200;
 
-  // No ownerRef -> never collected (a user-owned top-level object). Otherwise
-  // probe the owner.
+  // No ownerRef -> never collected (a user-owned top-level object). An
+  // owner of another kind than this sweep's (`label`: the kind its probe's
+  // prefix holds) is not this sweep's to judge — a StatefulSet's or a
+  // DaemonSet's Pod is not an orphan for want of a ReplicaSet of its owner's
+  // name. Otherwise probe the owner.
   decision probe(o: gc.Owned) -> gc.Probe {
-    when o.owner == "" ->
+    when o.owner == "" || (has(o.want) && o.want != "" && has(o.kind) && o.kind != o.want) ->
       gc.Probe { cid: o.seq, op: NOOP, key: "", owned: o.key, sep: "", name: "" };
     default ->
       gc.Probe { cid: o.seq, op: EXISTS, key: o.ns,
@@ -88,7 +93,7 @@ module nanocloud.gc {
   }
 
   transformation pass_owned(o: gc.Owned) -> gc.Owned {
-    gc.Owned { seq: o.seq, rev: o.rev, key: o.key, owner: o.owner, ns: o.ns }
+    gc.Owned { seq: o.seq, rev: o.rev, key: o.key, owner: o.owner, kind: o.kind, want: o.want, ns: o.ns }
   }
   transformation pass_answer(a: gc.Answer) -> gc.Answer {
     gc.Answer { cid: a.cid, status: a.status, value: a.value, owned: a.owned }

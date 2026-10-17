@@ -10,7 +10,9 @@
 //
 //   /pod-runtime/<uid>  kill_phase kill_deadline backoff_until run_started
 //                       paused_since restarts was_terminal      (mine)
-//   /pod-specs/<uid>    cmd desired restart rootfs graph grace   (the ask)
+//   /pod-specs/<uid>    cmd desired restart rootfs graph grace   (the ask;
+//                       restart defaulted to always by pod_specs, as the
+//                       API server defaults restartPolicy)
 //   /sandbox-status/    state code                               (the world)
 //   /probe-status/      live                                     (liveness)
 //   /sandboxes/         cmd                    (does the artifact exist yet)
@@ -91,8 +93,11 @@ module nanocloud.podlifecycle {
   // restartPolicy.
   decision step(d: pl.Rt) -> pl.Step {
     // The artifact is not resolved yet (an image still pulling): report
-    // Pending and project NO sandbox.
-    when d.desired != "deleted" && d.cmd == "" && d.graph == "" && d.sb_cmd == "" ->
+    // Pending and project NO sandbox. What says so is the SANDBOX's argv,
+    // not the spec's command: a container's command is only half of what an
+    // image Pod runs, and a sandbox started before the pull would run it on
+    // the node's own root.
+    when d.desired != "deleted" && d.graph == "" && d.sb_cmd == "" ->
       pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "", pod: "Pending", kill: "", rst: d.restarts, metal: "", podkey: d.pod } };
 
     // ── desired = deleted ──────────────────────────────────────────────
@@ -179,6 +184,18 @@ module nanocloud.podlifecycle {
     when d.state == "destroyed" ->
       pl.Step { cid: d.seq, op: MERGE, key: d.key,
                 v1: "was_terminal=0;backoff_until=0", ctx: Ctx { key: d.key, sb: "start", pod: "Restarting", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
+
+    // ── a workload the node's restart ended ──
+    // A running or paused status recorded under another boot is the last
+    // boot's: nothing of it runs now, so the Pod is not Running — Pending,
+    // while the sandbox chain creates it again under this boot
+    // (sandbox.uproc), never the stale Running a restart would otherwise
+    // leave in the API. Its run clock is the last boot's too, and restarts.
+    when (d.state == "running" || d.state == "paused") && has(d.sboot) && has(d.boot) && d.sboot != d.boot && (d.run_started != 0 || d.paused_since != 0) ->
+      pl.Step { cid: d.seq, op: MERGE, key: d.key,
+                v1: "run_started=0;paused_since=0", ctx: Ctx { key: d.key, sb: "start", pod: "Pending", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
+    when (d.state == "running" || d.state == "paused") && has(d.sboot) && has(d.boot) && d.sboot != d.boot ->
+      pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "start", pod: "Pending", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
 
     // ── running / paused: the reset clock, frozen across a pause ──
     when d.state == "running" && d.run_started == 0 ->

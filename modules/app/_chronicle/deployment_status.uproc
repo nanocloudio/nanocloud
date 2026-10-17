@@ -1,0 +1,171 @@
+// Deployment status as params: how many of its Pods there are, how many are
+// ready and available, and how many run its CURRENT template — what `kubectl
+// get deploy` prints, what `kubectl rollout status` and `kubectl wait
+// --for=condition=Available` wait on.
+//
+//   /deployments.apps/<ns>/<name> (and its ReplicaSet, and any Pod) ->
+//   GET its ReplicaSet (same name: deployment.uproc projects one, and
+//   replicaset_status.uproc counts it) -> COUNT the Pods it owns that run the
+//   Deployment's template (their pod-template-hash is the Deployment's) ->
+//   PATCH status {observedGeneration, replicas, updatedReplicas,
+//   readyReplicas, availableReplicas, unavailableReplicas, conditions
+//   Available and Progressing}
+//
+// Available is upstream's default rule: at least replicas - floor(replicas /
+// 4) available (maxUnavailable 25%). The PATCH is put-if-changed.
+module nanocloud.deploymentstatus {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PATCH = 5;
+  enum COUNT = 12;
+
+  // carried by: ws.Count, ws.Counted
+  message Ctx {
+    key: string = 30;     // "<ns>/<name>"
+    ns: string = 31;
+    ouid: string = 32;    // the ReplicaSet's uid: its Pods' owner
+    gen: int = 33;        // metadata.generation
+    all: int = 34;        // its active Pods
+    want: int = 35;       // the Deployment's spec.replicas
+    hash: string = 36;    // the Deployment's template digest
+    reps: int = 37;       // the ReplicaSet's status, read
+    ready: int = 38;
+    avail: int = 39;
+    name: string = 40;
+  }
+
+  message ws.Count {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/", under /pods/
+    ctx: Ctx = 254;
+  }
+  // A COUNT's answer: how many children its predicate kept.
+  message ws.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: Ctx = 254;
+  }
+  // One Pod, as a COUNT's predicate reads it (the node's `paths`).
+  message ws.Pod {
+    owner: string = 40;   // metadata.ownerReferences.0.uid
+    del: string = 41;     // metadata.deletionTimestamp
+    phase: string = 42;   // status.phase
+    ready: string = 43;   // status.conditions[type=Ready].status
+    hash: string = 44;    // metadata.labels.pod-template-hash
+    ctx: Ctx = 254;
+  }
+  message ws.Keep {
+    k: int = 1;
+  }
+  message ws.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;  v2: int = 5;  v3: string = 6;  v4: int = 7;
+    v5: string = 8;  v6: int = 9;  v7: string = 10; v8: int = 11;
+    v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16;
+    v14: string = 80; v15: string = 81; v16: string = 82; v17: string = 83;
+    path: string = 19;
+  }
+
+  // ---- the Deployment ----
+  message ws.Dep {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<name>" — its ReplicaSet's too
+    want: int = 50;       // spec.replicas
+    gen: int = 51;        // metadata.generation
+    hash: string = 27;    // FNV-1a of spec.template (`hash`), as deployment.uproc labels it
+    ns: string = 28;
+    name: string = 29;
+  }
+  // dps_rs's answer: the ReplicaSet's uid and status.
+  message ws.RsGot {
+    cid: int = 1;
+    status: int = 2;
+    uid: string = 40;
+    reps: int = 50;
+    ready: int = 51;
+    avail: int = 52;
+    ctx: Ctx = 254;
+  }
+  message ws.Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  decision dp_read(d: ws.Dep) -> ws.Get {
+    when d.ns != "" ->
+      ws.Get { cid: d.seq, op: GET, key: d.key,
+               ctx: Ctx { key: d.key, ns: d.ns, gen: d.gen, want: d.want, hash: d.hash, name: d.name } };
+    default ->
+      ws.Get { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: "", ns: "", gen: 0, want: 0, hash: "", name: "" } };
+  }
+  // No ReplicaSet yet: nothing of it is counted, and the status says so.
+  decision dp_count(g: ws.RsGot) -> ws.Count {
+    when g.status == 200 && g.uid != "" ->
+      ws.Count { cid: g.cid, op: COUNT, key: g.ctx.ns + "/",
+                 ctx: Ctx { key: g.ctx.key, ns: g.ctx.ns, ouid: g.uid, gen: g.ctx.gen, want: g.ctx.want,
+                            hash: g.ctx.hash, name: g.ctx.name, reps: g.reps, ready: g.ready, avail: g.avail } };
+    default ->
+      ws.Count { cid: g.cid, op: NOOP, key: "",
+                 ctx: Ctx { key: g.ctx.key, ns: g.ctx.ns, ouid: "", gen: g.ctx.gen, want: g.ctx.want,
+                            hash: g.ctx.hash, name: g.ctx.name, reps: 0, ready: 0, avail: 0 } };
+  }
+  // Updated: the ReplicaSet's active Pods that run the Deployment's template.
+  decision dp_updated(p: ws.Pod) -> ws.Keep {
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" && p.hash == p.ctx.hash ->
+      ws.Keep { k: 1 };
+    default -> ws.Keep { };
+  }
+  // The status. `upd` is the count, 0 when there was no ReplicaSet to count.
+  decision dp_status(c: ws.Counted) -> ws.Set {
+    when c.ctx.key == "" ->
+      ws.Set { cid: c.cid, op: NOOP, key: "" };
+    when (c.status == 200 && has(c.n) && c.ctx.avail >= c.ctx.want - c.ctx.want / 4)
+         && (c.n == c.ctx.want && c.ctx.reps == c.n && c.ctx.avail == c.n) ->
+      ws.Set { cid: c.cid, op: PATCH, key: c.ctx.key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.ctx.gen, v3: ",\"replicas\":", v4: c.ctx.reps,
+               v5: ",\"updatedReplicas\":", v6: c.n, v7: ",\"readyReplicas\":", v8: c.ctx.ready,
+               v9: ",\"availableReplicas\":", v10: c.ctx.avail, v11: ",\"unavailableReplicas\":",
+               v12: math.greatest(c.ctx.want - c.ctx.avail, 0),
+               v13: ",\"conditions\":[{\"type\":\"Available\",\"status\":\"True\",\"reason\":\"MinimumReplicasAvailable\",\"message\":\"Deployment has minimum availability.\"},{\"type\":\"Progressing\",\"status\":\"True\",\"reason\":\"NewReplicaSetAvailable\",\"message\":\"ReplicaSet \\\"",
+               v14: c.ctx.name, v15: "\\\" has successfully progressed.\"}]}" };
+    when c.status == 200 && has(c.n) && c.ctx.avail >= c.ctx.want - c.ctx.want / 4 ->
+      ws.Set { cid: c.cid, op: PATCH, key: c.ctx.key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.ctx.gen, v3: ",\"replicas\":", v4: c.ctx.reps,
+               v5: ",\"updatedReplicas\":", v6: c.n, v7: ",\"readyReplicas\":", v8: c.ctx.ready,
+               v9: ",\"availableReplicas\":", v10: c.ctx.avail, v11: ",\"unavailableReplicas\":",
+               v12: math.greatest(c.ctx.want - c.ctx.avail, 0),
+               v13: ",\"conditions\":[{\"type\":\"Available\",\"status\":\"True\",\"reason\":\"MinimumReplicasAvailable\",\"message\":\"Deployment has minimum availability.\"},{\"type\":\"Progressing\",\"status\":\"True\",\"reason\":\"ReplicaSetUpdated\",\"message\":\"ReplicaSet \\\"",
+               v14: c.ctx.name, v15: "\\\" is progressing.\"}]}" };
+    when c.status == 200 && has(c.n) ->
+      ws.Set { cid: c.cid, op: PATCH, key: c.ctx.key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.ctx.gen, v3: ",\"replicas\":", v4: c.ctx.reps,
+               v5: ",\"updatedReplicas\":", v6: c.n, v7: ",\"readyReplicas\":", v8: c.ctx.ready,
+               v9: ",\"availableReplicas\":", v10: c.ctx.avail, v11: ",\"unavailableReplicas\":",
+               v12: math.greatest(c.ctx.want - c.ctx.avail, 0),
+               v13: ",\"conditions\":[{\"type\":\"Available\",\"status\":\"False\",\"reason\":\"MinimumReplicasUnavailable\",\"message\":\"Deployment does not have minimum availability.\"},{\"type\":\"Progressing\",\"status\":\"True\",\"reason\":\"ReplicaSetUpdated\",\"message\":\"ReplicaSet \\\"",
+               v14: c.ctx.name, v15: "\\\" is progressing.\"}]}" };
+    default ->
+      ws.Set { cid: c.cid, op: PATCH, key: c.ctx.key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.ctx.gen, v3: ",\"replicas\":0,\"updatedReplicas\":0,\"readyReplicas\":0,\"availableReplicas\":0,\"unavailableReplicas\":",
+               v4: c.ctx.want,
+               v5: ",\"conditions\":[{\"type\":\"Available\",\"status\":\"False\",\"reason\":\"MinimumReplicasUnavailable\",\"message\":\"Deployment does not have minimum availability.\"},{\"type\":\"Progressing\",\"status\":\"True\",\"reason\":\"NewReplicaSetCreated\",\"message\":\"Created new replica set \\\"",
+               v14: c.ctx.name, v15: "\\\"\"}]}" };
+  }
+
+  pipeline dp_p(d: ws.Dep) -> ws.Get { call x = dp_read(d); return x; }
+  pipeline dp_cnt_p(g: ws.RsGot) -> ws.Count { call x = dp_count(g); return x; }
+  pipeline dp_upd_p(p: ws.Pod) -> ws.Keep { call x = dp_updated(p); return x; }
+  pipeline dp_st_p(c: ws.Counted) -> ws.Set { call x = dp_status(c); return x; }
+  entry dp_p = dp_p;
+  entry dp_cnt_p = dp_cnt_p;
+  entry dp_upd_p = dp_upd_p;
+  entry dp_st_p = dp_st_p;
+  provenance revision "deployment-status" toolchain "chronicle-authoring";
+}

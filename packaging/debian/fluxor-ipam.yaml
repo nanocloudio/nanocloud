@@ -15,7 +15,7 @@ modules:
     prefix: "/ipam-request/"
     unless: "/ipam-lease/"
     count: 1
-    watch: "/ipam-lease/,/ipam-retry/"
+    watch: "/ipam-"
   - name: ip_cur
     type: store_effect
     # chronicle-source: modules/app/_chronicle/ipam_pod.uproc pa_cur
@@ -69,7 +69,7 @@ modules:
     flat: 1
     paths: "owner"
     ints: "ip"
-    watch: "/ipam-lease/,/ipam-request/"
+    watch: "/ipam"
   - name: ip_owner
     type: store_effect
     # chronicle-source: modules/app/_chronicle/ipam_pod_release.uproc pr_owner

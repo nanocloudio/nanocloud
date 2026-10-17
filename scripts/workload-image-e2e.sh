@@ -9,8 +9,9 @@
 #   fluxor build --emit=workload  -> graph.flxa + program_probe.fmod
 #   a registry stub serves them as `fluxor publish workload` lays them out
 #   (artifactType application/vnd.nanocloud.fluxor.workload-image.v1)
-#   POST Pod image=nanocloud/probe:1 -> pull -> /image-manifests/ kind=workload
-#     -> /image-rootfs/ path=pack:… -> /pod-resolved/ -> /metal-sandboxes/
+#   POST Pod image=nanocloud/probe:1 -> pull -> /image-digests/nanocloud~probe+1
+#     (the manifest's digest <m>) -> /image-manifests/<m> kind=workload
+#     -> /image-rootfs/<m> path=pack:<m> -> /pod-resolved/ -> /metal-sandboxes/
 #     pack=… -> CREATE (pack) -> Running, and the module's own log line
 #   DELETE the Pod -> its sandbox destroyed
 #   a second image that SERVES: redis_edge_anchor wired to the node's network
@@ -78,6 +79,7 @@ workloads:
 YAML
 wn_publish front "$D/front.yaml"
 wn_registry "$REG_PORT"
+MDIG="$(sha256sum "$D/reg/probe/manifest.json" | cut -d' ' -f1)"
 
 echo "== 2. seed the operator's identity: SA key, cluster-admin binding, a ready node =="
 wn_seed_identity
@@ -110,7 +112,7 @@ done
 case "$r" in 200\|*) echo "   GET /version -> 200" ;; *) fail "no API: $r" ;; esac
 
 echo "== 5. a Pod of the workload image is created through the API =="
-POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"probe","namespace":"default"},"spec":{"runtimeClassName":"fluxor","containers":[{"name":"probe","image":"nanocloud/probe:1"}]}}'
+POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"probe","namespace":"default"},"spec":{"runtimeClassName":"fluxor","containers":[{"name":"probe","image":"nanocloud/probe:1","resources":{"limits":{"ephemeral-storage":"256Mi"}}}]}}'
 for _ in $(seq 90); do
   r="$(api POST /api/v1/namespaces/default/pods "$POD")"
   case "$r" in 503\|*|403\|*) sleep 1 ;; *) break ;; esac
@@ -120,14 +122,14 @@ UID_="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys; print(json.load(sys
 echo "   uid $UID_"
 dump() {
   local k
-  for k in "/~node/node-1/pod-specs/$UID_" "/~node/node-1/image-requests/nanocloud_probe" \
-           "/~node/node-1/image-manifests/nanocloud_probe" "/~node/node-1/image-rootfs/nanocloud_probe" \
+  for k in "/~node/node-1/pod-specs/$UID_" "/~node/node-1/image-requests/nanocloud~probe+1" \
+           "/~node/node-1/image-digests/nanocloud~probe+1" "/~node/node-1/image-manifests/$MDIG" "/~node/node-1/image-rootfs/$MDIG" \
            "/~node/node-1/pod-resolved/$UID_" "/~node/node-1/metal-sandboxes/$UID_" \
            "/~node/node-1/sandbox-status/$UID_" "/~node/node-1/pod-lifecycle-status/$UID_" "/podstatus/$UID_"; do
     printf '   %-56s %s\n' "$k" "$(nc_store_get "$STORE" "$k" 2>/dev/null | cut -c1-110)"
   done
   tail -5 "$D/reg.log" | sed 's/^/   registry: /'
-  nc_store_keys "$STORE" 2>/dev/null | grep -aE "fetch-q|/image-|/blobs/" | head -12 | sed 's/^/   key: /'
+  nc_store_keys "$STORE" 2>/dev/null | grep -aE "/image-" | head -12 | sed 's/^/   key: /'
   grep -a "http_fetch\]" "$D/run.log" | tail -3 | cut -c1-140
 }
 
@@ -145,12 +147,17 @@ echo "   phase=${phase:-}"
 if [ "$phase" != "Running" ]; then dump; fail "the Pod never reached Running (phase='${phase:-}')"; fi
 grep -aq "\[prog\]" "$D/run.log" || { dump; fail "Running, but program_probe never logged: the pack did not run"; }
 echo "   $(grep -ao '\[prog\][^"]*' "$D/run.log" | head -1 | cut -c1-80)"
-man="$(nc_store_get "$STORE" /~node/node-1/image-manifests/nanocloud_probe)"
+[ "$(nc_store_get "$STORE" "/~node/node-1/image-digests/nanocloud~probe+1")" = "digest=$MDIG" ] \
+  || { dump; fail "nanocloud/probe:1 did not resolve to its manifest's digest"; }
+man="$(nc_store_get "$STORE" "/~node/node-1/image-manifests/$MDIG")"
 case "$man" in *";kind=workload;"*) echo "   manifest: kind=workload" ;; *) fail "manifest not marked a workload image: $man" ;; esac
 case "$(nc_store_get "$STORE" "/~node/node-1/metal-sandboxes/$UID_")" in
-  *"pack=nanocloud_probe"*) echo "   metal sandbox names its pack" ;;
-  *) dump; fail "the metal sandbox does not name the pack" ;;
+  *"pack=$MDIG"*";eph=268435456"*) echo "   metal sandbox names its pack (the digest) and its ephemeral-storage limit" ;;
+  *) dump; fail "the metal sandbox does not name the pack and its limit" ;;
 esac
+grep -aq "\[workload\] graph workload [0-9.]*: storage_bytes=268435456" "$D/run.log" \
+  || fail "the pack was not created with its ephemeral-storage limit as its owner's storage cap"
+echo "   created with storage_bytes=268435456: the Pod's own storage root capped at its ephemeral-storage"
 
 echo "== 7. the Pod is deleted; its workload goes =="
 r="$(api DELETE /api/v1/namespaces/default/pods/probe)"

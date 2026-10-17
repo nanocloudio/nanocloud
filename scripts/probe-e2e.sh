@@ -18,8 +18,10 @@
 #                no dial connector exists yet: it gets NO probe state and no
 #                status — never faked as pass OR fail, no restart may fire
 #
-# Probe fields on /pod-specs/<uid> (flat, per kind l|r):
-#   <k>p_cmd <k>p_period <k>p_timeout <k>p_fail <k>p_succ
+# Probe fields on /pod-probes/<uid> (flat, per kind l|r; pod_probes.uproc
+# writes them from a Pod's probes):
+#   <k>p_cmd <k>p_period <k>p_timeout <k>p_fail <k>p_succ <k>p_delay
+# (unstated: upstream's defaults, 10 s / 1 s / 3 / 1 / 0)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -104,11 +106,14 @@ nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 echo "== 2. materialize sleeper bundles + the probe matrix =="
 mkdir -p "$D/slp"
 # Readiness: /bin/true every 1s, timeout 2s, 1 fail / 1 success to flip.
-store_put "/pod-specs/pod-ready" "cmd=/bin/sleep 60;desired=running;rp_cmd=/bin/true;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
+store_put "/pod-specs/pod-ready" "cmd=/bin/sleep 60;desired=running"
+store_put "/pod-probes/pod-ready" "rp_cmd=/bin/true;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
 # Liveness: /bin/false every 1s, 2 consecutive fails flip live→0.
-store_put "/pod-specs/pod-live"  "cmd=/bin/sleep 60;desired=running;restart=always;lp_cmd=/bin/false;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
+store_put "/pod-specs/pod-live" "cmd=/bin/sleep 60;desired=running;restart=always"
+store_put "/pod-probes/pod-live" "lp_cmd=/bin/false;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
 # tcp: parsed, NOT IMPLEMENTED — must be ignored (no fake verdict, no restart).
-store_put "/pod-specs/pod-tcp"   "cmd=/bin/sleep 60;desired=running;lp_tcp=8080;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
+store_put "/pod-specs/pod-tcp" "cmd=/bin/sleep 60;desired=running"
+store_put "/pod-probes/pod-tcp" "lp_tcp=8080;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
 
 echo "== 3. run the pipeline (probe cadence ~1s; liveness kill + backoff ~4s) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 14 "$FLUXOR_RUNTIME" \

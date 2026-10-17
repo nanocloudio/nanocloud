@@ -141,6 +141,8 @@ struct State {
 
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -379,7 +381,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // re-adding (issuer, profile, kid) replaces it in kagi's keyset.
         if s.key_backoff == 0 {
             publish_key(s, sys);
-            s.key_backoff = if s.key_published == 0 { KEY_RETRY_STEPS } else { KEY_REFRESH_STEPS };
+            s.key_backoff = if s.key_published == 0 {
+                KEY_RETRY_STEPS
+            } else {
+                KEY_REFRESH_STEPS
+            };
         } else {
             s.key_backoff -= 1;
         }
@@ -421,7 +427,7 @@ unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
         let mut key = [0u8; KEY_BUF];
         // `get_value` REFUSES an oversized value rather than truncating it — a
         // half key would verify nothing and say nothing about why.
-        let Some(n) = get_value(&Store::plain(sys), path, &mut key) else {
+        let Some(n) = get_value(&Store::plain(sys, &s.nag), path, &mut key) else {
             return; // not published yet, or too large; retried next step
         };
         if n == 0 {

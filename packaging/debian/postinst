@@ -95,13 +95,20 @@ gen_peer_pki() {
         umask 022
         cat >"$ENV" <<EOF
 # This node in the store's group (nanocloud-graph.sh renders its graph from
-# these at each start). A single node: the control plane, replica 0, alone.
+# these at each start). A single node: the control plane, replica 0, alone,
+# and its own node: it registers itself and runs Pods (NANOCLOUD_PODS=1).
 NANOCLOUD_ROLE=plane
+NANOCLOUD_PODS=1
 NANOCLOUD_NODE_NAME=$HOST
 NANOCLOUD_REPLICA_ID=0
 NANOCLOUD_VOTERS=1
 NANOCLOUD_PEER_PORT=7450
 NANOCLOUD_PEERS="0=127.0.0.1:7450"
+# The registry a bare image reference means, and the only one pulled from;
+# its CA (DER) authenticates it. Without the CA the node pulls no images.
+#NANOCLOUD_REGISTRY=registry.nanocloud.io:5000
+#NANOCLOUD_REGISTRY_ADDR=registry.nanocloud.io:5000
+#NANOCLOUD_REGISTRY_CA=/etc/nanocloud.io/certs/ca.der
 EOF
     fi
 }
@@ -110,7 +117,10 @@ gen_seal_key() {
     # The node's ONE symmetric root: the key the fluxor vault seals its keys
     # under. The signing root — `nanocloud.ca`, which issues certificates and
     # ServiceAccount tokens — is generated INSIDE the vault on first use and is
-    # only ever stored sealed under this; nothing else is provisioned. Written
+    # only ever stored sealed under this, never written out. (The API's TLS key
+    # and the peer keys are provisioned as files, by gen_node_cert and
+    # gen_peer_pki, unless the node runs under NANOCLOUD_PEER_TRUST=authority,
+    # where they too are born in the vault.) Written
     # once and never rotated here: a new seal key orphans every sealed key, and
     # with them every certificate and token already issued.
     SEAL=/etc/nanocloud.io/seal.env

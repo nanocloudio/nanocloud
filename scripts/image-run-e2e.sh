@@ -17,6 +17,14 @@
 #     layer2 = /etc/tag + a whiteout deleting /marker.
 # The pod spec carries NO `cmd=` — argv comes from the image config's
 # Entrypoint ++ Cmd, which is the whole point: `image=<name>` alone must run.
+# A second image, v2 (another Entrypoint, one more layer), proves the keying:
+# every tag resolves to a manifest DIGEST and everything is cached by it, so
+# testapp:v1 and testapp:v2 run different programs; `registry.nanocloud.io:
+# 5000/testapp:v2` (the node's registry, named) and `testapp@sha256:…` run
+# v2; a reference to another registry is refused (ErrImagePull, nothing
+# pulled); and once `latest` is moved to v2, a new Pod (Always, the default
+# for :latest) runs v2 while an IfNotPresent one keeps the cached v1 and the
+# first Pod keeps the digest it resolved.
 # PASS = pod reaches Succeeded and /sandbox-logs/ carries the binary's output,
 # with the whiteout applied in the assembled rootfs.
 #
@@ -54,7 +62,7 @@ RUNTIME_PID=""
 cleanup() {
   [ -n "$RUNTIME_PID" ] && sudo -n kill "$RUNTIME_PID" 2>/dev/null || true
   [ -n "$REG_PID" ] && kill "$REG_PID" 2>/dev/null || true
-  sudo -n rm -rf "$D" 2>/dev/null || rm -rf "$D"
+  if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else sudo -n rm -rf "$D" 2>/dev/null || rm -rf "$D"; fi
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -25 "$D/run.log" 2>/dev/null || true; exit 1; }
@@ -98,18 +106,24 @@ print(out.decode() if out is not None else "")
 PY
 }
 
-echo "== 1. author a runnable 2-layer image (static binary + whiteout) =="
-mkdir -p "$D/reg" "$D/blobcache" "$D/rootfs" "$D/l1/bin" "$D/l2/etc"
+echo "== 1. author two runnable images (static binaries + a whiteout) =="
+mkdir -p "$D/reg" "$D/blobcache" "$D/rootfs" "$D/l1/bin" "$D/l2/etc" "$D/l3/bin"
 cat > "$D/hello.c" <<'EOF'
 #include <unistd.h>
 int main(void) { write(1, "hello-from-image\n", 17); return 0; }
 EOF
+cat > "$D/hello2.c" <<'EOF'
+#include <unistd.h>
+int main(void) { write(1, "hello-from-v2\n", 14); return 0; }
+EOF
 cc -static -o "$D/l1/bin/hello-static" "$D/hello.c"
+cc -static -o "$D/l3/bin/hello-v2" "$D/hello2.c"
 echo "to-be-whited-out" > "$D/l1/marker"
 echo "layer2" > "$D/l2/etc/tag"
 touch "$D/l2/.wh.marker"                       # OCI whiteout: delete /marker
 tar -czf "$D/reg/l1.tgz" -C "$D/l1" bin marker
 tar -czf "$D/reg/l2.tgz" -C "$D/l2" etc .wh.marker
+tar -czf "$D/reg/l3.tgz" -C "$D/l3" bin
 python3 - "$D/reg" <<'PY'
 import hashlib, json, os, sys
 d = sys.argv[1]
@@ -121,62 +135,62 @@ def land(raw):
     return h, len(raw)
 
 digs = []
-for f in ("l1.tgz", "l2.tgz"):
+for f in ("l1.tgz", "l2.tgz", "l3.tgz"):
     path = os.path.join(d, f)
     b = open(path, "rb").read()
     os.remove(path)
     digs.append(land(b))
 
-# The image config: what the runtime contract comes from. Entrypoint ++ Cmd is
-# the argv the pod must end up spawning without the spec ever naming it.
-config = {
-    "architecture": "arm64",
-    "os": "linux",
-    "config": {
-        "Env": ["PATH=/bin"],
-        "Entrypoint": ["/bin/hello-static"],
-        "Cmd": ["--ignored"],
-        "WorkingDir": "/",
-        "User": "root",
-    },
-}
-cfg_hex, cfg_len = land(json.dumps(config).encode())
+def image(entrypoint, layers):
+    # The image config: what the runtime contract comes from. Entrypoint ++
+    # Cmd is the argv the pod must end up spawning without the spec naming it.
+    config = {"architecture": "arm64", "os": "linux",
+              "config": {"Env": ["PATH=/bin"], "Entrypoint": [entrypoint], "Cmd": ["--ignored"],
+                         "WorkingDir": "/", "User": "root"}}
+    cfg_hex, cfg_len = land(json.dumps(config).encode())
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "size": cfg_len, "digest": "sha256:" + cfg_hex},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": n, "digest": "sha256:" + h} for h, n in layers],
+    }
+    return land(json.dumps(manifest).encode()) + (cfg_hex, cfg_len)
 
-manifest = {
-    "schemaVersion": 2,
-    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-    "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-               "size": cfg_len, "digest": "sha256:" + cfg_hex},
-    "layers": [
-        {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-         "size": n, "digest": "sha256:" + h} for h, n in digs
-    ],
-}
-man_hex, man_len = land(json.dumps(manifest).encode())
+v1_hex, v1_len, cfg_hex, cfg_len = image("/bin/hello-static", digs[:2])
+# v2: another Entrypoint, one more layer; the first two shared with v1.
+v2_hex, v2_len, _, _ = image("/bin/hello-v2", digs)
 
-# The tag resolves to an INDEX, not the manifest — the multi-arch shape. The
+# `latest` resolves to an INDEX, not the manifest — the multi-arch shape. The
 # amd64 entry comes FIRST so "take the first entry" would pick the wrong one.
-index = {
-    "schemaVersion": 2,
-    "mediaType": "application/vnd.oci.image.index.v1+json",
-    "manifests": [
-        {"mediaType": "application/vnd.oci.image.manifest.v1+json",
-         "size": 3, "digest": "sha256:" + "e" * 64,
-         "platform": {"architecture": "amd64", "os": "linux"}},
-        {"mediaType": "application/vnd.oci.image.manifest.v1+json",
-         "size": man_len, "digest": "sha256:" + man_hex,
-         "platform": {"architecture": "arm64", "os": "linux"}},
-    ],
-}
-open(os.path.join(d, "index.json"), "w").write(json.dumps(index))
+def index(h, n):
+    return json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "size": 3, "digest": "sha256:" + "e" * 64,
+             "platform": {"architecture": "amd64", "os": "linux"}},
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "size": n, "digest": "sha256:" + h,
+             "platform": {"architecture": "arm64", "os": "linux"}},
+        ]})
+open(os.path.join(d, "index-v2.json"), "w").write(index(v2_hex, v2_len))
+# The registry's tags, as files: what each names right now.
+os.makedirs(os.path.join(d, "tags"), exist_ok=True)
+for tag, body in (("latest", index(v1_hex, v1_len)), ("v1", open(os.path.join(d, v1_hex)).read()),
+                  ("v2", open(os.path.join(d, v2_hex)).read())):
+    open(os.path.join(d, "tags", tag), "w").write(body)
 open(os.path.join(d, "digests.txt"), "w").write(
-    "\n".join([h for h, _ in digs] + [cfg_hex, str(cfg_len), man_hex]))
+    "\n".join([h for h, _ in digs[:2]] + [cfg_hex, str(cfg_len), v1_hex, v2_hex]))
 PY
 D1="$(sed -n 1p "$D/reg/digests.txt")"
 D2="$(sed -n 2p "$D/reg/digests.txt")"
 DCFG="$(sed -n 3p "$D/reg/digests.txt")"
 NCFG="$(sed -n 4p "$D/reg/digests.txt")"
 DMAN="$(sed -n 5p "$D/reg/digests.txt")"
+DMAN2="$(sed -n 6p "$D/reg/digests.txt")"
 cp "$ROOT/packaging/debian/assemble-image.sh" "$D/assemble-image.sh"
 chmod 755 "$D/assemble-image.sh"
 
@@ -184,7 +198,6 @@ echo "== 2. start the registry stub (:$PORT) =="
 python3 - "$D/reg" "$PORT" >"$D/reg.log" 2>&1 <<'PY' &
 import http.server, os, socketserver, sys
 d, port = sys.argv[1], int(sys.argv[2])
-index = open(os.path.join(d, "index.json"), "rb").read()
 def blob(ref):
     p = os.path.join(d, ref.split(":")[-1])
     return open(p, "rb").read() if os.path.exists(p) else None
@@ -194,10 +207,14 @@ class H(http.server.BaseHTTPRequestHandler):
         parts = self.path.strip("/").split("/")
         body = None
         if len(parts) >= 4 and parts[0] == "v2" and parts[-2] == "manifests":
-            # A tag resolves to the index; a digest to that exact manifest.
-            body = blob(parts[-1]) if parts[-1].startswith("sha256:") else index
+            # A digest names that exact manifest; a tag what tags/<tag> holds now.
+            if parts[-1].startswith("sha256:"):
+                body = blob(parts[-1])
+            elif os.path.exists(os.path.join(d, "tags", parts[-1])):
+                body = open(os.path.join(d, "tags", parts[-1]), "rb").read()
         elif len(parts) >= 4 and parts[0] == "v2" and parts[-2] == "blobs":
             body = blob(parts[-1])
+        sys.stderr.write(f"GET {self.path} {200 if body is not None else 404}\n"); sys.stderr.flush()
         if body is None:
             self.send_response(404); self.send_header("Content-Length", "0")
             self.send_header("Connection", "close"); self.end_headers(); return
@@ -227,7 +244,7 @@ done
 # Guard against a STALE stub squatting the port (a previous run's trap not
 # firing — e.g. a machine reset): the listener must serve OUR manifest.
 kill -0 "$REG_PID" 2>/dev/null || fail "registry stub died (stale listener on :$PORT? $(ss -ltnp 2>/dev/null | grep ":$PORT" || true))"
-curl -s "http://127.0.0.1:$PORT/v2/testapp/manifests/latest" | cmp -s - "$D/reg/index.json" \
+curl -s "http://127.0.0.1:$PORT/v2/testapp/manifests/latest" | cmp -s - "$D/reg/tags/latest" \
   || fail "listener on :$PORT is not our stub (stale process from a previous run?)"
 
 echo "== 3. write the pod-image graph =="
@@ -239,7 +256,11 @@ chain_part() {
 import re, sys
 src = open(sys.argv[1]).read()
 if sys.argv[2] == "mods":
-    print(src[src.index('  # \u2500\u2500 project'):src.index('\nwiring:')].rstrip())
+    # Not pi_bad: sb_evout feeds it (a pack's cache faults), and this
+    # graph's sandbox runtime is not the block that carries sb_evout.
+    mods = src[src.index('  # \u2500\u2500 project'):src.index('\nwiring:')]
+    mods = mods[:mods.index("  # \u2500\u2500 a pack's cache faults")]
+    print(mods.rstrip())
 else:
     raw = src[src.index('wiring:') + len('wiring:\n'):].split('\n')
     blocks, cur = [], None
@@ -259,8 +280,10 @@ PY2
 CHAIN_MODS="$(chain_part mods)"
 CHAIN_WIRE="$(chain_part wire)"
 # The packaged pull chain too, pointed at the stub and the temp cache.
-PULL="$(sed -e "s#registry.nanocloud.io:5000#127.0.0.1:$PORT#" -e "s#/var/lib/nanocloud.io/image/blobs#$D/blobcache#" \
-  "$ROOT/packaging/debian/fluxor-imagepull.yaml")"
+# Only where it dials moves: the node's registry stays registry.nanocloud.io:5000,
+# which a reference naming it explicitly is served from too.
+PULL="$(sed -e "s#authority: \"registry.nanocloud.io:5000\"#authority: \"127.0.0.1:$PORT\"#" \
+  -e "s#/var/lib/nanocloud.io/image/blobs#$D/blobcache#" "$ROOT/packaging/debian/fluxor-imagepull.yaml")"
 PULL_MODS="$(printf '%s\n' "$PULL" | sed -n '/^modules:/,/^wiring:/p' | sed '1d;$d')"
 PULL_WIRE="$(printf '%s\n' "$PULL" | sed -n '/^wiring:/,$p' | sed '1d')"
 cat >"$D/graph.yaml" <<YAML
@@ -280,44 +303,76 @@ ${SANDBOX_WIRE}
 ${CHAIN_WIRE}
 YAML
 
-echo "== 4. build config + module table; seed the image-backed pod =="
+echo "== 4. build config + module table; seed the image-backed pods =="
 nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
-# No `cmd=`: argv must come from the image config the fetcher pulls.
+# No `cmd=`: argv must come from the image config the pull brings.
 # Where assembly runs, for this test (the packaged paths otherwise).
 wal_put "/config/image" "script=$D/assemble-image.sh;rootfs=$D/rootfs;blobs=$D/blobcache"
 # A volume: a host directory, bound read-only into the container at /data.
 mkdir -p "$D/voldata" && echo "from-the-host" >"$D/voldata/note"
 wal_put "/volumes/data" "path=$D/voldata"
+# No tag: latest, imagePullPolicy Always by default.
 wal_put "/pod-specs/pod-img-1" "image=testapp;iso=1;desired=running;restart=never;volumes=data:/data:ro"
+# Tags v1 and v2: different Entrypoints.
+wal_put "/pod-specs/pod-v1" "image=testapp:v1;iso=1;desired=running;restart=never"
+wal_put "/pod-specs/pod-v2" "image=testapp:v2;iso=1;desired=running;restart=never"
+# The node's own registry, named; and v2 pinned by its digest.
+wal_put "/pod-specs/pod-host" "image=registry.nanocloud.io:5000/testapp:v2;iso=1;desired=running;restart=never"
+wal_put "/pod-specs/pod-pin" "image=testapp@sha256:$DMAN2;iso=1;desired=running;restart=never"
+# :latest, IfNotPresent: the reference's cached resolution, shared.
+wal_put "/pod-specs/pod-inp1" "image=testapp:latest;pull=IfNotPresent;iso=1;desired=running;restart=never"
+# Another registry: refused, the Pod's event, nothing pulled from this one.
+wal_put "/pod-specs/pod-foreign" "image=other.example:5000/testapp:v1;pod=default/foreign;iso=1;desired=running;restart=never"
 
-echo "== 5. run the graph (as root — pivot_root) until the pod terminates =="
-sudo -n env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
-RUNTIME_PID=$!
-phase=""
-for i in $(seq 1 120); do
-  st="$(wal_last "/pod-lifecycle-status/pod-img-1")"
-  case "$st" in
-    *Succeeded*) phase="Succeeded"; break ;;
-    *Failed*)    phase="Failed"; break ;;
+terminal() { # terminal <uid>: Succeeded / Failed / ""
+  case "$(wal_last "/pod-lifecycle-status/$1")" in
+    *Succeeded*) echo Succeeded ;; *Failed*) echo Failed ;; *) echo "" ;;
   esac
-  sudo -n kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early"
-  sleep 0.25
-done
-sudo -n kill "$RUNTIME_PID" 2>/dev/null || true
-RUNTIME_PID=""
-[ "$phase" = "Succeeded" ] || fail "pod never Succeeded: status='$(wal_last "/pod-lifecycle-status/pod-img-1")' cfg='$(wal_last "/image-config/testapp")' man='$(wal_last "/image-manifests/testapp")' rootfs='$(wal_last "/image-rootfs/testapp")' sbx='$(wal_last "/sandbox-status/pod-img-1")' asmjob='$(wal_last "/sandboxes/img-asm-testapp")' asmst='$(wal_last "/sandbox-status/img-asm-testapp")' asmlog='$(wal_last "/sandbox-logs/img-asm-testapp")'"
+}
+run_until_done() { # run_until_done <uid>... — the graph (as root: pivot_root) until each terminates
+  sudo -n env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
+    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  RUNTIME_PID=$!
+  local i u left
+  for i in $(seq 1 240); do
+    left=""
+    for u in "$@"; do [ -n "$(terminal "$u")" ] || left="$left $u"; done
+    [ -z "$left" ] && break
+    sudo -n kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime exited early"
+    sleep 0.25
+  done
+  sleep 1
+  sudo -n kill "$RUNTIME_PID" 2>/dev/null || true
+  for i in $(seq 1 20); do sudo -n kill -0 "$RUNTIME_PID" 2>/dev/null || break; sleep 0.25; done
+  RUNTIME_PID=""
+  [ -z "$left" ] || fail "never terminated:$left (pod-img-1 status='$(wal_last /pod-lifecycle-status/pod-img-1)' digest='$(wal_last /image-digests/pod-img-1)')"
+}
+dig_of() { wal_last "/image-digests/$1" | sed -n 's/^digest=//p'; }
+ran() { # ran <uid> <digest> <log line>: Succeeded, resolved to that digest, said that
+  [ "$(terminal "$1")" = Succeeded ] || fail "$1 did not succeed: '$(wal_last "/pod-lifecycle-status/$1")'"
+  case ";$(wal_last "/pod-resolved/$1");" in
+    ";rootfs=$D/rootfs/$2;digest=$2;"*";cmd="*) ;;
+    *) fail "$1 resolved to '$(wal_last "/pod-resolved/$1")', not $2" ;;
+  esac
+  case "$(wal_last "/sandbox-logs/$1")" in
+    *"$3"*) ;; *) fail "$1 logs: '$(wal_last "/sandbox-logs/$1")', want '$3'" ;;
+  esac
+}
+
+echo "== 5. run the graph (as root — pivot_root) until every pod terminates =="
+run_until_done pod-img-1 pod-v1 pod-v2 pod-host pod-pin pod-inp1
 
 echo "== 6. verify every stage of the chain =="
-req="$(wal_last "/image-requests/testapp")"
-[ "$req" = "repo=testapp;tag=latest" ] || fail "pull trigger wrong: '$req'"
-echo "   pull trigger: $req (written by pod_lifecycle)"
-man="$(wal_last "/image-manifests/testapp")"
+req="$(wal_last "/image-requests/pod-img-1")"
+[ "$req" = "reg=;repo=testapp;tag=latest;pin=" ] || fail "pull trigger wrong: '$req'"
+echo "   pull trigger: /image-requests/pod-img-1 = $req (no tag: latest, Always — the Pod's own)"
+[ "$(dig_of pod-img-1)" = "$DMAN" ] || fail "latest resolved to '$(wal_last /image-digests/pod-img-1)', not the index's arm64 manifest $DMAN"
+man="$(wal_last "/image-manifests/$DMAN")"
 case "$man" in
-  *"config=$DCFG;configsize=$NCFG"*) echo "   index: arm64 manifest selected (amd64 decoy skipped), config descriptor recorded" ;;
+  *"config=$DCFG;configsize=$NCFG"*) echo "   index: arm64 manifest selected (amd64 decoy skipped) -> ${DMAN:0:12}…, config descriptor recorded" ;;
   *) fail "manifest record missing the config descriptor: '$man'" ;;
 esac
-cfg="$(wal_last "/image-config/testapp")"
+cfg="$(wal_last "/image-config/$DMAN")"
 want="entrypoint=/bin/hello-static;cmd=--ignored;env=PATH=/bin;workdir=/;user=root"
 [ "$cfg" = "$want" ] || fail "image config wrong: got '$cfg' want '$want'"
 echo "   image config: $cfg"
@@ -326,7 +381,7 @@ case "$sbx" in
   "cmd=/bin/hello-static --ignored;"*) echo "   argv came from the image (Entrypoint ++ Cmd), not the pod spec" ;;
   *) fail "sandbox argv not config-derived: '$sbx'" ;;
 esac
-[ -n "$(wal_last "/image-layer-ok/testapp-0")" ] && [ -n "$(wal_last "/image-layer-ok/testapp-1")" ] \
+[ -n "$(wal_last "/image-layer-ok/$DMAN-0")" ] && [ -n "$(wal_last "/image-layer-ok/$DMAN-1")" ] \
   || fail "layers not all marked cached"
 # Blob files + rootfs are root-owned (the runtime runs as root) — check via sudo.
 for dg in "$D1" "$D2"; do
@@ -334,23 +389,55 @@ for dg in "$D1" "$D2"; do
   [ "$got" = "$dg" ] || fail "cached blob mismatch: $dg"
 done
 echo "   blob cache: both layers digest-verified"
-rfs="$(wal_last "/image-rootfs/testapp")"
-[ "$rfs" = "path=$D/rootfs/testapp;state=ready" ] || fail "rootfs record wrong: '$rfs'"
-sudo -n test -x "$D/rootfs/testapp/bin/hello-static" || fail "assembled rootfs missing the binary"
-sudo -n test -f "$D/rootfs/testapp/etc/tag" || fail "assembled rootfs missing layer2 file"
-sudo -n test -e "$D/rootfs/testapp/marker" && fail "whiteout NOT applied (marker survived)"
-echo "   rootfs: assembled at $D/rootfs/testapp, whiteout applied"
-logs="$(wal_last "/sandbox-logs/pod-img-1")"
-case "$logs" in
-  *hello-from-image*) echo "   container ran: logs carry 'hello-from-image'" ;;
-  *) fail "sandbox logs wrong: got '$logs', want 'hello-from-image'" ;;
-esac
+rfs="$(wal_last "/image-rootfs/$DMAN")"
+[ "$rfs" = "path=$D/rootfs/$DMAN;state=ready" ] || fail "rootfs record wrong: '$rfs'"
+sudo -n test -x "$D/rootfs/$DMAN/bin/hello-static" || fail "assembled rootfs missing the binary"
+sudo -n test -f "$D/rootfs/$DMAN/etc/tag" || fail "assembled rootfs missing layer2 file"
+sudo -n test -e "$D/rootfs/$DMAN/marker" && fail "whiteout NOT applied (marker survived)"
+echo "   rootfs: assembled at $D/rootfs/${DMAN:0:12}… (keyed by the digest), whiteout applied"
+ran pod-img-1 "$DMAN" hello-from-image
+echo "   container ran: logs carry 'hello-from-image'"
 [ "$(wal_last /volume-binds/pod-img-1/0)" = "$D/voldata:/data:ro" ] || fail "volume bind row: '$(wal_last /volume-binds/pod-img-1/0)'"
 echo "   volume: $D/voldata bound read-only at /data (the pod ran with it)"
-asm="$(wal_last "/sandbox-status/img-asm-testapp")"
+asm="$(wal_last "/sandbox-status/img-asm-$DMAN")"
 case "$asm" in
   *destroyed*|*exited*) echo "   assembly job torn down ($asm)" ;;
   *) fail "assembly job not cleaned up: '$asm'" ;;
 esac
 
-echo "== E2E green: pod with image= ONLY — index→platform manifest→config+layers pulled, assembled (whiteouts + /dev), argv from the image config, and RAN — the full container chain =="
+echo "== 7. a tag change runs the other image: v1 and v2, different Entrypoints =="
+ran pod-v1 "$DMAN" hello-from-image
+ran pod-v2 "$DMAN2" hello-from-v2
+[ "$(dig_of 'testapp+v1')" = "$DMAN" ] && [ "$(dig_of 'testapp+v2')" = "$DMAN2" ] || fail "tags keyed wrong"
+echo "   testapp:v1 -> ${DMAN:0:12}… said hello-from-image; testapp:v2 -> ${DMAN2:0:12}… said hello-from-v2"
+
+echo "== 8. registry.nanocloud.io:5000/testapp:v2 (the node's registry, named) and testapp@sha256:… =="
+ran pod-host "$DMAN2" hello-from-v2
+ran pod-pin "$DMAN2" hello-from-v2
+grep -q "GET /v2/testapp/manifests/sha256:$DMAN2 200" "$D/reg.log" || fail "the pin was not fetched by its digest"
+echo "   both ran v2; the pin was fetched by digest"
+
+echo "== 9. another registry: refused, the Pod's ErrImagePull event, nothing pulled =="
+case "$(wal_last '/image-digests/other.example+5000~testapp+v1')" in
+  "refused=registry other.example:5000 is not this node's registry registry.nanocloud.io:5000"*) ;;
+  *) fail "foreign reference: '$(wal_last '/image-digests/other.example+5000~testapp+v1')'" ;;
+esac
+E="$(wal_last /events/default/pod-foreign.ErrImagePull)"
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["reason"]=="ErrImagePull" and e["type"]=="Warning" and e["involvedObject"]["name"]=="foreign", e' "$E" \
+  || fail "no ErrImagePull event: '$E'"
+[ -z "$(wal_last /pod-resolved/pod-foreign)" ] && [ -z "$(terminal pod-foreign)" ] || fail "a refused Pod ran"
+[ "$(grep -c 'manifests/v1 ' "$D/reg.log")" = 1 ] || fail "the foreign reference was asked of this registry"
+echo "   $(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["message"])' "$E")"
+
+echo "== 10. latest moves to v2: Always re-resolves for a new Pod, IfNotPresent keeps what is cached, a Pod keeps its digest =="
+cp "$D/reg/index-v2.json" "$D/reg/tags/latest"
+wal_put "/pod-specs/pod-latest2" "image=testapp:latest;iso=1;desired=running;restart=never"
+wal_put "/pod-specs/pod-inp2" "image=testapp:latest;pull=IfNotPresent;iso=1;desired=running;restart=never"
+run_until_done pod-latest2 pod-inp2
+ran pod-latest2 "$DMAN2" hello-from-v2
+ran pod-inp2 "$DMAN" hello-from-image
+[ "$(dig_of pod-img-1)" = "$DMAN" ] || fail "pod-img-1's resolution moved with the tag"
+ran pod-img-1 "$DMAN" hello-from-image
+echo "   pod-latest2 (Always) -> v2; pod-inp2 (IfNotPresent) -> the cached v1; pod-img-1 still names v1"
+
+echo "== E2E green: pods with image= ONLY — tags resolved to digests (index→platform manifest→config+layers), assembled per digest (whiteouts + /dev), argv from the image config, RAN; tag change, :latest Always, host:port and digest references, a foreign registry refused =="

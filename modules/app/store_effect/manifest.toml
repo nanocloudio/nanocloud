@@ -23,7 +23,8 @@ hardware_targets = ["bcm2712", "linux"]
 #                3, 17, 18 = KEY PARTS (bytes), joined after `key_prefix`. An
 #                     owner key `<ns>/<owner>` is two projected fields and a
 #                     literal separator, and the VM cannot concatenate.
-#                4..16 = value PARTS (bytes), joined in field order — PUT only.
+#                4..16, then 80..99 = value PARTS (bytes), joined in field
+#                     order (4..16 first) — PUT only.
 #                     The VM cannot concatenate, so joining bytes is done here;
 #                     it is the writev of this seam and carries no domain
 #                     meaning. Absent parts contribute nothing.
@@ -44,6 +45,8 @@ hardware_targets = ["bcm2712", "linux"]
 # silently consuming another's fields):
 #     1,2,3   cid / op / key
 #     4..16   value parts
+#     80..99  twenty more value parts, joined after 16 — a record of more
+#             parts than thirteen (a Pod's node ask)
 #     17,18   extra key parts, joined after field 3
 #     25..27  three MORE key parts, for keys the first three cannot build —
 #             `/authz/<subject>/<verb>/<resource>` is five parts and two

@@ -3,8 +3,8 @@ hardware_targets = ["bcm2712", "linux"]
 
 # The nanocloud CLI as a fluxor cli-applet fmod: ONE PIC module dispatches
 # nanocloud subcommands (status/get/describe/create/apply/delete/scale,
-# rollout, watch, logs, exec, diagnostics, policy, volume, config, bundle, ca,
-# token), reading argv from cli_in and driving the control-plane store. The
+# rollout, watch, logs, exec, diagnostics, policy, volume, config, bundle,
+# restore, install/uninstall, ca, token, help), reading argv from cli_in and driving the control-plane store. The
 # `cli` stack injects the host I/O surface (cli_in/cli_out). Installed + run
 # as `fluxor exec nanocloud -- <cmd>` (busybox symlink → `nanocloud <cmd>`).
 # On-node commands read the store directly; remote/API-backed commands are a

@@ -35,8 +35,10 @@ hardware_targets = ["bcm2712", "linux"]
 #   30..39 = carry, echoed with number and type
 # Out (`response_out`): 1 correlation, 2 status (the HTTP status; 304 skipped;
 #   422 digest or size mismatch; 0 when the origin could not be reached after
-#   retries), 3 bytes received (i64), 4 Content-Type, 40..47 the answers,
-#   30..39 carry.
+#   retries), 3 bytes received (i64), 4 Content-Type, 5 the sha256 of the
+#   body as 64 hex (a 200 answered in the reply; empty otherwise) — what a
+#   manifest fetched by tag IS, so its chain keys it by digest — 40..47 the
+#   answers, 30..39 carry.
 #
 # A 401 with a Bearer challenge (`WWW-Authenticate: Bearer realm=…,service=…,
 # scope=…` — the OCI distribution token flow, RFC 6750) is answered here, not
@@ -52,9 +54,13 @@ hardware_targets = ["bcm2712", "linux"]
 # A body comes framed by Content-Length or the chunked transfer coding.
 #
 # A transport failure (no connection, a dropped stream, a timeout) is retried
-# with exponential backoff, a bounded number of times, before it is answered
-# 0: the origin being briefly away is not the chain's decision to make. An
-# HTTP answer is final and goes straight back.
+# with exponential backoff before it is answered 0: six attempts once the
+# origin has answered some of the request (a transfer cut off mid-way resumes
+# from what it has), two while it has answered nothing at all — an origin
+# that is not there is the chain's to back off from (an image pull's
+# ImagePullBackOff, image_back.uproc), not this connector's to wait out while
+# every request behind it waits too. An HTTP answer is final and goes
+# straight back.
 timer_class = "wall_clock"
 
 [[ports]]

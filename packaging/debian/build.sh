@@ -89,12 +89,13 @@ install -Dm644 "${SCRIPT_DIR}/fluxor-controlplane.yaml" "${STAGING_ROOT}/etc/nan
 install -Dm644 "${SCRIPT_DIR}/fluxor-worker.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/worker.yaml"
 install -Dm644 "${SCRIPT_DIR}/fluxor-replica.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/replica.yaml"
 install -Dm644 "${SCRIPT_DIR}/fluxor-podlifecycle.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/kubelet.yaml"
+# The node's image pull, spliced beside the kubelet with this node's registry
+# (its CA by path, from cluster.env — never a certificate in the package).
+install -Dm644 "${SCRIPT_DIR}/fluxor-imagepull.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/image.yaml"
 install -Dm755 "${SCRIPT_DIR}/nanocloud-graph.sh" "${STAGING_ROOT}/usr/lib/nanocloud/nanocloud-graph.sh"
 install -Dm755 "${SCRIPT_DIR}/nanocloud-cluster.sh" "${STAGING_ROOT}/usr/sbin/nanocloud-cluster"
 # The node graph (dataplane workload substrate).
 install -Dm644 "${SCRIPT_DIR}/fluxor-node.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/node.yaml"
-# The image plane (pod-image pull → assemble → run).
-install -Dm644 "${SCRIPT_DIR}/fluxor-image-fetch.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/image-plane.yaml"
 install -Dm644 "${SCRIPT_DIR}/nanocloud.service" "${STAGING_ROOT}/lib/systemd/system/nanocloud.service"
 install -Dm644 "${SCRIPT_DIR}/nanocloud.default" "${STAGING_ROOT}/etc/default/nanocloud"
 
@@ -107,7 +108,7 @@ install -Dm644 "${REPO_ROOT}/packaging/cli/linux.yaml"       "${STAGING_ROOT}/us
 install -Dm644 "${SCRIPT_DIR}/nanocloud-profile.sh"       "${STAGING_ROOT}/etc/profile.d/nanocloud.sh"
 
 # The image-assembly effect script: run as a host workload by the sandbox runtime
-# when image_assembler projects an assembly job.
+# when image_asm.uproc projects an assembly job.
 install -Dm755 "${SCRIPT_DIR}/assemble-image.sh"          "${STAGING_ROOT}/usr/lib/nanocloud/assemble-image.sh"
 
 # The fluxor ABI this package's runtime and modules are built against: the

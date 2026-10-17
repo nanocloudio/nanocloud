@@ -1,0 +1,175 @@
+// A cached layer the node cannot use is dropped and fetched again.
+//
+// Where a layer is verified (its sha256 is its name):
+//   - on fetch: http_fetch hashes the body as it lands and keeps the file
+//     only when it is its digest and size, FSYNCed before its
+//     /image-blobs/<hex> marker is written (image.uproc);
+//   - on every use: workload_effect reads every layer of a pack from the
+//     blob cache and hashes it before each CREATE — after a restart, too —
+//     and the kernel checks each module against its pinned digest. The cost
+//     is one read and one sha256 of the image per CREATE of its Pod: what
+//     the CREATE reads anyway.
+// A marker therefore never vouches for bytes on its own. A power cut on a
+// FAT32 cache can lose or cut a file the marker outlives; the CREATE then
+// fails -2 (missing), -5 (short), -74 (not its digest) or EACCES (the
+// kernel's pin), and names the layers (`pack=<manifest>;layers=<hex>,…;
+// at=<index>,…`, on the status event: sandbox.uproc carries it):
+//
+//   bad   the sandbox's report -> /image-blob-bad/<uid>: the layers, the code
+//   h1    each layer named -> its /image-blobs/<hex> marker DELETEd: the
+//         layer is absent, so the pull fetches it again (im_lay -> a queue
+//         row, backing off and saying so like any pull, image_back.uproc)
+//   h2    -> /image-layer-ok/<manifest>-<index> DELETEd: the manifest is not
+//         whole until the layer is back
+//   h3    (the first layer) -> /image-rootfs/<manifest> DELETEd: the pack is
+//         not ready, so the Pod's resolution reads the pull's progress and
+//         failures again (pod_image.uproc: ImagePullBackOff while it fails)
+//   h4    (the first layer) -> the Pod's Warning event
+//         <uid>.CorruptImageLayer: which layer, and that it is fetched again
+//   h5    (the last layer) -> /image-blob-bad/<uid> DELETEd: handled once
+//
+// The Pod is created again by its restart policy (pod_lifecycle.uproc, its
+// backoff), and the CREATE after the layer is back verifies it as before:
+// a layer that keeps going bad is fetched again each time, never trusted,
+// and never retried faster than the restart backoff allows.
+module nanocloud.imageheal {
+
+  // sandbox.uproc's status reply, field for field: its Ctx2 carried.
+  message Ctx2 {
+    key: string = 30;
+    rev: int = 31;
+    out: string = 32;
+    tag: string = 33;
+    id: string = 34;
+    boot: string = 35;
+    bad: string = 36;
+    code: string = 37;
+  }
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx2 = 254;
+  }
+  message Rec {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  decision bad(d: Done) -> Rec {
+    when has(d.ctx.bad) && d.ctx.bad.startsWith("pack=") && d.ctx.id != "" ->
+      Rec { cid: d.cid, op: PUT, key: "/image-blob-bad/", k2: d.ctx.id,
+            v1: d.ctx.bad, v2: ";code=", v3: d.ctx.code };
+    default ->
+      Rec { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "" };
+  }
+
+  // carried by: Op, Ack
+  message Ctx {
+    pack: string = 30;
+    hex: string = 31;
+    at: string = 32;
+    pod: string = 33;     // <ns>/<name>
+    uid: string = 34;
+    code: string = 35;
+    i: int = 36;          // this layer's place in the report
+    n: int = 37;          // how many it names
+  }
+  // hl_src: /image-blob-bad/<uid>, one record per layer named.
+  message Bad {
+    seq: int = 1;
+    key: string = 3;
+    pack: string = 4;
+    hex: string = 5;      // layers.#
+    at: string = 6;       // at.#
+    code: string = 7;
+    i: int = 20;
+    n: int = 22;
+    pod: string = 70;     // /pod-specs/<uid> pod
+  }
+  message Op {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    k4: string = 25;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13; v11: string = 14;
+    v12: string = 15; v13: string = 16;
+    ctx: Ctx = 254;
+  }
+  message Ack {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+
+  decision h1(b: Bad) -> Op {
+    when b.hex.size() == 64 && b.pack != "" ->
+      Op { cid: b.seq, op: DELETE, key: "/image-blobs/", k2: b.hex, k3: "", k4: "",
+           ctx: Ctx { pack: b.pack, hex: b.hex, at: b.at, pod: b.pod, uid: b.key, code: b.code, i: b.i, n: b.n } };
+    default ->
+      Op { cid: b.seq, op: NOOP, key: "", k2: "", k3: "", k4: "",
+           ctx: Ctx { pack: "", hex: "", at: "", pod: "", uid: "", code: "", i: 0, n: 0 } };
+  }
+  decision h2(a: Ack) -> Op {
+    when a.ctx.pack != "" && a.ctx.at != "" ->
+      Op { cid: a.cid, op: DELETE, key: "/image-layer-ok/", k2: a.ctx.pack, k3: "-", k4: a.ctx.at, ctx: a.ctx };
+    default ->
+      Op { cid: a.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", ctx: a.ctx };
+  }
+  decision h3(a: Ack) -> Op {
+    when a.ctx.pack != "" && a.ctx.i == 0 ->
+      Op { cid: a.cid, op: DELETE, key: "/image-rootfs/", k2: a.ctx.pack, k3: "", k4: "", ctx: a.ctx };
+    default ->
+      Op { cid: a.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", ctx: a.ctx };
+  }
+  decision h4(a: Ack) -> Op {
+    when a.ctx.pack != "" && a.ctx.i == 0 && a.ctx.pod.indexOf("/") > 0 ->
+      Op { cid: a.cid, op: PUT,
+           key: "/events/" + a.ctx.pod.substring(0, a.ctx.pod.indexOf("/")) + "/", k2: a.ctx.uid,
+           k3: ".CorruptImageLayer", k4: "",
+           v1: "{\"metadata\":{\"name\":\"", v2: a.ctx.uid,
+           v3: ".CorruptImageLayer\",\"namespace\":\"", v4: a.ctx.pod.substring(0, a.ctx.pod.indexOf("/")),
+           v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+           v6: a.ctx.pod.substring(0, a.ctx.pod.indexOf("/")),
+           v7: "\",\"name\":\"", v8: a.ctx.pod.substring(a.ctx.pod.indexOf("/") + 1),
+           v9: "\",\"uid\":\"", v10: a.ctx.uid,
+           v11: "\"},\"reason\":\"CorruptImageLayer\",\"message\":\"Cached layer sha256:", v12: a.ctx.hex,
+           v13: " is missing, short or not its digest (status " + a.ctx.code + "): dropped from the node's cache and fetched again\",\"type\":\"Warning\",\"count\":1}",
+           ctx: a.ctx };
+    default ->
+      Op { cid: a.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", ctx: a.ctx };
+  }
+  decision h5(a: Ack) -> Op {
+    when a.ctx.uid != "" && a.ctx.i + 1 >= a.ctx.n ->
+      Op { cid: a.cid, op: DELETE, key: "/image-blob-bad/", k2: a.ctx.uid, k3: "", k4: "", ctx: a.ctx };
+    default ->
+      Op { cid: a.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", ctx: a.ctx };
+  }
+
+  transformation t_done(d: Done) -> Done { Done { cid: d.cid, status: d.status, ctx: d.ctx } }
+  transformation t_bad(b: Bad) -> Bad {
+    Bad { seq: b.seq, key: b.key, pack: b.pack, hex: b.hex, at: b.at, code: b.code, i: b.i, n: b.n, pod: b.pod }
+  }
+  transformation t_ack(a: Ack) -> Ack { Ack { cid: a.cid, status: a.status, ctx: a.ctx } }
+  pipeline hl_bad(d: Done) -> Rec { call x = t_done(d); call y = bad(x); return y; }
+  pipeline hl_1(b: Bad) -> Op { call x = t_bad(b); call y = h1(x); return y; }
+  pipeline hl_2(a: Ack) -> Op { call x = t_ack(a); call y = h2(x); return y; }
+  pipeline hl_3(a: Ack) -> Op { call x = t_ack(a); call y = h3(x); return y; }
+  pipeline hl_4(a: Ack) -> Op { call x = t_ack(a); call y = h4(x); return y; }
+  pipeline hl_5(a: Ack) -> Op { call x = t_ack(a); call y = h5(x); return y; }
+  entry hl_bad = hl_bad;
+  entry hl_1 = hl_1;
+  entry hl_2 = hl_2;
+  entry hl_3 = hl_3;
+  entry hl_4 = hl_4;
+  entry hl_5 = hl_5;
+  provenance revision "image-heal" toolchain "chronicle-authoring";
+}

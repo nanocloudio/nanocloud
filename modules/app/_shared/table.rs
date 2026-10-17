@@ -277,8 +277,92 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
                 },
             )
         }
+        // kubectl's pod STATUS (printPod): the phase, or the Pod's own
+        // reason, overridden by the last container's waiting reason
+        // (ContainerCreating, ImagePullBackOff, CrashLoopBackOff, …) or its
+        // terminated reason (Completed, Error; `ExitCode:<n>` without one);
+        // Terminating once it is being deleted.
+        b"podstatus" => {
+            let reason = tbl_pod_reason(obj);
+            put(out, at, reason.as_slice())
+        }
         _ => false,
     }
+}
+
+/// What [`tbl_fn`]'s `@podstatus()` prints: borrowed from `obj`, or one of
+/// its own words, or `ExitCode:<n>` built here.
+enum PodReason<'a> {
+    Of(&'a [u8]),
+    Exit([u8; 32], usize),
+}
+
+impl PodReason<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PodReason::Of(b) => b,
+            PodReason::Exit(b, n) => b.get(..*n).unwrap_or(&[]),
+        }
+    }
+}
+
+/// The non-empty scalar at the dotted `path` of one list element.
+fn tbl_in<'a>(el: &'a [u8], path: &[u8]) -> Option<&'a [u8]> {
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let n = split_dots(path, &mut segs);
+    j_path(el, &segs[..n]).filter(|v| !v.is_empty())
+}
+
+fn tbl_pod_reason(obj: &[u8]) -> PodReason<'_> {
+    if tbl_in(obj, b"metadata.deletionTimestamp").is_some() {
+        return PodReason::Of(&b"Terminating"[..]);
+    }
+    let mut reason: PodReason = PodReason::Of(
+        tbl_in(obj, b"status.reason")
+            .or_else(|| tbl_in(obj, b"status.phase"))
+            .unwrap_or(&b"Unknown"[..]),
+    );
+    let list = tbl_sub(obj, b"status.containerStatuses").unwrap_or(&b"[]"[..]);
+    let mut running = false;
+    // kubectl walks the containers in reverse, so the FIRST one with a
+    // reason names the Pod: forward, the first one taken is kept.
+    let mut taken = false;
+    for c in jp_elems(list) {
+        let waiting = tbl_in(c, b"state.waiting.reason");
+        let term = tbl_in(c, b"state.terminated.reason");
+        let code = tbl_in(c, b"state.terminated.exitCode");
+        if let (Some(w), false) = (waiting, taken) {
+            reason = PodReason::Of(w);
+            taken = true;
+        } else if let (Some(t), false) = (term, taken) {
+            reason = PodReason::Of(t);
+            taken = true;
+        } else if let (Some(code), false) = (code, taken) {
+            let mut b = [0u8; 32];
+            let mut n = 0usize;
+            for &ch in b"ExitCode:".iter().chain(code.iter()) {
+                if let Some(slot) = b.get_mut(n) {
+                    *slot = ch;
+                    n += 1;
+                }
+            }
+            reason = PodReason::Exit(b, n);
+            taken = true;
+        } else if waiting.is_none()
+            && term.is_none()
+            && code.is_none()
+            && tbl_in(c, b"ready") == Some(&b"true"[..])
+            && j_sub(c, &[&b"state"[..], &b"running"[..]]).is_some()
+        {
+            running = true;
+        }
+    }
+    // A Pod whose phase reads Completed while a container still runs is
+    // Running again, as kubectl prints it.
+    if running && reason.as_slice() == b"Completed" {
+        return PodReason::Of(&b"Running"[..]);
+    }
+    reason
 }
 
 /// One cell's text for `cell` over `obj`.

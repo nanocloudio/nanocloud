@@ -1,5 +1,8 @@
 // The lifecycle chain's writes, downstream of `pod_lifecycle.uproc`'s one
-// decision: the kill key, the sandbox phase, the pod phase, the event. Each
+// decision: the kill key, the sandbox phase, the pod phase, the event. (What
+// the Pod's status says to the plane is pod_report.uproc's: it reads the
+// phase written here, /pod-lifecycle-status/, with everything else the node
+// knows of the Pod.) Each
 // reads only the carry the decision stamped — which is the point of stamping
 // it: a stage after an effect sees a status and its carry, nothing else.
 module nanocloud.podeffect {
@@ -85,26 +88,8 @@ module nanocloud.podeffect {
       pe.Act { cid: s.cid, op: PUT, key: s.ctx.key,
                v1: "phase=", v2: s.ctx.pod, ctx: s.ctx };
   }
-  // The phase for the plane: /podstatus/<uid> is not a node-scoped prefix,
-  // so a worker's write lands in the plane's store as is, where the pod
-  // status chain (pod_status.uproc) patches the Pod it names.
-  //
-  // A deleted Pod's spec names no Pod (`pod=` is gone from it), so its
-  // phase is not reported — and its record is removed: a record left behind
-  // names a Pod by NAME, and the next Pod of that name is another
-  // incarnation. Delete-if-present, so the steps that follow cost a read.
-  // `has` guards both arms: a spec without `pod=` carries no `podkey`, and a
-  // `when` that read an absent field would fail closed rather than decide.
-  decision report(s: pe.Step) -> pe.Act {
-    when s.ctx.pod == "Terminating" && (!has(s.ctx.podkey) || s.ctx.podkey == "") ->
-      pe.Act { cid: s.cid, op: DELETE, key: s.ctx.key, ctx: s.ctx };
-    when has(s.ctx.podkey) && s.ctx.podkey != "" ->
-      pe.Act { cid: s.cid, op: PUT, key: s.ctx.key,
-               v1: "phase=", v2: s.ctx.pod, v3: ";pod=" + s.ctx.podkey, ctx: s.ctx };
-    default ->
-      pe.Act { cid: s.cid, op: NOOP, key: "", ctx: s.ctx };
-  }
-  // The event, from the write's own reply: 200 means the phase CHANGED.
+  // The event, from the phase write's own reply (pl_status, put-if-changed):
+  // 200 means the phase CHANGED.
   decision record(s: pe.Step) -> pe.Evt {
     when s.status == 200 && s.ctx.pod == "Running" ->
       pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.ctx.key, xk: ".Started.0",
@@ -136,13 +121,11 @@ module nanocloud.podeffect {
   pipeline sb(s: pe.Step) -> pe.Act { call x = pass(s); call y = sandbox(x); return y; }
   pipeline mt(s: pe.Step) -> pe.Act { call x = pass(s); call y = metal(x); return y; }
   pipeline st(s: pe.Step) -> pe.Act { call x = pass(s); call y = status(x); return y; }
-  pipeline rp(s: pe.Step) -> pe.Act { call x = pass(s); call y = report(x); return y; }
   pipeline ev(s: pe.Step) -> pe.Evt { call x = pass(s); call y = record(x); return y; }
   entry kl = kl;
   entry sb = sb;
   entry mt = mt;
   entry st = st;
-  entry rp = rp;
   entry ev = ev;
   provenance revision "podeffect-writes" toolchain "chronicle-authoring";
 }

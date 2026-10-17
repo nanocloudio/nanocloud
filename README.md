@@ -3,9 +3,11 @@
 Nanocloud is a Kubernetes control plane that runs as a [fluxor](../fluxor/)
 graph. The apiserver, every controller and the node's own lifecycle are chains
 of generic engines carrying compiled rules. The `no_std` position-independent
-modules (`.fmod`) in the tree hold no Kubernetes meaning: every one but the CLI
-is a connector, moving bytes across one seam — the store, a socket, an HTTP
-route, a container, the packet filter, a volume. There is no host binary and
+modules (`.fmod`) in the tree hold almost no Kubernetes meaning: nearly every
+one is a connector, moving bytes across one seam — the store, a socket, an
+HTTP route, a container, the packet filter, a volume. The exceptions are the
+CLI and `node_pki`, which writes the Kubernetes objects of a node's join (its
+Devices and the slot's ServiceAccount). There is no host binary and
 no separate database: install the package, start one systemd unit, and the
 node serves the Kubernetes API.
 
@@ -84,12 +86,30 @@ tools/install_deb.sh                    # dpkg -i the newest build, restart the 
 ```
 
 The package installs the fluxor CLI and runtime, every nanocloud `.fmod`, the
-control-plane and worker graph templates (`/etc/nanocloud.io/fluxor/`), the
-node and image-plane graphs, and a systemd unit that renders this node's graph
+control-plane and worker graph templates (`/etc/nanocloud.io/fluxor/`) with
+the fragments they are rendered from (the store's replica, the kubelet, the
+image pull), and a systemd unit that renders this node's graph
 (`nanocloud-graph.sh`, from `/etc/nanocloud.io/cluster.env` and the peer keys
 in `/etc/nanocloud.io/pki`, both provisioned on install) and runs it in
 `/var/lib/nanocloud.io/control-plane/store`. A fresh install is a cluster of
-one: the control plane, replica 0, alone.
+one: the control plane, replica 0, alone, and its own node — its cluster.env
+says `NANOCLOUD_PODS=1`, so it registers itself in `/nodes/`, keeps its lease
+and runs the Pods scheduled onto it.
+
+Images are pulled from one registry per node: `NANOCLOUD_REGISTRY` (default
+`registry.nanocloud.io:5000`), dialled at `NANOCLOUD_REGISTRY_ADDR`, over TLS
+authenticated by the CA at `NANOCLOUD_REGISTRY_CA` (DER, default
+`/etc/nanocloud.io/certs/ca.der`; without it the node pulls nothing and says
+so when its graph renders). A bare reference means that registry; one naming
+another registry is refused — the Pod stays Pending with an `ErrImagePull`
+event — never pulled from this one instead. A tag is resolved to its
+manifest digest and everything pulled is keyed by the digest; the Pod runs
+the digest it resolved. `imagePullPolicy` is honoured with upstream's
+defaults (`Always` for `:latest` or no tag: the tag is asked again for each
+Pod; `IfNotPresent` otherwise; `Never`: only what is cached). Registry
+credentials, when the registry asks for them, are the store key
+`/registry-auth/<registry host>` (`user:password`); a Pod's
+`imagePullSecrets` are not read.
 `/usr/bin/nanocloud` is a busybox-style symlink to `fluxor`, so `nanocloud <cmd>`
 dispatches the `nanocloud_cli` applet.
 
@@ -236,6 +256,55 @@ group-qualified (`deployments.apps`) so it never collides with a same-named
 resource in another group. `?watch=true` is served by a second chain driven by
 store changes, writing into the same reply stage.
 
+### Kubernetes compatibility: what a container becomes
+
+A Pod's first container runs as one process (a Pod without an image runs its
+command on the node, a Pod with `runtimeClassName: fluxor` as a module
+subgraph). What is honoured, and what is not yet:
+
+- **Image**: pulled, its rootfs the process's root (an isolated sandbox: the
+  node runs as root). Pending until pulled.
+- **command / args** against the image's Entrypoint / Cmd, by the Kubernetes
+  rules (both; command only; args only; neither).
+- **env**: exactly `HOSTNAME` (the Pod's name), the image's `Env`, the
+  container's `env` (`name`/`value`) overriding it in order, `HOME` from the
+  image's passwd, `PATH` defaulted when nothing sets it — nothing of the
+  node's own environment.
+- **workingDir**, else the image's `WorkingDir` (created), else `/`.
+- **User**: the image's `User` (`uid[:gid]`, or a name in the image's own
+  `/etc/passwd` and `/etc/group`).
+- **restartPolicy**: unset is `Always`, as the API server defaults it.
+- **resources.limits**: `cpu` (cgroup `cpu.max`), `memory` (`memory.max`),
+  `ephemeral-storage` (the Pod's own storage root's cap).
+- A command, an env, a working directory or a user too long for the record it
+  crosses is refused and the Pod Fails — never run cut short.
+- **Probes**: an `exec` `readinessProbe` gates the Pod's Ready condition (and
+  so its Service endpoints and its controller's ready count); an `exec`
+  `livenessProbe` restarts it. Both run inside the sandbox, with
+  `periodSeconds`, `timeoutSeconds`, `failureThreshold`, `successThreshold`
+  and `initialDelaySeconds` as stated, upstream's defaults (10 s, 1 s, 3, 1,
+  0) when not. A Pod with no readiness probe is Ready while it runs.
+- **Status**: `status.phase`, `startTime`, `hostIP`/`podIP` (the node's
+  address — a Pod shares its node's network unless it has an address of its
+  own), the conditions PodScheduled, Initialized, ContainersReady and Ready,
+  and `containerStatuses` (`ready`, `started`, `restartCount`, `imageID`,
+  `state` and `lastState`, with the waiting reasons ContainerCreating,
+  ErrImagePull, ImagePullBackOff, CrashLoopBackOff, CreateContainerError and
+  CorruptImageLayer) — what `kubectl get pods`, `kubectl wait` and `kubectl
+  rollout status` read. A moment a node observes before its clock is trusted
+  (a board before SNTP) is null until the clock is, never 1970. ReplicaSet,
+  Deployment, StatefulSet and DaemonSet status count their Ready Pods; a
+  StatefulSet's and a DaemonSet's update strategy defaults to RollingUpdate.
+
+Not implemented yet: `httpGet`, `tcpSocket` and `grpc` probes (a Pod
+declaring only those is treated as declaring none: Ready while it runs, never
+restarted by a probe), `startupProbe`, rolling a StatefulSet's or DaemonSet's
+Pods to a changed template, `securityContext` (`runAsUser`, `runAsGroup`, …), `$(VAR)`
+expansion in `command`/`args`/`env`, `env` from `valueFrom` (Secrets,
+ConfigMaps, the downward API — such entries are left out) and `envFrom`, the
+service environment variables (`<SVC>_SERVICE_HOST`, …), `resources.requests`
+(cpu shares), containers past the first, init containers.
+
 ## Security
 
 - **TLS at the edge.** The `tls` module terminates TLS 1.3 in front of the
@@ -244,12 +313,14 @@ store changes, writing into the same reply stage.
   which reaches the request chain as a field on the decoded record — so a
   certificate that does not chain never opens a connection, and one that does
   is authorized by its SVID.
-- **Two roots, nothing else provisioned.** A node holds one symmetric key —
-  `FLUXOR_SEAL_KEY`, generated once at install — and one signing key,
-  `nanocloud.ca`, generated *inside* the fluxor key vault on first use and only
-  ever stored sealed under the first. Every certificate and every
-  ServiceAccount token is signed under that one vault key, by kagi; no private
-  key is issued, exported or written to the store.
+- **Two roots.** A node holds one symmetric key — `FLUXOR_SEAL_KEY`,
+  generated once at install — and one signing key, `nanocloud.ca`, generated
+  *inside* the fluxor key vault on first use and only ever stored sealed under
+  the first. Every certificate and every ServiceAccount token is signed under
+  that one vault key, by kagi, and no private key is written to the store. A
+  node under the default peer trust (`pins`) is also provisioned key files on
+  install — the API's TLS key and its peer and operator keys; under
+  `NANOCLOUD_PEER_TRUST=authority` those keys are born in the vault too.
 - **Signed bearer tokens.** ServiceAccount tokens are Chronicle params over
   kagi's `token_mint` (through the `kagi_mint` connector): ES256 JWS with the
   `kubernetes.io` claim and a one-hour `iat`/`exp`. Verification is kagi's own,

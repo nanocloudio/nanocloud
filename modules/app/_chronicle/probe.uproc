@@ -10,9 +10,12 @@
 //   fail_n succ_n       the thresholds, copied from the spec at each attempt so
 //                       the collector (probe_collect.uproc) folds against them
 //
-// The spec states each probe as flat fields on /pod-specs/<uid>:
-//   lp_cmd lp_period lp_timeout lp_fail lp_succ     (liveness)
-//   rp_cmd rp_period rp_timeout rp_fail rp_succ     (readiness)
+// The plane states each probe as flat fields on /pod-probes/<uid>
+// (pod_probes.uproc, from the container's livenessProbe/readinessProbe):
+//   lp_cmd lp_period lp_timeout lp_fail lp_succ lp_delay     (liveness)
+//   rp_cmd rp_period rp_timeout rp_fail rp_succ rp_delay     (readiness)
+// An unstated one is upstream's default: period 10 s, timeout 1 s, failure
+// threshold 3, success threshold 1, no initial delay.
 // An exec probe runs its command inside the sandbox; exit 0 passes.
 //
 //   seed     a spec that names a probe gets its state record (create-only)
@@ -99,6 +102,7 @@ module nanocloud.probe {
     timeout: int = 72;
     fail_n: int = 73;
     succ_n: int = 74;
+    delay: int = 75;
     state: string = 80;
   }
   // act: 0 nothing, 1 start, 2 timed out, 3 reset, 4 dropped
@@ -144,12 +148,19 @@ module nanocloud.probe {
                v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=1", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "l" } };
     when t.state != "running" ->
       RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
+    // initialDelaySeconds: the first attempt waits that long after the
+    // container runs (the timer wakes the source at `due`).
+    when t.inflight == 0 && t.due == 0 && t.delay > 0 ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "due=", v2: t.now + t.delay * 1000, ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
+    // Unstated is upstream's default: periodSeconds 10, timeoutSeconds 1,
+    // failureThreshold 3, successThreshold 1 (0 is never a stated value).
     when t.inflight == 0 && t.now >= t.due ->
       RtCall { cid: t.seq, op: MERGE, key: t.key,
                v1: "inflight=1;deadline=", v2: t.now + math.greatest(t.timeout, 1) * 1000,
-               v3: ";due=", v4: t.now + math.greatest(t.period, 1) * 1000,
+               v3: ";due=", v4: t.now + (t.period + 10 * (1 - math.least(t.period, 1))) * 1000,
                v5: ";seq=", v6: t.pseq + 1,
-               v7: ";fail_n=", v8: math.greatest(t.fail_n, 1),
+               v7: ";fail_n=", v8: t.fail_n + 3 * (1 - math.least(t.fail_n, 1)),
                v9: ";succ_n=", v10: math.greatest(t.succ_n, 1), ctx: Ctx2 { uid: t.key, act: 1, cmd: t.cmd, w: "l" } };
     when t.inflight == 1 && t.now >= t.deadline && t.verdict == 1 && t.fails + 1 >= math.greatest(t.fail_n, 1) ->
       RtCall { cid: t.seq, op: MERGE, key: t.key,
@@ -168,12 +179,19 @@ module nanocloud.probe {
                v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "r" } };
     when t.state != "running" ->
       RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
+    // initialDelaySeconds: the first attempt waits that long after the
+    // container runs (the timer wakes the source at `due`).
+    when t.inflight == 0 && t.due == 0 && t.delay > 0 ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "due=", v2: t.now + t.delay * 1000, ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
+    // Unstated is upstream's default: periodSeconds 10, timeoutSeconds 1,
+    // failureThreshold 3, successThreshold 1 (0 is never a stated value).
     when t.inflight == 0 && t.now >= t.due ->
       RtCall { cid: t.seq, op: MERGE, key: t.key,
                v1: "inflight=1;deadline=", v2: t.now + math.greatest(t.timeout, 1) * 1000,
-               v3: ";due=", v4: t.now + math.greatest(t.period, 1) * 1000,
+               v3: ";due=", v4: t.now + (t.period + 10 * (1 - math.least(t.period, 1))) * 1000,
                v5: ";seq=", v6: t.pseq + 1,
-               v7: ";fail_n=", v8: math.greatest(t.fail_n, 1),
+               v7: ";fail_n=", v8: t.fail_n + 3 * (1 - math.least(t.fail_n, 1)),
                v9: ";succ_n=", v10: math.greatest(t.succ_n, 1), ctx: Ctx2 { uid: t.key, act: 1, cmd: t.cmd, w: "r" } };
     when t.inflight == 1 && t.now >= t.deadline && t.verdict == 1 && t.fails + 1 >= math.greatest(t.fail_n, 1) ->
       RtCall { cid: t.seq, op: MERGE, key: t.key,
@@ -219,7 +237,7 @@ module nanocloud.probe {
     Tick { seq: t.seq, key: t.key, inflight: t.inflight, due: t.due, deadline: t.deadline,
            pseq: t.pseq, fails: t.fails, oks: t.oks, verdict: t.verdict, now: t.now,
            cmd: t.cmd, period: t.period, timeout: t.timeout, fail_n: t.fail_n,
-           succ_n: t.succ_n, state: t.state }
+           succ_n: t.succ_n, delay: t.delay, state: t.state }
   }
   transformation prt(r: RtReply) -> RtReply {
     RtReply { cid: r.cid, status: r.status, ctx: r.ctx }

@@ -95,10 +95,10 @@ run_runtime() { # run_runtime — boot the runtime over the seeded log for one w
 echo "== phase A: project two services, four pods (web-2 NOT ready), reconcile =="
 store_put "/services/default/web" '{"metadata":{"name":"web"},"spec":{"selector":{"app":"web"}}}'
 store_put "/services/default/api" '{"metadata":{"name":"api"},"spec":{"selector":{"app":"api","tier":"backend"}}}'
-store_put "/pods/default/web-1"  '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","ready":true}}'
-store_put "/pods/default/web-2"  '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":false}}'  # NOT ready
-store_put "/pods/default/api-1"  '{"metadata":{"name":"api-1","labels":{"app":"api","tier":"backend"}},"status":{"podIP":"10.0.0.3","ready":true}}'
-store_put "/pods/default/db-1"   '{"metadata":{"name":"db-1","labels":{"app":"db"}},"status":{"podIP":"10.0.0.4","ready":true}}'  # matches nothing
+store_put "/pods/default/web-1"  '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}'
+store_put "/pods/default/web-2"  '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"False"}]}}'  # NOT ready
+store_put "/pods/default/api-1"  '{"metadata":{"name":"api-1","labels":{"app":"api","tier":"backend"}},"status":{"podIP":"10.0.0.3","conditions":[{"type":"Ready","status":"True"}]}}'
+store_put "/pods/default/db-1"   '{"metadata":{"name":"db-1","labels":{"app":"db"}},"status":{"podIP":"10.0.0.4","conditions":[{"type":"Ready","status":"True"}]}}'  # matches nothing
 run_runtime
 
 WEB="$(store_last /endpoints/default/web)"
@@ -111,7 +111,7 @@ echo "   web: $WEB"
 echo "   api: $API"
 
 echo "== phase B: web-2 becomes ready, re-boot, reconcile follows =="
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":true}}'  # readiness flips
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}'  # readiness flips
 run_runtime
 
 WEB2="$(store_last /endpoints/default/web)"

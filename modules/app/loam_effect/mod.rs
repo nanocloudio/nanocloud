@@ -153,6 +153,9 @@ struct State {
     reader: ac::NetReader,
     client: ac::Client,
     cap_file: [u8; ac::CAP_FILE_MAX],
+    /// Where the capability file's read stands (one step of it per poll;
+    /// zeroed state is a load not yet begun).
+    cap_load: ac::ChainFileLoad,
 
     answered: u32,
     dropped: u32,
@@ -500,15 +503,42 @@ unsafe fn drive_link(s: &mut State, sys: &SyscallTable) {
 unsafe fn open_link(s: &mut State, sys: &SyscallTable, now: u64) {
     core::ptr::write_bytes(&mut s.client as *mut ac::Client, 0, 1);
     let path: &[u8] = &*(&s.cap_path[..s.cap_path_len as usize] as *const [u8]);
-    if let Err(why) = ac::load_chain_file(&mut s.client, sys, path, &mut s.cap_file) {
-        if s.logged_why != LOGGED_CAP_FILE {
-            log(sys, 1, why);
-            s.logged_why = LOGGED_CAP_FILE;
+    match ac::load_chain_file(&mut s.client, sys, path, &mut s.cap_file, &mut s.cap_load) {
+        // The file system has not answered yet: asked again next step, the
+        // read continuing where it stopped.
+        ac::LoadPoll::Pending => return,
+        ac::LoadPoll::Loaded => {}
+        ac::LoadPoll::Failed(code) => {
+            if s.logged_why != LOGGED_CAP_FILE {
+                // One call per arm: no message chosen among literals.
+                match code {
+                    ac::LOAD_UNOPENABLE => log(
+                        sys,
+                        1,
+                        b"[loam_effect] the capability file cannot be opened",
+                    ),
+                    ac::LOAD_UNREADABLE => {
+                        log(sys, 1, b"[loam_effect] the capability file cannot be read")
+                    }
+                    ac::LOAD_TOO_LARGE => log(
+                        sys,
+                        1,
+                        b"[loam_effect] the capability file is larger than any set of chains",
+                    ),
+                    ac::LOAD_BAD_LINE => log(
+                        sys,
+                        1,
+                        b"[loam_effect] the capability file holds a line that is not a chain",
+                    ),
+                    _ => log(sys, 1, b"[loam_effect] the capability file holds no chain"),
+                }
+                s.logged_why = LOGGED_CAP_FILE;
+            }
+            s.down_code = Code::Unavailable;
+            s.down_now = 1;
+            s.retry_at = now + RETRY_MS;
+            return;
         }
-        s.down_code = Code::Unavailable;
-        s.down_now = 1;
-        s.retry_at = now + RETRY_MS;
-        return;
     }
     s.down_now = 0;
     let authority: &[u8] = &*(&s.admin[..s.admin_len as usize] as *const [u8]);

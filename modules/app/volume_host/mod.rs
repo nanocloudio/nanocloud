@@ -70,7 +70,18 @@ const MAX_INST: usize = 4;
 const MAX_CLAIM: usize = 128;
 const MAX_CRED: usize = 4096;
 const MAX_LABEL: usize = 64;
-const FLXA_CAP: usize = 3 * MAX_CRED + 2048;
+/// The node's capability file, read whole (one `fxcap1.` chain per line):
+/// as much as loam_volume takes, its `CAP_FILE_MAX` — eight chains
+/// (`MAX_SESSION_GRANTS`) of at most 1375 bytes (`MAX_TEXT_LEN`) and a newline.
+const CAP_TEXT_MAX: usize = 8 * (1375 + 1);
+const FLXA_CAP: usize = 3 * MAX_CRED + CAP_TEXT_MAX + 2048;
+const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
+const FS_CLOSE: u32 = 0x0903;
+const FS_EAGAIN: i32 = -11;
+const FS_EINPROGRESS: i32 = -36;
+const WL_EINPROGRESS: i32 = -36;
+const WL_EEXIST: i32 = -17;
 const STATUS_LEN: usize = 40;
 const CMD: usize = 256;
 /// The storage-key endpoint's path, on the HTTP client's pinned authority.
@@ -124,6 +135,12 @@ const W_ERASE: u8 = 3;
 const W_KAGI: u8 = 4;
 /// A tool's exit.
 const W_TOOL: u8 = 5;
+/// The node's capability file, read across steps (`GRAPH_START`).
+const W_CAP: u8 = 6;
+/// The volume graph's CREATE, asked once per step until it decides: a
+/// graph backend stages a subgraph a batch of modules per call
+/// (`EINPROGRESS`), so the step stays short while the kernel works.
+const W_CREATE: u8 = 7;
 
 /// FXST states.
 const ST_AWAITING: u8 = 1;
@@ -231,6 +248,20 @@ struct State {
     loam_authority_len: u8,
     loam_capability: [u8; 255],
     loam_capability_len: u8,
+    /// Its chains, as last read for an attach.
+    cap_text: [u8; CAP_TEXT_MAX],
+    /// The capability file's read in flight: its FD (-1: none open) and the
+    /// bytes of it already in `cap_text`. Both hold across steps, so a read
+    /// the file system answers "not yet" resumes where it stopped.
+    cap_fd: i32,
+    cap_filled: u32,
+    /// The CREATE in flight: its slot, generation, spec length (the spec
+    /// itself is `flxa`, unchanged until decided) and whether a stale
+    /// identity has already been destroyed once.
+    c_slot: u8,
+    c_gen: u16,
+    c_len: u32,
+    c_destroyed: bool,
     issuer: [u8; sk::MAX_ID],
     issuer_len: u8,
     device: [u8; sk::MAX_ID],
@@ -359,6 +390,93 @@ mod params_def {
         24, loam_capability, str, 0
             => |s, d, len| { super::set_str(&mut s.loam_capability, &mut s.loam_capability_len, d, len); };
     }
+}
+
+/// Where the read of the node's capability file stands.
+enum CapRead {
+    /// The file system answered "not yet": the FD and the bytes read so far
+    /// are kept, and the next step resumes from there.
+    Pending,
+    /// The whole file, in `cap_text[..n]`; its FD closed.
+    Done(usize),
+    /// Missing, unreadable, empty or larger than `CAP_TEXT_MAX`; FD closed.
+    Bad,
+}
+
+/// One step of reading the node's capability file into `cap_text`. The fs
+/// provider never waits on its device inside a call: `EAGAIN` means nothing
+/// moved, so the read is resumed on a later step, never restarted and never
+/// taken for its end. Bytes are taken while they move; a short count
+/// advances by what moved.
+unsafe fn read_capability(s: &mut State, sys: &SyscallTable) -> CapRead {
+    if s.cap_fd < 0 {
+        let mut path = [0u8; 256];
+        let pl = (s.loam_capability_len as usize)
+            .min(path.len())
+            .min(s.loam_capability.len());
+        let (Some(dst), Some(src)) = (path.get_mut(..pl), s.loam_capability.get(..pl)) else {
+            return CapRead::Bad;
+        };
+        dst.copy_from_slice(src);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), pl);
+        if fd == FS_EAGAIN || fd == FS_EINPROGRESS {
+            return CapRead::Pending;
+        }
+        if fd < 0 {
+            return CapRead::Bad;
+        }
+        s.cap_fd = fd;
+        s.cap_filled = 0;
+    }
+    let fd = s.cap_fd;
+    let mut filled = (s.cap_filled as usize).min(CAP_TEXT_MAX);
+    let mut eof = false;
+    while filled < CAP_TEXT_MAX {
+        let room = CAP_TEXT_MAX - filled;
+        let n = (sys.provider_call)(fd, FS_READ, s.cap_text.as_mut_ptr().add(filled), room);
+        if n == FS_EAGAIN || n == FS_EINPROGRESS {
+            s.cap_filled = filled as u32;
+            return CapRead::Pending;
+        }
+        if n < 0 {
+            close_capability(s, sys);
+            return CapRead::Bad;
+        }
+        if n == 0 {
+            eof = true;
+            break;
+        }
+        filled += (n as usize).min(room);
+    }
+    s.cap_filled = filled as u32;
+    if !eof {
+        // At the ceiling: one byte past it refuses the file, not cuts it.
+        let mut probe = [0u8; 1];
+        let n = (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), 1);
+        if n == FS_EAGAIN || n == FS_EINPROGRESS {
+            return CapRead::Pending;
+        }
+        if n != 0 {
+            close_capability(s, sys);
+            return CapRead::Bad;
+        }
+    }
+    close_capability(s, sys);
+    if filled == 0 {
+        return CapRead::Bad;
+    }
+    CapRead::Done(filled)
+}
+
+/// Release the capability file's FD, if one is open. Nothing here relies
+/// on the close: the file is only read.
+unsafe fn close_capability(s: &mut State, sys: &SyscallTable) {
+    if s.cap_fd >= 0 {
+        let mut z = [0u8; 4];
+        (sys.provider_call)(s.cap_fd, FS_CLOSE, z.as_mut_ptr(), 0);
+    }
+    s.cap_fd = -1;
+    s.cap_filled = 0;
 }
 
 unsafe fn set_str(dst: &mut [u8], dst_len: &mut u8, d: *const u8, len: usize) {
@@ -622,6 +740,8 @@ pub unsafe extern "C" fn module_new(
     s.response_in = -1;
     s.call.reset();
     s.proc_h = -1;
+    s.cap_fd = -1;
+    s.cap_filled = 0;
     s.device_key = issuer_key::IssuerKey::empty();
     s.attach = KagiAttach::empty();
     s.inst = [NO_INST; MAX_INST];
@@ -972,6 +1092,27 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
         answer(s, sys, Outcome::Unavailable);
         return;
     };
+    // The capability's chains, read now (a rotated file holds from the next
+    // attach on) and handed to the subgraph: it cannot read the file itself.
+    // A read the file system answers "not yet" holds the effect: the next
+    // step resumes it (`W_CAP`) and runs this again on the held record,
+    // which moved nothing before this point.
+    let cap_len = match read_capability(s, sys) {
+        CapRead::Done(n) => n,
+        CapRead::Pending => {
+            s.wait = W_CAP;
+            return;
+        }
+        CapRead::Bad => {
+            log(
+                sys,
+                1,
+                b"[volume_host] the Loam capability file cannot be read, or is empty or too large",
+            );
+            answer(s, sys, Outcome::Failed);
+            return;
+        }
+    };
     // The lease holder the attach flow acquired under: the claim's, or the
     // recovery's own owner `rc:<claim>`.
     let holder = if recovery {
@@ -986,11 +1127,13 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
     let mut g = [0u8; 2];
     g.copy_from_slice(&gen.to_le_bytes());
     let owner = digest16(&[b"volume_host:", claim, b":", &g]);
+    let st = s as *mut State;
+    let cap_text: &[u8] = &(&(*st).cap_text)[..cap_len];
     let graph = VolumeGraph {
         owner_uid: owner,
         state_cap: 0,
         loam_authority: &s.loam_authority[..s.loam_authority_len as usize],
-        capability: &s.loam_capability[..s.loam_capability_len as usize],
+        capability: cap_text,
         verify_hostname: &s.verify_hostname[..s.verify_hostname_len as usize],
         trust_der: &s.trust[..s.trust_len as usize],
         cert_der: &s.cert[..s.cert_len as usize],
@@ -1008,7 +1151,7 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
         nbd_port: (s.nbd_port_base as u16).wrapping_add(slot as u16),
         export: &[],
     };
-    // [header 68][FLXA]
+    // [header][FLXA]
     let hdr = wl::CREATE_HEADER_SIZE;
     let Some(n) = encode(&graph, &mut s.flxa[hdr..]) else {
         answer(s, sys, Outcome::Failed);
@@ -1021,7 +1164,34 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
     h[17] = wl::SOURCE_FMOD_GRAPH;
     h[18] = wl::NET_ISO_SHARED;
     h[40..42].copy_from_slice(&(n as u16).to_le_bytes());
-    let handle = (sys.provider_call)(-1, wl::CREATE, s.flxa.as_mut_ptr(), hdr + n);
+    // The spec stands in `flxa` until the CREATE decides; each step asks it
+    // once (`W_CREATE`).
+    s.c_slot = slot as u8;
+    s.c_gen = gen;
+    s.c_len = (hdr + n) as u32;
+    s.c_destroyed = false;
+    s.wait = W_CREATE;
+    create_step(s, sys);
+}
+
+/// One ask of the volume graph's CREATE. `EINPROGRESS`: a batch staged,
+/// asked again next step with the same spec. `EEXIST`: an attach of this
+/// generation that never finished still holds the identity; it is destroyed
+/// by identity once and the spec asked again next step. Decided, the
+/// workload starts and its slot is seated.
+unsafe fn create_step(s: &mut State, sys: &SyscallTable) {
+    let handle = (sys.provider_call)(-1, wl::CREATE, s.flxa.as_mut_ptr(), s.c_len as usize);
+    if handle == WL_EINPROGRESS {
+        return;
+    }
+    if handle == WL_EEXIST && !s.c_destroyed {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&s.flxa[0..16]);
+        (sys.provider_call)(-1, wl::DESTROY, id.as_mut_ptr(), id.len());
+        s.c_destroyed = true;
+        return;
+    }
+    s.wait = W_NONE;
     if handle < 0 {
         log(
             sys,
@@ -1031,6 +1201,10 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
         answer(s, sys, Outcome::Failed);
         return;
     }
+    let slot = s.c_slot as usize;
+    let gen = s.c_gen;
+    let rec = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
+    let claim = frame_bytes(rec, 3);
     if (sys.provider_call)(handle, wl::START, core::ptr::null_mut(), 0) < 0 {
         (sys.provider_call)(handle, wl::DESTROY, core::ptr::null_mut(), 0);
         answer(s, sys, Outcome::Failed);
@@ -1374,6 +1548,19 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) {
             }
         }
         W_KAGI => kagi_reply(s, sys),
+        W_CAP => {
+            let held = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
+            start_graph(s, sys, held);
+            if s.busy == 0 {
+                return;
+            }
+        }
+        W_CREATE => {
+            create_step(s, sys);
+            if s.busy == 0 {
+                return;
+            }
+        }
         W_TOOL => {
             poll_tool(s, sys);
             return;
@@ -1459,6 +1646,8 @@ unsafe fn poll_tool(s: &mut State, sys: &SyscallTable) {
 unsafe fn answer(s: &mut State, sys: &SyscallTable, o: Outcome) {
     s.busy = 0;
     s.wait = W_NONE;
+    // A capability read still open (the effect timed out) is given up on.
+    close_capability(s, sys);
     // A call still open is given up on: a late answer is not the next
     // effect's, and the client is told.
     s.call.cancel();

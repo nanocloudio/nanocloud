@@ -114,14 +114,14 @@ absent  /pods/default/db-1 || fail "db-1 must WAIT until db-0 is ready"
 echo "   db-0 created; db-1 held"
 
 echo "== phase 2: db-0 becomes ready → db-1 is created; db-2 waits =="
-store_put "/pods/default/db-0" '{"metadata":{"name":"db-0"},"spec":{"containers":[{"image":"postgres"}]},"status":{"ready":true}}'
+store_put "/pods/default/db-0" '{"metadata":{"name":"db-0"},"spec":{"containers":[{"image":"postgres"}]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 run_runtime
 present /pods/default/db-1 || fail "db-1 should be created once db-0 is ready"
 absent  /pods/default/db-2 || fail "db-2 must WAIT until db-1 is ready"
 echo "   db-1 created; db-2 held"
 
 echo "== phase 3: db-1 becomes ready → db-2 is created =="
-store_put "/pods/default/db-1" '{"metadata":{"name":"db-1"},"spec":{"containers":[{"image":"postgres"}]},"status":{"ready":true}}'
+store_put "/pods/default/db-1" '{"metadata":{"name":"db-1"},"spec":{"containers":[{"image":"postgres"}]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 run_runtime
 present /pods/default/db-2 || fail "db-2 should be created once db-1 is ready"
 echo "   db-2 created — full ordered bring-up"
@@ -142,9 +142,9 @@ echo "== phase 5: scale-down across a HOLE — the surplus above a missing ordin
 # torn down late.
 store_put "/statefulsets.apps/default/db" '{"metadata":{"name":"db"},"spec":{"replicas":4,"template":{"spec":{"containers":[{"name":"db","image":"postgres"}]}}}}'
 run_runtime                                          # db-0 ready -> db-1 created
-store_put "/pods/default/db-1" '{"metadata":{"name":"db-1"},"spec":{"containers":[{"image":"postgres"}]},"status":{"ready":true}}'
+store_put "/pods/default/db-1" '{"metadata":{"name":"db-1"},"spec":{"containers":[{"image":"postgres"}]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 run_runtime                                          # db-1 ready -> db-2 created
-store_put "/pods/default/db-2" '{"metadata":{"name":"db-2"},"spec":{"containers":[{"image":"postgres"}]},"status":{"ready":true}}'
+store_put "/pods/default/db-2" '{"metadata":{"name":"db-2"},"spec":{"containers":[{"image":"postgres"}]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 run_runtime                                          # db-2 ready -> db-3 created
 for i in 0 1 2 3; do
   present /pods/default/db-$i || fail "phase 5 setup: db-$i missing"

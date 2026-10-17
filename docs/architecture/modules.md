@@ -12,13 +12,16 @@ namespaces, cgroups, packet policy, durable disk, private keys — is reached
 only through fluxor **capability surfaces**: kernel providers addressed by
 contract class, which admission can gate.
 
-Between the two sit the `.fmod` modules, and the control plane has eighteen
-of them. Seventeen are **connectors**: each crosses one seam a rules VM
+Between the two sit the `.fmod` modules, and the control plane has twenty
+of them. Eighteen are **connectors**: each crosses one seam a rules VM
 cannot — the store, a socket, a container, the packet filter, a mount, a key
 service — and decides nothing, performing the key, field and op it is told
-and reporting what happened. The eighteenth is the CLI, an operator's entry
-point rather than part of any chain. No `.fmod` in this tree holds what a
-Deployment is, what `/api/v1` names, or when a Pod may restart.
+and reporting what happened. The other two are the CLI, an operator's entry
+point rather than part of any chain, and `node_pki`, the node's certificate
+and join service, which writes the bootstrap objects a joining operator needs
+(its Namespace, the `cluster-admin` ClusterRole and binding, its Device). No
+`.fmod` in this tree holds what a Deployment is, what `/api/v1` names, or
+when a Pod may restart.
 
 Three rules hold everywhere:
 
@@ -347,7 +350,7 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | ------ | ---- | ---- |
 | `store_source` | `storage.namespace`, `timer` | subscription-driven entry into a chain: a prefix's changes and timer deadlines become record frames, optionally walking each object's children (`list_children`, `list_values`) and decorating them as it goes |
 | `store_effect` | `storage.object`, `storage.namespace` | the reads and writes a chain asks for — GET, CREATE, guarded PUT, PATCH, MERGE (conditional on a revision when one is given), REPLACE, APPEND, DELETE, LIST, COUNT (optionally of the children a `count_where` decision keeps), EXISTS and `EXISTS_ANY` — over a key assembled from record fields; a fused decision builds the request from the arriving record, given the wall clock when `wall` is set |
-| `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Five request inputs, so the runtime's chains feed it without a merge |
+| `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Six request inputs, so the runtime's chains feed it without a merge |
 | `net_apply` | `net_policy` (`0x1E`) | rows under a prefix → one `net.policy` table, replaced whole (a row set that does not fit is not applied); the platform's ENFORCED bit and the generation at `/np-status/<table>` |
 | `http_fetch` | net pair, `fs` | one GET at a time (behind `tls`, or plaintext); the answer comes back as the JSON members the record asked for (`a[].b` collect, `a[k=v].b` select), or lands as a sha256-verified file (optionally in Range chunks); a request whose result already exists is answered 304 without a byte on the wire |
 | `http_chain` | Wave's `http` (an exchange PROVIDER on an application route) | each exchange → one request envelope for a chain, a large body staged in the store; the chain's reply envelopes → the exchange's response, a watch held open, within the server's credit |
@@ -355,6 +358,7 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the verification key from `/authn-keys/sa` |
 | `kagi_mint` | kagi's `token_mint` (an exchange REQUESTER of the typed operation) | a record → the signed token as a record; names the signing key by vault label and stores the public half the mint announces at `/authn-keys/sa` |
 | `store_doc` | `storage.object` | the API writer's record adapter in front of lattice's JSON document dialect: each write leaves as one document request, and an object too large for the reply record is sent empty so the answer becomes a GET the watch chain serves |
+| `store_stamped` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a small heap, for a controller's writer: whole-object writes that follow a document `schema` are stamped with a uid and creationTimestamp, kept when rewritten, as an object the API created |
 | `store_big` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a heap, for the few nodes handling a document past a record: a body the HTTP front staged, and an object projected from a heap copy. Every other `store_effect` stays bounded |
 | `store_watch` | `storage.namespace`, `storage.object`, `timer` | `store_source`'s `events` mode with a heap — the watch connector: objects past one record streamed across records, and change batches past `EV_BUF` |
 | `kagi_storage_effect` | Kagi's storage-key service | a volume-key effect in, storage-key requests out, the typed outcome back as a record |
@@ -362,14 +366,17 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `volume_relay` | `storage.object`, `storage.namespace` | carries the encrypted-volume effects between the control plane and a node over the replicated store, so neither addresses the other |
 | `mount_effect` | `host_mount`, `proc` | the claim chain's mount actuator: a `Mnt` record in, the raw facts of what ran back |
 | `volume_host` | `workload`, `proc` | a node's volume effector: the volume's subgraph staged, unlocked through Kagi, published over NBD, and torn down |
+| `node_pki` | kagi's `certificate_endpoint`, `tls`'s identity ports | the node's certificate: tls's identity request answered by the authority; with `join: 1`, the operator's first credential minted behind a one-time join secret, and the bootstrap objects it needs |
 | `nanocloud_cli` | the host's argv and stdio | a cli-applet: argv in, the store read and written directly, bytes to stdout and a latched exit code — so the CLI works with no HTTP edge running |
 
 The token mint and the certificate issuer sign under the same vault key,
 `nanocloud.ca`: generated inside the vault on first open, sealed under the
 node's `FLUXOR_SEAL_KEY` (written once by the package's postinst), and never
-exported. That symmetric key and that signing key are the node's only two
-roots; nothing else is provisioned, and no private key is issued or written to
-the store.
+exported. That symmetric key and that signing key are the trust roots; no
+private key is issued or written to the store. (The Debian postinst also
+writes a self-signed node TLS key and the peer/operator keys under
+/etc/nanocloud.io — `gen_node_cert`, `gen_peer_pki` — for the default `pins`
+peer trust, `NANOCLOUD_PEER_TRUST` in packaging/debian/nanocloud-graph.sh.)
 
 ## 6. Capability-surface inventory
 

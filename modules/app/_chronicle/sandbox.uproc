@@ -2,7 +2,8 @@
 // connector (which performs the ops, holds the live handles and reports what it
 // observes).
 //
-//   spec   /sandboxes/<id> (phase, cmd, rootfs, iso, net, tasks) against its
+//   spec   /sandboxes/<id> (phase, cmd, rootfs, iso, net, tasks; the process:
+//          env, host, wd, iwd, user; the limits: cpu, mem, eph) against its
 //          /sandbox-status/: CREATE when it has no workload under this boot
 //          (an own-network sandbox waits for its /ipam-lease/; a sandbox
 //          naming volumes waits until each is bound, /volume-binds/), START a
@@ -43,6 +44,11 @@ module nanocloud.sandbox {
     tag: string = 33;
     id: string = 34;
     boot: string = 35;
+    // A failed pack's cached layers it could not use (workload_effect's
+    // `pack=…;layers=…;at=…`), and the status code: handed on to pi_bad
+    // (image_heal.uproc), which has them dropped and fetched again.
+    bad: string = 36;
+    code: string = 37;
   }
   enum NOOP = 0;
   enum GET = 1;
@@ -69,6 +75,14 @@ module nanocloud.sandbox {
     iso: string = 7;
     net: string = 8;
     tasks: string = 9;
+    env: string = 10;      // NAME=VALUE,… escaped, later entries overriding
+    host: string = 11;     // its Pod's name (HOSTNAME)
+    wd: string = 12;       // the container's workingDir
+    iwd: string = 13;      // the image's WorkingDir
+    user: string = 14;     // the image's User
+    cpu: string = 15;      // limits: millicores
+    mem: string = 16;      //         bytes
+    eph: string = 17;      //         ephemeral-storage bytes
     bound: int = 22;       // /volume-binds/<id>-* present
     binds: string = 56;    // their values
     st: string = 70;       // /sandbox-status/ state
@@ -88,11 +102,21 @@ module nanocloud.sandbox {
     rev: int = 11;
     a12: string = 12;
     a13: string = 13;      // pack: a pulled workload image (/image-manifests/<pack>)
+    // CREATE: the process (a host workload's) and the limits (every kind's).
+    a14: string = 14;      // env
+    a15: string = 15;      // host
+    a16: string = 16;      // wd
+    a17: string = 17;      // iwd
+    a18: string = 18;      // user
+    a19: string = 19;      // cpu
+    a20: string = 20;      // mem
+    a21: string = 21;      // eph
     ctx: Ctx = 254;
   }
   // A graph-backed sandbox (/metal-sandboxes/): the workload is the FLXA the
-  // node was given at /graphs/<graph>, realised as modules of its own image —
-  // no rootfs, binds or lease to wait for. Its own message, so the host
+  // node was given at /graphs/<graph>, realised as modules of the node's own
+  // image — or a pulled workload image (`pack`), whose modules it brings —
+  // with no rootfs, binds or lease to wait for. Its own message, so the host
   // decision never reads a field a host record does not carry.
   message MSpec {
     seq: int = 1;
@@ -100,6 +124,9 @@ module nanocloud.sandbox {
     phase: string = 4;
     graph: string = 5;
     pack: string = 6;      // a workload image's pack (absent: a Graph's FLXA)
+    cpu: string = 7;       // limits: millicores
+    mem: string = 8;       //         bytes
+    eph: string = 9;       //         ephemeral-storage bytes
     st: string = 70;       // /sandbox-status/ state   (related, in order: 70, 80, 90)
     boot: string = 80;     // /sandbox-boot: this runtime's
     sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
@@ -112,7 +139,8 @@ module nanocloud.sandbox {
          && s.boot != ""
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack, ctx: Ctx { tag: "" } };
+           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
       Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
@@ -125,12 +153,16 @@ module nanocloud.sandbox {
          && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != ""
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
-           a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
+           a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, a12: "",
+           a14: s.env, a15: s.host, a16: s.wd, a17: s.iwd, a18: s.user,
+           a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && s.bound >= s.nvol && s.net != "own"
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
-           a8: "", a9: "", a10: s.binds, rev: 0, a12: "", ctx: Ctx { tag: "" } };
+           a8: "", a9: "", a10: s.binds, rev: 0, a12: "",
+           a14: s.env, a15: s.host, a16: s.wd, a17: s.iwd, a18: s.user,
+           a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
       Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
@@ -226,7 +258,7 @@ module nanocloud.sandbox {
     when e.kind == 1 ->
       W { cid: e.cid, op: PUT, key: "/sandbox-status/", k2: e.id, k3: "",
           v1: "state=", v2: e.label, v3: ";code=", v4: e.code, v5: "", v6: "",
-          rev: 0, ctx: Ctx2 { out: "", tag: "", id: e.id, boot: e.boot } };
+          rev: 0, ctx: Ctx2 { out: "", tag: "", id: e.id, boot: e.boot, bad: e.bytes, code: e.code } };
     when e.kind == 2 ->
       W { cid: e.cid, op: APPEND, key: "/sandbox-logs/", k2: e.id, k3: "",
           v1: e.bytes, v2: "", v3: "", v4: "", v5: "", v6: "", rev: 0, ctx: Ctx2 { out: "", tag: "", id: "", boot: "" } };
@@ -263,24 +295,28 @@ module nanocloud.sandbox {
     key: string = 3;
     k2: string = 17;
     v1: string = 4;
+    ctx: Ctx2 = 254;
   }
   decision evout(d: Done) -> W2 {
     when d.ctx.tag != "" && d.ctx.out != "" ->
-      W2 { cid: d.cid, op: PUT, key: "/sandbox-exec-output/", k2: d.ctx.tag, v1: d.ctx.out };
+      W2 { cid: d.cid, op: PUT, key: "/sandbox-exec-output/", k2: d.ctx.tag, v1: d.ctx.out, ctx: d.ctx };
     // The boot a status was recorded under, beside it (the status itself stays
     // `state=;code=` for every reader of it).
     when d.ctx.id != "" && d.ctx.boot != "" ->
-      W2 { cid: d.cid, op: PUT, key: "/sandbox-boot-of/", k2: d.ctx.id, v1: d.ctx.boot };
-    default -> W2 { cid: d.cid, op: NOOP, key: "", k2: "", v1: "" };
+      W2 { cid: d.cid, op: PUT, key: "/sandbox-boot-of/", k2: d.ctx.id, v1: d.ctx.boot, ctx: d.ctx };
+    default -> W2 { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", ctx: d.ctx };
   }
 
   transformation t_spec(s: Spec) -> Spec {
     Spec { seq: s.seq, key: s.key, phase: s.phase, cmd: s.cmd, rootfs: s.rootfs, iso: s.iso,
-           net: s.net, tasks: s.tasks, bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
+           net: s.net, tasks: s.tasks, env: s.env, host: s.host, wd: s.wd, iwd: s.iwd,
+           user: s.user, cpu: s.cpu, mem: s.mem, eph: s.eph,
+           bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
            lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol, desired: s.desired }
   }
   transformation t_mspec(s: MSpec) -> MSpec {
     MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph, pack: s.pack,
+            cpu: s.cpu, mem: s.mem, eph: s.eph,
             st: s.st, sboot: s.sboot, boot: s.boot, desired: s.desired }
   }
   transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }

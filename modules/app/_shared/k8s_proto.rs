@@ -102,7 +102,11 @@ fn sch_msg(m: u16) -> Option<(u16, u16, usize)> {
     }
     let at = sch_u32(8)? as usize + m as usize * 8;
     let fields_base = sch_u32(8)? as usize + n_msgs as usize * 8;
-    Some((sch_u16(at)?, sch_u16(at + 2)?, fields_base + sch_u32(at + 4)? as usize))
+    Some((
+        sch_u16(at)?,
+        sch_u16(at + 2)?,
+        fields_base + sch_u32(at + 4)? as usize,
+    ))
 }
 
 fn sch_field(first: usize, i: u16) -> Option<PbField> {
@@ -184,7 +188,12 @@ fn pb_next<'a>(b: &'a [u8], at: &mut usize) -> Option<Result<PbWire<'a>, PbErr>>
     };
     let wt = (key & 7) as u8;
     let num = (key >> 3) as u32;
-    let mut w = PbWire { num, wt, varint: 0, bytes: &[] };
+    let mut w = PbWire {
+        num,
+        wt,
+        varint: 0,
+        bytes: &[],
+    };
     match wt {
         0 => match pb_varint(b, at) {
             Some(v) => w.varint = v,
@@ -251,7 +260,14 @@ fn j_string<S: PbSink>(out: &mut S, s: &[u8]) -> Result<(), PbErr> {
             b'\n' => Some([b'\\', b'n', 0, 0, 0, 0]),
             b'\r' => Some([b'\\', b'r', 0, 0, 0, 0]),
             b'\t' => Some([b'\\', b't', 0, 0, 0, 0]),
-            0..=0x1F => Some([b'\\', b'u', b'0', b'0', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]]),
+            0..=0x1F => Some([
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(c >> 4) as usize],
+                HEX[(c & 15) as usize],
+            ]),
             _ => None,
         };
         if let Some(e) = esc {
@@ -294,8 +310,16 @@ fn j_base64<S: PbSink>(out: &mut S, b: &[u8]) -> Result<(), PbErr> {
         let q = [
             T[(b0 >> 2) as usize],
             T[(((b0 & 3) << 4) | (b1 >> 4)) as usize],
-            if chunk.len() > 1 { T[(((b1 & 15) << 2) | (b2 >> 6)) as usize] } else { b'=' },
-            if chunk.len() > 2 { T[(b2 & 63) as usize] } else { b'=' },
+            if chunk.len() > 1 {
+                T[(((b1 & 15) << 2) | (b2 >> 6)) as usize]
+            } else {
+                b'='
+            },
+            if chunk.len() > 2 {
+                T[(b2 & 63) as usize]
+            } else {
+                b'='
+            },
         ];
         j_put(out, &q)?;
     }
@@ -465,7 +489,13 @@ fn pb_message<S: PbSink>(out: &mut S, b: &[u8], m: u16, depth: u32) -> Result<()
             if ty == 1 {
                 j_string(out, pb_last(b, 3)?.map(|w| w.bytes).unwrap_or(&[]))
             } else {
-                j_i64(out, pb_last(b, 2)?.map(|w| w.varint as i64 as i32).unwrap_or(0).into())
+                j_i64(
+                    out,
+                    pb_last(b, 2)?
+                        .map(|w| w.varint as i64 as i32)
+                        .unwrap_or(0)
+                        .into(),
+                )
             }
         }
         PB_S_RAWJSON => match pb_last(b, 1)? {
@@ -499,7 +529,13 @@ fn pb_message<S: PbSink>(out: &mut S, b: &[u8], m: u16, depth: u32) -> Result<()
 /// Message `m`'s fields present in `b`, as `"name":value` members in schema
 /// order, each led by a comma unless `first` still holds. Whether `first`
 /// still holds after (nothing was written).
-fn pb_fields<S: PbSink>(out: &mut S, b: &[u8], m: u16, depth: u32, first: bool) -> Result<bool, PbErr> {
+fn pb_fields<S: PbSink>(
+    out: &mut S,
+    b: &[u8],
+    m: u16,
+    depth: u32,
+    first: bool,
+) -> Result<bool, PbErr> {
     if depth > PB_MAX_DEPTH {
         return Err(PbErr::Unsupported);
     }
@@ -540,7 +576,16 @@ fn pb_fields<S: PbSink>(out: &mut S, b: &[u8], m: u16, depth: u32, first: bool) 
                             j_put(out, b",")?;
                         }
                         lead = false;
-                        pb_scalar(out, f.kind, PbWire { num, wt: 0, varint: v, bytes: &[] })?;
+                        pb_scalar(
+                            out,
+                            f.kind,
+                            PbWire {
+                                num,
+                                wt: 0,
+                                varint: v,
+                                bytes: &[],
+                            },
+                        )?;
                     }
                 } else {
                     pb_value(out, f.kind, f.reference, w, depth)?;
@@ -595,7 +640,13 @@ fn pb_map_entry<S: PbSink>(out: &mut S, b: &[u8], f: PbField, depth: u32) -> Res
     }
 }
 
-fn pb_value<S: PbSink>(out: &mut S, kind: u8, reference: u16, w: PbWire<'_>, depth: u32) -> Result<(), PbErr> {
+fn pb_value<S: PbSink>(
+    out: &mut S,
+    kind: u8,
+    reference: u16,
+    w: PbWire<'_>,
+    depth: u32,
+) -> Result<(), PbErr> {
     match kind {
         PB_K_MESSAGE => {
             if w.wt != 2 {

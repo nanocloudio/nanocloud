@@ -15,15 +15,24 @@
 #   REPLICA  the store's replica (fluxor-replica.yaml, installed as
 #            /etc/nanocloud.io/fluxor/replica.yaml;
 #            NANOCLOUD_REPLICA_FRAGMENT overrides)
-#   KUBELET  the node's pod plane (fluxor-podlifecycle.yaml, installed as
-#            /etc/nanocloud.io/fluxor/kubelet.yaml;
-#            NANOCLOUD_KUBELET_FRAGMENT overrides)
+#   KUBELET  the node's pod plane: the kubelet's chains and its sandbox
+#            runtime (fluxor-podlifecycle.yaml, installed as
+#            /etc/nanocloud.io/fluxor/kubelet.yaml; NANOCLOUD_KUBELET_FRAGMENT
+#            overrides) and its image pull (fluxor-imagepull.yaml, installed
+#            as /etc/nanocloud.io/fluxor/image.yaml; NANOCLOUD_IMAGE_FRAGMENT
+#            overrides) — on a worker always; on the control plane when it
+#            runs Pods too (NANOCLOUD_PODS=1), with this node's lease
+#            (worker.yaml's), so a cluster of one is its own node
 #
 # Values come from /etc/nanocloud.io/cluster.env (NANOCLOUD_CLUSTER_ENV
 # overrides the path), each overridable from the environment:
 #
 #   NANOCLOUD_ROLE        plane or node                (default: plane)
 #   NANOCLOUD_NODE_NAME   this node's name             (default: hostname -s)
+#   NANOCLOUD_NODE_ADDRESS  this node's address: its Node's InternalIP, the
+#                         hostIP of its Pods (and their podIP, sharing its
+#                         network)  (default: the source address of its
+#                         default route; none when it has none)
 #   NANOCLOUD_FLUXOR_ABI  the fluxor ABI its runtime and modules are built
 #                         against, its `nanocloud.io/fluxor-abi` label
 #                         (default: /usr/share/nanocloud/fluxor-abi)
@@ -50,9 +59,37 @@
 # worker slot (every replica in NANOCLOUD_PEERS past the voters).
 #   NANOCLOUD_PLANE_API   a worker's control plane API under `authority`,
 #                         host:port: its link ends are certified there
-#   NANOCLOUD_SCOPED      a worker's private prefixes  (default: the
+#   NANOCLOUD_SCOPED      a node's private prefixes  (default: the
 #                         kubelet's, its sandboxes', probes' and image
-#                         cache's; see below)
+#                         cache's — every image record, its blob markers
+#                         and its fetch queue among them, are /image-…;
+#                         see below)
+#   NANOCLOUD_PODS        on the control plane: 1 runs Pods here too
+#                         (default: 0; a fresh install's cluster.env says 1)
+#
+# The image pull, from the node's own config (never from the graph's
+# artifacts: the CA is named by path, credentials are a store key):
+#
+#   NANOCLOUD_REGISTRY    the registry a bare image reference means, and
+#                         the one registry this node pulls from: a
+#                         reference naming another is refused (the Pod's
+#                         ErrImagePull event), never pulled from this one
+#                         (default: registry.nanocloud.io:5000)
+#   NANOCLOUD_REGISTRY_ADDR  where it is dialled, host:port (default: the
+#                         registry's own name)
+#   NANOCLOUD_REGISTRY_TLS   1: through a `tls` client that authenticates
+#                         the registry by its CA and its name (the default);
+#                         0: plaintext (a registry on a trusted link only)
+#   NANOCLOUD_REGISTRY_CA    that CA, DER (default:
+#                         /etc/nanocloud.io/certs/ca.der). Absent: the node
+#                         renders without the pull, and says so
+#   NANOCLOUD_IMAGE_BLOBS    the blob cache (default:
+#                         /var/lib/nanocloud.io/image/blobs)
+#
+# A registry's credentials (OCI token auth) are the value `user:password`
+# of the store key /registry-auth/<registry host>, when the operator writes
+# one; anonymous otherwise. imagePullSecrets are not read (a Pod's own
+# credentials for its own registry): one registry, one credential, per node.
 #
 # A worker's replica is scoped to its node: its private records are kept
 # under /~node/<node> in the store, apart from every other node's, and its
@@ -107,6 +144,8 @@ esac
 FLUXOR_ABI="${NANOCLOUD_FLUXOR_ABI:-$(cat /usr/share/nanocloud/fluxor-abi 2>/dev/null || true)}"
 NODE_FACTS="\"kubernetes.io/arch\":\"$ARCH\",\"kubernetes.io/os\":\"linux\",\"kubernetes.io/hostname\":\"$NODE_NAME\""
 [ -z "$FLUXOR_ABI" ] || NODE_FACTS="$NODE_FACTS,\"nanocloud.io/fluxor-abi\":\"$FLUXOR_ABI\""
+# The node's address, as its Node advertises it (node_lease.uproc `renew`).
+NODE_ADDRESS="${NANOCLOUD_NODE_ADDRESS-$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)}"
 REPLICA_ID="${NANOCLOUD_REPLICA_ID:-0}"
 VOTERS="${NANOCLOUD_VOTERS:-1}"
 PEER_PORT="${NANOCLOUD_PEER_PORT:-7450}"
@@ -115,9 +154,28 @@ PKI="${NANOCLOUD_PKI:-/etc/nanocloud.io/pki}"
 PEER_TRUST="${NANOCLOUD_PEER_TRUST:-pins}"
 TRUST_DOMAIN="${NANOCLOUD_TRUST_DOMAIN:-nanocloud.local}"
 SCOPED="${NANOCLOUD_SCOPED:-/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,/volume-binds/,/image-,/volume-ops/}"
+PODS="${NANOCLOUD_PODS:-0}"
 case "${NANOCLOUD_ROLE:-plane}" in
-    node) SCOPE="$NODE_NAME" ;;
-    *) SCOPE=""; SCOPED="" ;;
+    node) SCOPE="$NODE_NAME"; PODS=1 ;;
+    *)
+        case "$PODS" in
+            1) SCOPE="$NODE_NAME" ;;
+            0) SCOPE=""; SCOPED="" ;;
+            *) fail "NANOCLOUD_PODS is '$PODS', not 0 or 1" ;;
+        esac
+        ;;
+esac
+REGISTRY="${NANOCLOUD_REGISTRY:-registry.nanocloud.io:5000}"
+REGISTRY_ADDR="${NANOCLOUD_REGISTRY_ADDR:-$REGISTRY}"
+REGISTRY_TLS="${NANOCLOUD_REGISTRY_TLS:-1}"
+REGISTRY_CA="${NANOCLOUD_REGISTRY_CA:-/etc/nanocloud.io/certs/ca.der}"
+IMAGE_BLOBS="${NANOCLOUD_IMAGE_BLOBS:-/var/lib/nanocloud.io/image/blobs}"
+REGISTRY_HOST="${REGISTRY%%:*}"
+case "$REGISTRY" in
+    ""|*/*|*" "*|*'"'*) fail "NANOCLOUD_REGISTRY is '$REGISTRY', not host[:port]" ;;
+esac
+case "$REGISTRY_ADDR$IMAGE_BLOBS$REGISTRY_CA" in
+    *'"'*|*" "*) fail "a registry setting holds a quote or a space" ;;
 esac
 
 # fragment <override> <installed name> <source name>: the graph to splice.
@@ -141,11 +199,70 @@ CLIENT_REPLIES=0
 grep -q "^  - from: gateway.client_responses" "$TEMPLATE" && CLIENT_REPLIES=1
 KUBELET_MODULES=""
 KUBELET_WIRING=""
-if grep -q "__KUBELET_MODULES__" "$TEMPLATE"; then
+if [ "$PODS" = 1 ] && grep -q "__KUBELET_MODULES__" "$TEMPLATE"; then
     F="$(fragment "${NANOCLOUD_KUBELET_FRAGMENT:-}" kubelet.yaml fluxor-podlifecycle.yaml)" \
         || fail "no kubelet graph beside $TEMPLATE"
-    KUBELET_MODULES="$(modules_of "$F")"
+    # Its blob cache is the pull's.
+    KUBELET_MODULES="$(modules_of "$F" \
+        | sed "s#^    blobs: \"/var/lib/nanocloud.io/image/blobs\"\$#    blobs: \"$IMAGE_BLOBS\"#")"
     KUBELET_WIRING="$(wiring_of "$F")"
+    # The image pull: the fragment as installed, given this node's registry.
+    F="$(fragment "${NANOCLOUD_IMAGE_FRAGMENT:-}" image.yaml fluxor-imagepull.yaml)" \
+        || fail "no image graph beside $TEMPLATE"
+    if [ "$REGISTRY_TLS" = 1 ] && [ ! -r "$REGISTRY_CA" ]; then
+        echo "nanocloud-graph: no registry CA at $REGISTRY_CA: this node does not pull images" \
+            "(NANOCLOUD_REGISTRY_CA, or NANOCLOUD_REGISTRY_TLS=0)" >&2
+    else
+        IMAGE_MODULES="$(modules_of "$F" | sed \
+            -e "s#^    authority: \"registry.nanocloud.io:5000\"\$#    authority: \"$REGISTRY_ADDR\"#" \
+            -e "s#^    label: \"registry.nanocloud.io:5000\"\$#    label: \"$REGISTRY\"#" \
+            -e "s#^    credentials: \"/registry-auth/registry.nanocloud.io\"\$#    credentials: \"/registry-auth/$REGISTRY_HOST\"#" \
+            -e "s#^    dir: \"/var/lib/nanocloud.io/image/blobs\"\$#    dir: \"$IMAGE_BLOBS\"#")"
+        IMAGE_WIRING="$(wiring_of "$F")"
+        if [ "$REGISTRY_TLS" = 1 ]; then
+            # fetch <-> fetch_tls <-> linux_net, in place of fetch <-> linux_net.
+            IMAGE_MODULES="$IMAGE_MODULES
+  - name: fetch_tls
+    type: tls
+    mode: 0
+    alpn_h1_only: 1
+    peer_auth: 2
+    trust: \"\${file:$REGISTRY_CA}\"
+    verify_hostname: \"$REGISTRY_HOST\""
+            IMAGE_WIRING="$(printf '%s\n' "$IMAGE_WIRING" | awk '
+                /^  - from: / { f = $3; next }
+                /^    to: / { t = $2
+                    if (!((f ~ /^linux_net\./ && t ~ /^fetch\./) || (f ~ /^fetch\./ && t ~ /^linux_net\./)))
+                        printf "  - from: %s\n    to: %s\n", f, t
+                    next }
+                { print }')
+  - from: linux_net.net_out
+    to: fetch_tls.cipher_in
+  - from: fetch_tls.cipher_out
+    to: linux_net.net_in
+  - from: fetch_tls.clear_out
+    to: fetch.net_in
+  - from: fetch.net_out
+    to: fetch_tls.clear_in"
+        fi
+        KUBELET_MODULES="$KUBELET_MODULES
+$IMAGE_MODULES"
+        KUBELET_WIRING="$KUBELET_WIRING
+$IMAGE_WIRING"
+    fi
+    # The control plane's own lease, as a worker keeps its (worker.yaml).
+    if [ "${NANOCLOUD_ROLE:-plane}" != node ]; then
+        F="$(fragment "" worker.yaml fluxor-worker.yaml)" || fail "no worker graph beside $TEMPLATE"
+        LEASE="$(sed -n '/^  - name: nl_self$/,/^wiring:$/p' "$F" | sed '$d')"
+        [ -n "$LEASE" ] || fail "no node lease (nl_self) in $F"
+        KUBELET_MODULES="$KUBELET_MODULES
+$LEASE"
+        KUBELET_WIRING="$KUBELET_WIRING
+  - from: nl_self.status
+    to: nl_self.changes
+  - from: nl_self.record_out
+    to: nl_renew.request_in"
+    fi
 fi
 
 pin() { # the SHA-256 of a certificate's raw P-256 point
@@ -394,6 +511,7 @@ fluxor render-template "$TEMPLATE" \
     --var "KUBELET_WIRING=$KUBELET_WIRING" \
     --var "NODE_NAME=$NODE_NAME" \
     --var "NODE_FACTS=$NODE_FACTS" \
+    --var "NODE_ADDRESS=$NODE_ADDRESS" \
     --var "REPLICA_ID=$REPLICA_ID" \
     --var "VOTERS=$VOTERS" \
     --var "QUORUM=$((VOTERS / 2 + 1))" \

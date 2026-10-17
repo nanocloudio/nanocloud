@@ -377,10 +377,10 @@ for w in "node=$N" "image=nginx:1.27" "restart=always" "desired=running" "cmd=ng
   case "$SPEC" in *"$w"*) ;; *) fail "/~node/$N/pod-specs/uid-web lacks '$w': '$SPEC'";; esac
 done
 wait_for 30 "$N's image chain never asked for web's image" \
-  holds plane "/~node/$N/image-requests/nginx" "repo=nginx;tag=1.27"
+  holds plane "/~node/$N/image-requests/nginx+1.27" "reg=;repo=nginx;tag=1.27;pin="
 OTHER=node-b; [ "$N" = node-b ] && OTHER=node-c
-absent plane "/~node/$OTHER/image-requests/nginx" || fail "$OTHER asked for an image it was not asked to run"
-holds "$N" "/~node/$N/image-requests/nginx" "repo=nginx;tag=1.27" || fail "$N lacks its own image request"
+absent plane "/~node/$OTHER/image-requests/nginx+1.27" || fail "$OTHER asked for an image it was not asked to run"
+holds "$N" "/~node/$N/image-requests/nginx+1.27" "reg=;repo=nginx;tag=1.27;pin=" || fail "$N lacks its own image request"
 echo "   web scheduled onto $N; its image asked for in $N's scope only"
 
 echo "== 6. the voter restarts: its store is the log's, and its import resumes where it ended =="

@@ -294,7 +294,11 @@ fn hc_header_lines(h: &[u8]) -> impl Iterator<Item = &[u8]> {
             return None;
         }
         let rest = h.get(at..)?;
-        let n = rest.windows(2).position(|w| w == b"\r\n").map(|i| i + 2).unwrap_or(rest.len());
+        let n = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|i| i + 2)
+            .unwrap_or(rest.len());
         at += n;
         rest.get(..n)
     })
@@ -304,7 +308,9 @@ fn hc_header_lines(h: &[u8]) -> impl Iterator<Item = &[u8]> {
 fn hc_header_name_is(line: &[u8], name: &[u8]) -> bool {
     line.len() > name.len()
         && line.get(name.len()) == Some(&b':')
-        && line.get(..name.len()).is_some_and(|n| n.eq_ignore_ascii_case(name))
+        && line
+            .get(..name.len())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// Whether the block's content type is `ct` (parameters aside).
@@ -562,7 +568,11 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         let old = self.slots[at].req;
         let (t, h, p) = {
             let s = &self.slots[at];
-            (s.target_len as usize, s.hdr_len as usize, s.peer_len as usize)
+            (
+                s.target_len as usize,
+                s.hdr_len as usize,
+                s.peer_len as usize,
+            )
         };
         let all = old.bytes();
         let headers = all.get(t..t + h).unwrap_or(&[]);
@@ -594,7 +604,12 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             return false;
         }
         let res = {
-            let mut sink = HcSink { buf: &mut nb, heap, limit, full: false };
+            let mut sink = HcSink {
+                buf: &mut nb,
+                heap,
+                limit,
+                full: false,
+            };
             pb_to_json(body, &mut sink).map(|()| sink.full)
         };
         match res {

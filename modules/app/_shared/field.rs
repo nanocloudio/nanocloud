@@ -4,12 +4,8 @@
 // Included by the modules that want exactly this rule. The other variants in
 // this repo are DELIBERATE and stay in the modules that need them:
 //
-//   * `,` as an additional delimiter (11 modules) — for records like
-//     `sel=k=v,k=v` where a comma separates entries rather than ending one.
-//   * `>=` instead of `>` (image_assembler, hpa_reconciler) —
-//     so a drained `pull=` reads `Some("")` rather than None. image_assembler
-//     depends on exactly that: the empty value is how it knows a pull plan
-//     completed, and the strict form would report it as missing.
+//   * `,` as an additional delimiter — for records like `sel=k=v,k=v`
+//     where a comma separates entries rather than ending one.
 //
 // Flattening these into one shared default would change parsing silently, in
 // states the E2Es do not all reach. One file, one meaning; divergence stays

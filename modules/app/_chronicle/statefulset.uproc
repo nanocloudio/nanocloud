@@ -53,7 +53,7 @@ module nanocloud.statefulset {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    ready: string = 40;   // the neighbour's status.ready
+    ready: string = 40;   // the neighbour's Ready condition: True|False
     ctx: Ctx = 254;
   }
   message st.Probe {
@@ -104,7 +104,7 @@ module nanocloud.statefulset {
       st.Probe { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", in: "", ns: a.ctx.ns, name: a.ctx.name, gate: "", pod: a.ctx.pod, ouid: a.ctx.ouid } };
     when a.ctx.in == "1" && a.status == 204 ->
       st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "1", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod, ouid: a.ctx.ouid } };
-    when a.ctx.in == "1" && a.status == 200 && a.ready == "true" ->
+    when a.ctx.in == "1" && a.status == 200 && a.ready == "True" ->
       st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "1", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod, ouid: a.ctx.ouid } };
     when a.ctx.in == "" && a.status == 404 ->
       st.Probe { cid: a.cid, op: GET, key: a.ctx.key, ctx: Ctx { key: a.ctx.key, tmpl: a.ctx.tmpl, in: "", ns: a.ctx.ns, name: a.ctx.name, gate: "1", pod: a.ctx.pod, ouid: a.ctx.ouid } };
@@ -124,7 +124,7 @@ module nanocloud.statefulset {
                p6: a.ctx.name,
                p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":",
                p8: a.ctx.tmpl,
-               p9: "}" };
+               p9: ",\"status\":{\"phase\":\"Pending\"}}" };
     when a.ctx.in == "" && a.status == 200 && a.ctx.gate == "1" ->
       st.Act { cid: a.cid, op: DELETE, key: a.ctx.key };
     default ->

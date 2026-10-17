@@ -16,15 +16,27 @@ hardware_targets = ["bcm2712", "linux"]
 # PTY pump). It is the only module holding `requires_contract = "workload"`
 # plus `platform_raw`, so namespace surgery stays one auditable grant.
 #
-# In: five request inputs (so five chains feed it without a merge), each a
+# In: six request inputs (so six chains feed it without a merge), each a
 # Chronicle record (a byte stream, self-framed, or a mailbox):
 #   1 correlation (i64)   2 op (i64)   3 id (the sandbox; the pty session's
 #   tail for the pty ops)   30..39 carry, echoed on the op's event
 #   op 1 CREATE   4 cmd (argv, whitespace-split)  5 rootfs  6 iso ("1")
+#                 14 env (`NAME=VALUE`, `,`-separated, each escaped; a later
+#                 entry overrides an earlier of its name)  15 host (HOSTNAME)
+#                 16 wd (the cwd)  17 iwd (the cwd when 16 is empty)
+#                 18 user (`uid[:gid]` | `name[:group]`) — the process gets
+#                 exactly HOSTNAME, that env and a default PATH when it names
+#                 none, never the runtime's environment; 14-18 escaped `%XX`
+#                 19 cpu (millicores)  20 mem (bytes)  21 eph (bytes): the
+#                 CREATE envelope (compute_milli, memory_bytes,
+#                 storage_bytes — what the workload's own owner may hold in
+#                 its storage root), every kind of workload; empty =
+#                 unlimited
 #                 12 graph: the workload is the FLXA subgraph of the Graph
 #                 object /graphs.nanocloud.io/<graph> (spec.flxa, hex) — a
-#                 module subgraph of the node's own image, the only kind a
-#                 bare-metal node runs; cmd/rootfs/binds are then unused
+#                 module subgraph of the node's own image; cmd/rootfs/binds
+#                 are then unused. A bare-metal node runs these and pulled
+#                 workload images (13), never a host process
 #                 13 pack: the workload is a PULLED WORKLOAD IMAGE, named
 #                 as its /image-manifests/<pack> record (`kind=workload`;
 #                 layers and sizes, the FLXA first, then one `.fmod` per
@@ -75,7 +87,9 @@ hardware_targets = ["bcm2712", "linux"]
 #   kind 4 pty output (bytes)   kind 5 pty status (open | failed |
 #   exited, code)   kind 6 boot (emitted once at start)   kind 7 pty input
 #   consumed
-# `boot` is this process's identity: a status recorded under another boot
+# `boot` is this process's identity, a random nonce drawn at start (never
+# the wall clock, which a board reads as 0 until its time protocol answers):
+# a status recorded under another boot
 # describes a workload that no longer exists (the node restarted), which is
 # how the chain knows to create it again.
 # Param `blobs`: the node's blob cache (the directory a pulled image's layers

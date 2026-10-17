@@ -88,7 +88,7 @@ modules:
     join: "/pods/"
     join_scoped: 2
     join_match: "metadata.labels:spec.selector"
-    join_paths: "status.ready,status.podIP,metadata.uid"
+    join_paths: "status.conditions[type=Ready].status,status.podIP,metadata.uid"
     watch: "/pods/,/probe-status/"
   - name: probe
     type: store_effect
@@ -169,32 +169,32 @@ PY2
 echo "== 1. two Services, four Pods (web-2 not ready, db-1 matches nothing) =="
 store_put "/services/default/web" '{"metadata":{"name":"web"},"spec":{"selector":{"app":"web"}}}'
 store_put "/services/default/api" '{"metadata":{"name":"api"},"spec":{"selector":{"app":"api","tier":"backend"}}}'
-store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","ready":true}}'
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":false}}'
-store_put "/pods/default/api-1" '{"metadata":{"name":"api-1","labels":{"app":"api","tier":"backend"}},"status":{"podIP":"10.0.0.3","ready":true}}'
-store_put "/pods/default/db-1"  '{"metadata":{"name":"db-1","labels":{"app":"db"}},"status":{"podIP":"10.0.0.4","ready":true}}'
+store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}'
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"False"}]}}'
+store_put "/pods/default/api-1" '{"metadata":{"name":"api-1","labels":{"app":"api","tier":"backend"}},"status":{"podIP":"10.0.0.3","conditions":[{"type":"Ready","status":"True"}]}}'
+store_put "/pods/default/db-1"  '{"metadata":{"name":"db-1","labels":{"app":"db"}},"status":{"podIP":"10.0.0.4","conditions":[{"type":"Ready","status":"True"}]}}'
 run 7
 [ "$(store_last /endpoints/default/web)" = "web-1=10.0.0.1" ] || fail "web: '$(store_last /endpoints/default/web)'"
 [ "$(store_last /endpoints/default/api)" = "api-1=10.0.0.3" ] || fail "api: '$(store_last /endpoints/default/api)' (db-1 must not match; multi-label selector)"
 echo "   web: web-1=10.0.0.1 (web-2 not ready); api: api-1=10.0.0.3 (db-1 excluded)"
 
 echo "== 2. web-2 becomes ready: included, in key order =="
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":true}}'
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}'
 run 6
 [ "$(store_last /endpoints/default/web)" = "web-1=10.0.0.1,web-2=10.0.0.2" ] || fail "web after flip: '$(store_last /endpoints/default/web)'"
 echo "   web: web-1=10.0.0.1,web-2=10.0.0.2"
 
 echo "== 3. the probe runner overrides: web-1 has a uid and a failing probe; web-3 a passing one =="
-store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","uid":"u1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","ready":true}}'
+store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","uid":"u1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}'
 store_put "/probe-status/u1" "live=1;ready=0"
-store_put "/pods/default/web-3" '{"metadata":{"name":"web-3","uid":"u3","labels":{"app":"web"}},"status":{"podIP":"10.0.0.5","ready":false}}'
+store_put "/pods/default/web-3" '{"metadata":{"name":"web-3","uid":"u3","labels":{"app":"web"}},"status":{"podIP":"10.0.0.5","conditions":[{"type":"Ready","status":"False"}]}}'
 store_put "/probe-status/u3" "live=1;ready=1"
 run 6
 [ "$(store_last /endpoints/default/web)" = "web-2=10.0.0.2,web-3=10.0.0.5" ] || fail "probe override: '$(store_last /endpoints/default/web)'"
 echo "   web: web-2=10.0.0.2,web-3=10.0.0.5 — the probe's verdict in AND out"
 
 echo "== 4. a label change and a deletion: web-2 relabelled, web-3 deleted =="
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"other"}},"status":{"podIP":"10.0.0.2","ready":true}}'
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"other"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}'
 store_del "/pods/default/web-3"
 run 7
 [ -z "$(store_last /endpointslices/default/web/web-3)" ] || fail "web-3's slice should be pruned"

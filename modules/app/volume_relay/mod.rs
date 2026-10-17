@@ -139,6 +139,10 @@ struct State {
     reply_len: u16,
     effect: [u8; REC],
     effect_len: u16,
+    /// An effect taken from the chains whose address read was not answered
+    /// yet (`EAGAIN`): addressed again next step, before any new one.
+    held: [u8; REC],
+    held_len: u16,
     /// Scratch, kept off the stack.
     rec: [u8; REC],
     rec2: [u8; REC],
@@ -152,6 +156,8 @@ struct State {
     last_hb_ms: u64,
     /// The counters' sum at the last heartbeat.
     last_hb_sum: u32,
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 define_params! {
@@ -280,9 +286,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.effect_len != 0 && !flush(sys, s.effect_out, &mut s.effect, &mut s.effect_len) {
             return 0;
         }
-        issue(s, sys, now, swept);
-        serve(s, sys, now, swept);
-        s.woken = 0;
+        let waited = issue(s, sys, now, swept);
+        let waited = serve(s, sys, now, swept) | waited;
+        // A pass whose reads were not all answered (`EAGAIN`) runs again
+        // next step rather than at the next sweep.
+        s.woken = u8::from(waited);
         let sum = s
             .relayed
             .wrapping_add(s.answered)
@@ -390,14 +398,24 @@ fn rl_frame_len(data: &[u8]) -> Option<usize> {
 
 // ── issuing: this graph's chains' effects, to the other side ─────────
 
-unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
-    let store = Store::plain(sys);
-    // A new effect, into a free slot.
+/// True when a read of the pass was not answered yet (`EAGAIN`).
+unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) -> bool {
+    let store = Store::plain(sys, &s.nag);
+    // A new effect, into a free slot: the held one first.
     if let Some(i) = s.issued.iter().position(|x| x.phase == PHASE_FREE) {
-        if let Some(n) = take(sys, s.request_in, &mut s.rec, &mut s.dropped) {
+        let got = if s.held_len != 0 {
+            let n = s.held_len as usize;
+            s.rec[..n].copy_from_slice(&s.held[..n]);
+            s.held_len = 0;
+            Some(n)
+        } else {
+            take(sys, s.request_in, &mut s.rec, &mut s.dropped)
+        };
+        if let Some(n) = got {
             let rec = &s.rec[..n];
-            if rl_carries(&s.ops, rl_i64(rec, 2)) {
-                start_issue(s, &store, i, n, now);
+            if rl_carries(&s.ops, rl_i64(rec, 2)) && !start_issue(s, &store, i, n, now) {
+                s.held[..n].copy_from_slice(&s.rec[..n]);
+                s.held_len = n as u16;
             }
         }
     }
@@ -417,6 +435,9 @@ unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
                 let x = &s.issued[i];
                 let key = &x.key[..x.key_len as usize];
                 let Some(n) = get_value(&store, key, &mut s.buf) else {
+                    if store.waiting() {
+                        continue; // not answered yet, not withdrawn
+                    }
                     // Withdrawn under it (a restart's sweep): asked again by
                     // the chain.
                     s.issued[i] = SLOT_FREE;
@@ -457,10 +478,13 @@ unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
     if s.reply_len != 0 {
         flush(sys, s.response_out, &mut s.reply, &mut s.reply_len);
     }
+    store.waiting()
 }
 
-/// Address effect `s.rec[..n]` and stage its request in slot `i`.
-unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64) {
+/// Address effect `s.rec[..n]` and stage its request in slot `i`. False
+/// when the address could not be read yet (`EAGAIN`): nothing was staged,
+/// and the caller holds the effect for the next step.
+unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64) -> bool {
     let rec = &s.rec[..n];
     let mut key = [0u8; MAX_KEY];
     let mut k = 0usize;
@@ -506,6 +530,9 @@ unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64
                 }
             }
         };
+        if store.waiting() {
+            return false;
+        }
         let name = &node[..nl];
         rl_node_ok(name)
             && add(&mut key, TO_NODE)
@@ -526,11 +553,11 @@ unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64
         s.dropped = s.dropped.wrapping_add(1);
         let m = b"[volume_relay] an effect names no node this relay can reach - dropped";
         dev_log(store.table(), 2, m.as_ptr(), m.len());
-        return;
+        return true;
     }
     let Some(vl) = rl_request(rec, &mut s.issued_values[i]) else {
         s.dropped = s.dropped.wrapping_add(1);
-        return;
+        return true;
     };
     x.key[..k].copy_from_slice(&key[..k]);
     x.key_len = k as u8;
@@ -538,6 +565,7 @@ unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64
     x.since_ms = now;
     x.phase = PHASE_WRITE;
     s.relayed = s.relayed.wrapping_add(1);
+    true
 }
 
 unsafe fn give_up(s: &mut State, sys: &SyscallTable, i: usize) {
@@ -549,8 +577,9 @@ unsafe fn give_up(s: &mut State, sys: &SyscallTable, i: usize) {
 
 // ── serving: the other side's requests, through this graph's effectors ─
 
-unsafe fn serve(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
-    let store = Store::plain(sys);
+/// True when a read of the pass was not answered yet (`EAGAIN`).
+unsafe fn serve(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) -> bool {
+    let store = Store::plain(sys, &s.nag);
     // Outcomes from the effectors: a served request's (by its id) is
     // written back; the chains' own pass by.
     while let Some(n) = take(sys, s.answer_in, &mut s.rec, &mut s.dropped) {
@@ -585,6 +614,7 @@ unsafe fn serve(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
                     s.served[i].rev = rev;
                     s.served[i].phase = PHASE_ANSWERING;
                 }
+                None if store.waiting() => continue, // not answered yet
                 None => {
                     s.served[i] = SLOT_FREE;
                     continue;
@@ -609,7 +639,7 @@ unsafe fn serve(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
     }
     // New requests: on a change, and on the sweep.
     if !(s.woken != 0 || swept) || s.effect_len != 0 {
-        return;
+        return store.waiting();
     }
     let prefix = if s.side == SIDE_NODE { NODE_OPS } else { ASKS };
     let mut walk = ListWalk::new(prefix);
@@ -658,6 +688,9 @@ unsafe fn serve(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) {
         s.effect_len = el as u16;
         flush(sys, s.effect_out, &mut s.effect, &mut s.effect_len);
     }
+    // A page or a value not answered yet: the requests past it are found
+    // on the next pass.
+    store.waiting()
 }
 
 /// A served slot's tag in the correlation id its effect carries: its key's

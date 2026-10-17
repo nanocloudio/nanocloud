@@ -3,8 +3,10 @@
 # The control plane is a fluxor graph (see nanocloud.service). There is no host
 # server process and no `--*-mode` flags — the graph IS the control plane.
 
-# The control-plane store directory (store.log). The graph is its sole writer.
-FLUXOR_STORE_DIR=/var/lib/nanocloud.io/control-plane/store
+# FLUXOR_STORE_DIR is deliberately NOT set (nanocloud.service): with it,
+# fluxor brings up a host store of its own beside the graph's lattice store,
+# and a lattice store that could not start would be replaced by it silently.
+# The graph's store lives in the unit's WorkingDirectory.
 
 # The packaged fluxor project root — where `fluxor run` resolves the runtime and
 # the .fmod modules the control-plane graph references.

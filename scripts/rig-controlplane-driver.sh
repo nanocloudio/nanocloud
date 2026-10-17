@@ -329,6 +329,13 @@ YAML
     for i in $(seq 120); do apps_running && apps_serving && break; sleep 3; done
     apps_running && apps_serving || { k get pods -o wide; fail "the apps did not come back after the power cycle"; }
     echo "   every app Running and serving again after the power cycle"
+    # lattice keeps its data in the Pod's own storage root on the board's
+    # FAT32: what was SET before the cut must still be there.
+    if has_app lattice-kv; then
+      got="$(redis-cli -h "$IP" -p 6379 GET greeting 2>/dev/null)"
+      [ "$got" = "hello" ] || fail "lattice-kv lost its data across the power cycle: GET greeting -> '$got'"
+      echo "   lattice-kv GET greeting -> $got (written before the power cycle)"
+    fi
   fi
 fi
 echo "PASS: kubectl drives the bare-metal control plane"

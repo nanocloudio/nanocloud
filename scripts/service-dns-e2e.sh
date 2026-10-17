@@ -84,8 +84,8 @@ nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. a Service and two ready backend pods =="
 store_put "/services/default/web" '{"metadata":{"name":"web"},"spec":{"selector":{"app":"web"}}}'
-store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","ready":true}}'
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":true}}'
+store_put "/pods/default/web-1" '{"metadata":{"name":"web-1","labels":{"app":"web"}},"status":{"podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}'
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}'
 
 echo "== 3. phase A: endpoints → DNS A-records for both backends =="
 run_runtime
@@ -95,7 +95,7 @@ DNS="$(store_last '/dns/web.default.svc.cluster.local')"
 echo "   web.default.svc.cluster.local -> $DNS"
 
 echo "== 4. phase B: a backend goes not-ready → its A-record drops out =="
-store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","ready":false}}'
+store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"False"}]}}'
 run_runtime
 DNS="$(store_last '/dns/web.default.svc.cluster.local')"
 [ "$DNS" = "a=10.0.0.1" ] \

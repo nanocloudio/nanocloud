@@ -5,8 +5,9 @@
 #   lattice-kv       packaging/apps/lattice-kv.yaml       RESP on :6379
 #   chronicle-http   packaging/apps/chronicle-http.yaml   HTTP on :8080
 #   quantum-mqtt     quantum's examples/linux/minimal.yaml (scripts/support/
-#                    to-workload.py, durability volatile, without the admin
-#                    plane whose `monitor` privilege a tenant may not hold)
+#                    to-workload.py, its durable WAL in its own storage root,
+#                    without the admin plane whose `monitor` privilege a
+#                    tenant may not hold)
 #                                                          MQTT on :9090
 #
 #   apps-publish.sh [registry host:port]     (default registry.nanocloud.io:5000)
@@ -43,7 +44,6 @@ publish lattice-kv "$W/lattice-kv.yaml" "$ROOT"
 publish chronicle-http "$W/chronicle-http.yaml" "$ROOT"
 mkdir -p "$QROOT/target/nanocloud-apps"
 python3 -B "$ROOT/scripts/support/to-workload.py" "$QROOT/examples/linux/minimal.yaml" \
-  "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" --variant durability=volatile --drop operations --drop http \
-  --param consensus.durability_mode=2 --param consensus.persist_meta=0 \
+  "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" --drop operations --drop http \
   "$QROOT/modules" "$QROOT/../clustor/modules" "$QROOT/../wave/modules" 2>/dev/null
 publish quantum-mqtt "$QROOT/target/nanocloud-apps/quantum-mqtt.yaml" "$QROOT"

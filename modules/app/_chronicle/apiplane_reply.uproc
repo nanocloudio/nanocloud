@@ -53,7 +53,11 @@ module nanocloud.apiplane_reply {
   // (and a refusal of it — 409, a patch's 400/422 — is `reply`'s).
   decision d_answer(w: Wrote) -> Acted {
     // A join secret that answered nothing — never issued, or spent — is a
-    // credential that did not verify.
+    // credential that did not verify. Only a MISS is: a take the store could
+    // not decide (503) is not a verdict on the secret, which stays unspent.
+    when w.c_verb == "join" && w.status == 503 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 503,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the join could not be decided; present the secret again\"}", c_stream: 0, c_key: w.c_key };
     when w.c_verb == "join" && w.status != 200 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 401,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"join secret not recognised\"}", c_stream: 0, c_key: w.c_key };

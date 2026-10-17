@@ -1,9 +1,13 @@
 // Endpoints as params. Three chains.
 //   slice   /services/ JOIN /pods/ scoped to the namespace, with the label
-//           selector as the join predicate (65) and the pod's readiness, IP
-//           and uid projected (60..62); the probe runner's verdict, when it
-//           has one, overrides readiness -> /endpointslices/<ns>/<svc>/<pod>
-//           = ip, or deleted
+//           selector as the join predicate (65) and the pod's readiness (its
+//           Ready condition, `status.conditions[type=Ready].status`), IP and
+//           uid projected (60..62); the probe runner's verdict, when it has
+//           one on this store, overrides readiness ->
+//           /endpointslices/<ns>/<svc>/<pod> = ip, or deleted. The IP is
+//           status.podIP as the node reports it — the node's own address for
+//           a Pod that shares its network (pod_status.uproc), where a Pod
+//           listening on a port is reached
 //   prune   a slice whose pod is gone
 //   doc     /services/ with list_children over /endpointslices/ ->
 //           /endpoints/<ns>/<svc> = "<pod>=<ip>,…" — the consumers' document,
@@ -29,7 +33,7 @@ module nanocloud.endpoints {
     key: string = 3;      // "<ns>/<svc>"
     pod: string = 21;     // the pod's name
     podkey: string = 24;  // its full key
-    ready: string = 60;   // status.ready
+    ready: string = 60;   // the Ready condition's status: True|False
     ip: string = 61;      // status.podIP
     uid: string = 62;     // metadata.uid
     hit: string = 65;     // "1" when labels ⊇ selector
@@ -108,11 +112,11 @@ module nanocloud.endpoints {
       ep.Ask { cid: p.seq, op: NOOP, key: "", ctx: Ctx { key: p.key, pod: p.pod, ready: p.ready, ip: p.ip, hit: p.hit } };
   }
   // Included when matched, addressed, and ready — the probe's verdict when
-  // it has one, the static field otherwise. Excluded is a delete-if-present.
+  // it has one, the Pod's Ready condition otherwise. Excluded is a delete-if-present.
   decision slice(a: ep.Probe) -> ep.Slice {
     when a.ctx.hit == "1" && a.ctx.ip != "" && a.status == 200 && a.pready == "1" ->
       ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: a.ctx.ip };
-    when a.ctx.hit == "1" && a.ctx.ip != "" && a.status != 200 && a.ctx.ready == "true" ->
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.status != 200 && a.ctx.ready == "True" ->
       ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: a.ctx.ip };
     default ->
       ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: "" };

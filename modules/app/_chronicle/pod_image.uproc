@@ -1,36 +1,83 @@
 // An image reference resolved to something runnable: the pull trigger, the
-// two gates, and the answer.
+// digest it names, the two gates, and the answer.
 //
-//   /pod-specs/<uid>  image=<repo>[:<tag>]        (the ask)
-//   /image-requests/<flat>  repo=..;tag=..        (the trigger; image_fetcher)
-//   /image-rootfs/<flat>    state=ready;path=..   (the assembler's answer;
-//                           path=pack:<flat> for a workload image)
-//   /image-config/<flat>    entrypoint=..;cmd=..  (the OCI config)
-//   /pod-resolved/<uid>     rootfs=..;cmd=..      (what the project chain uses)
+//   /pod-specs/<uid>        image=<ref>;pull=<imagePullPolicy>  (the ask)
+//   /image-requests/<rk>    reg=..;repo=..;tag=..;pin=..  (the trigger;
+//                           image.uproc's pull)
+//   /image-digests/<rk>     digest=<hex> | refused=<why>  (what <rk> names)
+//   /image-rootfs/<hex>     state=ready;path=..   (the assembler's answer;
+//                           path=pack:<hex> for a workload image)
+//   /image-config/<hex>     entrypoint=..;cmd=..  (the OCI config)
+//   /pod-resolved/<uid>     rootfs=..;digest=<hex>;env=..;workdir=..;
+//                           user=..;cmd=..  (what the project chain uses:
+//                           the digest the Pod runs, the image's Env,
+//                           WorkingDir and User, the argv by the Kubernetes
+//                           command/args rules)
 //
-// `cmd=` is the LAST field because argv is the one value that can contain the
-// record separator: `CMD ["nginx","-g","daemon off;"]` is ordinary, and the
-// compact `;` grammar cannot carry it. A reader that splits on `;` therefore
-// loses the tail; carrying it whole needs the READER (the sandbox runtime) to
-// take the remainder of the record after `cmd=` rather than the next segment,
-// which is a change to that module, not to this decision.
+// <rk> is the reference's store-key spelling (`!ikey`) — what every Pod of
+// that reference shares — unless the Pod's imagePullPolicy is Always: then
+// it is the Pod's uid, a resolution of its own, and the tag is asked of the
+// registry again for this Pod whatever is cached. The policy defaults as
+// upstream's does: Always for `:latest` or no tag, IfNotPresent otherwise
+// (a digest is never moved). Never resolves only what is cached under the
+// reference. A Pod keeps the digest it resolved: a tag moved later is a
+// later Pod's, never this one's.
 //
-// The repo/tag split and the `/`->`_` store-key spelling are `!` projection
-// modifiers on the source: turning `nanocloud/hello:v2` into the three things
-// a key and a URL need is transcription, not policy. So is `!argv`, which
-// undoes image_fetcher's escaping of the OCI Entrypoint/Cmd lists.
+// A reference this node will not pull (refused: another registry than its
+// own) and one it may not (Never, nothing cached) is the Pod's Warning
+// event — ErrImagePull / ErrImageNeverPull, upstream's reasons — on the
+// /events/ the plane serves; the Pod stays Pending. A reference that is not
+// one (`!ikey` empty) triggers nothing.
+//
+// A pull that fails (the registry unreachable, a TLS failure, a 5xx, …) is
+// asked again with a growing delay (image_back.uproc), and while it is the
+// Pod is told: its pull's /image-pull-failed/<pull> record — the request
+// <rk> for the manifest, the digest for its config and layers — is its
+// Warning event, ErrImagePull at the first failure and ImagePullBackOff
+// with the count after (upstream's reasons); the Pod stays Pending and
+// resolves by itself once a retry serves. A Pod whose reference is cached
+// (IfNotPresent, Never) is resolved from the node's records and its blob
+// cache alone: nothing here asks the registry for it.
+//
+// argv is the one value whose bytes can include the record separator:
+// `CMD ["nginx","-g","daemon off;"]` is ordinary. It never reaches a record
+// raw: image.uproc writes the config lists (`!esc`) with `%`, `,` and `;` escaped
+// (`%25`, `%2C`, `%3B`), and `!argv` renders them in the argv grammar
+// (_shared/argv.rs), which escapes `;`, `,`, `%` and whitespace inside each
+// token — `cmd=nginx -g daemon%20off%3B` — so the record's own `;` stays the
+// only separator and workload_effect's spawn decodes each token
+// (scripts/image-chronicle-e2e.sh step 3b). `cmd=` is still written last.
+//
+// The registry/repo/tag/digest split and the store-key spelling are `!`
+// projection modifiers on the source (Docker's normalization, _shared/
+// pathmod.rs): turning `host:5000/nanocloud/hello:v2` into the things a key
+// and a URL need is transcription, not policy. So is `!argv`, which undoes
+// image.uproc's `!esc` escaping of the OCI Entrypoint/Cmd lists.
 module nanocloud.podimage {
 
   // The context each chain here carries across its effects: ONE nested
   // message in the reserved carry field (254), echoed unchanged by every
   // connector. Inner numbers are the old carry-through numbers, so every
   // module that hands a context on agrees on it.
-  // carried by: pi.Req, pi.Sent, pi.Ask, pi.Rootfs, pi.Cfg
+  // carried by: pi.Req, pi.Sent, pi.Dig, pi.Look, pi.Rootfs, pi.Cfg, pi.Res,
+  // pi.Done
   message Ctx {
-    key: string = 30;
-    flat: string = 31;
+    key: string = 30;     // the uid
+    rk: string = 31;      // the request it resolves through
     cmd: string = 32;
     rootfs: string = 33;
+    dig: string = 34;     // the digest it resolved to
+    pod: string = 35;     // <ns>/<name>
+    img: string = 36;     // the reference, as the Pod states it
+    never: string = 37;   // "1": imagePullPolicy Never
+    args: string = 38;    // the container's args (argv)
+    fk: string = 39;      // "m": look the request's failure up; "1": a
+                          // failure is what was read
+    wr: string = 40;      // why the Pod waits on its image (ErrImagePull,
+                          //   ImagePullBackOff, ErrImageNeverPull) — its
+                          //   /pod-wait/ record — and the message's parts:
+    ww: string = 41;      //   the failure in words
+    wc: string = 42;      //   the registry's status ("0": it did not answer)
   }
 
   message pi.Spec {
@@ -38,18 +85,23 @@ module nanocloud.podimage {
     rev: int = 2;
     key: string = 3;      // uid
     image: string = 4;
-    repo: string = 5;     // image!repo
-    tag: string = 6;      // image!tag
-    flat: string = 7;     // image!flat
-    rootfs: string = 8;   // an explicit rootfs wins outright
-    cmd: string = 9;      // an explicit cmd wins outright
+    reg: string = 5;      // image!reg
+    repo: string = 6;     // image!repo
+    tag: string = 7;      // image!tag
+    pin: string = 8;      // image!pin
+    ikey: string = 9;     // image!ikey
+    rootfs: string = 10;  // an explicit rootfs wins outright
+    cmd: string = 11;     // an explicit cmd wins outright
+    pull: string = 12;    // imagePullPolicy
+    pod: string = 13;
+    args: string = 14;    // the container's args
   }
   message pi.Req {
     cid: int = 1;
     op: int = 2;
-    key: string = 3;      // the flat name, under /image-requests/
+    key: string = 3;      // <rk>, under /image-requests/
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
-// the uid
+    v5: string = 8; v6: string = 9; v7: string = 10; v8: string = 11;
     ctx: Ctx = 254;
   }
   message pi.Sent {
@@ -58,10 +110,31 @@ module nanocloud.podimage {
     value: string = 3;
     ctx: Ctx = 254;
   }
+  message pi.Dig {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    digest: string = 40;
+    refused: string = 41;
+    ctx: Ctx = 254;
+  }
   message pi.Ask {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
+    ctx: Ctx = 254;
+  }
+  // The rootfs read — or, for a Pod whose image cannot be had, its event
+  // (/events/<ns>/<uid>.<reason>): the effect's key_prefix is `/`.
+  message pi.Look {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+    v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80; v15: string = 81;
     ctx: Ctx = 254;
   }
   message pi.Rootfs {
@@ -72,96 +145,303 @@ module nanocloud.podimage {
     path: string = 41;
     ctx: Ctx = 254;
   }
+  // (pi_rootfs projects only state and path: a failure is read by the next
+  // effect, pi_config, whose answer carries it as pi.Cfg's fails/code/why.)
   message pi.Cfg {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
     ep: string = 40;      // entrypoint!argv
     ccmd: string = 41;    // cmd!argv
+    env: string = 42;     // Env, NAME=VALUE,… escaped
+    wd: string = 43;      // WorkingDir, escaped
+    user: string = 44;    // User, escaped
+    fails: string = 45;   // /image-pull-failed/: the pull's failures
+    code: string = 46;    //   the last one's status (0: no answer)
+    why: string = 47;     //   in words
     ctx: Ctx = 254;
   }
   message pi.Res {
     cid: int = 1;
     op: int = 2;
-    key: string = 3;      // the uid, under /pod-resolved/
+    key: string = 3;      // pod-resolved/<uid>, or the Pod's event (the
+                          // effect's key_prefix is `/`)
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
-    v5: string = 8; v6: string = 9;
+    v5: string = 8; v6: string = 9; v7: string = 10; v8: string = 11;
+    v9: string = 12; v10: string = 13; v11: string = 14; v12: string = 15;
+    v13: string = 16; v14: string = 80; v15: string = 81; v16: string = 82;
+    v17: string = 83; v18: string = 84; v19: string = 85;
+    ctx: Ctx = 254;
+  }
+  // pi_resolved's answer, for the wait record.
+  message pi.Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message pi.Wait {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8; v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12;
   }
 
   enum NOOP = 0;
   enum GET = 1;
   enum PUT = 3;
+  enum DELETE = 4;
 
   // Trigger the pull. An explicit rootfs means the pod is not image-backed.
   decision request(s: pi.Spec) -> pi.Req {
-    when s.image == "" || s.rootfs != "" ->
-      pi.Req { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key, flat: "", cmd: s.cmd } };
+    when s.image == "" || s.rootfs != "" || s.ikey == "" ->
+      pi.Req { cid: s.seq, op: NOOP, key: "",
+               ctx: Ctx { key: s.key, rk: "", cmd: s.cmd, args: s.args, pod: s.pod, img: s.image, never: "" } };
+    // Never: what is cached under the reference, or nothing — read, not asked.
+    when s.pull == "Never" ->
+      pi.Req { cid: s.seq, op: GET, key: s.ikey,
+               ctx: Ctx { key: s.key, rk: s.ikey, cmd: s.cmd, args: s.args, pod: s.pod, img: s.image, never: "1" } };
+    // Always (stated, or upstream's default for `:latest` and no tag): this
+    // Pod's own resolution, keyed by its uid — the tag asked again.
+    when s.pull == "Always" || (s.pull != "IfNotPresent" && s.pin == "" && s.tag == "latest") ->
+      pi.Req { cid: s.seq, op: PUT, key: s.key,
+               v1: "reg=", v2: s.reg, v3: ";repo=", v4: s.repo, v5: ";tag=", v6: s.tag,
+               v7: ";pin=", v8: s.pin,
+               ctx: Ctx { key: s.key, rk: s.key, cmd: s.cmd, args: s.args, pod: s.pod, img: s.image, never: "" } };
     default ->
-      pi.Req { cid: s.seq, op: PUT, key: s.flat,
-               v1: "repo=", v2: s.repo, v3: ";tag=", v4: s.tag, ctx: Ctx { key: s.key, flat: s.flat, cmd: s.cmd } };
+      pi.Req { cid: s.seq, op: PUT, key: s.ikey,
+               v1: "reg=", v2: s.reg, v3: ";repo=", v4: s.repo, v5: ";tag=", v6: s.tag,
+               v7: ";pin=", v8: s.pin,
+               ctx: Ctx { key: s.key, rk: s.ikey, cmd: s.cmd, args: s.args, pod: s.pod, img: s.image, never: "" } };
   }
-  decision ask_rootfs(r: pi.Sent) -> pi.Ask {
-    when r.ctx.flat == "" ->
-      pi.Ask { cid: r.cid, op: NOOP, key: "", ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd, rootfs: "" } };
+  // What the request names: a digest, a refusal, or nothing yet.
+  decision ask_digest(r: pi.Sent) -> pi.Ask {
+    when r.ctx.rk == "" ->
+      pi.Ask { cid: r.cid, op: NOOP, key: "", ctx: r.ctx };
     default ->
-      pi.Ask { cid: r.cid, op: GET, key: r.ctx.flat, ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd, rootfs: "" } };
+      pi.Ask { cid: r.cid, op: GET, key: r.ctx.rk, ctx: r.ctx };
+  }
+  decision ask_rootfs(r: pi.Dig) -> pi.Look {
+    when r.ctx.rk == "" ->
+      pi.Look { cid: r.cid, op: NOOP, key: "",
+                ctx: Ctx { key: r.ctx.key, rk: "", cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", dig: "", pod: r.ctx.pod } };
+    when has(r.refused) && r.refused != "" && r.ctx.pod.indexOf("/") > 0 ->
+      pi.Look { cid: r.cid, op: PUT,
+                key: "events/" + r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")) + "/",
+                k2: r.ctx.key, k3: ".ErrImagePull",
+                v1: "{\"metadata\":{\"name\":\"", v2: r.ctx.key,
+                v3: ".ErrImagePull\",\"namespace\":\"", v4: r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")),
+                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+                v6: r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")),
+                v7: "\",\"name\":\"", v8: r.ctx.pod.substring(r.ctx.pod.indexOf("/") + 1),
+                v9: "\",\"uid\":\"", v10: r.ctx.key,
+                v11: "\"},\"reason\":\"ErrImagePull\",\"message\":\"Failed to pull image \\\"", v12: r.ctx.img,
+                v13: "\\\": ", v14: r.refused, v15: "\",\"type\":\"Warning\",\"count\":1}",
+                ctx: Ctx { key: r.ctx.key, rk: "", cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", dig: "", pod: r.ctx.pod,
+                           wr: "ErrImagePull", ww: r.refused, wc: "0", img: r.ctx.img } };
+    when r.status == 404 && r.ctx.never == "1" && r.ctx.pod.indexOf("/") > 0 ->
+      pi.Look { cid: r.cid, op: PUT,
+                key: "events/" + r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")) + "/",
+                k2: r.ctx.key, k3: ".ErrImageNeverPull",
+                v1: "{\"metadata\":{\"name\":\"", v2: r.ctx.key,
+                v3: ".ErrImageNeverPull\",\"namespace\":\"", v4: r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")),
+                v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+                v6: r.ctx.pod.substring(0, r.ctx.pod.indexOf("/")),
+                v7: "\",\"name\":\"", v8: r.ctx.pod.substring(r.ctx.pod.indexOf("/") + 1),
+                v9: "\",\"uid\":\"", v10: r.ctx.key,
+                v11: "\"},\"reason\":\"ErrImageNeverPull\",\"message\":\"Container image \\\"", v12: r.ctx.img,
+                v13: "\\\" is not present with pull policy of Never\",\"type\":\"Warning\",\"count\":1}",
+                ctx: Ctx { key: r.ctx.key, rk: "", cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", dig: "", pod: r.ctx.pod,
+                           wr: "ErrImageNeverPull", ww: "", wc: "0", img: r.ctx.img } };
+    when r.status == 200 && has(r.digest) && r.digest.size() == 64 ->
+      pi.Look { cid: r.cid, op: GET, key: "image-rootfs/", k2: r.digest, k3: "",
+                ctx: Ctx { key: r.ctx.key, rk: r.ctx.rk, cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", dig: r.digest, pod: r.ctx.pod, img: r.ctx.img, fk: "" } };
+    // Not resolved yet: whether its pull is failing is the next stage's read.
+    when r.status == 404 && r.ctx.never != "1" ->
+      pi.Look { cid: r.cid, op: NOOP, key: "",
+                ctx: Ctx { key: r.ctx.key, rk: r.ctx.rk, cmd: "", args: "", rootfs: "", dig: "", pod: r.ctx.pod, img: r.ctx.img, fk: "m" } };
+    default ->
+      pi.Look { cid: r.cid, op: NOOP, key: "",
+                ctx: Ctx { key: r.ctx.key, rk: "", cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", dig: "", pod: r.ctx.pod } };
   }
   // The rootfs gate: nothing is resolved until the assembler says ready.
-  decision ask_cfg(r: pi.Rootfs) -> pi.Ask {
-    when r.state == "ready" && r.ctx.cmd != "" ->
-      pi.Ask { cid: r.cid, op: NOOP, key: "", ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd, rootfs: r.path } };
+  // Short of it, the pull's failure is read: the request's, while it names
+  // no digest; the digest's (its config or a layer), while it is assembled.
+  decision ask_cfg(r: pi.Rootfs) -> pi.Look {
+    when r.ctx.fk == "m" && r.ctx.rk != "" ->
+      pi.Look { cid: r.cid, op: GET, key: "image-pull-failed/", k2: r.ctx.rk, k3: "",
+                ctx: Ctx { key: r.ctx.key, dig: "", cmd: "", args: "", rootfs: "", pod: r.ctx.pod, img: r.ctx.img, fk: "1" } };
+    when r.ctx.dig == "" ->
+      pi.Look { cid: r.cid, op: NOOP, key: "", ctx: Ctx { key: r.ctx.key, dig: "", cmd: r.ctx.cmd, args: r.ctx.args, rootfs: "", fk: "", wr: r.ctx.wr, ww: r.ctx.ww, wc: r.ctx.wc, img: r.ctx.img } };
     when r.state == "ready" ->
-      pi.Ask { cid: r.cid, op: GET, key: r.ctx.flat, ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd, rootfs: r.path } };
+      pi.Look { cid: r.cid, op: GET, key: "image-config/", k2: r.ctx.dig, k3: "",
+                ctx: Ctx { key: r.ctx.key, dig: r.ctx.dig, cmd: r.ctx.cmd, args: r.ctx.args, rootfs: r.path, fk: "" } };
     default ->
-      pi.Ask { cid: r.cid, op: NOOP, key: "", ctx: Ctx { key: r.ctx.key, flat: "", cmd: r.ctx.cmd, rootfs: "" } };
+      pi.Look { cid: r.cid, op: GET, key: "image-pull-failed/", k2: r.ctx.dig, k3: "",
+                ctx: Ctx { key: r.ctx.key, dig: "", cmd: "", args: "", rootfs: "", pod: r.ctx.pod, img: r.ctx.img, fk: "1" } };
   }
-  // The answer. An explicit spec `cmd=` wins outright; otherwise argv is the
-  // image's Entrypoint ++ Cmd, exactly as the OCI runtime spec composes them.
+  // The answer: the rootfs, the digest, the image's Env, WorkingDir and
+  // User, and the argv by the Kubernetes rules for a container's command
+  // and args against the image's Entrypoint and Cmd:
+  //   command and args  command ++ args          (the image's neither)
+  //   command only      command                  (Entrypoint replaced, Cmd ignored)
+  //   args only         Entrypoint ++ args       (Cmd replaced)
+  //   neither           Entrypoint ++ Cmd
+  // Not before the config is read (200): the env, cwd and user are the
+  // image's whatever the command, and a sandbox made without them would not
+  // be the image's.
   decision resolve(c: pi.Cfg) -> pi.Res {
-    when c.ctx.rootfs == "" ->
-      pi.Res { cid: c.cid, op: NOOP, key: "" };
-    // A workload image resolves to its pack (`pack:<flat>`): no argv, no
+    // The pull is failing: the Pod's Warning event. ErrImagePull at the
+    // first failure, ImagePullBackOff (with how many) while it is retried;
+    // the registry's status when it answered one (0: it did not answer).
+    when c.ctx.fk == "1" && c.status == 200 && has(c.fails) && c.fails == "1" && c.code == "0" && c.ctx.pod.indexOf("/") > 0 ->
+      pi.Res { cid: c.cid, op: PUT,
+               key: "events/" + c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")) + "/" + c.ctx.key + ".ErrImagePull",
+               v1: "{\"metadata\":{\"name\":\"", v2: c.ctx.key,
+               v3: ".ErrImagePull\",\"namespace\":\"", v4: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v7: "\",\"name\":\"", v8: c.ctx.pod.substring(c.ctx.pod.indexOf("/") + 1),
+               v9: "\",\"uid\":\"", v10: c.ctx.key,
+               v11: "\"},\"reason\":\"ErrImagePull\",\"message\":\"Failed to pull image \\\"", v12: c.ctx.img,
+               v13: "\\\": ", v14: c.why, v15: "\",\"type\":\"Warning\",\"count\":1}",
+               ctx: Ctx { key: c.ctx.key, wr: "ErrImagePull", ww: c.why, wc: c.code, img: c.ctx.img } };
+    when c.ctx.fk == "1" && c.status == 200 && has(c.fails) && c.fails == "1" && c.ctx.pod.indexOf("/") > 0 ->
+      pi.Res { cid: c.cid, op: PUT,
+               key: "events/" + c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")) + "/" + c.ctx.key + ".ErrImagePull",
+               v1: "{\"metadata\":{\"name\":\"", v2: c.ctx.key,
+               v3: ".ErrImagePull\",\"namespace\":\"", v4: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v7: "\",\"name\":\"", v8: c.ctx.pod.substring(c.ctx.pod.indexOf("/") + 1),
+               v9: "\",\"uid\":\"", v10: c.ctx.key,
+               v11: "\"},\"reason\":\"ErrImagePull\",\"message\":\"Failed to pull image \\\"", v12: c.ctx.img,
+               v13: "\\\": ", v14: c.why, v15: " (status ", v16: c.code, v17: ")\",\"type\":\"Warning\",\"count\":1}",
+               ctx: Ctx { key: c.ctx.key, wr: "ErrImagePull", ww: c.why, wc: c.code, img: c.ctx.img } };
+    when c.ctx.fk == "1" && c.status == 200 && has(c.fails) && c.fails != "" && c.code == "0" && c.ctx.pod.indexOf("/") > 0 ->
+      pi.Res { cid: c.cid, op: PUT,
+               key: "events/" + c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")) + "/" + c.ctx.key + ".ImagePullBackOff",
+               v1: "{\"metadata\":{\"name\":\"", v2: c.ctx.key,
+               v3: ".ImagePullBackOff\",\"namespace\":\"", v4: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v7: "\",\"name\":\"", v8: c.ctx.pod.substring(c.ctx.pod.indexOf("/") + 1),
+               v9: "\",\"uid\":\"", v10: c.ctx.key,
+               v11: "\"},\"reason\":\"ImagePullBackOff\",\"message\":\"Back-off pulling image \\\"", v12: c.ctx.img,
+               v13: "\\\": ", v14: c.why, v15: "\",\"type\":\"Warning\",\"count\":", v16: c.fails, v17: "}",
+               ctx: Ctx { key: c.ctx.key, wr: "ImagePullBackOff", ww: c.why, wc: c.code, img: c.ctx.img } };
+    when c.ctx.fk == "1" && c.status == 200 && has(c.fails) && c.fails != "" && c.ctx.pod.indexOf("/") > 0 ->
+      pi.Res { cid: c.cid, op: PUT,
+               key: "events/" + c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")) + "/" + c.ctx.key + ".ImagePullBackOff",
+               v1: "{\"metadata\":{\"name\":\"", v2: c.ctx.key,
+               v3: ".ImagePullBackOff\",\"namespace\":\"", v4: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
+               v6: c.ctx.pod.substring(0, c.ctx.pod.indexOf("/")),
+               v7: "\",\"name\":\"", v8: c.ctx.pod.substring(c.ctx.pod.indexOf("/") + 1),
+               v9: "\",\"uid\":\"", v10: c.ctx.key,
+               v11: "\"},\"reason\":\"ImagePullBackOff\",\"message\":\"Back-off pulling image \\\"", v12: c.ctx.img,
+               v13: "\\\": ", v14: c.why, v15: " (status ", v16: c.code, v17: ")\",\"type\":\"Warning\",\"count\":", v18: c.fails, v19: "}",
+               ctx: Ctx { key: c.ctx.key, wr: "ImagePullBackOff", ww: c.why, wc: c.code, img: c.ctx.img } };
+    when c.ctx.fk == "1" ->
+      pi.Res { cid: c.cid, op: NOOP, key: "", ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    when c.ctx.rootfs == "" || c.ctx.dig == "" ->
+      pi.Res { cid: c.cid, op: NOOP, key: "", ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    // A workload image resolves to its pack (`pack:<hex>`): no argv, no
     // rootfs — the project chain gives the metal sandbox its name.
     when c.ctx.rootfs.startsWith("pack:") ->
-      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key, v1: "rootfs=", v2: c.ctx.rootfs };
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key, v1: "rootfs=", v2: c.ctx.rootfs,
+               v3: ";digest=", v4: c.ctx.dig, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    when c.status != 200 ->
+      pi.Res { cid: c.cid, op: NOOP, key: "", ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    when c.ctx.cmd != "" && c.ctx.args != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ctx.cmd, v13: " ", v14: c.ctx.args, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
     when c.ctx.cmd != "" ->
-      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key,
-               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";cmd=", v4: c.ctx.cmd };
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ctx.cmd, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    when c.ctx.args != "" && c.ep != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ep, v13: " ", v14: c.ctx.args, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+    when c.ctx.args != "" ->
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ctx.args, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
     when c.ep != "" && c.ccmd != "" ->
-      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key,
-               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";cmd=", v4: c.ep, v5: " ", v6: c.ccmd };
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ep, v13: " ", v14: c.ccmd, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
     when c.ep != "" ->
-      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key,
-               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";cmd=", v4: c.ep };
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ep, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
     when c.ccmd != "" ->
-      pi.Res { cid: c.cid, op: PUT, key: c.ctx.key,
-               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";cmd=", v4: c.ccmd };
+      pi.Res { cid: c.cid, op: PUT, key: "pod-resolved/" + c.ctx.key,
+               v1: "rootfs=", v2: c.ctx.rootfs, v3: ";digest=", v4: c.ctx.dig, v5: ";env=", v6: c.env,
+               v7: ";workdir=", v8: c.wd, v9: ";user=", v10: c.user, v11: ";cmd=", v12: c.ccmd, ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
     default ->
-      pi.Res { cid: c.cid, op: NOOP, key: "" };
+      pi.Res { cid: c.cid, op: NOOP, key: "", ctx: Ctx { key: c.ctx.key, wr: c.ctx.wr, ww: c.ctx.ww, wc: c.ctx.wc, img: c.ctx.img } };
+  }
+
+  // The Pod's wait on its image, for its status (pod_report.uproc): while
+  // its pull fails, or its image cannot be had, /pod-wait/<uid> says why and
+  // what upstream would say; once resolved, or while a pull is merely in
+  // progress, there is none (delete-if-present, a read when absent).
+  decision wait(d: pi.Done) -> pi.Wait {
+    when has(d.ctx.wr) && d.ctx.wr == "ErrImageNeverPull" ->
+      pi.Wait { cid: d.cid, op: PUT, key: d.ctx.key, v1: "why=", v2: d.ctx.wr, v3: ";msg=Container image \\\"", v4: d.ctx.img,
+                v5: "\\\" is not present with pull policy of Never" };
+    when has(d.ctx.wr) && d.ctx.wr == "ImagePullBackOff" && d.ctx.wc != "0" ->
+      pi.Wait { cid: d.cid, op: PUT, key: d.ctx.key, v1: "why=", v2: d.ctx.wr, v3: ";msg=Back-off pulling image \\\"", v4: d.ctx.img,
+                v5: "\\\": ", v6: d.ctx.ww, v7: " (status ", v8: d.ctx.wc, v9: ")" };
+    when has(d.ctx.wr) && d.ctx.wr == "ImagePullBackOff" ->
+      pi.Wait { cid: d.cid, op: PUT, key: d.ctx.key, v1: "why=", v2: d.ctx.wr, v3: ";msg=Back-off pulling image \\\"", v4: d.ctx.img,
+                v5: "\\\": ", v6: d.ctx.ww };
+    when has(d.ctx.wr) && d.ctx.wr == "ErrImagePull" && d.ctx.wc != "0" ->
+      pi.Wait { cid: d.cid, op: PUT, key: d.ctx.key, v1: "why=", v2: d.ctx.wr, v3: ";msg=Failed to pull image \\\"", v4: d.ctx.img,
+                v5: "\\\": ", v6: d.ctx.ww, v7: " (status ", v8: d.ctx.wc, v9: ")" };
+    when has(d.ctx.wr) && d.ctx.wr == "ErrImagePull" ->
+      pi.Wait { cid: d.cid, op: PUT, key: d.ctx.key, v1: "why=", v2: d.ctx.wr, v3: ";msg=Failed to pull image \\\"", v4: d.ctx.img,
+                v5: "\\\": ", v6: d.ctx.ww };
+    when has(d.ctx.key) && d.ctx.key != "" ->
+      pi.Wait { cid: d.cid, op: DELETE, key: d.ctx.key };
+    default ->
+      pi.Wait { cid: d.cid, op: NOOP, key: "" };
   }
 
   transformation p1(s: pi.Spec) -> pi.Spec {
-    pi.Spec { seq: s.seq, rev: s.rev, key: s.key, image: s.image, repo: s.repo,
-              tag: s.tag, flat: s.flat, rootfs: s.rootfs, cmd: s.cmd }
+    pi.Spec { seq: s.seq, rev: s.rev, key: s.key, image: s.image, reg: s.reg, repo: s.repo,
+              tag: s.tag, pin: s.pin, ikey: s.ikey, rootfs: s.rootfs, cmd: s.cmd, pull: s.pull,
+              pod: s.pod, args: s.args }
   }
   transformation p2(r: pi.Sent) -> pi.Sent {
-    pi.Sent { cid: r.cid, status: r.status, value: r.value, ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd } }
+    pi.Sent { cid: r.cid, status: r.status, value: r.value, ctx: r.ctx }
+  }
+  transformation p5(r: pi.Dig) -> pi.Dig {
+    pi.Dig { cid: r.cid, status: r.status, value: r.value, digest: r.digest, refused: r.refused, ctx: r.ctx }
   }
   transformation p3(r: pi.Rootfs) -> pi.Rootfs {
     pi.Rootfs { cid: r.cid, status: r.status, value: r.value,
-                state: r.state, path: r.path, ctx: Ctx { key: r.ctx.key, flat: r.ctx.flat, cmd: r.ctx.cmd, rootfs: r.ctx.rootfs } }
+                state: r.state, path: r.path, ctx: r.ctx }
   }
   transformation p4(c: pi.Cfg) -> pi.Cfg {
     pi.Cfg { cid: c.cid, status: c.status, value: c.value,
-             ep: c.ep, ccmd: c.ccmd, ctx: c.ctx }
+             ep: c.ep, ccmd: c.ccmd, env: c.env, wd: c.wd, user: c.user,
+             fails: c.fails, code: c.code, why: c.why, ctx: c.ctx }
   }
   pipeline rq(s: pi.Spec) -> pi.Req { call x = p1(s); call y = request(x); return y; }
-  pipeline ar(r: pi.Sent) -> pi.Ask { call x = p2(r); call y = ask_rootfs(x); return y; }
-  pipeline ac(r: pi.Rootfs) -> pi.Ask { call x = p3(r); call y = ask_cfg(x); return y; }
+  pipeline ad(r: pi.Sent) -> pi.Ask { call x = p2(r); call y = ask_digest(x); return y; }
+  pipeline ar(r: pi.Dig) -> pi.Look { call x = p5(r); call y = ask_rootfs(x); return y; }
+  pipeline ac(r: pi.Rootfs) -> pi.Look { call x = p3(r); call y = ask_cfg(x); return y; }
   pipeline rs(c: pi.Cfg) -> pi.Res { call x = p4(c); call y = resolve(x); return y; }
+  pipeline wt(d: pi.Done) -> pi.Wait { call x = wait(d); return x; }
   entry rq = rq;
+  entry ad = ad;
   entry ar = ar;
   entry ac = ac;
   entry rs = rs;
+  entry wt = wt;
   provenance revision "podimage-resolve" toolchain "chronicle-authoring";
 }

@@ -1,0 +1,111 @@
+// A failed GET of the image pull (image.uproc), after `ans` and `tg`: the
+// row backs off, and the pull's failure is recorded for the Pods waiting on
+// it. Its own module only because image.uproc is at its declaration limit;
+// the context (Ctx3) and the record (Done) are image.uproc's, field for field.
+//
+//   bo   the row: `fails=<n>;due=<when>;why=<status>` merged into
+//        /image-fetch-q/<row>, the next ask not before 10 s x 2^(n-1), at most
+//        300 s (the kubelet's image pull backoff). The queue's source arms a
+//        timer for `due` and asks the row again then; im_fq leaves it until
+//        then, so a failing row never holds the others
+//   bf   /image-pull-failed/<pull> fails=<n>;code=<status>;why=<text> — <pull>
+//        the request <rk> for a manifest, the manifest digest for its config
+//        and its layers — which pod_image.uproc turns into the Pod's
+//        ErrImagePull and ImagePullBackOff events; removed once a GET of the
+//        pull serves
+module nanocloud.imageback {
+
+  // carried by: Put, Done, Back, Fail — the request a manifest resolves;
+  // for a GET that failed, the row, its failures and the pull it fails
+  message Ctx3 {
+    rk: string = 30;
+    dig: string = 31;
+    q: string = 32;        // the row (failed: it backs off)
+    pull: string = 33;     // the pull a GET served or failed: <rk> or <hex>
+    bad: string = 34;      // "1": the GET failed
+    ok: string = 35;       // "1": the GET served what it was asked
+    st: int = 36;          // the answer's status (0: no answer at all)
+    fails: int = 37;       // the row's failures, this one counted
+    now: int = 38;
+  }
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx3 = 254;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // A failed GET's row backs off: its failures counted, the next ask not
+  // before 10 s x 2^(n-1), at most 300 s — the ladder IS the function (no
+  // shift in the VM, n bounded by the cap). The source wakes on `due`.
+  message Back {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: int = 9;
+    ctx: Ctx3 = 254;
+  }
+  decision bo(d: Done) -> Back {
+    when d.ctx.bad == "1" && d.ctx.q != "" && d.ctx.fails <= 1 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 10000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    when d.ctx.bad == "1" && d.ctx.q != "" && d.ctx.fails == 2 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 20000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    when d.ctx.bad == "1" && d.ctx.q != "" && d.ctx.fails == 3 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 40000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    when d.ctx.bad == "1" && d.ctx.q != "" && d.ctx.fails == 4 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 80000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    when d.ctx.bad == "1" && d.ctx.q != "" && d.ctx.fails == 5 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 160000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    when d.ctx.bad == "1" && d.ctx.q != "" ->
+      Back { cid: d.cid, op: MERGE, key: "/image-fetch-q/", k2: d.ctx.q,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 300000, v5: ";why=", v6: d.ctx.st, ctx: d.ctx };
+    default ->
+      Back { cid: d.cid, op: NOOP, key: "", k2: "", ctx: d.ctx };
+  }
+  // What the Pods waiting on a pull are told: its failures, the status and
+  // why, under the pull — and nothing, once a GET of it serves.
+  message Fail {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: string = 9;
+  }
+  decision bf(d: Done) -> Fail {
+    when d.ctx.bad == "1" && d.ctx.pull != "" && d.ctx.st == 0 ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "the registry could not be reached" };
+    when d.ctx.bad == "1" && d.ctx.pull != "" && d.ctx.st == 404 ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "not found in the registry" };
+    when d.ctx.bad == "1" && d.ctx.pull != "" && (d.ctx.st == 401 || d.ctx.st == 403) ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "the registry refused the credentials" };
+    when d.ctx.bad == "1" && d.ctx.pull != "" && d.ctx.st >= 500 && d.ctx.st != 507 ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "the registry failed to answer" };
+    when d.ctx.bad == "1" && d.ctx.pull != "" ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "the answer was not what was asked" };
+    when d.ctx.ok == "1" && d.ctx.pull != "" ->
+      Fail { cid: d.cid, op: DELETE, key: "/image-pull-failed/", k2: d.ctx.pull };
+    default ->
+      Fail { cid: d.cid, op: NOOP, key: "", k2: "" };
+  }
+
+  transformation t_done(d: Done) -> Done { Done { cid: d.cid, status: d.status, ctx: d.ctx } }
+  pipeline im_bo(d: Done) -> Back { call x = t_done(d); call y = bo(x); return y; }
+  pipeline im_bf(d: Done) -> Fail { call x = t_done(d); call y = bf(x); return y; }
+  entry im_bo = im_bo;
+  entry im_bf = im_bf;
+  provenance revision "image-backoff" toolchain "chronicle-authoring";
+}

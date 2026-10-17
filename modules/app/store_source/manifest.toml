@@ -110,6 +110,8 @@ hardware_targets = ["bcm2712", "linux"]
 # node graph's own name, so it can register and renew itself. `facts = <text>`
 # stamps it at 49 the same way: what the render knows of the node and no record
 # says (its labels, as JSON members — arch, os, the fluxor ABI).
+# `address = <ip>` stamps it at 47: the node's own address as its render knows
+# it — what its Node advertises as InternalIP, the hostIP of its Pods.
 #
 # `join_fit = "<object path>:<prefix>:<joined path>"` narrows a `join_pick`
 # to the joined entries the object FITS: the object's selector (a JSON object

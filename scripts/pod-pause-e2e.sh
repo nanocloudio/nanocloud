@@ -2,8 +2,9 @@
 # Live E2E for PAUSE/RESUME through the node pipeline: the paused-aware status
 # loop in the sandbox runtime and the paused-aware pod_lifecycle state machine.
 #
-# No CLI/API verb can issue PAUSE yet, so this script plays the orchestrator
-# the way the other E2Es drive effects — through the store seam:
+# Nothing in the plane issues PAUSE — the Kubernetes API has no pause verb and
+# no module writes /sandbox-pause/ — so this script plays the orchestrator the
+# way the other E2Es drive effects, through the store seam:
 # /sandbox-pause/<id> = "pause" | "resume" (consumed by the sandbox runtime, gated
 # on the backend CAPS PAUSE bit).
 #

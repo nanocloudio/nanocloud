@@ -26,6 +26,7 @@ include!("../_shared/views.rs");
 include!("../_shared/docschema.rs");
 include!("../_shared/head_rev.rs");
 include!("../_shared/jsonq.rs");
+include!("../_shared/moment.rs");
 
 // Chronicle's stage executor, from its published cores — not restated. With
 // `ir_stages` the watch connector runs a Chronicle PIPELINE on each candidate
@@ -71,6 +72,13 @@ const LIST_BUF: usize = 2048;
 const MAX_PREFIX: usize = 96;
 /// `paths` param: `spec.host,spec.to.name,...` — dotted, comma-separated.
 const MAX_PATHS_SPEC: usize = 256;
+/// `related`'s room: nine blocks of ten paths, long ones (a container probe's
+/// fields, read off the Pod).
+const RELATED_SPEC: usize = 768;
+/// The `paths` param itself: fifteen paths into a Pod's container spec
+/// (`spec.containers.0.resources.limits.ephemeral-storage!bytes`) run past
+/// 256 bytes, and a param past its buffer is cut, silently.
+const PATHS_TEXT: usize = 640;
 /// The `table` column spec a graph may state.
 const TABLE_SPEC: usize = 2048;
 /// The document schema (`schema`, _shared/docschema.rs).
@@ -292,9 +300,14 @@ struct State {
     /// about this object" is a lookup, not a join, and a chain that needed
     /// five read stages to gather them needs none. Fields land at 70.. in
     /// blocks of ten: the first related prefix at 70..79, the second at
-    /// 80..89, and so on. Absent resolves to empty, like every projection.
-    related: [u8; MAX_PATHS_SPEC],
+    /// 80..89, and so on — nine blocks, to 150..159 (a Pod's status reads
+    /// its spec, sandbox, probe, image and run records at once). The same
+    /// prefix may be named twice, for twenty fields of one record. Absent
+    /// resolves to empty, like every projection.
+    related: [u8; RELATED_SPEC],
     related_len: u16,
+    /// A `related` spec past [`RELATED_SPEC`]: refused at the first step.
+    related_cut: u8,
     /// `unless = <prefix>`: emit only objects whose SAME KEY under that
     /// prefix is ABSENT — "a request with no lease", "a claim whose owner is
     /// gone". A filter like `where`, so count mode indexes among the objects
@@ -311,6 +324,13 @@ struct State {
     scan_now: i64,
     /// Earliest deadline ahead of `scan_now` seen this scan; i64::MAX = none.
     next_due: i64,
+    /// `recheck = <ms>`: while a `!wall` projection read a moment it could
+    /// not yet say as wall-clock time (the node's clock untrusted), the
+    /// source scans again that long after — the clock's becoming trusted is
+    /// no store change, and nothing else would wake it. Reads, no writes.
+    recheck: u32,
+    /// A `!wall` read of this scan came back unresolved.
+    unresolved: core::cell::Cell<u8>,
     /// `child_sep`: the byte between the tail and a child's name for
     /// `count_children` and `expand_over` — `-` for ordinals (default), `/`
     /// for a namespace's objects.
@@ -326,8 +346,11 @@ struct State {
     truncated: u32,
     prefix: [u8; MAX_PREFIX],
     prefix_len: u8,
-    paths: [u8; MAX_PATHS_SPEC],
+    paths: [u8; PATHS_TEXT],
     paths_len: u16,
+    /// `paths` ran past [`PATHS_TEXT`]: refused whole (no projection), never
+    /// cut — a cut path names a different field.
+    paths_bad: u8,
     /// 0 = the projected value is nested JSON and `paths` are dotted JSON
     /// paths; 1 = it is a flat `k=v;k=v` record and each `paths` entry is a
     /// field name. Both formats are in the control plane — k8s objects are
@@ -426,6 +449,12 @@ struct State {
     /// members: arch, os, the fluxor ABI), which no store record says.
     facts: [u8; 192],
     facts_len: u8,
+    /// `address = <ip>`: stamped at 47 on every record beside `label` — the
+    /// node's own address as its render knows it, which no store record
+    /// says: what its Node advertises as its InternalIP, and so the hostIP
+    /// of the Pods it runs.
+    address: [u8; 48],
+    address_len: u8,
     /// `trace` param: a periodic counter line (`[store_source] trace`), for
     /// a source whose silence needs explaining. Off by default.
     trace: u8,
@@ -434,6 +463,10 @@ struct State {
     t_wakes: u32,
     t_subrc: i32,
     t_stalls: u32,
+    /// Reads this step's pass met `EAGAIN` on (the trace's `waits=`).
+    t_waits: u32,
+    /// A read of the pass in hand was not answered yet ([`Wait`]).
+    waited: Wait,
     /// Slow-step breakdown, reset every step: time in the scan's LIST and
     /// GET calls and how many, and which phase ran — 0 none of the below,
     /// 1 subscribe, 2 flush, 3 events, 4 count, 5 emit. A step past
@@ -498,7 +531,7 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::{LIST_BUF, MAX_PATHS_SPEC, MAX_PREFIX};
+    use super::{LIST_BUF, MAX_PATHS_SPEC, MAX_PREFIX, PATHS_TEXT};
 
     define_params! {
         State;
@@ -510,11 +543,18 @@ mod params_def {
                 if n > 0 { ptr_copy(s.prefix.as_mut_ptr(), d, n); }
             };
 
-        2, paths, str, 0
+        // Chunked: fifteen paths into a container spec are longer than one
+        // TLV entry; each chunk is appended.
+        2, paths, str_chunked, 0
             => |s, d, len| {
-                let n = if len > MAX_PATHS_SPEC { MAX_PATHS_SPEC } else { len };
-                s.paths_len = n as u16;
-                if n > 0 { ptr_copy(s.paths.as_mut_ptr(), d, n); }
+                let at = s.paths_len as usize;
+                if at + len > PATHS_TEXT {
+                    s.paths_len = 0;
+                    s.paths_bad = 1;
+                } else if s.paths_bad == 0 && len > 0 {
+                    ptr_copy(s.paths.as_mut_ptr().add(at), d, len);
+                    s.paths_len = (at + len) as u16;
+                }
             };
 
         3, page_bytes, u32, LIST_BUF as u32
@@ -700,11 +740,20 @@ mod params_def {
                 if n > 0 { ptr_copy(s.due.as_mut_ptr(), d, n); }
             };
 
-        24, related, str, 0
+        // Chunked: nine blocks of paths are longer than one TLV entry; each
+        // chunk is appended. Past its room the spec is refused whole (the
+        // source then FAULTs at its first step): cut, it would lose its last
+        // block's fields without a word.
+        24, related, str_chunked, 0
             => |s, d, len| {
-                let n = if len > MAX_PATHS_SPEC { MAX_PATHS_SPEC } else { len };
-                s.related_len = n as u16;
-                if n > 0 { ptr_copy(s.related.as_mut_ptr(), d, n); }
+                let at = s.related_len as usize;
+                if at + len > super::RELATED_SPEC {
+                    s.related_len = 0;
+                    s.related_cut = 1;
+                } else if s.related_cut == 0 && len > 0 {
+                    ptr_copy(s.related.as_mut_ptr().add(at), d, len);
+                    s.related_len = (at + len) as u16;
+                }
             };
 
         19, list_children, str, 0
@@ -773,6 +822,16 @@ mod params_def {
                 if n > 0 { ptr_copy(s.facts.as_mut_ptr(), d, n); }
             };
 
+        50, recheck, u32, 0
+            => |s, d, len| { s.recheck = super::p_u32(d, len, 0, 0); };
+
+        49, address, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 0 } else { len };
+                s.address_len = n as u8;
+                if n > 0 { ptr_copy(s.address.as_mut_ptr(), d, n); }
+            };
+
         48, join_fit, str, 0
             => |s, d, len| {
                 let n = if len > 96 { 0 } else { len };
@@ -787,7 +846,70 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
     core::ptr::copy_nonoverlapping(src, dst, n);
 }
 
-unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> Option<usize> {
+/// Whether a read of the pass in hand answered `EAGAIN` — or any refusal
+/// but the contract's absence (`ENXIO`/`ENOENT`, [`refused`]): not yet,
+/// never absent. Every reader below takes one; once set, the readers answer
+/// "nothing" without asking the store, and the pass that holds it decides
+/// nothing from what it read — it is run again on a later step from where
+/// it stood (`emit_page` at the key it was on, a watch's step restored
+/// whole). So a value the store has not handed over yet is never served as
+/// NotFound, an empty list, or a 410.
+///
+/// It also carries the module's [`ReadNag`]: a refusal other than `EAGAIN`
+/// is said at ERROR, at most once per [`REFUSAL_SAY_MS`]. Only the flag is
+/// the pass's; the nag outlives it.
+struct Wait {
+    waited: core::cell::Cell<bool>,
+    nag: ReadNag,
+}
+
+impl Wait {
+    const fn new(v: bool) -> Wait {
+        Wait {
+            waited: core::cell::Cell::new(v),
+            nag: ReadNag::new(),
+        }
+    }
+
+    fn get(&self) -> bool {
+        self.waited.get()
+    }
+
+    fn set(&self, v: bool) {
+        self.waited.set(v);
+    }
+
+    /// A read refused with `rc`: absence (`true`) only for `ENXIO`/`ENOENT`;
+    /// anything else waits the pass, said when it is not `EAGAIN`.
+    unsafe fn absent(&self, sys: &SyscallTable, op: &[u8], key: &[u8], rc: i32) -> bool {
+        match refusal::<()>(sys, &self.nag, op, key, rc) {
+            Got::Absent => true,
+            _ => {
+                self.set(true);
+                false
+            }
+        }
+    }
+
+    /// A refused read of an open handle, or of a listing / change feed,
+    /// which have no "absent": the pass waits, said when it is not `EAGAIN`.
+    unsafe fn refused_open(&self, sys: &SyscallTable, op: &[u8], key: &[u8], rc: i32) {
+        if rc != ERR_EAGAIN {
+            say_refused(sys, &self.nag, op, key, rc);
+        }
+        self.set(true);
+    }
+}
+
+/// `EAGAIN` from a read: ask again.
+const ERR_EAGAIN: i32 = -11;
+
+/// storage.object GET+RANGE_GET+CLOSE — `key` into `dst`; its length, or
+/// `None` when absent, past `dst`, or not answered yet (`w` then set).
+unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) -> Option<usize> {
+    if w.get() {
+        return None;
+    }
     let mut garg = [0u8; MAX_KEY];
     if key.len() > garg.len() {
         return None;
@@ -795,6 +917,7 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> Option<us
     garg[..key.len()].copy_from_slice(key);
     let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
     if h < 0 {
+        w.absent(sys, b"GET", key, h);
         return None;
     }
     let mut rarg = [0u8; 20];
@@ -813,19 +936,42 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> Option<us
         parg[0..8].copy_from_slice(&(dst.len() as u64).to_le_bytes());
         parg[8..12].copy_from_slice(&1u32.to_le_bytes());
         parg[12..20].copy_from_slice(&(probe.as_mut_ptr() as u64).to_le_bytes());
-        cut = (sys.provider_call)(h, OBJ_RANGE_GET, parg.as_mut_ptr(), 20) > 0;
+        let pr = (sys.provider_call)(h, OBJ_RANGE_GET, parg.as_mut_ptr(), 20);
+        cut = pr > 0;
+        if pr < 0 {
+            w.refused_open(sys, b"RANGE_GET", key, pr);
+        }
     }
     let mut carg = [0u8; 4];
     (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    // A refused read of an open handle is never absence.
+    if n < 0 {
+        w.refused_open(sys, b"RANGE_GET", key, n);
+    }
+    if w.get() {
+        return None;
+    }
     if cut {
         let m = b"[store_source] value larger than the buffer - REFUSED, not read cut";
         dev_log(sys, 1, m.as_ptr(), m.len());
         return None;
     }
-    if n < 0 {
-        None
-    } else {
-        Some(n as usize)
+    Some(n as usize)
+}
+
+/// A key's store revision ([`head_rev`]); `None` when absent or not
+/// answered yet (`w` then set).
+unsafe fn head(sys: &SyscallTable, key: &[u8], w: &Wait) -> Option<u64> {
+    if w.get() {
+        return None;
+    }
+    match head_rev(sys, &w.nag, key) {
+        Got::Found(r) => Some(r),
+        Got::Absent => None,
+        Got::Pending => {
+            w.set(true);
+            None
+        }
     }
 }
 
@@ -836,6 +982,21 @@ fn entries(spec: &[u8]) -> usize {
     } else {
         spec.iter().filter(|&&b| b == b',').count() + 1
     }
+}
+
+/// Whether `one` is covered by an entry of `watches` other than the
+/// `skip`-th: a strictly shorter prefix of it, or the same prefix earlier in
+/// the list (so of two equal entries the first is kept).
+fn sub_covered(one: &[u8], skip: usize, watches: &[u8]) -> bool {
+    for (j, other) in watches.split(|&b| b == b',').enumerate() {
+        if j == skip || other.is_empty() || !one.starts_with(other) {
+            continue;
+        }
+        if other.len() < one.len() || j < skip {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
@@ -853,14 +1014,44 @@ unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
     arg[p] = 0;
     p += 1;
     let rc = (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), p);
-    if rc < 0 {
+    if rc < 0 && rc != ERR_EAGAIN {
         // The store's subscription table is full (or the prefix is refused):
         // this source still scans once, but a change here will never wake it
-        // again — a controller that looks converged and is not.
-        let m = b"[store_source] SUBSCRIBE refused - changes under this prefix will NOT wake this source";
-        dev_log(sys, 1, m.as_ptr(), m.len());
+        // again — a controller that looks converged and is not. Said at
+        // ERROR, naming the module (its scheduler index, as the kernel's own
+        // lines name it) and the prefix, every time.
+        sub_refused_log(sys, prefix, rc);
     }
     rc
+}
+
+/// `[store_source] ERROR module=<idx> SUBSCRIBE <prefix> refused rc=<n>`.
+unsafe fn sub_refused_log(sys: &SyscallTable, prefix: &[u8], rc: i32) {
+    let mut b = [0u8; 256];
+    let mut n = 0usize;
+    let mut put = |part: &[u8]| {
+        for &c in part {
+            if let Some(slot) = b.get_mut(n) {
+                *slot = c;
+                n += 1;
+            }
+        }
+    };
+    let mut d = [0u8; 20];
+    put(b"[store_source] ERROR module=");
+    let idx = dev_self_index(sys);
+    let dn = dec_into(idx.unsigned_abs() as u64, &mut d);
+    if idx < 0 {
+        put(b"-");
+    }
+    put(d.get(..dn).unwrap_or(&[]));
+    put(b" SUBSCRIBE ");
+    put(prefix);
+    put(b" refused rc=-");
+    let dn = dec_into(rc.unsigned_abs() as u64, &mut d);
+    put(d.get(..dn).unwrap_or(&[]));
+    put(b": the store's subscription table is full - changes under it will NOT wake this source");
+    dev_log(sys, 1, b.as_ptr(), n);
 }
 
 /// Microseconds since `t0`, as a `u32`: one step's own time never needs more,
@@ -918,7 +1109,7 @@ unsafe fn slow_line(s: &State, us: u64) {
     dev_log(&*s.syscalls, 2, b.as_ptr(), n);
 }
 
-/// `[store_source] trace <prefix> scans= wakes= emitted= subrc= stalls= paging=`.
+/// `[store_source] trace <prefix> scans= wakes= emitted= subrc= stalls= paging= waits=`.
 unsafe fn trace_line(s: &State) {
     let mut b = [0u8; 200];
     let mut n = 0usize;
@@ -967,6 +1158,9 @@ unsafe fn trace_line(s: &State) {
     put(b" paging=");
     let (t, i) = num(u64::from(s.paging), false);
     put(&t[i..]);
+    put(b" waits=");
+    let (t, i) = num(u64::from(s.t_waits), false);
+    put(&t[i..]);
     dev_log(&*s.syscalls, 3, b.as_ptr(), n);
 }
 
@@ -996,8 +1190,10 @@ unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
 ///
 /// Returns (page length in bytes, cursor length written to `cursor_out`); a
 /// zero cursor length means the listing is complete. A page the provider
-/// refuses is reported at error level and returned as empty AND complete —
-/// which is wrong, but loud, and the next change re-arms the scan.
+/// has not answered yet (`EAGAIN`) — or refuses at all, said at error level
+/// rate-limited ([`Wait::refused_open`]) — is returned empty with `w` set:
+/// the caller's pass is then run again from the same cursor, never taken as
+/// the end of the listing.
 unsafe fn list_page(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -1005,13 +1201,18 @@ unsafe fn list_page(
     cap: usize,
     out: &mut [u8],
     cursor_out: &mut [u8],
+    w: &Wait,
 ) -> (usize, usize) {
     let mut fence = 0u64;
-    list_page_fenced(sys, prefix, cursor_in, cap, out, cursor_out, &mut fence)
+    list_page_fenced(sys, prefix, cursor_in, cap, out, cursor_out, &mut fence, w)
 }
 
 /// [`list_page`], with the revision the page is consistent at
 /// (`fence_revision` of its `ViewConsistent` fence).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one LIST call's request, its two outputs, and the pass's wait"
+)]
 unsafe fn list_page_fenced(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -1020,7 +1221,11 @@ unsafe fn list_page_fenced(
     out: &mut [u8],
     cursor_out: &mut [u8],
     fence_out: &mut u64,
+    w: &Wait,
 ) -> (usize, usize) {
+    if w.get() {
+        return (0, 0);
+    }
     let mut larg = [0u8; MAX_KEY + MAX_CURSOR + 32];
     if 2 + prefix.len() + 2 + cursor_in.len() + 8 + 4 + 8 + 2 > larg.len() {
         return (0, 0);
@@ -1047,12 +1252,13 @@ unsafe fn list_page_fenced(
     larg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
     p += 2;
     let n = (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p);
-    *fence_out = fence_revision(&fence);
     if n < 0 {
-        let m = b"[store_source] LIST refused a page - NOTHING emitted this pass";
-        dev_log(sys, 1, m.as_ptr(), m.len());
+        // Not yet — or refused, which a listing never answers for "empty":
+        // no page, no fence, and not the end. The pass waits and asks again.
+        w.refused_open(sys, b"LIST", prefix, n);
         return (0, 0);
     }
+    *fence_out = fence_revision(&fence);
     let n = (n as usize).min(cap);
     // Find the trailing record to lift the cursor out; entries are consumed
     // by the caller, in place.
@@ -1232,7 +1438,7 @@ unsafe fn project(
         let a = append_bytes(&mut k, 0, &s.prefix[..plen]);
         let kl = append_bytes(&mut k, a, key_tail);
         if kl <= MAX_KEY {
-            revision = head_rev(&*s.syscalls, &k[..kl]).unwrap_or(0) as i64;
+            revision = head(&*s.syscalls, &k[..kl], &s.waited).unwrap_or(0) as i64;
         }
     }
     let Some(q) = put_field(out, p, 2, TY_I64, &revision.to_le_bytes()) else {
@@ -1254,6 +1460,13 @@ unsafe fn project(
     }
     if s.facts_len > 0 {
         let Some(q) = put_field(out, p, 49, TY_BYTES, &s.facts[..s.facts_len as usize]) else {
+            return 0;
+        };
+        p = q;
+        n += 1;
+    }
+    if s.address_len > 0 {
+        let Some(q) = put_field(out, p, 47, TY_BYTES, &s.address[..s.address_len as usize]) else {
             return 0;
         };
         p = q;
@@ -1384,7 +1597,15 @@ unsafe fn project(
             let mut modbuf = [0u8; 512];
             let got = match modifier {
                 Some(m) => {
-                    let n = apply_mod(m, got, &mut modbuf);
+                    let n = if m == b"wall" {
+                        let n = mo_wall(&*s.syscalls, got, &mut modbuf);
+                        if n == 0 && got.first() == Some(&b'm') {
+                            s.unresolved.set(1);
+                        }
+                        n
+                    } else {
+                        apply_mod(m, got, &mut modbuf)
+                    };
                     &modbuf[..n]
                 }
                 None => got,
@@ -1446,7 +1667,7 @@ unsafe fn project(
         let spec = &s.related[..s.related_len as usize];
         let mut start = 0usize;
         let mut blk = 0u8;
-        while start <= spec.len() && blk < 6 {
+        while start <= spec.len() && blk < 9 {
             let end = spec[start..]
                 .iter()
                 .position(|&b| b == b';')
@@ -1518,7 +1739,7 @@ unsafe fn project(
                 };
                 let mut rv = [0u8; MAX_VALUE];
                 let rvl = if rl <= MAX_KEY {
-                    get_value(sys, &rk[..rl], &mut rv).unwrap_or(0)
+                    get_value(sys, &rk[..rl], &mut rv, &s.waited).unwrap_or(0)
                 } else {
                     0
                 };
@@ -1555,10 +1776,20 @@ unsafe fn project(
                                 .or_else(|| j_path(rval, &segs[..ns]))
                                 .unwrap_or(&[])
                         };
-                        let mut modbuf = [0u8; 64];
+                        // Room for an argv (`!jargv`: a probe's command read
+                        // off the object itself), not only for a number.
+                        let mut modbuf = [0u8; 256];
                         let got = match modifier {
                             Some(m) => {
-                                let n = apply_mod(m, got, &mut modbuf);
+                                let n = if m == b"wall" {
+                                    let n = mo_wall(&*s.syscalls, got, &mut modbuf);
+                                    if n == 0 && got.first() == Some(&b'm') {
+                                        s.unresolved.set(1);
+                                    }
+                                    n
+                                } else {
+                                    apply_mod(m, got, &mut modbuf)
+                                };
                                 &modbuf[..n]
                             }
                             None => got,
@@ -1910,6 +2141,7 @@ unsafe fn project(
                 key_tail,
                 &view,
                 &mut lc,
+                &s.waited,
             );
             let Some(q) = put_field(out, p, 56, TY_BYTES, &lc[..ll]) else {
                 return 0;
@@ -1933,6 +2165,7 @@ unsafe fn project(
                 &s.count_children[..s.count_children_len as usize],
                 key_tail,
                 s.child_sep,
+                &s.waited,
             );
             let mut dec = [0u8; 12];
             let dl = write_dec(&mut dec, cc as u64);
@@ -2165,7 +2398,7 @@ unsafe fn joined_fields(
     if s.join_paths_len > 0 || s.join_match_len > 0 || s.join_each_len > 0 || s.join_terms_len > 0 {
         let sys = &*s.syscalls;
         let mut jv = [0u8; MAX_VALUE];
-        let jl = get_value(sys, jkey, &mut jv).unwrap_or(0);
+        let jl = get_value(sys, jkey, &mut jv, &s.waited).unwrap_or(0);
         let jval = &jv[..jl];
         let spec = &s.join_paths[..s.join_paths_len as usize];
         let mut start = 0usize;
@@ -2182,14 +2415,43 @@ unsafe fn joined_fields(
                 // as `paths`: a joined record whose value is not JSON
                 // (an endpoint address, a key frame) has no path to
                 // read, and the walk already holds the bytes.
-                let got = if one == b"." {
+                // `a[k=v].b` selects as in `paths` (`_shared/jsonq.rs`): a
+                // Pod's readiness is its Ready condition's status,
+                // `status.conditions[type=Ready].status`. `<path>!<mod>`
+                // decodes first, as everywhere.
+                #[allow(
+                    clippy::manual_contains,
+                    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+                )]
+                let query = one.iter().any(|&c| c == b'[');
+                let mut qbuf = [0u8; COLLECT_BUF];
+                let mut modbuf = [0u8; 512];
+                let got: &[u8] = if one == b"." {
                     jval
+                } else if query {
+                    match jq(jval, one, &mut qbuf) {
+                        Some(n) => qbuf.get(..n).unwrap_or(&[]),
+                        None => {
+                            // Too long is refused, never cut: the one entry
+                            // nothing names (as `paths` does).
+                            qbuf[0] = b'-';
+                            &qbuf[..1]
+                        }
+                    }
                 } else {
+                    let (path, modifier) = split_mod(one);
                     let mut segs: [&[u8]; 6] = [&[]; 6];
-                    let ns = split_dots(one, &mut segs);
-                    j_sub(jval, &segs[..ns])
+                    let ns = split_dots(path, &mut segs);
+                    let raw = j_sub(jval, &segs[..ns])
                         .or_else(|| j_path(jval, &segs[..ns]))
-                        .unwrap_or(&[])
+                        .unwrap_or(&[]);
+                    match modifier {
+                        Some(m) => {
+                            let n = apply_mod(m, raw, &mut modbuf);
+                            modbuf.get(..n).unwrap_or(&[])
+                        }
+                        None => raw,
+                    }
                 };
                 let q = put_field(out, p, fno, TY_BYTES, got)?;
                 p = q;
@@ -2296,6 +2558,7 @@ unsafe fn highest_child(s: &State, sys: &SyscallTable, tail: &[u8]) -> i64 {
             LIST_BUF,
             &mut page,
             &mut next,
+            &s.waited,
         );
         let mut rp = 0usize;
         while let Some((name, q)) = raw_entry(&page[..pn], rp) {
@@ -2322,7 +2585,7 @@ unsafe fn highest_child(s: &State, sys: &SyscallTable, tail: &[u8]) -> i64 {
 
 /// How many children `<prefix><tail><sep>*` exist, summed over every
 /// comma-separated prefix in `prefixes`.
-unsafe fn child_count(sys: &SyscallTable, prefixes: &[u8], tail: &[u8], sep: u8) -> i64 {
+unsafe fn child_count(sys: &SyscallTable, prefixes: &[u8], tail: &[u8], sep: u8, w: &Wait) -> i64 {
     let mut total = 0i64;
     let mut start = 0usize;
     while start <= prefixes.len() {
@@ -2332,7 +2595,7 @@ unsafe fn child_count(sys: &SyscallTable, prefixes: &[u8], tail: &[u8], sep: u8)
             .map(|i| start + i)
             .unwrap_or(prefixes.len());
         if end > start {
-            total += child_count_one(sys, &prefixes[start..end], tail, sep);
+            total += child_count_one(sys, &prefixes[start..end], tail, sep, w);
         }
         if end >= prefixes.len() {
             break;
@@ -2342,7 +2605,13 @@ unsafe fn child_count(sys: &SyscallTable, prefixes: &[u8], tail: &[u8], sep: u8)
     total
 }
 
-unsafe fn child_count_one(sys: &SyscallTable, prefix: &[u8], tail: &[u8], sep: u8) -> i64 {
+unsafe fn child_count_one(
+    sys: &SyscallTable,
+    prefix: &[u8],
+    tail: &[u8],
+    sep: u8,
+    w: &Wait,
+) -> i64 {
     let mut pfx = [0u8; MAX_PREFIX + MAX_KEY + 2];
     let mut pl = append_bytes(&mut pfx, 0, prefix);
     pl = append_bytes(&mut pfx, pl, tail);
@@ -2363,6 +2632,7 @@ unsafe fn child_count_one(sys: &SyscallTable, prefix: &[u8], tail: &[u8], sep: u
             LIST_BUF,
             &mut page,
             &mut next,
+            w,
         );
         let mut rp = 0usize;
         while let Some((_, q)) = raw_entry(&page[..pn], rp) {
@@ -2412,8 +2682,15 @@ unsafe fn join_nth(
                 loop {
                     let mut page = [0u8; LIST_BUF];
                     let mut next = [0u8; MAX_CURSOR];
-                    let (pn, nlen) =
-                        list_page(sys, &jp[..jl], &cur[..clen], LIST_BUF, &mut page, &mut next);
+                    let (pn, nlen) = list_page(
+                        sys,
+                        &jp[..jl],
+                        &cur[..clen],
+                        LIST_BUF,
+                        &mut page,
+                        &mut next,
+                        &s.waited,
+                    );
                     let mut rp = 0usize;
                     while let Some((name, q)) = raw_entry(&page[..pn], rp) {
                         rp = q;
@@ -2463,7 +2740,7 @@ unsafe fn unless_ok(s: &State, sys: &SyscallTable, tail: &[u8]) -> bool {
         return true;
     }
     let mut probe = [0u8; MAX_VALUE];
-    get_value(sys, &k[..kl], &mut probe).is_none()
+    get_value(sys, &k[..kl], &mut probe, &s.waited).is_none()
 }
 
 fn where_ok(s: &State, value: &[u8]) -> bool {
@@ -2563,6 +2840,7 @@ unsafe fn list_children(
     tail: &[u8],
     view: &ChildView,
     out: &mut [u8],
+    w: &Wait,
 ) -> usize {
     let ChildView {
         sep,
@@ -2590,6 +2868,7 @@ unsafe fn list_children(
             LIST_BUF,
             &mut page,
             &mut next,
+            w,
         );
         let mut rp = 0usize;
         while let Some((name, q)) = raw_entry(&page[..pn], rp) {
@@ -2599,7 +2878,7 @@ unsafe fn list_children(
             }
             let child = &name[pl..];
             let mut v = [0u8; 256];
-            let Some(vl) = get_value(sys, name, &mut v) else {
+            let Some(vl) = get_value(sys, name, &mut v, w) else {
                 continue;
             };
             let need = if values_only {
@@ -2666,7 +2945,7 @@ unsafe fn join_fits(s: &State, sys: &SyscallTable, val: &[u8], name: &[u8]) -> b
     let kl = append_bytes(&mut key, 0, prefix);
     let kl = append_bytes(&mut key, kl, name);
     let mut v = [0u8; MAX_VALUE];
-    let Some(vl) = get_value(sys, &key[..kl], &mut v) else {
+    let Some(vl) = get_value(sys, &key[..kl], &mut v, &s.waited) else {
         return false;
     };
     let mut jsegs: [&[u8]; 6] = [&[]; 6];
@@ -2723,7 +3002,7 @@ unsafe fn join_argmin(
                 Some(x) => &k[x + 1..kl],
                 None => &k[..kl],
             };
-            count_where(sys, prefix, path, name)
+            count_where(sys, prefix, path, name, &s.waited)
         } else {
             let mut segs: [&[u8]; 6] = [&[]; 6];
             let ns = split_dots(rest, &mut segs);
@@ -2736,7 +3015,7 @@ unsafe fn join_argmin(
                 append_bytes(&mut full, a, &k[..kl])
             };
             let mut v = [0u8; MAX_VALUE];
-            match get_value(sys, &full[..fl], &mut v) {
+            match get_value(sys, &full[..fl], &mut v, &s.waited) {
                 Some(vl) => j_path(&v[..vl], &segs[..ns])
                     .map(parse_dec_bytes)
                     .unwrap_or(0) as i64,
@@ -2757,7 +3036,13 @@ unsafe fn join_argmin(
 }
 
 /// How many objects under `prefix` have `path` equal to `want`.
-unsafe fn count_where(sys: &SyscallTable, prefix: &[u8], path: &[u8], want: &[u8]) -> i64 {
+unsafe fn count_where(
+    sys: &SyscallTable,
+    prefix: &[u8],
+    path: &[u8],
+    want: &[u8],
+    w: &Wait,
+) -> i64 {
     let mut segs: [&[u8]; 6] = [&[]; 6];
     let ns = split_dots(path, &mut segs);
     let mut cur = [0u8; MAX_CURSOR];
@@ -2766,12 +3051,12 @@ unsafe fn count_where(sys: &SyscallTable, prefix: &[u8], path: &[u8], want: &[u8
     loop {
         let mut page = [0u8; LIST_BUF];
         let mut next = [0u8; MAX_CURSOR];
-        let (pn, nlen) = list_page(sys, prefix, &cur[..clen], LIST_BUF, &mut page, &mut next);
+        let (pn, nlen) = list_page(sys, prefix, &cur[..clen], LIST_BUF, &mut page, &mut next, w);
         let mut rp = 0usize;
         while let Some((name, q)) = raw_entry(&page[..pn], rp) {
             rp = q;
             let mut v = [0u8; MAX_VALUE];
-            if let Some(vl) = get_value(sys, name, &mut v) {
+            if let Some(vl) = get_value(sys, name, &mut v, w) {
                 if j_path(&v[..vl], &segs[..ns]) == Some(want) {
                     total += 1;
                 }
@@ -2819,8 +3104,15 @@ unsafe fn join_count(s: &State, sys: &SyscallTable, tail: &[u8]) -> i64 {
                 loop {
                     let mut page = [0u8; LIST_BUF];
                     let mut next = [0u8; MAX_CURSOR];
-                    let (pn, nlen) =
-                        list_page(sys, &jp[..jl], &cur[..clen], LIST_BUF, &mut page, &mut next);
+                    let (pn, nlen) = list_page(
+                        sys,
+                        &jp[..jl],
+                        &cur[..clen],
+                        LIST_BUF,
+                        &mut page,
+                        &mut next,
+                        &s.waited,
+                    );
                     let mut rp = 0usize;
                     while let Some((_, q)) = raw_entry(&page[..pn], rp) {
                         rp = q;
@@ -2862,8 +3154,10 @@ unsafe fn count_page(s: &mut State) -> bool {
         s.page_bytes as usize,
         &mut lout,
         &mut next,
+        &s.waited,
     );
     st_list(s, sys, tl);
+    let total0 = s.total;
     let mut rp = 0usize;
     while let Some((name, q)) = raw_entry(&lout[..n], rp) {
         rp = q;
@@ -2883,7 +3177,7 @@ unsafe fn count_page(s: &mut State) -> bool {
             // in a set the emit walk does not emit.
             let mut v = [0u8; MAX_VALUE];
             let tg = dev_micros(sys);
-            let got = get_value(sys, name, &mut v);
+            let got = get_value(sys, name, &mut v, &s.waited);
             st_get(s, sys, tg);
             let Some(vl) = got else {
                 continue;
@@ -2894,6 +3188,13 @@ unsafe fn count_page(s: &mut State) -> bool {
         }
         s.total += 1;
     }
+    if s.waited.get() {
+        // A page or a value not answered yet: this page is counted again
+        // next step, from the same cursor.
+        s.total = total0;
+        s.t_waits = s.t_waits.wrapping_add(1);
+        return false;
+    }
     if nlen == 0 {
         s.clen = 0;
         return true;
@@ -2901,6 +3202,20 @@ unsafe fn count_page(s: &mut State) -> bool {
     s.cursor[..nlen].copy_from_slice(&next[..nlen]);
     s.clen = nlen as u16;
     false
+}
+
+/// Stop the page at `key`, expansion `ord`, because a read for it was not
+/// answered yet (`EAGAIN`): nothing for it went out, and the next step lists
+/// the same page again and resumes HERE — as backpressure does, so a value
+/// the store has not handed over is delayed, never skipped.
+unsafe fn hold_at(s: &mut State, key: &[u8], ord: i64, wrote: u32) -> u32 {
+    s.t_waits = s.t_waits.wrapping_add(1);
+    s.page_off = 1;
+    s.resume_key[..key.len()].copy_from_slice(key);
+    s.resume_len = key.len() as u16;
+    s.exp_off = ord;
+    s.emitted = s.emitted.wrapping_add(wrote);
+    wrote
 }
 
 /// Emit ONE page of the current scan. Returns frames written.
@@ -2973,8 +3288,15 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         s.page_bytes as usize,
         &mut lout,
         &mut next,
+        &s.waited,
     );
     st_list(s, sys, tl);
+    if s.waited.get() {
+        // The page was not answered yet: asked again next step, from the
+        // same cursor — never taken as the end of the listing.
+        s.t_waits = s.t_waits.wrapping_add(1);
+        return 0;
+    }
 
     let mut wrote = 0u32;
     let mut rp = 0usize;
@@ -3004,8 +3326,11 @@ unsafe fn emit_page(s: &mut State) -> u32 {
 
         let mut val = [0u8; MAX_VALUE];
         let tg = dev_micros(sys);
-        let got = get_value(sys, &key[..klen], &mut val);
+        let got = get_value(sys, &key[..klen], &mut val, &s.waited);
         st_get(s, sys, tg);
+        if s.waited.get() {
+            return hold_at(s, &key[..klen], s.exp_off, wrote);
+        }
         let Some(vlen) = got else {
             continue;
         };
@@ -3018,7 +3343,11 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             } else {
                 &key[..0]
             };
-            if !unless_ok(s, sys, tl) {
+            let ok = unless_ok(s, sys, tl);
+            if s.waited.get() {
+                return hold_at(s, &key[..klen], s.exp_off, wrote);
+            }
+            if !ok {
                 continue;
             }
         }
@@ -3161,7 +3490,13 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                 // A pick among the entries the object fits: none fits, no
                 // record.
                 let mut probe = [0u8; MAX_KEY];
-                Some(if join_argmin(s, sys, tail, &val[..vlen], &mut probe).is_some() { 1 } else { 0 })
+                Some(
+                    if join_argmin(s, sys, tail, &val[..vlen], &mut probe).is_some() {
+                        1
+                    } else {
+                        0
+                    },
+                )
             } else if s.join_pick_len > 0 {
                 // A pick reduces the join to one record — or none, when the
                 // joined set is empty: there is nothing to choose.
@@ -3172,6 +3507,10 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         } else {
             None
         };
+        if s.waited.get() {
+            // The expansion or the join read the store and was not answered.
+            return hold_at(s, &key[..klen], s.exp_off, wrote);
+        }
         let (count, hi) = match (span, joined) {
             (Some((c, h)), _) => (c, h),
             (None, Some(j)) => (j, j),
@@ -3215,6 +3554,9 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                         }
                     }
                     None => {
+                        if s.waited.get() {
+                            break; // not answered: resumed at this ordinal
+                        }
                         ord += 1;
                         continue;
                     }
@@ -3230,6 +3572,11 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                 join,
                 &mut frame,
             );
+            if s.waited.get() {
+                // This record's reads were not answered: it is not sent,
+                // and the scan resumes at it.
+                break;
+            }
             if flen == 0 {
                 s.truncated = s.truncated.wrapping_add(1);
                 ord += 1;
@@ -3254,6 +3601,9 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             ord += 1;
         }
         let _ = count;
+        if s.waited.get() {
+            return hold_at(s, &key[..klen], ord, wrote);
+        }
         if blocked {
             // Downstream is full. RETAIN the work: leave the cursor where it is
             // so the next step repeats this page. Dropping would be a leak, not
@@ -3285,6 +3635,12 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         s.seq = s.seq.wrapping_add(1);
         let mut frame = [0u8; FRAME_BUF];
         let flen = project(s, &[], &[], None, Some((0, 0)), None, &mut frame);
+        if s.waited.get() {
+            // Not answered yet: the (empty) prefix is listed again.
+            s.t_waits = s.t_waits.wrapping_add(1);
+            s.clen = 0;
+            return wrote;
+        }
         if flen > 0 {
             s.frame[..flen].copy_from_slice(&frame[..flen]);
             if let Sent::Blocked = send(s, flen) {
@@ -3366,6 +3722,8 @@ pub unsafe extern "C" fn module_new(
         s.join_scoped = 0;
         s.join_match_len = 0;
         s.join_paths_len = 0;
+        s.paths_len = 0;
+        s.paths_bad = 0;
         s.each_len = 0;
         s.join_each_len = 0;
         s.join_terms_len = 0;
@@ -3380,9 +3738,13 @@ pub unsafe extern "C" fn module_new(
         s.join_pick_len = 0;
         s.join_fit_len = 0;
         s.facts_len = 0;
+        s.address_len = 0;
+        s.recheck = 0;
+        s.unresolved = core::cell::Cell::new(0);
         s.now = 0;
         s.due_len = 0;
         s.related_len = 0;
+        s.related_cut = 0;
         s.timer_fd = -1;
         s.scan_now = 0;
         s.next_due = i64::MAX;
@@ -3401,6 +3763,8 @@ pub unsafe extern "C" fn module_new(
         s.t_wakes = 0;
         s.t_subrc = 0;
         s.t_stalls = 0;
+        s.t_waits = 0;
+        s.waited.set(false);
         s.st_list_us = 0;
         s.st_get_us = 0;
         s.st_lists = 0;
@@ -3484,6 +3848,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*s.syscalls;
         let t0 = dev_micros(sys);
+        // Each step's pass reads afresh: one the store answered `EAGAIN`
+        // on runs again now.
+        s.waited.set(false);
         s.st_list_us = 0;
         s.st_get_us = 0;
         s.st_lists = 0;
@@ -3512,6 +3879,11 @@ unsafe fn step_body(s: &mut State) -> i32 {
             // A field past the last number a record carries would be missing
             // from every record, and a decision reading it fails closed on
             // each one: refused here, where it is a configuration fault.
+            if s.related_cut != 0 {
+                let m = b"[store_source] FAULT: `related` longer than its room - REFUSED, a record would miss its last fields";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -22;
+            }
             if entries(&s.paths[..s.paths_len as usize]) > MAX_PATHS
                 || entries(&s.ints[..s.ints_len as usize]) > MAX_INTS
             {
@@ -3520,31 +3892,43 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 return -22;
             }
             if s.sink >= 0 && s.prefix_len > 0 {
+                // One subscription per prefix that no other of this source's
+                // prefixes covers: its own prefix and its extra watches all
+                // mean the same thing — "something changed, scan again" —
+                // so `/pod-specs/` beside a watch on `/pod-` is one
+                // subscription, not two. The store's subscription table is
+                // shared by every module of the node; a watch spelt
+                // coarsely (`/image-`, `/rbac-`) is how a source that reads
+                // a family of prefixes takes one seat instead of five.
                 let plen = s.prefix_len as usize;
                 let mut pfx = [0u8; MAX_PREFIX];
                 pfx[..plen].copy_from_slice(&s.prefix[..plen]);
+                let w = s.watch_len as usize;
+                let mut wspec = [0u8; MAX_PATHS_SPEC];
+                wspec[..w].copy_from_slice(&s.watch[..w]);
+                let watches = &wspec[..w];
                 s.st_phase = 1;
-                s.t_subrc = store_subscribe(sys, &pfx[..plen], s.sink);
+                if !sub_covered(&pfx[..plen], usize::MAX, watches) {
+                    s.t_subrc = store_subscribe(sys, &pfx[..plen], s.sink);
+                    if s.t_subrc == ERR_EAGAIN {
+                        // The store cannot take it yet: nothing was made, and
+                        // it is asked again next step.
+                        return 0;
+                    }
+                }
                 // Extra watches: changes here re-arm the scan but are never
                 // listed, so a deleted child wakes its parent.
-                let w = s.watch_len as usize;
-                let mut start = 0usize;
-                while start < w {
-                    let end = s.watch[start..w]
-                        .iter()
-                        .position(|&b| b == b',')
-                        .map(|i| start + i)
-                        .unwrap_or(w);
-                    if end > start {
-                        let mut wb = [0u8; MAX_PREFIX];
-                        let n = (end - start).min(MAX_PREFIX);
-                        wb[..n].copy_from_slice(&s.watch[start..start + n]);
-                        store_subscribe(sys, &wb[..n], s.sink);
+                for (i, one) in watches.split(|&b| b == b',').enumerate() {
+                    if one.is_empty() || one.len() > MAX_PREFIX {
+                        continue;
                     }
-                    if end >= w {
-                        break;
+                    if one.starts_with(&pfx[..plen]) || sub_covered(one, i, watches) {
+                        continue;
                     }
-                    start = end + 1;
+                    let rc = store_subscribe(sys, one, s.sink);
+                    if s.t_subrc >= 0 && rc < 0 {
+                        s.t_subrc = rc;
+                    }
                 }
                 s.subscribed = 1;
             }
@@ -3599,6 +3983,7 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 s.counting = if s.count != 0 { 1 } else { 0 };
                 s.scan_now = dev_millis(sys) as i64;
                 s.next_due = i64::MAX;
+                s.unresolved.set(0);
             }
             if s.paging == 1 && s.counting == 1 {
                 // One page per step here too: the count walk is bounded work
@@ -3791,13 +4176,18 @@ const WATCHER_EMPTY: Watcher = Watcher {
 
 /// `CHANGES(prefix, since)` into `out`: the byte count written and the fence
 /// revision, or the negative errno.
+/// `EAGAIN` (the store has not answered yet) sets `w`: not a lost history.
 unsafe fn store_changes(
     sys: &SyscallTable,
     prefix: &[u8],
     since: u64,
     out: &mut [u8],
     fence_rev: &mut u64,
+    w: &Wait,
 ) -> i32 {
+    if w.get() {
+        return ERR_EAGAIN;
+    }
     let mut arg = [0u8; MAX_KEY + 40];
     if prefix.len() + 34 > arg.len() {
         return -22;
@@ -3819,6 +4209,12 @@ unsafe fn store_changes(
     arg[p..p + 2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
     p += 2;
     let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), p);
+    // `ENOMEM` is decided — the batch is past `out`, asked again on the heap
+    // by the caller. Any other refusal is not yet: never a 410 for it.
+    if n < 0 && n != ERR_ENOMEM {
+        w.refused_open(sys, b"CHANGES", prefix, n);
+        return n;
+    }
     *fence_rev = fence_revision(&fence);
     n
 }
@@ -3909,6 +4305,7 @@ unsafe fn ev_sync(s: &mut State, now: i64) {
             LIST_BUF,
             &mut lout,
             &mut next,
+            &s.waited,
         );
         let mut rp = 0usize;
         while let Some((name, q)) = raw_entry(&lout[..n], rp) {
@@ -3925,7 +4322,7 @@ unsafe fn ev_sync(s: &mut State, now: i64) {
                 continue;
             }
             let mut val = [0u8; MAX_VALUE];
-            let Some(vl) = get_value(sys, name, &mut val) else {
+            let Some(vl) = get_value(sys, name, &mut val, &s.waited) else {
                 continue;
             };
             let v = &val[..vl];
@@ -3996,6 +4393,13 @@ unsafe fn ev_sync(s: &mut State, now: i64) {
         cur[..nlen].copy_from_slice(&next[..nlen]);
         clen = nlen;
     }
+    if s.waited.get() {
+        // A page or a registration was not answered yet: the listing is
+        // not the table, so nothing it did not see is dropped, and the
+        // table is synced again next step.
+        s.dirty = 1;
+        return;
+    }
     for w in s.watchers.iter_mut() {
         if w.live != 0 && w.seen == 0 {
             *w = WATCHER_EMPTY;
@@ -4031,7 +4435,13 @@ unsafe fn purge_page(s: &mut State) -> bool {
         &mut lout,
         &mut next,
         &mut rev,
+        &s.waited,
     );
+    if s.waited.get() {
+        // The page was not answered yet: listed again next step, from the
+        // same cursor, and no revision taken from an answer not given.
+        return false;
+    }
     if s.purge_rev == 0 {
         // A provider that reports no revision leaves every listed key stale.
         s.purge_rev = if rev == 0 { u64::MAX } else { rev };
@@ -4039,8 +4449,13 @@ unsafe fn purge_page(s: &mut State) -> bool {
     let mut rp = 0usize;
     while let Some((name, q)) = raw_entry(&lout[..n], rp) {
         rp = q;
-        match head_rev(sys, name) {
+        match head(sys, name, &s.waited) {
             Some(r) if r <= s.purge_rev => {}
+            // Not answered yet: the next pass asks it again.
+            None if s.waited.get() => {
+                s.purge_pending = 1;
+                continue;
+            }
             // Gone already, or this runtime's.
             _ => continue,
         }
@@ -4173,7 +4588,7 @@ unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> u
         let kl = append_bytes(&mut tk, a, key);
         let mut tv = [0u8; MAX_VALUE];
         if kl <= MAX_KEY {
-            if let Some(n) = get_value(sys, &tk[..kl], &mut tv) {
+            if let Some(n) = get_value(sys, &tk[..kl], &mut tv, &s.waited) {
                 if let Some(obj) = j_sub1(&tv[..n], b"obj") {
                     if let Some(dst) = out.get_mut(..obj.len()) {
                         dst.copy_from_slice(obj);
@@ -4364,6 +4779,11 @@ unsafe fn ev_emit(
             None => len = 0,
         }
     }
+    if s.waited.get() {
+        // Its projections read the store and were not answered: nothing is
+        // staged, and the watch's step is run again (`events_step`).
+        return Emit::Failed;
+    }
     if len != 0 && filter && !filter_keeps(s, &frame[..len]) {
         return Emit::Filtered;
     }
@@ -4407,8 +4827,12 @@ enum Val {
     TooBig,
 }
 
-/// Read `key` whole: into `raw` when it fits, else onto the heap.
-unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8]) -> Val {
+/// Read `key` whole: into `raw` when it fits, else onto the heap. `Missing`
+/// with `w` set when the store has not answered yet (`EAGAIN`).
+unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8], w: &Wait) -> Val {
+    if w.get() {
+        return Val::Missing;
+    }
     let mut garg = [0u8; MAX_KEY];
     if key.len() > garg.len() {
         return Val::Missing;
@@ -4416,6 +4840,7 @@ unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8]) -> Val {
     garg[..key.len()].copy_from_slice(key);
     let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
     if h < 0 {
+        w.absent(sys, b"GET", key, h);
         return Val::Missing;
     }
     let got = range_get(sys, h, 0, raw);
@@ -4424,14 +4849,29 @@ unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8]) -> Val {
     } else {
         Val::Stack(got as usize)
     };
+    // A refused read of an open handle is never absence.
+    let mut wait = got;
     if got >= 0 && got as usize == raw.len() {
         let mut probe = [0u8; 1];
-        if range_get(sys, h, raw.len() as u64, &mut probe) > 0 {
-            out = read_heap(sys, h);
+        let pr = range_get(sys, h, raw.len() as u64, &mut probe);
+        if pr < 0 {
+            wait = pr;
+        }
+        if pr > 0 {
+            out = read_heap(sys, h, key, w);
         }
     }
     let mut carg = [0u8; 4];
     (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    if wait < 0 {
+        w.refused_open(sys, b"RANGE_GET", key, wait);
+    }
+    if w.get() {
+        if let Val::Heap(p, _) = out {
+            heap_free(sys, p);
+        }
+        return Val::Missing;
+    }
     out
 }
 
@@ -4446,7 +4886,7 @@ unsafe fn range_get(sys: &SyscallTable, h: i32, off: u64, dst: &mut [u8]) -> i32
 
 /// The whole value behind an open handle, on the heap, the buffer doubled as
 /// it fills.
-unsafe fn read_heap(sys: &SyscallTable, h: i32) -> Val {
+unsafe fn read_heap(sys: &SyscallTable, h: i32, key: &[u8], w: &Wait) -> Val {
     let mut cap = 64 * 1024usize;
     let mut p = heap_alloc(sys, cap as u32);
     let mut len = 0usize;
@@ -4458,6 +4898,7 @@ unsafe fn read_heap(sys: &SyscallTable, h: i32) -> Val {
         let n = range_get(sys, h, len as u64, dst);
         if n < 0 {
             heap_free(sys, p);
+            w.refused_open(sys, b"RANGE_GET", key, n);
             return Val::Missing;
         }
         len += n as usize;
@@ -4605,7 +5046,7 @@ unsafe fn changes_on_heap(s: &mut State, prefix: &[u8], since: u64, fence: &mut 
             s.evh_cap = cap;
         }
         let dst = core::slice::from_raw_parts_mut(s.evh, s.evh_cap);
-        let n = store_changes(sys, prefix, since, dst, fence);
+        let n = store_changes(sys, prefix, since, dst, fence, &s.waited);
         if n != ERR_ENOMEM || cap >= EVH_MAX {
             if n >= 0 {
                 s.ev_heap = 1;
@@ -4665,7 +5106,7 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
         let view = view_args(view).0;
         let reg_key = &w.name[..w.name_len as usize];
         let mut raw = [0u8; MAX_VALUE];
-        let (p, n) = match read_value(sys, key, &mut raw) {
+        let (p, n) = match read_value(sys, key, &mut raw, &s.waited) {
             Val::Stack(n) => (core::ptr::null_mut(), n),
             Val::Heap(p, n) => (p, n),
             Val::Missing | Val::TooBig => {
@@ -4690,11 +5131,17 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
                 None => doc,
             },
             SchView::Text(prefix, path) => {
-                related_text(sys, doc, prefix, path, w.tail, w.lbytes, &mut lg)
+                let tv = TextView {
+                    prefix,
+                    path,
+                    tail: w.tail,
+                    lbytes: w.lbytes,
+                };
+                related_text(sys, doc, &tv, &mut lg, &s.waited)
             }
             SchView::Whole => doc,
         };
-        let rev = head_rev(sys, key).unwrap_or(0);
+        let rev = head(sys, key, &s.waited).unwrap_or(0);
         s.watchers[wi].lrev = rev;
         let sent = stamped_emit(s, wi, b"ITEM", key, rev, doc, b"", false);
         if !p.is_null() {
@@ -4728,6 +5175,7 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
                 &mut s.lp_page,
                 &mut next,
                 &mut fence,
+                &s.waited,
             );
             if w.lrev == 0 {
                 s.watchers[wi].lrev = fence;
@@ -4767,7 +5215,7 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
         let mut key = [0u8; MAX_KEY];
         key[..kl].copy_from_slice(name);
         let mut raw = [0u8; MAX_VALUE];
-        let (p, vl) = match read_value(sys, &key[..kl], &mut raw) {
+        let (p, vl) = match read_value(sys, &key[..kl], &mut raw, &s.waited) {
             Val::Stack(n) => (core::ptr::null_mut(), n),
             Val::Heap(p, n) => (p, n),
             Val::Missing => continue,
@@ -4782,7 +5230,7 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
         } else {
             core::slice::from_raw_parts(p, vl)
         };
-        let rev = head_rev(sys, &key[..kl]).unwrap_or(0);
+        let rev = head(sys, &key[..kl], &s.waited).unwrap_or(0);
         // "," before every item but the first; the head before the first.
         let e = if w.sent == 0 {
             let head = w.head;
@@ -4992,18 +5440,31 @@ fn stamp_rv(raw: &[u8], rev: u64, out: &mut [u8], rvp: &[u8]) -> usize {
     }
 }
 
+/// What a `text:` view reads: the key `<prefix><doc's value at path>`, cut
+/// to its last `tail` lines and at most `lbytes` bytes (0: no cut).
+struct TextView<'v> {
+    prefix: &'v [u8],
+    path: &'v [u8],
+    tail: u32,
+    lbytes: u32,
+}
+
 /// A `text:` view: the text stored at `<prefix><doc's value at path>` (for
 /// a Pod's log, the sandbox's output tail under its uid), its last `tail`
 /// lines and at most `lbytes` bytes when asked. Nothing stored: empty.
 unsafe fn related_text<'a>(
     sys: &SyscallTable,
     doc: &[u8],
-    prefix: &[u8],
-    path: &[u8],
-    tail: u32,
-    lbytes: u32,
+    view: &TextView,
     out: &'a mut [u8; MAX_VALUE],
+    w: &Wait,
 ) -> &'a [u8] {
+    let TextView {
+        prefix,
+        path,
+        tail,
+        lbytes,
+    } = *view;
     let id = sch_at(doc, path).unwrap_or(&[]);
     let id = id
         .strip_prefix(b"\"")
@@ -5015,7 +5476,7 @@ unsafe fn related_text<'a>(
     }
     key[..prefix.len()].copy_from_slice(prefix);
     key[prefix.len()..prefix.len() + id.len()].copy_from_slice(id);
-    let n = match read_value(sys, &key[..prefix.len() + id.len()], out) {
+    let n = match read_value(sys, &key[..prefix.len() + id.len()], out, w) {
         Val::Stack(n) => n,
         Val::Heap(p, _) => {
             heap_free(sys, p);
@@ -5165,217 +5626,293 @@ unsafe fn events_step(s: &mut State) {
         s.dirty = 0;
         s.scan_now = dev_millis(sys) as i64;
         ev_sync(s, s.scan_now);
+        // A sync a read was not answered for has re-armed `dirty`.
+        s.waited.set(false);
         s.ev_w = 0;
         s.ev_len = 0;
     }
     let now = s.scan_now;
     while (s.ev_w as usize) < MAX_WATCHERS {
         let wi = s.ev_w as usize;
-        let w = s.watchers[wi];
-        if w.live == 0 || w.done != 0 {
-            s.ev_w += 1;
-            continue;
-        }
-        // A LIST: served once, one item per step, then its tail.
-        if w.list != 0 {
-            if list_step(s, wi) {
-                return;
-            }
-            continue;
-        }
-        let reg_key = &w.name[..w.name_len as usize];
-        if s.ev_len == 0 {
-            // The watch's own end: timeoutSeconds.
-            if now >= w.deadline {
-                s.watchers[wi].done = 1;
-                s.ev_w += 1;
-                ev_event(s, wi, b"CLOSE", reg_key, w.cursor, b"{}", false);
-                return;
-            }
-            let mut fence = 0u64;
-            s.ev_heap = 0;
-            let mut n = store_changes(
-                sys,
-                &w.prefix[..w.prefix_len as usize],
-                w.cursor,
-                &mut s.ev_buf,
-                &mut fence,
-            );
-            // A batch past `ev_buf` (large objects): again, on the heap.
-            if n == ERR_ENOMEM {
-                n = changes_on_heap(s, &w.prefix[..w.prefix_len as usize], w.cursor, &mut fence);
-            }
-            s.ev_len = if n > 0 { n as u32 } else { 0 };
-            let head5 = ev_bytes(s);
-            // LOST (history no longer reaches the cursor) or a batch past
-            // every buffer: 410, and the client relists.
-            if n < 5 || head5.first() == Some(&1) {
-                s.watchers[wi].done = 1;
-                s.ev_w += 1;
-                s.ev_len = 0;
-                s.ev_heap = 0;
-                let mut ex = [0u8; 256];
-                let el = expired(s, &mut ex);
-                ev_event(s, wi, b"ERROR", reg_key, fence, &ex[..el], false);
-                return;
-            }
-            let count = u32::from_le_bytes([head5[1], head5[2], head5[3], head5[4]]);
-            if count == 0 {
-                if s.watchers[wi].cursor == 0 {
-                    s.watchers[wi].cursor = fence;
-                }
-                if now >= w.next_bm {
-                    s.watchers[wi].next_bm = now.saturating_add(s.bookmark_ms as i64);
-                    s.ev_w += 1;
-                    let rv = s.watchers[wi].cursor;
-                    let mut reg = [0u8; MAX_VALUE];
-                    let rl = get_value(sys, reg_key, &mut reg).unwrap_or(0);
-                    let mut obj = [0u8; 256];
-                    let ol = bookmark_object(
-                        &s.schema[..s.schema_len as usize],
-                        &reg[..rl],
-                        rv,
-                        &mut obj,
-                    );
-                    ev_event(s, wi, b"BOOKMARK", reg_key, rv, &obj[..ol], false);
-                    return;
-                }
-                s.ev_len = 0;
-                s.ev_heap = 0;
-                s.ev_w += 1;
-                continue;
-            }
-            s.ev_at = 5;
-            s.ev_fence = fence;
-        }
-        // The next change of this watcher's batch.
-        let at = s.ev_at as usize;
-        let len = s.ev_len as usize;
-        if at + 15 > len {
-            let f = s.ev_fence;
-            let c = &mut s.watchers[wi].cursor;
-            *c = (*c).max(f);
-            s.ev_len = 0;
-            s.ev_heap = 0;
-            s.ev_w += 1;
-            continue;
-        }
-        let b = ev_bytes(s);
-        let rev = u64::from_le_bytes([
-            b[at],
-            b[at + 1],
-            b[at + 2],
-            b[at + 3],
-            b[at + 4],
-            b[at + 5],
-            b[at + 6],
-            b[at + 7],
-        ]);
-        let kind = b[at + 8];
-        let kl = u16::from_le_bytes([b[at + 9], b[at + 10]]) as usize;
-        let vl = u32::from_le_bytes([b[at + 11], b[at + 12], b[at + 13], b[at + 14]]) as usize;
-        let ks = at + 15;
-        if ks + kl + vl > len || kl > MAX_KEY {
-            // A malformed batch: stop reading it rather than misreading.
-            s.watchers[wi].done = 1;
-            s.ev_len = 0;
-            s.ev_w += 1;
-            let mut ex = [0u8; 256];
-            let el = expired(s, &mut ex);
-            ev_event(s, wi, b"ERROR", reg_key, rev, &ex[..el], false);
+        // A watcher's step that met a read the store had not answered yet
+        // (`EAGAIN`) decided nothing: it is put back as it stood and run
+        // again next step — not served as NotFound, an empty list or a 410.
+        let snap = EvSnap::take(s, wi);
+        let stop = watcher_step(s, wi, now);
+        if s.waited.get() {
+            snap.restore(s, wi);
+            s.t_waits = s.t_waits.wrapping_add(1);
             return;
         }
-        s.ev_at = (ks + kl + vl) as u32;
-        let mut key = [0u8; MAX_KEY];
-        key[..kl].copy_from_slice(&b[ks..ks + kl]);
-        let mut raw = [0u8; MAX_VALUE];
-        let doc: &[u8] = if kind == 2 {
-            let mut reg = [0u8; MAX_VALUE];
-            let rl = get_value(sys, reg_key, &mut reg).unwrap_or(0);
-            let n = deleted_object(s, &key[..kl], &reg[..rl], &mut raw);
-            &raw[..n]
-        } else {
-            &b[ks + kl..ks + kl + vl]
-        };
-        // The object's resourceVersion is the change's revision — stamped on
-        // the stack when it fits, on the heap when it does not.
-        let (rvb, rvl) = (s.rv, s.rv_len as usize);
-        let mut obj = [0u8; MAX_VALUE + 32];
-        let mut hp: *mut u8 = core::ptr::null_mut();
-        let ol = if doc.len() + 32 <= obj.len() {
-            stamp_rv(doc, rev, &mut obj, &rvb[..rvl])
-        } else {
-            hp = heap_alloc(sys, (doc.len() + 48) as u32);
-            if hp.is_null() {
-                0
-            } else {
-                stamp_rv(
-                    doc,
-                    rev,
-                    core::slice::from_raw_parts_mut(hp, doc.len() + 48),
-                    &rvb[..rvl],
-                )
-            }
-        };
-        let c = &mut s.watchers[wi].cursor;
-        *c = (*c).max(rev);
-        let o: &[u8] = if ol == 0 {
-            doc
-        } else if hp.is_null() {
-            &obj[..ol]
-        } else {
-            core::slice::from_raw_parts(hp, ol)
-        };
-        // A watcher that asked for a Table gets each event's object as a
-        // one-row Table (the columns again: a client may join mid-stream).
-        let mut tp: *mut u8 = core::ptr::null_mut();
-        let mut tl = 0usize;
-        if w.table != 0 {
-            let cols = tbl_spec(
-                &s.table[..s.table_len as usize],
-                &w.kind[..w.kind_len as usize],
-            );
-            let cap = o.len() + 4096;
-            tp = heap_alloc(sys, cap as u32);
-            if !tp.is_null() {
-                let tb = core::slice::from_raw_parts_mut(tp, cap);
-                let now = dev_unix_millis(sys);
-                let sch = &s.schema[..s.schema_len as usize];
-                if tbl_head(sch, cols, tb, &mut tl)
-                    && tbl_row(sch, cols, o, now, tb, &mut tl)
-                    && tbl_end(sch, tb, &mut tl)
-                {
-                } else {
-                    tl = 0;
-                }
-            }
-        }
-        let body: &[u8] = if tl > 0 {
-            core::slice::from_raw_parts(tp, tl)
-        } else {
-            o
-        };
-        // A change the filter refuses sends nothing: on to the next one. One
-        // call per arm: a `match` that YIELDS a byte-string literal is a table
-        // of unrelocated pointers in a PIC module.
-        let k = &key[..kl];
-        let sent = match kind {
-            0 => event_emit(s, wi, b"ADDED", k, rev, o, body),
-            1 => event_emit(s, wi, b"MODIFIED", k, rev, o, body),
-            _ => event_emit(s, wi, b"DELETED", k, rev, o, body),
-        };
-        if !hp.is_null() {
-            heap_free(sys, hp);
-        }
-        if !tp.is_null() {
-            heap_free(sys, tp);
-        }
-        if sent == Emit::Sent {
+        if stop {
             return;
         }
     }
     s.ev_w = EV_IDLE;
     ev_arm(s, sys);
+}
+
+/// What one watcher's step may move, to put it back when the step met a read
+/// not answered yet.
+struct EvSnap {
+    w: Watcher,
+    ev_w: u8,
+    ev_len: u32,
+    ev_at: u32,
+    ev_fence: u64,
+    ev_heap: u8,
+    lp_n: usize,
+    lp_rp: usize,
+    lp_end: u8,
+    lp_cut: u8,
+    lp_next: [u8; MAX_CURSOR],
+    lp_next_len: u8,
+    pend_at: u16,
+    pend_len: u16,
+}
+
+impl EvSnap {
+    fn take(s: &State, wi: usize) -> EvSnap {
+        EvSnap {
+            w: s.watchers[wi],
+            ev_w: s.ev_w,
+            ev_len: s.ev_len,
+            ev_at: s.ev_at,
+            ev_fence: s.ev_fence,
+            ev_heap: s.ev_heap,
+            lp_n: s.lp_n,
+            lp_rp: s.lp_rp,
+            lp_end: s.lp_end,
+            lp_cut: s.lp_cut,
+            lp_next: s.lp_next,
+            lp_next_len: s.lp_next_len,
+            pend_at: s.pend_at,
+            pend_len: s.pend_len,
+        }
+    }
+
+    fn restore(&self, s: &mut State, wi: usize) {
+        s.watchers[wi] = self.w;
+        s.ev_w = self.ev_w;
+        s.ev_len = self.ev_len;
+        s.ev_at = self.ev_at;
+        s.ev_fence = self.ev_fence;
+        s.ev_heap = self.ev_heap;
+        s.lp_n = self.lp_n;
+        s.lp_rp = self.lp_rp;
+        s.lp_end = self.lp_end;
+        s.lp_cut = self.lp_cut;
+        s.lp_next = self.lp_next;
+        s.lp_next_len = self.lp_next_len;
+        s.pend_at = self.pend_at;
+        s.pend_len = self.pend_len;
+    }
+}
+
+/// One watcher's part of [`events_step`]: true when the step is over (a
+/// record went out), false to go on to the next watcher.
+unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
+    let sys = &*s.syscalls;
+    let w = s.watchers[wi];
+    if w.live == 0 || w.done != 0 {
+        s.ev_w += 1;
+        return false;
+    }
+    // A LIST: served once, one item per step, then its tail.
+    if w.list != 0 {
+        if list_step(s, wi) {
+            return true;
+        }
+        return false;
+    }
+    let reg_key = &w.name[..w.name_len as usize];
+    if s.ev_len == 0 {
+        // The watch's own end: timeoutSeconds.
+        if now >= w.deadline {
+            s.watchers[wi].done = 1;
+            s.ev_w += 1;
+            ev_event(s, wi, b"CLOSE", reg_key, w.cursor, b"{}", false);
+            return true;
+        }
+        let mut fence = 0u64;
+        s.ev_heap = 0;
+        let mut n = store_changes(
+            sys,
+            &w.prefix[..w.prefix_len as usize],
+            w.cursor,
+            &mut s.ev_buf,
+            &mut fence,
+            &s.waited,
+        );
+        // A batch past `ev_buf` (large objects): again, on the heap.
+        if n == ERR_ENOMEM {
+            n = changes_on_heap(s, &w.prefix[..w.prefix_len as usize], w.cursor, &mut fence);
+        }
+        s.ev_len = if n > 0 { n as u32 } else { 0 };
+        let head5 = ev_bytes(s);
+        // LOST (history no longer reaches the cursor) or a batch past
+        // every buffer: 410, and the client relists.
+        if n < 5 || head5.first() == Some(&1) {
+            s.watchers[wi].done = 1;
+            s.ev_w += 1;
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            let mut ex = [0u8; 256];
+            let el = expired(s, &mut ex);
+            ev_event(s, wi, b"ERROR", reg_key, fence, &ex[..el], false);
+            return true;
+        }
+        let count = u32::from_le_bytes([head5[1], head5[2], head5[3], head5[4]]);
+        if count == 0 {
+            if s.watchers[wi].cursor == 0 {
+                s.watchers[wi].cursor = fence;
+            }
+            if now >= w.next_bm {
+                s.watchers[wi].next_bm = now.saturating_add(s.bookmark_ms as i64);
+                s.ev_w += 1;
+                let rv = s.watchers[wi].cursor;
+                let mut reg = [0u8; MAX_VALUE];
+                let rl = get_value(sys, reg_key, &mut reg, &s.waited).unwrap_or(0);
+                let mut obj = [0u8; 256];
+                let ol =
+                    bookmark_object(&s.schema[..s.schema_len as usize], &reg[..rl], rv, &mut obj);
+                ev_event(s, wi, b"BOOKMARK", reg_key, rv, &obj[..ol], false);
+                return true;
+            }
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            s.ev_w += 1;
+            return false;
+        }
+        s.ev_at = 5;
+        s.ev_fence = fence;
+    }
+    // The next change of this watcher's batch.
+    let at = s.ev_at as usize;
+    let len = s.ev_len as usize;
+    if at + 15 > len {
+        let f = s.ev_fence;
+        let c = &mut s.watchers[wi].cursor;
+        *c = (*c).max(f);
+        s.ev_len = 0;
+        s.ev_heap = 0;
+        s.ev_w += 1;
+        return false;
+    }
+    let b = ev_bytes(s);
+    let rev = u64::from_le_bytes([
+        b[at],
+        b[at + 1],
+        b[at + 2],
+        b[at + 3],
+        b[at + 4],
+        b[at + 5],
+        b[at + 6],
+        b[at + 7],
+    ]);
+    let kind = b[at + 8];
+    let kl = u16::from_le_bytes([b[at + 9], b[at + 10]]) as usize;
+    let vl = u32::from_le_bytes([b[at + 11], b[at + 12], b[at + 13], b[at + 14]]) as usize;
+    let ks = at + 15;
+    if ks + kl + vl > len || kl > MAX_KEY {
+        // A malformed batch: stop reading it rather than misreading.
+        s.watchers[wi].done = 1;
+        s.ev_len = 0;
+        s.ev_w += 1;
+        let mut ex = [0u8; 256];
+        let el = expired(s, &mut ex);
+        ev_event(s, wi, b"ERROR", reg_key, rev, &ex[..el], false);
+        return true;
+    }
+    s.ev_at = (ks + kl + vl) as u32;
+    let mut key = [0u8; MAX_KEY];
+    key[..kl].copy_from_slice(&b[ks..ks + kl]);
+    let mut raw = [0u8; MAX_VALUE];
+    let doc: &[u8] = if kind == 2 {
+        let mut reg = [0u8; MAX_VALUE];
+        let rl = get_value(sys, reg_key, &mut reg, &s.waited).unwrap_or(0);
+        let n = deleted_object(s, &key[..kl], &reg[..rl], &mut raw);
+        &raw[..n]
+    } else {
+        &b[ks + kl..ks + kl + vl]
+    };
+    // The object's resourceVersion is the change's revision — stamped on
+    // the stack when it fits, on the heap when it does not.
+    let (rvb, rvl) = (s.rv, s.rv_len as usize);
+    let mut obj = [0u8; MAX_VALUE + 32];
+    let mut hp: *mut u8 = core::ptr::null_mut();
+    let ol = if doc.len() + 32 <= obj.len() {
+        stamp_rv(doc, rev, &mut obj, &rvb[..rvl])
+    } else {
+        hp = heap_alloc(sys, (doc.len() + 48) as u32);
+        if hp.is_null() {
+            0
+        } else {
+            stamp_rv(
+                doc,
+                rev,
+                core::slice::from_raw_parts_mut(hp, doc.len() + 48),
+                &rvb[..rvl],
+            )
+        }
+    };
+    let c = &mut s.watchers[wi].cursor;
+    *c = (*c).max(rev);
+    let o: &[u8] = if ol == 0 {
+        doc
+    } else if hp.is_null() {
+        &obj[..ol]
+    } else {
+        core::slice::from_raw_parts(hp, ol)
+    };
+    // A watcher that asked for a Table gets each event's object as a
+    // one-row Table (the columns again: a client may join mid-stream).
+    let mut tp: *mut u8 = core::ptr::null_mut();
+    let mut tl = 0usize;
+    if w.table != 0 {
+        let cols = tbl_spec(
+            &s.table[..s.table_len as usize],
+            &w.kind[..w.kind_len as usize],
+        );
+        let cap = o.len() + 4096;
+        tp = heap_alloc(sys, cap as u32);
+        if !tp.is_null() {
+            let tb = core::slice::from_raw_parts_mut(tp, cap);
+            let now = dev_unix_millis(sys);
+            let sch = &s.schema[..s.schema_len as usize];
+            if tbl_head(sch, cols, tb, &mut tl)
+                && tbl_row(sch, cols, o, now, tb, &mut tl)
+                && tbl_end(sch, tb, &mut tl)
+            {
+            } else {
+                tl = 0;
+            }
+        }
+    }
+    let body: &[u8] = if tl > 0 {
+        core::slice::from_raw_parts(tp, tl)
+    } else {
+        o
+    };
+    // A change the filter refuses sends nothing: on to the next one. One
+    // call per arm: a `match` that YIELDS a byte-string literal is a table
+    // of unrelocated pointers in a PIC module.
+    let k = &key[..kl];
+    let sent = match kind {
+        0 => event_emit(s, wi, b"ADDED", k, rev, o, body),
+        1 => event_emit(s, wi, b"MODIFIED", k, rev, o, body),
+        _ => event_emit(s, wi, b"DELETED", k, rev, o, body),
+    };
+    if !hp.is_null() {
+        heap_free(sys, hp);
+    }
+    if !tp.is_null() {
+        heap_free(sys, tp);
+    }
+    if sent == Emit::Sent {
+        return true;
+    }
+    false
 }
 
 /// A BOOKMARK's object: the schema's `bookmark` template, filled with the
@@ -5455,7 +5992,13 @@ const TIMER_CANCEL: u32 = 0x0606;
 /// none is), at the end of a scan. The kernel wakes this module when it
 /// fires; `module_step` sees POLL_IN and re-arms the scan.
 unsafe fn arm_due(s: &mut State, sys: &SyscallTable) {
-    if s.due_len == 0 {
+    if s.recheck > 0 && s.unresolved.get() != 0 {
+        let d = s.scan_now.saturating_add(i64::from(s.recheck));
+        if d < s.next_due {
+            s.next_due = d;
+        }
+    }
+    if s.due_len == 0 && (s.recheck == 0 || s.next_due == i64::MAX) {
         return;
     }
     if s.timer_fd < 0 {

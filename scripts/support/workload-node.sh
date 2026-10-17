@@ -41,13 +41,26 @@ PY
 
 # wn_registry <port>: serve $D/reg/<repo> as registry repos nanocloud/<repo>,
 # tag `1` (manifest and blobs); its pid in REG_PID, its requests in $D/reg.log.
+# While $D/reg.fail holds an HTTP status, every request is answered that
+# status instead (a registry that is up and failing: 503, 500, …).
 wn_registry() {
-  python3 - "$D/reg" "$1" >"$D/reg.log" 2>&1 <<'PY' &
+  python3 - "$D/reg" "$1" "$D/reg.fail" >>"$D/reg.log" 2>&1 <<'PY' &
 import http.server, os, socketserver, sys
-d, port = sys.argv[1], int(sys.argv[2])
+d, port, failf = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def do_GET(self):
+        try:
+            fail = int(open(failf).read().strip())
+        except (OSError, ValueError):
+            fail = 0
+        if fail:
+            sys.stderr.write(f"{self.path} {fail}\n"); sys.stderr.flush()
+            self.send_response(fail)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
         parts = self.path.strip("/").split("/")
         body, ctype = None, "application/octet-stream"
         repo = os.path.join(d, parts[2]) if len(parts) == 5 and parts[:2] == ["v2", "nanocloud"] else ""
@@ -160,7 +173,8 @@ put_text() { store_put "$1" "$(printf '%s' "$2" | python3 -c 'import sys,binasci
 
 # wn_seed_identity: the operator's identity (an SA key, its token at
 # $D/token.admin, a cluster-admin binding), the default namespace and a ready
-# node-1, seeded into $STORE.
+# node-1, seeded into $STORE — no node-1 with WN_NO_NODE=1 (a node that
+# registers itself).
 wn_seed_identity() {
   python3 - "$D" <<'PY'
 import base64, json, struct, sys, time, binascii
@@ -192,7 +206,7 @@ PY
   rbac_clusterrole "$STORE/store.log" admin "*" "*"
   rbac_crb "$STORE/store.log" admins admin ServiceAccount admin default
   put_text "/namespaces/default" '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}'
-  put_text "/nodes/node-1" '{"apiVersion":"v1","kind":"Node","metadata":{"name":"node-1"},"status":{"ready":true,"conditions":[{"type":"Ready","status":"True"}]}}'
+  [ "${WN_NO_NODE:-0}" = 1 ] || put_text "/nodes/node-1" '{"apiVersion":"v1","kind":"Node","metadata":{"name":"node-1"},"status":{"ready":true,"conditions":[{"type":"Ready","status":"True"}]}}'
 }
 
 # api <method> <path> [json-body] -> "<status>|<body>", as the operator, to the

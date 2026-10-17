@@ -166,6 +166,9 @@ struct State {
     /// whether the request is held for a write the store has not decided.
     journal: Journal,
     held: u8,
+    /// The held request's TAKE nonce ([`take_value`]): drawn when the
+    /// request is first served, kept while it is held.
+    take_nonce: [u8; 16],
     corr: u64,
     sent_ms: u64,
     /// The request message, envelope header first (heap).
@@ -543,20 +546,31 @@ impl State {
                 };
             }
             OP_TAKE => {
+                // 200 with the value, taken by this request alone; 404 only
+                // when it is not there. A take not decided this step holds
+                // the request (the journal), and one that could not be
+                // decided is 503, never "missing".
+                if self.held == 0 {
+                    let cid = frame_i64(req, 1).unwrap_or(0) as u64;
+                    // SAFETY: the loader's table.
+                    self.take_nonce = unsafe { take_nonce(self.sys(), cid ^ self.corr) };
+                }
+                if self.ans.is_null() {
+                    return self.reply(503, &[]);
+                }
+                // Each read lands in the (idle) answer buffer: a TAKE
+                // answers here, and never reaches the dialect.
+                // SAFETY: MSG_CAP >= BUF bytes of this module's heap.
+                let scratch = unsafe { core::slice::from_raw_parts_mut(self.ans, BUF) };
+                let nonce = self.take_nonce;
                 let st = self.store();
                 let mut got = [0u8; BUF];
                 // SAFETY: storage.object through the loader's table.
-                let taken = unsafe {
-                    match (head(&st, key), get_value(&st, key, &mut got)) {
-                        (Some(at), Some(n)) if at > 0 => {
-                            (code(delete_cond(&st, key, PRE_ETAG, at)) == 0).then_some(n)
-                        }
-                        _ => None,
-                    }
-                };
-                return match taken {
-                    Some(n) => self.reply(200, &got[..n]),
-                    None => self.reply(404, &[]),
+                let took = unsafe { take_value(&st, key, &nonce, &mut got, scratch) };
+                return match took {
+                    Took::Taken(n) => self.reply(200, got.get(..n).unwrap_or(&[])),
+                    Took::Absent => self.reply(404, &[]),
+                    Took::Waiting | Took::Failed => self.reply(503, &[]),
                 };
             }
             OP_CREATE | OP_REPLACE | OP_PATCH_MERGE | OP_PATCH_JSON | OP_PATCH_SMP | OP_APPLY

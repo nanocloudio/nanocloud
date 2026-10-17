@@ -76,6 +76,8 @@ struct State {
     applied: u32,
     refused: u32,
     skipped: u32,
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -412,7 +414,7 @@ unsafe fn status(s: &mut State, sys: &SyscallTable, text: &[u8]) {
     }
     let key = &s.status_key[..s.status_key_len as usize];
     let mut cur = [0u8; 128];
-    if let Some(n) = get_value(&Store::plain(sys), key, &mut cur) {
+    if let Some(n) = get_value(&Store::plain(sys, &s.nag), key, &mut cur) {
         if &cur[..n] == text {
             return;
         }
@@ -427,7 +429,7 @@ unsafe fn status(s: &mut State, sys: &SyscallTable, text: &[u8]) {
 unsafe fn ask_status(s: &mut State, sys: &SyscallTable) {
     let key = &s.status_key[..s.status_key_len as usize];
     let val = &s.status_val[..s.status_len as usize];
-    if put_value(&Store::plain(sys), key, val) != WriteAnswer::Pending {
+    if put_value(&Store::plain(sys, &s.nag), key, val) != WriteAnswer::Pending {
         s.status_owed = 0;
     }
 }
@@ -445,7 +447,7 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
         rules: 0,
         full: false,
     };
-    let store = Store::plain(sys);
+    let store = Store::plain(sys, &s.nag);
     let mut walk = ListWalk::new(&prefix[..prefix_len]);
     let mut skipped = 0u32;
     while let Some(key) = walk.next(&store) {
@@ -462,6 +464,11 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
         if out.full {
             break;
         }
+    }
+    if store.waiting() {
+        // A row or a page was not answered yet (`EAGAIN`): what was read is
+        // not the table, so the old one stands and this is asked again.
+        return false;
     }
     s.skipped = s.skipped.wrapping_add(skipped);
     let mut st = [0u8; 128];
@@ -611,7 +618,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let pl = s.prefix_len as usize;
                 let mut p = [0u8; MAX_PARAM];
                 p[..pl].copy_from_slice(&s.prefix[..pl]);
-                store_subscribe(sys, &p[..pl], s.sink, 0);
+                if store_subscribe(sys, &p[..pl], s.sink, 0) == READ_WAIT {
+                    // Not yet: no subscription was made; asked next step.
+                    return 0;
+                }
             }
             s.subscribed = 1;
         }

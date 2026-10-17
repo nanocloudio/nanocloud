@@ -207,6 +207,8 @@ struct State {
     joins_minted: u32,
 
     in_buf: [u8; BUF],
+    /// This module's refused store reads, said rate-limited (`ReadNag`).
+    nag: ReadNag,
 }
 
 mod params_def {
@@ -473,12 +475,14 @@ pub unsafe extern "C" fn module_new(
             return -1;
         }
         if s.join != 0 {
-            let m = b"[node_pki] refusing to construct: a remote identity's node does not mint joins";
+            let m =
+                b"[node_pki] refusing to construct: a remote identity's node does not mint joins";
             dev_log(sys, 1, m.as_ptr(), m.len());
             return -1;
         }
     } else if s.subject_len == 0 || s.tenant_len == 0 || s.device_len == 0 {
-        let m = b"[node_pki] refusing to construct: subject, tenant and device name the certificate";
+        let m =
+            b"[node_pki] refusing to construct: subject, tenant and device name the certificate";
         dev_log(sys, 1, m.as_ptr(), m.len());
         return -1;
     }
@@ -642,7 +646,14 @@ unsafe fn ask_extra(s: &mut State, sys: &SyscallTable, k: usize) {
 /// The certificate request for a point: `{"subject","tenant","device",
 /// "public_key"[,"dns"]}` (`public_key` base64url; no `dns` asked for, the
 /// member is left out rather than sent empty). Its length.
-fn cert_body(point: &[u8; POINT], subject: &[u8], tenant: &[u8], device: &[u8], dns: &[u8], body: &mut [u8]) -> Option<usize> {
+fn cert_body(
+    point: &[u8; POINT],
+    subject: &[u8],
+    tenant: &[u8],
+    device: &[u8],
+    dns: &[u8],
+    body: &mut [u8],
+) -> Option<usize> {
     let mut key = [0u8; 96];
     let kl = b64::encode(point, &mut key)?;
     let mut at = put(body, 0, b"{\"subject\":\"")?;
@@ -754,7 +765,11 @@ unsafe fn answered(s: &mut State, sys: &SyscallTable, status: u16, body: &[u8]) 
     let Some((ll, cl)) = decoded.filter(|(ll, cl)| ll + cl <= CHAIN_MAX) else {
         s.cert_refused = s.cert_refused.wrapping_add(1);
         if s.cert_refused & 15 == 1 {
-            log_status(sys, b"[node_pki] the authority refused a certificate: ", status);
+            log_status(
+                sys,
+                b"[node_pki] the authority refused a certificate: ",
+                status,
+            );
         }
         return;
     };
@@ -859,24 +874,40 @@ unsafe fn remote_step(s: &mut State, sys: &SyscallTable) {
     let mut bl = 0usize;
     let method = match s.r_phase {
         R_SPEC => {
-            let parts: [&[u8]; 3] = [b"{\"spec\":{\"publicKey\":\"", &s.r_key[..s.r_key_len as usize], b"\"}}"];
+            let parts: [&[u8]; 3] = [
+                b"{\"spec\":{\"publicKey\":\"",
+                &s.r_key[..s.r_key_len as usize],
+                b"\"}}",
+            ];
             for p in parts {
                 bl = put(&mut body, bl, p).unwrap_or(bl);
             }
-            h = put(&mut hdr, h, b"content-type: application/merge-patch+json\r\n").unwrap_or(h);
+            h = put(
+                &mut hdr,
+                h,
+                b"content-type: application/merge-patch+json\r\n",
+            )
+            .unwrap_or(h);
             6
         }
         R_CLEAR => {
             pl = put(&mut path, pl, b"/status").unwrap_or(pl);
             bl = put(&mut body, 0, b"{\"status\":{\"publicKey\":null}}").unwrap_or(0);
-            h = put(&mut hdr, h, b"content-type: application/merge-patch+json\r\n").unwrap_or(h);
+            h = put(
+                &mut hdr,
+                h,
+                b"content-type: application/merge-patch+json\r\n",
+            )
+            .unwrap_or(h);
             6
         }
         _ => 1,
     };
     let port = s.request_out;
     let (hdr, path, body) = (&hdr[..h], &path[..pl], &body[..bl]);
-    if s.call.begin(port, |id, out| call_head(id, method, path, hdr, body, out)) {
+    if s.call
+        .begin(port, |id, out| call_head(id, method, path, hdr, body, out))
+    {
         flush_call(s, sys);
     }
 }
@@ -889,7 +920,11 @@ unsafe fn remote_answered(s: &mut State, sys: &SyscallTable, status: u16, body: 
         R_SPEC | R_CLEAR if !ok => {
             s.r_refused = s.r_refused.wrapping_add(1);
             if s.r_refused & 15 == 1 {
-                log_status(sys, b"[node_pki] the API refused the Device's key: ", status);
+                log_status(
+                    sys,
+                    b"[node_pki] the API refused the Device's key: ",
+                    status,
+                );
             }
             s.r_next_at = now + RETRY_MS;
         }
@@ -965,7 +1000,7 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
     if now < s.next_at {
         return;
     }
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     match s.phase {
         J_CLEAN => {
             // A stale secret of an earlier boot: the first listed name that
@@ -993,6 +1028,10 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
                     break;
                 }
             }
+            if st.waiting() {
+                // A page or a probe was not answered yet: asked next step.
+                return;
+            }
             if walk.failed {
                 s.next_at = now + RETRY_MS;
                 return;
@@ -1015,7 +1054,11 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
                 s.wrote_at = 0;
                 return;
             };
-            if exists(&st, &key[..kl]) {
+            let present = exists(&st, &key[..kl]);
+            if st.waiting() {
+                return; // not answered yet (`EAGAIN`): asked next step
+            }
+            if present {
                 s.decl_i += 1;
                 s.wrote_at = 0;
             } else if s.wrote_at == 0 || now - s.wrote_at >= REASK_MS {
@@ -1047,7 +1090,11 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let mut key = [0u8; 48];
             let kl = token_key(s, b"/token-resp/join-", &mut key);
             let mut val = [0u8; TOKEN_MAX + 16];
-            match get_value(&st, &key[..kl], &mut val) {
+            let got = get_value(&st, &key[..kl], &mut val);
+            if st.waiting() {
+                return; // not answered yet (`EAGAIN`), not absent
+            }
+            match got {
                 Some(n) if val[..n].starts_with(b"token=") && n - 6 <= TOKEN_MAX => {
                     let t = s.tok_n as usize;
                     if t == 0 {
@@ -1083,7 +1130,11 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             // make the mint answer it again.
             let mut key = [0u8; 48];
             let kl = token_key(s, b"/token-req/join-", &mut key);
-            if !exists(&st, &key[..kl]) {
+            let present = exists(&st, &key[..kl]);
+            if st.waiting() {
+                return;
+            }
+            if !present {
                 s.phase = J_DROP_RESP;
                 s.wrote_at = 0;
             } else {
@@ -1093,7 +1144,11 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
         J_DROP_RESP => {
             let mut key = [0u8; 48];
             let kl = token_key(s, b"/token-resp/join-", &mut key);
-            if !exists(&st, &key[..kl]) {
+            let present = exists(&st, &key[..kl]);
+            if st.waiting() {
+                return;
+            }
+            if !present {
                 s.wrote_at = 0;
                 if s.tok_ok == 0 {
                     s.phase = J_ASK;
@@ -1116,7 +1171,11 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             kl = put(&mut key, kl, &s.secret).unwrap_or(kl);
             let at = join_record(s);
             // Published once it reads back; asked at most every REASK_MS.
-            let answer = if exists(&st, &key[..kl]) {
+            let present = exists(&st, &key[..kl]);
+            if st.waiting() {
+                return;
+            }
+            let answer = if present {
                 WriteAnswer::Decided(0)
             } else if s.wrote_at == 0 || now - s.wrote_at >= REASK_MS {
                 s.wrote_at = now;
@@ -1155,7 +1214,13 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let mut key = [0u8; 48];
             let mut kl = put(&mut key, 0, JOIN_PREFIX).unwrap_or(0);
             kl = put(&mut key, kl, &s.secret).unwrap_or(kl);
-            if exists(&st, &key[..kl]) {
+            let present = exists(&st, &key[..kl]);
+            if st.waiting() {
+                // Not answered yet: the secret is not spent on a read that
+                // has not come back.
+                return;
+            }
+            if present {
                 announce(s, sys);
                 s.next_at = now + ANNOUNCE_EVERY_MS;
             } else {
@@ -1196,7 +1261,11 @@ fn declared(s: &State, i: u8, key: &mut [u8], val: &mut [u8]) -> Option<(usize, 
         return None;
     }
     let mut d = [0u8; 10];
-    let (slot, role) = if i >= 5 { ((i - 5) / 4, (i - 5) % 4) } else { (0, 0) };
+    let (slot, role) = if i >= 5 {
+        ((i - 5) / 4, (i - 5) % 4)
+    } else {
+        (0, 0)
+    };
     let dn = dec_u32(u32::from(*s.slots.get(slot)?), &mut d);
     let n = d.get(..dn)?;
     let (mut kl, mut vl) = (0usize, 0usize);
@@ -1205,7 +1274,11 @@ fn declared(s: &State, i: u8, key: &mut [u8], val: &mut [u8]) -> Option<(usize, 
             let ns: &[u8] = if i == 0 { b"default" } else { b"kube-system" };
             kl = put(key, kl, b"/namespaces/")?;
             kl = put(key, kl, ns)?;
-            vl = put(val, vl, b"{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"")?;
+            vl = put(
+                val,
+                vl,
+                b"{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"",
+            )?;
             vl = put(val, vl, ns)?;
             vl = put(val, vl, b"\"}}")?;
         }
@@ -1237,14 +1310,22 @@ fn declared(s: &State, i: u8, key: &mut [u8], val: &mut [u8]) -> Option<(usize, 
             vl = put(val, vl, b"{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"Device\",\"metadata\":{\"name\":\"replica-")?;
             vl = put(val, vl, n)?;
             vl = put(val, vl, end)?;
-            vl = put(val, vl, b"\",\"namespace\":\"nanocloud-peers\"},\"spec\":{}}")?;
+            vl = put(
+                val,
+                vl,
+                b"\",\"namespace\":\"nanocloud-peers\"},\"spec\":{}}",
+            )?;
         }
         (_, 2) => {
             kl = put(key, kl, b"/roles/nanocloud-peers/node-bootstrap-")?;
             kl = put(key, kl, n)?;
             vl = put(val, vl, b"{\"apiVersion\":\"")?;
             vl = put(val, vl, RBAC)?;
-            vl = put(val, vl, b"\",\"kind\":\"Role\",\"metadata\":{\"name\":\"node-bootstrap-")?;
+            vl = put(
+                val,
+                vl,
+                b"\",\"kind\":\"Role\",\"metadata\":{\"name\":\"node-bootstrap-",
+            )?;
             vl = put(val, vl, n)?;
             vl = put(val, vl, b"\",\"namespace\":\"nanocloud-peers\"},\"rules\":[{\"apiGroups\":[\"nanocloud.io\"],\"resources\":[\"devices\",\"devices/status\"],\"resourceNames\":[\"replica-")?;
             vl = put(val, vl, n)?;
@@ -1257,7 +1338,11 @@ fn declared(s: &State, i: u8, key: &mut [u8], val: &mut [u8]) -> Option<(usize, 
             kl = put(key, kl, n)?;
             vl = put(val, vl, b"{\"apiVersion\":\"")?;
             vl = put(val, vl, RBAC)?;
-            vl = put(val, vl, b"\",\"kind\":\"RoleBinding\",\"metadata\":{\"name\":\"node-bootstrap-")?;
+            vl = put(
+                val,
+                vl,
+                b"\",\"kind\":\"RoleBinding\",\"metadata\":{\"name\":\"node-bootstrap-",
+            )?;
             vl = put(val, vl, n)?;
             vl = put(val, vl, b"\",\"namespace\":\"nanocloud-peers\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"node-bootstrap-")?;
             vl = put(val, vl, n)?;
@@ -1279,7 +1364,12 @@ fn join_record(s: &mut State) -> usize {
     let cl = b64::encode(&s.ca[..s.ca_len as usize], &mut ca).unwrap_or(0);
     let out = &mut s.pub_buf;
     let mut at = 0usize;
-    let parts: [&[u8]; 4] = [b"{\"token\":\"", &s.token[..s.token_len as usize], b"\",\"ca\":\"", &ca[..cl]];
+    let parts: [&[u8]; 4] = [
+        b"{\"token\":\"",
+        &s.token[..s.token_len as usize],
+        b"\",\"ca\":\"",
+        &ca[..cl],
+    ];
     for p in parts {
         at = put(out, at, p).unwrap_or(at);
     }
@@ -1288,7 +1378,12 @@ fn join_record(s: &mut State) -> usize {
         let mut d = [0u8; 10];
         let dn = dec_u32(u32::from(s.slots[i]), &mut d);
         let sep: &[u8] = if i == 0 { b"\"" } else { b",\"" };
-        let parts: [&[u8]; 4] = [sep, &d[..dn], b"\":\"", &s.node_tokens[i][..s.node_token_len[i] as usize]];
+        let parts: [&[u8]; 4] = [
+            sep,
+            &d[..dn],
+            b"\":\"",
+            &s.node_tokens[i][..s.node_token_len[i] as usize],
+        ];
         for p in parts {
             at = put(out, at, p).unwrap_or(at);
         }
@@ -1314,7 +1409,12 @@ unsafe fn ask_token(s: &mut State, sys: &SyscallTable) {
     // The admin's credential first, then each slot's node-bootstrap-<id>.
     let mut sa = [0u8; PARAM_MAX];
     let sl = if s.tok_n == 0 {
-        put(&mut sa, 0, or(&s.join_sa[..s.join_sa_len as usize], b"admin")).unwrap_or(0)
+        put(
+            &mut sa,
+            0,
+            or(&s.join_sa[..s.join_sa_len as usize], b"admin"),
+        )
+        .unwrap_or(0)
     } else {
         let mut d = [0u8; 10];
         let dn = dec_u32(u32::from(s.slots[s.tok_n as usize - 1]), &mut d);
@@ -1332,9 +1432,11 @@ unsafe fn ask_token(s: &mut State, sys: &SyscallTable) {
     for p in parts {
         at = put(&mut val, at, p).unwrap_or(at);
     }
-    let st = Store::plain(sys);
+    let st = Store::plain(sys, &s.nag);
     let now = dev_millis(sys);
-    if !exists(&st, &key[..kl]) && (s.wrote_at == 0 || now - s.wrote_at >= REASK_MS) {
+    let present = exists(&st, &key[..kl]);
+    // A probe not answered yet (`EAGAIN`) asks nothing: asked again later.
+    if !present && !st.waiting() && (s.wrote_at == 0 || now - s.wrote_at >= REASK_MS) {
         s.wrote_at = now;
         let _ = put_value(&st, &key[..kl], &val[..at]);
     }

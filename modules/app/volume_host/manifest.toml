@@ -121,5 +121,12 @@ access = "write"
 requires_contract = "proc"
 access = "write"
 
+# The node's Loam capability file (`loam_capability`), read at each attach:
+# its chains are handed to the volume's subgraph, which as a workload reads
+# none of the node's files.
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
 [observability]
 exempt = "connector — each effect's outcome is a record in the store; Kagi audits every decision, the subgraph's modules observe the data path"

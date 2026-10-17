@@ -77,10 +77,38 @@ module nanocloud.admission {
     c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
     c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
   }
+  // The defaults upstream's API server applies before any policy does:
+  // a StatefulSet's and a DaemonSet's update strategy is RollingUpdate
+  // (what `kubectl rollout status` requires of either). They take the first
+  // of the three defaults a policy may state; the policy's own follow.
   decision ac(p: Pol) -> CntCall {
+    when p.verb == "create" && p.status == 200 && p.quota != "" && (p.verb == "create" || p.verb == "update") && (p.res == "statefulsets" || p.res == "statefulsets.apps" || p.res == "daemonsets" || p.res == "daemonsets.apps") && p.defs != "" ->
+      CntCall { cid: p.cid, op: COUNT, key: p.res, k2: "/", k3: p.ns, k4: "/",
+                req: p.req, defs: "spec.updateStrategy={\"type\":\"RollingUpdate\"}," + p.defs, quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
+    when p.verb == "create" && p.status == 200 && p.quota != "" && (p.verb == "create" || p.verb == "update") && (p.res == "statefulsets" || p.res == "statefulsets.apps" || p.res == "daemonsets" || p.res == "daemonsets.apps") ->
+      CntCall { cid: p.cid, op: COUNT, key: p.res, k2: "/", k3: p.ns, k4: "/",
+                req: p.req, defs: "spec.updateStrategy={\"type\":\"RollingUpdate\"}", quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
     when p.verb == "create" && p.status == 200 && p.quota != "" ->
       CntCall { cid: p.cid, op: COUNT, key: p.res, k2: "/", k3: p.ns, k4: "/",
                 req: p.req, defs: p.defs, quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
+    when (p.verb == "create" || p.verb == "update") && (p.res == "statefulsets" || p.res == "statefulsets.apps" || p.res == "daemonsets" || p.res == "daemonsets.apps") && p.defs != "" ->
+      CntCall { cid: p.cid, op: COUNT, key: "-/", k2: "", k3: "", k4: "",
+                req: p.req, defs: "spec.updateStrategy={\"type\":\"RollingUpdate\"}," + p.defs, quota: p.quota, q: p.q,
+                verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
+                c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
+                c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };
+    when (p.verb == "create" || p.verb == "update") && (p.res == "statefulsets" || p.res == "statefulsets.apps" || p.res == "daemonsets" || p.res == "daemonsets.apps") ->
+      CntCall { cid: p.cid, op: COUNT, key: "-/", k2: "", k3: "", k4: "",
+                req: p.req, defs: "spec.updateStrategy={\"type\":\"RollingUpdate\"}", quota: p.quota, q: p.q,
                 verb: p.verb, res: p.res, ns: p.ns, obj: p.obj, pstatus: p.status,
                 c_cid: p.c_cid, c_method: p.c_method, c_key: p.c_key, c_verdict: p.c_verdict,
                 c_name: p.c_name, c_reason: p.c_reason, c_verb: p.c_verb };

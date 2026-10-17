@@ -1,0 +1,128 @@
+// ReplicaSet status as params: how many of its Pods there are and how many
+// are ready and available — what `kubectl get rs` prints, and what the
+// Deployment's status (deployment_status.uproc) is counted from.
+//
+//   /replicasets.apps/<ns>/<name> (and any Pod changing) ->
+//   COUNT its Pods (/pods/<ns>/, count_where: owned by its uid, not being
+//   deleted, not terminal) -> COUNT the Ready ones (their Ready condition
+//   True: the node's readiness probe, or running when none is declared) ->
+//   PATCH status {replicas, fullyLabeledReplicas, readyReplicas,
+//   availableReplicas, observedGeneration}
+//
+// availableReplicas is readyReplicas: minReadySeconds is 0 here. The PATCH
+// is put-if-changed: a re-count that finds what the status already says
+// writes nothing.
+module nanocloud.replicasetstatus {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PATCH = 5;
+  enum COUNT = 12;
+
+  // carried by: ws.Count, ws.Counted
+  message Ctx {
+    key: string = 30;     // "<ns>/<name>"
+    ns: string = 31;
+    ouid: string = 32;    // the ReplicaSet's uid: its Pods' owner
+    gen: int = 33;        // metadata.generation
+    all: int = 34;        // its active Pods
+    want: int = 35;       // the Deployment's spec.replicas
+    hash: string = 36;    // the Deployment's template digest
+    reps: int = 37;       // the ReplicaSet's status, read
+    ready: int = 38;
+    avail: int = 39;
+    name: string = 40;
+  }
+
+  message ws.Count {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/", under /pods/
+    ctx: Ctx = 254;
+  }
+  // A COUNT's answer: how many children its predicate kept.
+  message ws.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: Ctx = 254;
+  }
+  // One Pod, as a COUNT's predicate reads it (the node's `paths`).
+  message ws.Pod {
+    owner: string = 40;   // metadata.ownerReferences.0.uid
+    del: string = 41;     // metadata.deletionTimestamp
+    phase: string = 42;   // status.phase
+    ready: string = 43;   // status.conditions[type=Ready].status
+    hash: string = 44;    // metadata.labels.pod-template-hash
+    ctx: Ctx = 254;
+  }
+  message ws.Keep {
+    k: int = 1;
+  }
+  message ws.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;  v2: int = 5;  v3: string = 6;  v4: int = 7;
+    v5: string = 8;  v6: int = 9;  v7: string = 10; v8: int = 11;
+    v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16;
+    v14: string = 80; v15: string = 81; v16: string = 82; v17: string = 83;
+    path: string = 19;
+  }
+
+  // ---- the ReplicaSet ----
+  message ws.Rs {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<name>"
+    uid: string = 4;      // metadata.uid
+    gen: int = 50;        // metadata.generation (0 when unstated)
+    ns: string = 28;
+  }
+  decision rs_count(r: ws.Rs) -> ws.Count {
+    when r.uid != "" && r.ns != "" ->
+      ws.Count { cid: r.seq, op: COUNT, key: r.ns + "/", ctx: Ctx { key: r.key, ns: r.ns, ouid: r.uid, gen: r.gen } };
+    default ->
+      ws.Count { cid: r.seq, op: NOOP, key: "", ctx: Ctx { key: "", ns: "", ouid: "", gen: 0 } };
+  }
+  // A Pod counts while it is the ReplicaSet's, not being deleted, and not
+  // done (upstream's active Pods).
+  decision rs_owned(p: ws.Pod) -> ws.Keep {
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" ->
+      ws.Keep { k: 1 };
+    default -> ws.Keep { };
+  }
+  decision rs_ready_count(c: ws.Counted) -> ws.Count {
+    when c.status == 200 && has(c.n) ->
+      ws.Count { cid: c.cid, op: COUNT, key: c.ctx.ns + "/",
+                 ctx: Ctx { key: c.ctx.key, ns: c.ctx.ns, ouid: c.ctx.ouid, gen: c.ctx.gen, all: c.n } };
+    default ->
+      ws.Count { cid: c.cid, op: NOOP, key: "", ctx: Ctx { key: "", ns: "", ouid: "", gen: 0, all: 0 } };
+  }
+  decision rs_ready(p: ws.Pod) -> ws.Keep {
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" && p.ready == "True" ->
+      ws.Keep { k: 1 };
+    default -> ws.Keep { };
+  }
+  decision rs_status(c: ws.Counted) -> ws.Set {
+    when c.status == 200 && has(c.n) && c.ctx.key != "" ->
+      ws.Set { cid: c.cid, op: PATCH, key: c.ctx.key, path: "status",
+               v1: "{\"replicas\":", v2: c.ctx.all, v3: ",\"fullyLabeledReplicas\":", v4: c.ctx.all,
+               v5: ",\"readyReplicas\":", v6: c.n, v7: ",\"availableReplicas\":", v8: c.n,
+               v9: ",\"observedGeneration\":", v10: c.ctx.gen, v11: "}" };
+    default ->
+      ws.Set { cid: c.cid, op: NOOP, key: "" };
+  }
+
+  pipeline rs_p(r: ws.Rs) -> ws.Count { call x = rs_count(r); return x; }
+  pipeline rs_owned_p(p: ws.Pod) -> ws.Keep { call x = rs_owned(p); return x; }
+  pipeline rs_rdy_p(c: ws.Counted) -> ws.Count { call x = rs_ready_count(c); return x; }
+  pipeline rs_ready_p(p: ws.Pod) -> ws.Keep { call x = rs_ready(p); return x; }
+  pipeline rs_st_p(c: ws.Counted) -> ws.Set { call x = rs_status(c); return x; }
+  entry rs_p = rs_p;
+  entry rs_owned_p = rs_owned_p;
+  entry rs_rdy_p = rs_rdy_p;
+  entry rs_ready_p = rs_ready_p;
+  entry rs_st_p = rs_st_p;
+  provenance revision "replicaset-status" toolchain "chronicle-authoring";
+}

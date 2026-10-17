@@ -70,7 +70,7 @@ modules:
     join: "/rbac-bind/"
     join_scoped: 2
     join_paths: "id,scope"
-    watch: "/rbac-bind/"
+    watch: "/rbac-"
   - name: rb_src_e
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_grants.uproc gr_src
@@ -115,7 +115,7 @@ modules:
     type: store_source
     prefix: "/rbac-perm/"
     paths: "rule"
-    watch: "/rbac-rule/"
+    watch: "/rbac-"
   - name: rb_pperm_chk
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_prune.uproc pm_chk
@@ -163,7 +163,7 @@ modules:
     join_scoped: 2
     paths: "id,scope,src,g"
     ints: "d"
-    watch: "/rbac-agg/"
+    watch: "/rbac-"
   - name: rb_mirror
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_agg.uproc ag_mirror
@@ -188,7 +188,7 @@ modules:
     type: store_source
     prefix: "/rbac-agg/"
     paths: "src,g"
-    watch: "/rbac-aggsel/"
+    watch: "/rbac-"
   - name: rb_pagg_get
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_prune.uproc dv_get
@@ -217,7 +217,7 @@ modules:
     type: store_source
     prefix: "/rbac-bind/"
     paths: "agg"
-    watch: "/rbac-agg/"
+    watch: "/rbac-"
   - name: rb_pmirror_chk
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_prune.uproc pm_chk
@@ -232,7 +232,7 @@ modules:
     prefix: "/rbac-src/"
     flat: 1
     paths: "perm,bind"
-    watch: "/rbac-perm/,/rbac-bind/"
+    watch: "/rbac-"
   - name: rb_psrc_p
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_prune.uproc sr_perm
@@ -251,7 +251,7 @@ modules:
     prefix: "/rbac-g/"
     count_children: "/rbac-src/"
     child_sep: "/"
-    watch: "/rbac-src/"
+    watch: "/rbac-"
   - name: rb_pg_del
     type: store_effect
     # chronicle-source: modules/app/_chronicle/rbac_prune.uproc gr_drop
