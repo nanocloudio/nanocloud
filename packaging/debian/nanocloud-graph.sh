@@ -22,7 +22,19 @@
 #            as /etc/nanocloud.io/fluxor/image.yaml; NANOCLOUD_IMAGE_FRAGMENT
 #            overrides) — on a worker always; on the control plane when it
 #            runs Pods too (NANOCLOUD_PODS=1), with this node's lease
-#            (worker.yaml's), so a cluster of one is its own node
+#            (worker.yaml's), so a cluster of one is its own node — and the
+#            node's dataplane enforcement: the `net_apply` nodes of the proxy
+#            (and, with NANOCLOUD_NETPOLICY=1, the NetworkPolicy) graph
+#            (below), which realize the cluster's rows as this node's packet
+#            policy (nftables DNAT and filters)
+#   SERVICES the cluster's Service plane, on the control plane (a template
+#            naming `__SERVICES_MODULES__`): the endpoints controller
+#            (fluxor-endpoints.yaml, installed as endpoints.yaml), the cluster
+#            DNS (fluxor-dns.yaml, as dns.yaml), and the proxy's chain
+#            (fluxor-proxy.yaml, as proxy.yaml) — and with NANOCLOUD_NETPOLICY=1
+#            the NetworkPolicy chain (fluxor-netpolicy.yaml, as
+#            netpolicy.yaml) — every node of those but their `net_apply`,
+#            which each node runs for itself (KUBELET)
 #
 # Values come from /etc/nanocloud.io/cluster.env (NANOCLOUD_CLUSTER_ENV
 # overrides the path), each overridable from the environment:
@@ -33,6 +45,8 @@
 #                         hostIP of its Pods (and their podIP, sharing its
 #                         network)  (default: the source address of its
 #                         default route; none when it has none)
+#   NANOCLOUD_NODE_CAPACITY  its capacity, as JSON members (default: its
+#                         CPUs, its MemTotal, 110 Pods)
 #   NANOCLOUD_FLUXOR_ABI  the fluxor ABI its runtime and modules are built
 #                         against, its `nanocloud.io/fluxor-abi` label
 #                         (default: /usr/share/nanocloud/fluxor-abi)
@@ -66,14 +80,31 @@
 #                         see below)
 #   NANOCLOUD_PODS        on the control plane: 1 runs Pods here too
 #                         (default: 0; a fresh install's cluster.env says 1)
+#   NANOCLOUD_NETPOLICY   1: NetworkPolicy is computed (the control plane)
+#                         and enforced (each node). Default 0: a single node
+#                         that also pulls images cannot hold its chain — the
+#                         runtime's config arena (fluxor's CONFIG_ARENA_SIZE,
+#                         256 KiB) overflows and the node does not start
+#   NANOCLOUD_NODE_PORTS  the NodePort range (default: 30000-32767)
+#   NANOCLOUD_LB_POOL     the addresses LoadBalancer Services are given,
+#                         <a.b.c.d>/<n> (default: none — such a Service stays
+#                         pending). Each node DNATs them; nothing announces
+#                         them (no ARP): the network routes them to a node
+#   NANOCLOUD_DNS_PORT    the cluster DNS's port on the control plane
+#                         (default: 53)
+#   NANOCLOUD_DNS_UPSTREAM  where it forwards every name outside
+#                         cluster.local, an IPv4 address (default: the first
+#                         nameserver of /etc/resolv.conf that is neither
+#                         loopback nor this node; none: such names are
+#                         REFUSED)
 #
 # The image pull, from the node's own config (never from the graph's
 # artifacts: the CA is named by path, credentials are a store key):
 #
-#   NANOCLOUD_REGISTRY    the registry a bare image reference means, and
-#                         the one registry this node pulls from: a
-#                         reference naming another is refused (the Pod's
-#                         ErrImagePull event), never pulled from this one
+#   NANOCLOUD_REGISTRY    the registry a bare image reference means (one
+#                         naming another registry is asked of that
+#                         registry, by its name — over TLS, only one the
+#                         `tls` client below trusts and may name)
 #                         (default: registry.nanocloud.io:5000)
 #   NANOCLOUD_REGISTRY_ADDR  where it is dialled, host:port (default: the
 #                         registry's own name)
@@ -86,10 +117,10 @@
 #   NANOCLOUD_IMAGE_BLOBS    the blob cache (default:
 #                         /var/lib/nanocloud.io/image/blobs)
 #
-# A registry's credentials (OCI token auth) are the value `user:password`
-# of the store key /registry-auth/<registry host>, when the operator writes
-# one; anonymous otherwise. imagePullSecrets are not read (a Pod's own
-# credentials for its own registry): one registry, one credential, per node.
+# A registry's challenge (OCI token auth, or Basic) is answered with the
+# imagePullSecrets of the Pods a pull serves (image_auth.uproc), then the
+# value `user:password` of the store key /registry-auth/<registry host>, when
+# the operator writes one, then anonymously.
 #
 # A worker's replica is scoped to its node: its private records are kept
 # under /~node/<node> in the store, apart from every other node's, and its
@@ -146,6 +177,10 @@ NODE_FACTS="\"kubernetes.io/arch\":\"$ARCH\",\"kubernetes.io/os\":\"linux\",\"ku
 [ -z "$FLUXOR_ABI" ] || NODE_FACTS="$NODE_FACTS,\"nanocloud.io/fluxor-abi\":\"$FLUXOR_ABI\""
 # The node's address, as its Node advertises it (node_lease.uproc `renew`).
 NODE_ADDRESS="${NANOCLOUD_NODE_ADDRESS-$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)}"
+# The node's capacity, as its Node reports it (status.capacity and
+# allocatable, node_lease.uproc `renew`): what the scheduler fits requests
+# within — its CPUs, its memory, and upstream's 110 Pods.
+NODE_CAPACITY="${NANOCLOUD_NODE_CAPACITY-\"cpu\":\"$(nproc 2>/dev/null || echo 1)\",\"memory\":\"$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)Ki\",\"pods\":\"110\"}"
 REPLICA_ID="${NANOCLOUD_REPLICA_ID:-0}"
 VOTERS="${NANOCLOUD_VOTERS:-1}"
 PEER_PORT="${NANOCLOUD_PEER_PORT:-7450}"
@@ -153,8 +188,14 @@ PEERS="${NANOCLOUD_PEERS:-0=127.0.0.1:$PEER_PORT}"
 PKI="${NANOCLOUD_PKI:-/etc/nanocloud.io/pki}"
 PEER_TRUST="${NANOCLOUD_PEER_TRUST:-pins}"
 TRUST_DOMAIN="${NANOCLOUD_TRUST_DOMAIN:-nanocloud.local}"
-SCOPED="${NANOCLOUD_SCOPED:-/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,/volume-binds/,/image-,/volume-ops/}"
+SCOPED="${NANOCLOUD_SCOPED:-/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,/volume-binds/,/image-,/volume-ops/,/np-status/}"
 PODS="${NANOCLOUD_PODS:-0}"
+NETPOLICY="${NANOCLOUD_NETPOLICY:-0}"
+case "$NETPOLICY" in 0|1) ;; *) fail "NANOCLOUD_NETPOLICY is '$NETPOLICY', not 0 or 1" ;; esac
+# The dataplane graphs a node enforces (their net_apply) and the control
+# plane computes (the rest).
+DATAPLANE="proxy.yaml:fluxor-proxy.yaml"
+[ "$NETPOLICY" = 0 ] || DATAPLANE="$DATAPLANE netpolicy.yaml:fluxor-netpolicy.yaml"
 case "${NANOCLOUD_ROLE:-plane}" in
     node) SCOPE="$NODE_NAME"; PODS=1 ;;
     *)
@@ -188,6 +229,26 @@ fragment() {
 }
 modules_of() { sed -n '/^modules:$/,/^wiring:$/p' "$1" | sed '1d;$d'; }
 wiring_of() { sed -n '/^wiring:$/,$p' "$1" | sed '1d'; }
+# A dataplane graph split in two: the node's enforcement (its `net_apply`
+# nodes) and the rest (the cluster's chains).
+#   applied_of <graph>            the net_apply nodes' names
+#   split_modules <graph> in|out  their module blocks / every other one
+#   split_wiring <graph> in|out   the edges touching them / every other one
+applied_of() { modules_of "$1" | awk '/^  - name: /{n=$3} /^    type: net_apply$/{print n}'; }
+split_modules() {
+    modules_of "$1" | awk -v names=" $(applied_of "$1" | tr '\n' ' ')" -v want="$2" '
+        /^  - name: / { hit = index(names, " " $3 " ") > 0 }
+        { if ((want == "in") == hit) print }'
+}
+split_wiring() {
+    wiring_of "$1" | awk -v names=" $(applied_of "$1" | tr '\n' ' ')" -v want="$2" '
+        function end() { if (e != "" && (want == "in") == hit) printf "%s", e; e = ""; hit = 0 }
+        /^  - from: / { end(); split($3, a, "."); hit = index(names, " " a[1] " ") > 0; e = $0 "\n"; next }
+        /^    to: / { split($2, a, "."); if (index(names, " " a[1] " ") > 0) hit = 1; e = e $0 "\n"; next }
+        /^    / { e = e $0 "\n"; next }
+        { end() }
+        END { end() }'
+}
 
 F="$(fragment "${NANOCLOUD_REPLICA_FRAGMENT:-}" replica.yaml fluxor-replica.yaml)" \
     || fail "no replica fragment beside $TEMPLATE"
@@ -250,6 +311,18 @@ $IMAGE_MODULES"
         KUBELET_WIRING="$KUBELET_WIRING
 $IMAGE_WIRING"
     fi
+    # The node's dataplane enforcement: the proxy's (and NetworkPolicy's)
+    # rows, realized as this node's packet policy.
+    # Its node ports are DNATed at its own address.
+    NODE_ADDR_LINE=""
+    [ -z "$NODE_ADDRESS" ] || NODE_ADDR_LINE="\\n    node_address: \"$NODE_ADDRESS\""
+    for pair in $DATAPLANE; do
+        F="$(fragment "" "${pair%%:*}" "${pair#*:}")" || fail "no ${pair%%:*} beside $TEMPLATE"
+        KUBELET_MODULES="$KUBELET_MODULES
+$(split_modules "$F" in | sed "s#^    table: \"proxy\"\$#    table: \"proxy\"$NODE_ADDR_LINE#")"
+        KUBELET_WIRING="$KUBELET_WIRING
+$(split_wiring "$F" in)"
+    done
     # The control plane's own lease, as a worker keeps its (worker.yaml).
     if [ "${NANOCLOUD_ROLE:-plane}" != node ]; then
         F="$(fragment "" worker.yaml fluxor-worker.yaml)" || fail "no worker graph beside $TEMPLATE"
@@ -263,6 +336,47 @@ $LEASE"
   - from: nl_self.record_out
     to: nl_renew.request_in"
     fi
+fi
+
+# The cluster's Service plane, where the template names it (the control
+# plane): endpoints, DNS, and the proxy's and NetworkPolicy's chains.
+SERVICES_MODULES=""
+SERVICES_WIRING=""
+if grep -q "__SERVICES_MODULES__" "$TEMPLATE"; then
+    DNS_PORT="${NANOCLOUD_DNS_PORT:-53}"
+    if [ -n "${NANOCLOUD_DNS_UPSTREAM+set}" ]; then
+        DNS_UPSTREAM="$NANOCLOUD_DNS_UPSTREAM"
+    else
+        DNS_UPSTREAM="$(awk -v self="$NODE_ADDRESS" '$1 == "nameserver" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ \
+            && $2 !~ /^127\./ && $2 != self { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"
+    fi
+    case "$DNS_PORT$DNS_UPSTREAM" in
+        *[!0-9.]*) fail "NANOCLOUD_DNS_PORT or NANOCLOUD_DNS_UPSTREAM is not a number or an address" ;;
+    esac
+    NODE_PORTS="${NANOCLOUD_NODE_PORTS:-30000-32767}"
+    LB_POOL="${NANOCLOUD_LB_POOL:-}"
+    case "$NODE_PORTS" in *[!0-9-]*|"") fail "NANOCLOUD_NODE_PORTS is '$NODE_PORTS', not <lo>-<hi>" ;; esac
+    case "$LB_POOL" in *[!0-9./]*) fail "NANOCLOUD_LB_POOL is '$LB_POOL', not <a.b.c.d>/<n>" ;; esac
+    for pair in endpoints.yaml:fluxor-endpoints.yaml dns.yaml:fluxor-dns.yaml $DATAPLANE; do
+        F="$(fragment "" "${pair%%:*}" "${pair#*:}")" || fail "no ${pair%%:*} beside $TEMPLATE"
+        SERVICES_MODULES="$SERVICES_MODULES
+$(split_modules "$F" out)"
+        SERVICES_WIRING="$SERVICES_WIRING
+$(split_wiring "$F" out)"
+    done
+    UP_LINE=""
+    [ -z "$DNS_UPSTREAM" ] || UP_LINE="\\n    upstream: \"$DNS_UPSTREAM\""
+    # Where Pods reach it: this node's address (/cluster-dns).
+    [ -z "$NODE_ADDRESS" ] || UP_LINE="$UP_LINE\\n    address: \"$NODE_ADDRESS\""
+    LB_LINE=""
+    [ -z "$LB_POOL" ] || LB_LINE="\\n    lb_pool: \"$LB_POOL\""
+    SERVICES_MODULES="$(printf '%s\n' "$SERVICES_MODULES" \
+        | sed -e "/^  - name: cluster_dns\$/,/^  - name: /s#^    port: 53\$#    port: $DNS_PORT$UP_LINE#" \
+              -e "s#^    node_ports: \"30000-32767\"\$#    node_ports: \"$NODE_PORTS\"$LB_LINE#")"
+    SERVICES_MODULES="${SERVICES_MODULES#
+}"
+    SERVICES_WIRING="${SERVICES_WIRING#
+}"
 fi
 
 pin() { # the SHA-256 of a certificate's raw P-256 point
@@ -509,9 +623,12 @@ fluxor render-template "$TEMPLATE" \
     --var "REPLICA_WIRING=$REPLICA_WIRING" \
     --var "KUBELET_MODULES=$KUBELET_MODULES" \
     --var "KUBELET_WIRING=$KUBELET_WIRING" \
+    --var "SERVICES_MODULES=$SERVICES_MODULES" \
+    --var "SERVICES_WIRING=$SERVICES_WIRING" \
     --var "NODE_NAME=$NODE_NAME" \
     --var "NODE_FACTS=$NODE_FACTS" \
     --var "NODE_ADDRESS=$NODE_ADDRESS" \
+    --var "NODE_CAPACITY=$NODE_CAPACITY" \
     --var "REPLICA_ID=$REPLICA_ID" \
     --var "VOTERS=$VOTERS" \
     --var "QUORUM=$((VOTERS / 2 + 1))" \

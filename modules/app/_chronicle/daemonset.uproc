@@ -2,7 +2,8 @@
 //
 //   ready   /nodes/ -> /ready-nodes/<node>   the readiness projection; a
 //           fold the scheduler also performs, now a record nothing else
-//           has to recompute
+//           has to recompute; a Node deleted outright (its tomb's index)
+//           -> its mark deleted
 //   place   /daemonsets.apps/ JOIN /ready-nodes/ -> one record per (ds,
 //           node) -> EXISTS the pod -> create-if-absent, node-pinned
 //   prune   /pods/ owned by a DaemonSet -> GET /ready-nodes/<nodeName> ->
@@ -15,16 +16,19 @@ module nanocloud.daemonset {
 
   // The context each chain here carries across its effects: ONE nested
   // message in the reserved carry field (254), echoed unchanged by every
-  // connector. Inner numbers are the old carry-through numbers, so every
-  // module that hands a context on agrees on it.
+  // connector. Names, digests and verdicts only — never the template: a
+  // real one is kilobytes, and carried here it overflowed the decisions'
+  // 512 B scratch (and a source's 512 B field before that). The writer
+  // SPLICES it from the stored DaemonSet (`src`).
   // carried by: ds.Probe, ds.Answer, ds.Ask, ds.Known
   message Ctx {
     key: string = 30;
-    members: string = 31;
+    src: string = 31;     // the DaemonSet's key tail, the splice source
     node: string = 32;
     ns: string = 34;
     ds: string = 35;
     ouid: string = 36;    // the DaemonSet's metadata.uid: its Pods' controller reference
+    hash: string = 37;    // its template's digest: controller-revision-hash
     pod: string = 39;
   }
 
@@ -48,17 +52,36 @@ module nanocloud.daemonset {
       ds.Mark { cid: n.seq, op: DELETE, key: n.key, v1: "" };
   }
 
+  // ---- gone: a Node deleted outright ----
+  // The readiness projection reads /nodes/, and a deleted Node is no record
+  // there: its /ready-nodes/ mark stayed, so its DaemonSet Pods were never
+  // pruned (and it stayed schedulable). Its tomb's index
+  // (/~tomb-at/nodes/<node>) ends the mark — unless a Node of that name is
+  // back (`related` /nodes/: its name, empty when there is none), whose
+  // mark is the readiness projection's again.
+  message ds.Gone {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;    // "<node>" — the tail below /~tomb-at/nodes/
+    back: string = 70;  // /nodes/<node> metadata.name, "" when it is gone
+  }
+  decision unmark(g: ds.Gone) -> ds.Mark {
+    when g.back == "" ->
+      ds.Mark { cid: g.seq, op: DELETE, key: g.key, v1: "" };
+    default ->
+      ds.Mark { cid: g.seq, op: NOOP, key: "", v1: "" };
+  }
+
   // ---- place: one Pod per (DaemonSet, ready Node) ----
   message ds.Pair {
     seq: int = 1;
     rev: int = 2;
     key: string = 3;      // "<ns>/<ds>"
-    members: string = 4;  // spec.template.spec.* — the template's members,
-                          // braces off, so nodeName can be spliced in
-    uid: string = 5;      // metadata.uid, the Pods' controller reference
+    uid: string = 4;      // metadata.uid, the Pods' controller reference
     node: string = 21;    // the joined ready node
     podkey: string = 24;  // "<ns>/<ds>-<node>"
     podname: string = 26; // "<ds>-<node>"
+    hash: string = 27;    // the digest of spec.template (`hash`)
     ns: string = 28;
     ds: string = 29;
   }
@@ -74,6 +97,9 @@ module nanocloud.daemonset {
     value: string = 3;
     ctx: Ctx = 254;
   }
+  // The Pod as VALUE PARTS joined in field order (4..16, then 80..), the
+  // template's labels, annotations and spec SPLICED in by the writer from
+  // the stored DaemonSet (70 its key tail, 71 what goes where).
   message ds.Create {
     cid: int = 1;
     op: int = 2;
@@ -82,6 +108,10 @@ module nanocloud.daemonset {
     p4: string = 7;   p5: string = 8;   p6: string = 9;
     p7: string = 10;  p8: string = 11;  p9: string = 12;
     p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    p14: string = 80; p15: string = 81; p16: string = 82;
+    src: string = 70;
+    splice: string = 71;
   }
 
   enum NOOP = 0;
@@ -92,40 +122,36 @@ module nanocloud.daemonset {
 
   decision probe(p: ds.Pair) -> ds.Probe {
     default ->
-      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey, ctx: Ctx { key: p.podkey, members: p.members, node: p.node, ns: p.ns, ds: p.ds, ouid: p.uid, pod: p.podname } };
+      ds.Probe { cid: p.seq, op: EXISTS, key: p.podkey, ctx: Ctx { key: p.podkey, src: p.key, node: p.node, ns: p.ns, ds: p.ds, ouid: p.uid, hash: p.hash, pod: p.podname } };
   }
 
-  // Create-if-absent, node-pinned: the template's members with nodeName
-  // spliced in first. An empty template takes the comma-less form.
+  // Create-if-absent, node-pinned, as upstream's DaemonSet controller makes
+  // its Pods: the template's labels beside controller-revision-hash (the
+  // template's digest), the template's annotations, the template's spec
+  // with nodeName first — all three spliced from the stored DaemonSet, so
+  // a template of any size arrives whole. An empty label or spec member
+  // list splices nothing (and no comma).
   decision create(a: ds.Answer) -> ds.Create {
-    when a.status == 404 && a.ctx.members == "" ->
-      ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
-                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
-                  p2: a.ctx.pod,
-                  p3: "\",\"namespace\":\"",
-                  p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"name\":\"",
-                  p6: a.ctx.ds,
-                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":{\"nodeName\":\"",
-                  p8: a.ctx.node,
-                  p9: "\"",
-                  p10: "",
-                  p11: "",
-                  p12: "},\"status\":{\"phase\":\"Pending\"}}" };
     when a.status == 404 ->
       ds.Create { cid: a.cid, op: PUT, key: a.ctx.key,
                   p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
                   p2: a.ctx.pod,
                   p3: "\",\"namespace\":\"",
                   p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"name\":\"",
-                  p6: a.ctx.ds,
-                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":{\"nodeName\":\"",
-                  p8: a.ctx.node,
-                  p9: "\",",
-                  p10: a.ctx.members,
-                  p11: "",
-                  p12: "},\"status\":{\"phase\":\"Pending\"}}" };
+                  p5: "\",\"labels\":{\"controller-revision-hash\":\"",
+                  p6: a.ctx.hash,
+                  p7: "\"",
+                  p8: "},\"annotations\":{",
+                  p9: "},\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"DaemonSet\",\"name\":\"",
+                  p10: a.ctx.ds,
+                  p11: "\",\"uid\":\"",
+                  p12: a.ctx.ouid,
+                  p13: "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":{\"nodeName\":\"",
+                  p14: a.ctx.node,
+                  p15: "\"",
+                  p16: "},\"status\":{\"phase\":\"Pending\"}}",
+                  src: a.ctx.src,
+                  splice: "/daemonsets.apps/|11=,spec.template.metadata.labels.*;12=spec.template.metadata.annotations.*;82=,spec.template.spec.*" };
     default ->
       ds.Create { cid: a.cid, op: NOOP, key: "" };
   }
@@ -173,8 +199,8 @@ module nanocloud.daemonset {
     ds.Node { seq: n.seq, rev: n.rev, key: n.key, ready: n.ready }
   }
   transformation pass_pair(p: ds.Pair) -> ds.Pair {
-    ds.Pair { seq: p.seq, rev: p.rev, key: p.key, members: p.members, node: p.node,
-              podkey: p.podkey, podname: p.podname, ns: p.ns, ds: p.ds }
+    ds.Pair { seq: p.seq, rev: p.rev, key: p.key, uid: p.uid, node: p.node,
+              podkey: p.podkey, podname: p.podname, hash: p.hash, ns: p.ns, ds: p.ds }
   }
   transformation pass_answer(a: ds.Answer) -> ds.Answer {
     ds.Answer { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }
@@ -190,6 +216,10 @@ module nanocloud.daemonset {
     call x = pass_node(n);
     call y = ready(x);
     return y;
+  }
+  pipeline gone_p(g: ds.Gone) -> ds.Mark {
+    call x = unmark(g);
+    return x;
   }
   pipeline prb(p: ds.Pair) -> ds.Probe {
     call x = pass_pair(p);
@@ -215,6 +245,7 @@ module nanocloud.daemonset {
   }
 
   entry rdy = rdy;
+  entry gone = gone_p;
   entry prb = prb;
   entry mk = mk;
   entry ask = ask_p;

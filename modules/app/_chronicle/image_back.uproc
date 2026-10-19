@@ -10,7 +10,9 @@
 //        then, so a failing row never holds the others
 //   bf   /image-pull-failed/<pull> fails=<n>;code=<status>;why=<text> — <pull>
 //        the request <rk> for a manifest, the manifest digest for its config
-//        and its layers — which pod_image.uproc turns into the Pod's
+//        and its layers; `why` the chain's own words when it gave them (an
+//        index with no entry for this node's platform) — which
+//        pod_image.uproc turns into the Pod's
 //        ErrImagePull and ImagePullBackOff events; removed once a GET of the
 //        pull serves
 module nanocloud.imageback {
@@ -27,6 +29,7 @@ module nanocloud.imageback {
     st: int = 36;          // the answer's status (0: no answer at all)
     fails: int = 37;       // the row's failures, this one counted
     now: int = 38;
+    why: string = 39;      // the failure in words, when the status does not say it
   }
   message Done {
     cid: int = 1;
@@ -81,6 +84,9 @@ module nanocloud.imageback {
     v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: string = 9;
   }
   decision bf(d: Done) -> Fail {
+    when d.ctx.bad == "1" && d.ctx.pull != "" && has(d.ctx.why) && d.ctx.why != "" ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: d.ctx.why };
     when d.ctx.bad == "1" && d.ctx.pull != "" && d.ctx.st == 0 ->
       Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.pull,
              v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.st, v5: ";why=", v6: "the registry could not be reached" };

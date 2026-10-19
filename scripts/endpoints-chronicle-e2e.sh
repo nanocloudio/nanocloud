@@ -16,7 +16,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_source store_scan store_effect decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -70,7 +70,7 @@ print(n)
 PY
 }
 
-for e in ak sl ex pr dc; do
+for e in ak sl ex pr dc gn; do
   v="$(nc_decision "$ROOT/modules/app/_chronicle/endpoints.uproc" $e)"
   [ -n "$v" ] || { echo "FAIL: endpoints.uproc $e did not compile"; exit 1; }
   eval "DEC_$(echo $e | tr a-z A-Z)=\"$v\""
@@ -82,7 +82,7 @@ scheduler:
   accept_cycles: true
 modules:
   - name: pairs
-    type: store_source
+    type: store_scan
     prefix: "/services/"
     paths: "spec.selector"
     join: "/pods/"
@@ -103,7 +103,8 @@ modules:
   - name: sl_source
     type: store_source
     prefix: "/endpointslices/"
-    watch: "/pods/"
+    related: "/services/^1:metadata.name"
+    watch: "/pods/,/services/"
   - name: podexists
     type: store_effect
     decision: {hex: "${DEC_EX}"}
@@ -123,6 +124,16 @@ modules:
     type: store_effect
     decision: {hex: "${DEC_DC}"}
     key_prefix: "/endpoints/"
+  - name: docs
+    type: store_source
+    rev: 1
+    prefix: "/endpoints/"
+    related: "/services/:metadata.name"
+    watch: "/services/"
+  - name: gone
+    type: store_effect
+    decision: {hex: "${DEC_GN}"}
+    key_prefix: "/endpoints/"
 wiring:
   - from: pairs.status
     to: pairs.changes
@@ -140,6 +151,10 @@ wiring:
     to: svcs.changes
   - from: svcs.record_out
     to: write.request_in
+  - from: docs.status
+    to: docs.changes
+  - from: docs.record_out
+    to: gone.request_in
 YAML
 
 run() { # run <seconds>
@@ -200,5 +215,33 @@ run 7
 [ -z "$(store_last /endpointslices/default/web/web-3)" ] || fail "web-3's slice should be pruned"
 [ -z "$(store_last /endpoints/default/web)" ] || fail "web should have no endpoints now: '$(store_last /endpoints/default/web)'"
 echo "   web-2 dropped (selector), web-3 pruned (gone): the document removed"
+
+echo "== 5. a Service is deleted: its slices and its Endpoints document go with it =="
+[ -n "$(store_last /endpointslices/default/api/api-1)" ] || fail "api-1's slice is missing before the delete"
+store_del "/services/default/api"
+run 7
+[ -z "$(store_last /endpointslices/default/api/api-1)" ] || fail "a deleted Service's slice was left behind"
+[ -z "$(store_last /endpoints/default/api)" ] || fail "a deleted Service's Endpoints document was left behind: '$(store_last /endpoints/default/api)'"
+echo "   api deleted: /endpointslices/default/api/api-1 and /endpoints/default/api removed"
+
+echo "== 6. a Pod past 4 KiB (a real spec) is selected like any other =="
+BIGPOD="$(python3 - <<'PYB'
+import json
+env = [{"name": "SETTING_%02d" % i, "value": "value-%02d-abcdefghijklmnopqrstuvwxyz0123456789" % i} for i in range(64)]
+pod = {"metadata": {"name": "big-1", "uid": "ub1", "labels": {"app": "big", "tier": "web"},
+                    "annotations": {"example.com/note-%d" % i: "annotation %d" % i for i in range(8)}},
+       "spec": {"containers": [{"name": "c", "image": "busybox", "env": env}]},
+       "status": {"podIP": "10.0.0.9", "conditions": [{"type": "Ready", "status": "True"}]}}
+s = json.dumps(pod, separators=(",", ":"))
+assert len(s) > 4096
+print(s)
+PYB
+)"
+store_put "/services/default/big" '{"metadata":{"name":"big"},"spec":{"selector":{"app":"big"}}}'
+store_put "/pods/default/big-1" "$BIGPOD"
+store_put "/pods/default/big-2" '{"metadata":{"name":"big-2","labels":{"app":"big"}},"status":{"podIP":"10.0.0.10","conditions":[{"type":"Ready","status":"True"}]}}'
+run 7
+[ "$(store_last /endpoints/default/big)" = "big-1=10.0.0.9,big-2=10.0.0.10" ] || fail "big: '$(store_last /endpoints/default/big)' (big-1 is $(printf '%s' "$BIGPOD" | wc -c) bytes)"
+echo "   big: big-1=10.0.0.9 ($(printf '%s' "$BIGPOD" | wc -c) bytes),big-2=10.0.0.10"
 
 echo "== E2E green: endpoints as params — a scoped join with a selector predicate, the probe override, a materialised list =="

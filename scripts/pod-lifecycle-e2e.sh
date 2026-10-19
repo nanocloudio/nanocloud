@@ -229,7 +229,8 @@ import sys
 src, dst, port = sys.argv[1], sys.argv[2], sys.argv[3]
 g = open(src).read()
 mods, wiring = g.split("\nwiring:\n", 1)
-mods = mods.replace("\nmodules:\n", "\nplatform:\n  net: {}\nmodules:\n", 1)
+if "\nplatform:\n" not in mods:
+    mods = mods.replace("\nmodules:\n", "\nplatform:\n  net: {}\nmodules:\n", 1)
 mods += f"""
   - name: drv
     type: remote_channel

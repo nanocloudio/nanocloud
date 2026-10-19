@@ -167,11 +167,11 @@ iblocks, ipairs = parts(f"{root}/packaging/debian/fluxor-imagepull.yaml")
 img = "".join(iblocks)
 img = sub('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"', img)
 img = sub('dir: "/var/lib/nanocloud.io/image/blobs"', f'dir: "{blobs}"', img)
-eblocks, epairs = parts(f"{root}/packaging/debian/fluxor-endpoints.yaml")
+# Endpoints come with the control plane (its Service plane).
 mods, wiring = g.split("\nwiring:\n", 1)
-g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane, Endpoints ──\n" + kube.rstrip("\n") + "\n"
-     + img.rstrip("\n") + "\n" + "".join(eblocks).rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
-     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs + epairs))
+g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane ──\n" + kube.rstrip("\n") + "\n"
+     + img.rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
+     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs))
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
 PY

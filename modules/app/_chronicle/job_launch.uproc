@@ -1,0 +1,244 @@
+// A Job's Pods, started from its state at /job-ctl/ (job.uproc keeps it).
+//
+//   NonIndexed  /job-ctl/ expanded by `n` (and past its highest existing
+//               Pod) -> ordinal i is the Pod <job>-<i>, CREATEd (the store
+//               refuses a second creator) while the Job runs and i < n
+//   Indexed     /job-ctl/ expanded by `c` -> ONE weighted COUNT whose sum
+//               carries index i covered (a Pod of it succeeded or is
+//               running), its failed Pods (the next attempt's number), the
+//               indexes BELOW it covered, and the Job's active Pods ->
+//               /job-idx/<ns>/<job>/<i>;
+//               /job-idx/ -> CREATE <job>-<i>-<attempt> while the active
+//               Pods and the pending indexes below i stay under
+//               parallelism, so the lowest pending start first and never
+//               more than parallelism run at once. Every count is of the
+//               same pass. The
+//               completion index is the Pod's annotation and label, as
+//               upstream sets them.
+//
+// Every Pod carries upstream's labels (batch.kubernetes.io/controller-uid,
+// batch.kubernetes.io/job-name, and the legacy controller-uid, job-name)
+// beside its template's, and the Job as its controller.
+module nanocloud.joblaunch {
+
+  enum NOOP = 0;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum COUNT = 12;
+
+  message jb.Ord {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<job>"
+    fin: string = 4;
+    sp: string = 5;
+    u: string = 6;        // the Job's uid, as its /job-ctl/ record keeps it
+    idx: int = 20;
+    n: int = 22;
+    selfkey: string = 24; // "<ns>/<job>-<i>"
+    pod: string = 26;     // "<job>-<i>"
+    ns: string = 28;
+    name: string = 29;
+  }
+  // The Pod as VALUE PARTS joined in field order (4..16, then 80..); the
+  // template's labels, annotations and spec SPLICED in by the writer from
+  // the stored Job (70 its key tail, 71 what goes where). Names and uids
+  // only cross the decision: a template is as large as its user makes it.
+  message jb.Create {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17; k3: string = 18; k4: string = 25; k5: string = 26;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;
+    p4: string = 7;   p5: string = 8;   p6: string = 9;
+    p7: string = 10;  p8: string = 11;  p9: string = 12;
+    p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    p14: string = 80; p15: string = 81; p16: string = 82; p17: string = 83;
+    p18: string = 84; p19: string = 85; p20: string = 86; p21: string = 87;
+    p22: string = 88; p23: string = 89; p24: string = 90; p25: string = 91;
+    p26: string = 92;
+    src: string = 70;
+    splice: string = 71;
+  }
+  // The Job's uid comes from its /job-ctl/ record: job.uproc's c0 drops a
+  // record whose Job is gone or is another Job of the name, and the splice
+  // answers 404 (writing nothing) when the Job is gone.
+  decision launch(o: jb.Ord) -> jb.Create {
+    when o.fin == "" && o.sp != "1" && o.u != "" && o.idx < o.n ->
+      jb.Create { cid: o.seq, op: CREATE, key: o.selfkey,
+                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"", p2: o.pod,
+                  p3: "\",\"namespace\":\"", p4: o.ns,
+                  p5: "\",\"labels\":{\"batch.kubernetes.io/controller-uid\":\"", p6: o.u,
+                  p7: "\",\"batch.kubernetes.io/job-name\":\"", p8: o.name,
+                  p9: "\",\"controller-uid\":\"", p10: o.u,
+                  p11: "\",\"job-name\":\"", p12: o.name,
+                  p13: "\"",
+                  p14: "},\"annotations\":{",
+                  p15: "},\"ownerReferences\":[{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"name\":\"", p16: o.name,
+                  p17: "\",\"uid\":\"", p18: o.u,
+                  p19: "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":", p20: "}",
+                  src: o.key,
+                  splice: "/jobs.batch/|80=,spec.template.metadata.labels.*;81=spec.template.metadata.annotations.*;86=spec.template.spec" };
+    default ->
+      jb.Create { cid: o.seq, op: NOOP, key: "" };
+  }
+
+  // ------------------------------------------------------------- Indexed ----
+  // carried by: jb.ICount, jb.ITally
+  message ICtx {
+    key: string = 30;     // "<ns>/<job>"
+    ns: string = 31;
+    ouid: string = 32;
+    i: int = 33;
+    go: string = 34;      // "1" while the Job runs
+    w: int = 35;          // the Job's `w`: 0 holds every start (a backoff)
+    stop: string = 36;    // "1": nothing to count
+    p: int = 37;          // parallelism
+    job: string = 38;     // the Job's name, kept on its index records
+  }
+  message jb.Idx {
+    seq: int = 1;
+    key: string = 3;
+    fin: string = 4;
+    sp: string = 5;
+    u: string = 6;
+    idx: int = 20;
+    ns: string = 28;
+    name: string = 29;
+    w: int = 50;
+    p: int = 51;
+  }
+  message jb.ICount {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    cov: int = 37;        // carried: index i covered, its failures, the
+    fi: int = 38;         // covered indexes below it
+    bi: int = 39;
+    ctx: ICtx = 254;
+  }
+  message jb.IPod {
+    owner: string = 40;   // metadata.ownerReferences.0.uid
+    del: string = 41;
+    phase: string = 42;
+    idx: int = 50;        // its completion index (`ints`)
+    ctx: ICtx = 254;
+  }
+  message jb.Keep {
+    k: int = 1;
+  }
+  decision i0(x: jb.Idx) -> jb.ICount {
+    when x.u == "" ->
+      jb.ICount { cid: x.seq, op: NOOP, key: "", cov: 0, fi: 0, bi: 0,
+                  ctx: ICtx { key: x.key, ns: x.ns, ouid: "", i: x.idx, go: "", w: 0, stop: "1", p: 0, job: x.name } };
+    when x.fin == "" && x.sp != "1" ->
+      jb.ICount { cid: x.seq, op: COUNT, key: "pods/" + x.ns + "/", cov: 0, fi: 0, bi: 0,
+                  ctx: ICtx { key: x.key, ns: x.ns, ouid: x.u, i: x.idx, go: "1", w: x.w, stop: "", p: x.p, job: x.name } };
+    default ->
+      jb.ICount { cid: x.seq, op: COUNT, key: "pods/" + x.ns + "/", cov: 0, fi: 0, bi: 0,
+                  ctx: ICtx { key: x.key, ns: x.ns, ouid: x.u, i: x.idx, go: "0", w: 0, stop: "", p: x.p, job: x.name } };
+  }
+  // The four counts in ONE walk of the namespace's Pods: each of the Job's
+  // Pods counts as the SUM of the weights of what it is — index i covered
+  // 1, index i failed 2^16, an index below i covered 2^32, active (any
+  // index) 2^48 — and i3 unpacks the sum (each count under 2^15). A Pod
+  // past a record is read whole on the counting node's heap: one node, not
+  // four.
+  decision itally(p: jb.IPod) -> jb.Keep {
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.phase == "Succeeded" && p.idx == p.ctx.i -> jb.Keep { k: 1 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.phase == "Succeeded" && p.idx < p.ctx.i -> jb.Keep { k: 4294967296 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.phase == "Failed" && p.idx == p.ctx.i -> jb.Keep { k: 65536 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" && p.idx == p.ctx.i ->
+      jb.Keep { k: 281474976710657 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" && p.idx < p.ctx.i ->
+      jb.Keep { k: 281479271677952 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" ->
+      jb.Keep { k: 281474976710656 };
+    default -> jb.Keep { };
+  }
+  // The weighted count (`itally`), unpacked where i3 reads it: covered
+  // n % 2^16, failed n / 2^16 % 2^16, below n / 2^32 % 2^16, active n / 2^48.
+  message jb.ITally {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: ICtx = 254;
+  }
+  // The index's facts, put-if-changed at /job-idx/<ns>/<job>/<i>.
+  message jb.IPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: int = 17;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: int = 9;
+    v7: string = 10; v8: int = 11; v9: string = 12; v10: int = 13; v11: string = 14;
+    v12: string = 15; v13: string = 16;
+    v14: string = 80; v15: int = 81; v16: string = 82; v17: int = 83;
+    v18: string = 84; v19: string = 85;
+  }
+  decision i3(c: jb.ITally) -> jb.IPut {
+    when c.ctx.stop != "" || c.status != 200 ->
+      jb.IPut { cid: c.cid, op: NOOP, key: "" };
+    default ->
+      jb.IPut { cid: c.cid, op: MERGE, key: c.ctx.key + "/", k2: c.ctx.i,
+                v1: "cov=", v2: (c.n % 65536), v3: ";fi=", v4: (c.n / 65536 % 65536), v5: ";bi=", v6: (c.n / 4294967296 % 65536), v7: ";w=", v8: c.ctx.w,
+                v9: ";i=", v10: c.ctx.i, v11: ";go=" + c.ctx.go, v12: ";u=", v13: c.ctx.ouid,
+                v14: ";a=", v15: (c.n / 281474976710656), v16: ";p=", v17: c.ctx.p, v18: ";j=", v19: c.ctx.job };
+  }
+  // An index uncovered, the Job not held (`w`), and its active Pods plus
+  // the pending indexes below it under parallelism: its next attempt,
+  // <job>-<i>-<failures>. An index record whose Job's /job-ctl/ record is
+  // gone or names another uid (the Job is gone, or is another Job of the
+  // name) goes.
+  message jb.IRec {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<job>/<i>"
+    go: string = 4;
+    u: string = 5;
+    istr: string = 6;
+    fistr: string = 7;
+    job: string = 8;      // the Job's name
+    ns: string = 28;
+    cov: int = 50;
+    bi: int = 51;
+    w: int = 52;
+    i: int = 53;
+    a: int = 54;
+    p: int = 55;
+    cu: string = 70;      // its /job-ctl/ record's uid (`related`)
+  }
+  decision ilaunch(o: jb.IRec) -> jb.Create {
+    when o.cu == "" || o.cu != o.u || o.job == "" ->
+      jb.Create { cid: o.seq, op: DELETE, key: "job-idx/" + o.key };
+    when o.go == "1" && o.cov == 0 && o.w > 0 && o.a + o.i - o.bi < o.p ->
+      jb.Create { cid: o.seq, op: CREATE, key: "pods/" + o.ns + "/", k2: o.job, k3: "-" + o.istr, k4: "-", k5: o.fistr,
+                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"", p2: o.job,
+                  p3: "-" + o.istr + "-", p4: o.fistr,
+                  p5: "\",\"namespace\":\"", p6: o.ns,
+                  p7: "\",\"annotations\":{\"batch.kubernetes.io/job-completion-index\":\"", p8: o.istr,
+                  p9: "\"",
+                  p10: "},\"labels\":{\"batch.kubernetes.io/job-completion-index\":\"", p11: o.istr,
+                  p12: "\",\"batch.kubernetes.io/controller-uid\":\"", p13: o.u,
+                  p14: "\",\"batch.kubernetes.io/job-name\":\"", p15: o.job,
+                  p16: "\",\"controller-uid\":\"", p17: o.u,
+                  p18: "\",\"job-name\":\"", p19: o.job,
+                  p20: "\"",
+                  p21: "},\"ownerReferences\":[{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"name\":\"", p22: o.job,
+                  p23: "\",\"uid\":\"", p24: o.u,
+                  p25: "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":", p26: "}",
+                  src: o.ns + "/" + o.job,
+                  splice: "/jobs.batch/|13=,spec.template.metadata.annotations.*;87=,spec.template.metadata.labels.*;92=spec.template.spec" };
+    default ->
+      jb.Create { cid: o.seq, op: NOOP, key: "" };
+  }
+
+  pipeline launch_p(o: jb.Ord) -> jb.Create { call x = launch(o); return x; }
+  pipeline i0_p(x: jb.Idx) -> jb.ICount { call y = i0(x); return y; }
+  pipeline itally_p(p: jb.IPod) -> jb.Keep { call x = itally(p); return x; }
+  pipeline i3_p(t: jb.ITally) -> jb.IPut { call x = i3(t); return x; }
+  pipeline ilaunch_p(o: jb.IRec) -> jb.Create { call x = ilaunch(o); return x; }
+  // No `entry` lines: a document holds eight, and a graph names its
+  // pipeline (`chronicle-source: <uproc> <pipeline>`), not an entry.
+  provenance revision "job-launch" toolchain "chronicle-authoring";
+}

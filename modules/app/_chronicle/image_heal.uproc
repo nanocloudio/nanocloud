@@ -20,7 +20,8 @@
 //         layer is absent, so the pull fetches it again (im_lay -> a queue
 //         row, backing off and saying so like any pull, image_back.uproc)
 //   h2    -> /image-layer-ok/<manifest>-<index> DELETEd: the manifest is not
-//         whole until the layer is back
+//         whole until the layer is back (a report stating no indexes names
+//         every layer in order: each one's place is its index)
 //   h3    (the first layer) -> /image-rootfs/<manifest> DELETEd: the pack is
 //         not ready, so the Pod's resolution reads the pull's progress and
 //         failures again (pod_image.uproc: ImagePullBackOff while it fails)
@@ -79,6 +80,7 @@ module nanocloud.imageheal {
     code: string = 35;
     i: int = 36;          // this layer's place in the report
     n: int = 37;          // how many it names
+    idx: string = 38;     // that place, as digits
   }
   // hl_src: /image-blob-bad/<uid>, one record per layer named.
   message Bad {
@@ -89,6 +91,7 @@ module nanocloud.imageheal {
     at: string = 6;       // at.#
     code: string = 7;
     i: int = 20;
+    idx: string = 21;     // i, as digits
     n: int = 22;
     pod: string = 70;     // /pod-specs/<uid> pod
   }
@@ -113,14 +116,19 @@ module nanocloud.imageheal {
   decision h1(b: Bad) -> Op {
     when b.hex.size() == 64 && b.pack != "" ->
       Op { cid: b.seq, op: DELETE, key: "/image-blobs/", k2: b.hex, k3: "", k4: "",
-           ctx: Ctx { pack: b.pack, hex: b.hex, at: b.at, pod: b.pod, uid: b.key, code: b.code, i: b.i, n: b.n } };
+           ctx: Ctx { pack: b.pack, hex: b.hex, at: b.at, pod: b.pod, uid: b.key, code: b.code, i: b.i, n: b.n, idx: b.idx } };
     default ->
       Op { cid: b.seq, op: NOOP, key: "", k2: "", k3: "", k4: "",
-           ctx: Ctx { pack: "", hex: "", at: "", pod: "", uid: "", code: "", i: 0, n: 0 } };
+           ctx: Ctx { pack: "", hex: "", at: "", pod: "", uid: "", code: "", i: 0, n: 0, idx: "" } };
   }
   decision h2(a: Ack) -> Op {
     when a.ctx.pack != "" && a.ctx.at != "" ->
       Op { cid: a.cid, op: DELETE, key: "/image-layer-ok/", k2: a.ctx.pack, k3: "-", k4: a.ctx.at, ctx: a.ctx };
+    // A report naming every layer of its image in order (an assembly that
+    // found the cache wrong, image_asm.uproc) states no indexes: each
+    // layer's place in it is its index.
+    when a.ctx.pack != "" && a.ctx.at == "" && a.ctx.idx != "" ->
+      Op { cid: a.cid, op: DELETE, key: "/image-layer-ok/", k2: a.ctx.pack, k3: "-", k4: a.ctx.idx, ctx: a.ctx };
     default ->
       Op { cid: a.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", ctx: a.ctx };
   }
@@ -156,7 +164,7 @@ module nanocloud.imageheal {
 
   transformation t_done(d: Done) -> Done { Done { cid: d.cid, status: d.status, ctx: d.ctx } }
   transformation t_bad(b: Bad) -> Bad {
-    Bad { seq: b.seq, key: b.key, pack: b.pack, hex: b.hex, at: b.at, code: b.code, i: b.i, n: b.n, pod: b.pod }
+    Bad { seq: b.seq, key: b.key, pack: b.pack, hex: b.hex, at: b.at, code: b.code, i: b.i, idx: b.idx, n: b.n, pod: b.pod }
   }
   transformation t_ack(a: Ack) -> Ack { Ack { cid: a.cid, status: a.status, ctx: a.ctx } }
   pipeline hl_bad(d: Done) -> Rec { call x = t_done(d); call y = bad(x); return y; }

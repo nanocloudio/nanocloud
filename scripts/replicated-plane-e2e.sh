@@ -153,8 +153,8 @@ print(len(names))
 PY
 }
 NP="$(shipped "$ROOT/packaging/debian/fluxor-controlplane.yaml" "$D/plane-chains" \
-  '(nl_(nodes|seen|leases|stale)|ds_(nodes|mark)|sc_(unbound|patch|events)|ps_(pods|spec|tombs|gone))')"
-[ "$NP" = 13 ] || fail "fluxor-controlplane.yaml: expected 13 plane chain modules, found $NP"
+  '(nl_(nodes|seen|leases|stale)|ds_(nodes|mark)|sc_(unbound|victim|patch|events)|ps_(pods|spec|resolve|rput|tombs|gone))')"
+[ "$NP" = 16 ] || fail "fluxor-controlplane.yaml: expected 16 plane chain modules, found $NP"
 
 # A test's reader on each replica: lattice's redis edge through a router
 # whose writes go to the group, as the control plane's router's do.

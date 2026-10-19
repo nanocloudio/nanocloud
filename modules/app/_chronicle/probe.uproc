@@ -1,28 +1,36 @@
 // Liveness and readiness probes as params: the TICK half.
 //
-// A probe's state is a flat record at /probe-rt-<l|r>/<uid>, not module memory:
+// A probe's state is a flat record at /probe-rt-<l|r|s>/<uid>, not module memory:
 //   inflight  0|1       an attempt is out on the exec seam
 //   due       ms        when the next attempt may start   (armed as a timer)
 //   deadline  ms        when the one in flight times out  (armed as a timer)
 //   seq       n         attempts started
 //   fails oks n         consecutive outcomes since the last opposite one
-//   verdict   0|1       liveness starts 1, readiness 0
+//   verdict   0|1|2     liveness starts 1, readiness 0, startup 2 (not yet:
+//                       1 started, 0 failed for good)
 //   fail_n succ_n       the thresholds, copied from the spec at each attempt so
 //                       the collector (probe_collect.uproc) folds against them
 //
 // The plane states each probe as flat fields on /pod-probes/<uid>
-// (pod_probes.uproc, from the container's livenessProbe/readinessProbe):
+// (pod_resolve, _shared/podres.rs, from the container's probes):
 //   lp_cmd lp_period lp_timeout lp_fail lp_succ lp_delay     (liveness)
 //   rp_cmd rp_period rp_timeout rp_fail rp_succ rp_delay     (readiness)
+//   sp_cmd sp_period sp_timeout sp_fail sp_succ sp_delay     (startup)
 // An unstated one is upstream's default: period 10 s, timeout 1 s, failure
 // threshold 3, success threshold 1, no initial delay.
-// An exec probe runs its command inside the sandbox; exit 0 passes.
+// An exec probe runs its command inside the sandbox; exit 0 passes. An
+// httpGet or tcpSocket probe is spelled `@http …`/`@tcp …` on the same seam
+// and dialled by the node's probe_dial, which answers the same way.
 //
 //   seed     a spec that names a probe gets its state record (create-only)
 //   tick     per kind: start an attempt when due, time one out at its
 //            deadline, reset while the sandbox is not running, drop the
 //            record when the spec stops naming the probe — then clear the
-//            exec seam keys and, when starting, write the request
+//            exec seam keys and, when starting, write the request. A
+//            container with a startup probe runs neither its liveness nor its
+//            readiness probe until the startup probe has passed, and the
+//            startup probe runs no more once it has passed or failed for good
+//            (its failure is the container's liveness failing: restarted)
 //
 // The state record is written FIRST, so it is also the lock: a rescan that
 // arrives mid-attempt sees inflight=1 and does nothing.
@@ -36,6 +44,7 @@ module nanocloud.probe {
   message Ctx {
     uid: string = 30;
     rcmd: string = 31;
+    scmd: string = 32;
   }
   // carried by: RtCall, RtReply, SeamCall
   message Ctx2 {
@@ -56,6 +65,7 @@ module nanocloud.probe {
     key: string = 3;
     lcmd: string = 4;
     rcmd: string = 5;
+    scmd: string = 6;
   }
   message SeedCall {
     cid: int = 1;
@@ -73,16 +83,16 @@ module nanocloud.probe {
   decision seed_l(s: SpecRec) -> SeedCall {
     when s.lcmd != "" ->
       SeedCall { cid: s.seq, op: CREATE, key: "/probe-rt-l/", key2: s.key,
-                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=1;fail_n=1;succ_n=1", ctx: Ctx { uid: s.key, rcmd: s.rcmd } };
+                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=1;fail_n=1;succ_n=1", ctx: Ctx { uid: s.key, rcmd: s.rcmd, scmd: s.scmd } };
     default ->
-      SeedCall { cid: s.seq, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.key, rcmd: s.rcmd } };
+      SeedCall { cid: s.seq, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.key, rcmd: s.rcmd, scmd: s.scmd } };
   }
   decision seed_r(s: SeedReply) -> SeedCall {
     when s.ctx.rcmd != "" ->
       SeedCall { cid: s.cid, op: CREATE, key: "/probe-rt-r/", key2: s.ctx.uid,
-                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=0;fail_n=1;succ_n=1", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } };
+                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=0;fail_n=1;succ_n=1", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } };
     default ->
-      SeedCall { cid: s.cid, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } };
+      SeedCall { cid: s.cid, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } };
   }
 
   // ---- tick ----
@@ -104,6 +114,8 @@ module nanocloud.probe {
     succ_n: int = 74;
     delay: int = 75;
     state: string = 80;
+    sseq: string = 90;     // /probe-rt-s/ seq: empty with no startup probe
+    sverd: int = 91;       //   its verdict
   }
   // act: 0 nothing, 1 start, 2 timed out, 3 reset, 4 dropped
   message RtCall {
@@ -148,6 +160,9 @@ module nanocloud.probe {
                v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=1", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "l" } };
     when t.state != "running" ->
       RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
+    // A startup probe that has not passed holds this one back.
+    when has(t.sseq) && t.sseq != "" && t.sverd != 1 && t.inflight == 0 ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "l" } };
     // initialDelaySeconds: the first attempt waits that long after the
     // container runs (the timer wakes the source at `due`).
     when t.inflight == 0 && t.due == 0 && t.delay > 0 ->
@@ -179,6 +194,8 @@ module nanocloud.probe {
                v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "r" } };
     when t.state != "running" ->
       RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
+    when has(t.sseq) && t.sseq != "" && t.sverd != 1 && t.inflight == 0 ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
     // initialDelaySeconds: the first attempt waits that long after the
     // container runs (the timer wakes the source at `due`).
     when t.inflight == 0 && t.due == 0 && t.delay > 0 ->
@@ -203,7 +220,7 @@ module nanocloud.probe {
       RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "r" } };
   }
 
-  // The exec seam, keyed /sandbox-*/<uid>/probe-<l|r>. A stale result must go
+  // The exec seam, keyed /sandbox-*/<uid>/probe-<l|r|s>. A stale result must go
   // before a request is written (the runner skips a request that already has
   // one); a timed-out, reset or dropped attempt takes its request with it.
   decision seam_result(r: RtReply) -> SeamCall {
@@ -231,13 +248,13 @@ module nanocloud.probe {
       SeamCall { cid: r.cid, op: NOOP, key: "", key2: "", key3: "", key4: "", v1: "", ctx: r.ctx };
   }
 
-  transformation ps(s: SpecRec) -> SpecRec { SpecRec { seq: s.seq, key: s.key, lcmd: s.lcmd, rcmd: s.rcmd } }
-  transformation psr(s: SeedReply) -> SeedReply { SeedReply { cid: s.cid, status: s.status, ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd } } }
+  transformation ps(s: SpecRec) -> SpecRec { SpecRec { seq: s.seq, key: s.key, lcmd: s.lcmd, rcmd: s.rcmd, scmd: s.scmd } }
+  transformation psr(s: SeedReply) -> SeedReply { SeedReply { cid: s.cid, status: s.status, ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } } }
   transformation pt(t: Tick) -> Tick {
     Tick { seq: t.seq, key: t.key, inflight: t.inflight, due: t.due, deadline: t.deadline,
            pseq: t.pseq, fails: t.fails, oks: t.oks, verdict: t.verdict, now: t.now,
            cmd: t.cmd, period: t.period, timeout: t.timeout, fail_n: t.fail_n,
-           succ_n: t.succ_n, delay: t.delay, state: t.state }
+           succ_n: t.succ_n, delay: t.delay, state: t.state, sseq: t.sseq, sverd: t.sverd }
   }
   transformation prt(r: RtReply) -> RtReply {
     RtReply { cid: r.cid, status: r.status, ctx: r.ctx }

@@ -21,8 +21,8 @@
 # every tag resolves to a manifest DIGEST and everything is cached by it, so
 # testapp:v1 and testapp:v2 run different programs; `registry.nanocloud.io:
 # 5000/testapp:v2` (the node's registry, named) and `testapp@sha256:…` run
-# v2; a reference to another registry is refused (ErrImagePull, nothing
-# pulled); and once `latest` is moved to v2, a new Pod (Always, the default
+# v2; a reference to another registry is asked of that registry, by its name
+# (here unreachable: ErrImagePull, nothing pulled from this one); and once `latest` is moved to v2, a new Pod (Always, the default
 # for :latest) runs v2 while an IfNotPresent one keeps the cached v1 and the
 # first Pod keeps the digest it resolved.
 # PASS = pod reaches Succeeded and /sandbox-logs/ carries the binary's output,
@@ -321,7 +321,8 @@ wal_put "/pod-specs/pod-host" "image=registry.nanocloud.io:5000/testapp:v2;iso=1
 wal_put "/pod-specs/pod-pin" "image=testapp@sha256:$DMAN2;iso=1;desired=running;restart=never"
 # :latest, IfNotPresent: the reference's cached resolution, shared.
 wal_put "/pod-specs/pod-inp1" "image=testapp:latest;pull=IfNotPresent;iso=1;desired=running;restart=never"
-# Another registry: refused, the Pod's event, nothing pulled from this one.
+# Another registry: asked of it (unreachable), the Pod's event, nothing
+# pulled from this one.
 wal_put "/pod-specs/pod-foreign" "image=other.example:5000/testapp:v1;pod=default/foreign;iso=1;desired=running;restart=never"
 
 terminal() { # terminal <uid>: Succeeded / Failed / ""
@@ -417,15 +418,15 @@ ran pod-pin "$DMAN2" hello-from-v2
 grep -q "GET /v2/testapp/manifests/sha256:$DMAN2 200" "$D/reg.log" || fail "the pin was not fetched by its digest"
 echo "   both ran v2; the pin was fetched by digest"
 
-echo "== 9. another registry: refused, the Pod's ErrImagePull event, nothing pulled =="
-case "$(wal_last '/image-digests/other.example+5000~testapp+v1')" in
-  "refused=registry other.example:5000 is not this node's registry registry.nanocloud.io:5000"*) ;;
-  *) fail "foreign reference: '$(wal_last '/image-digests/other.example+5000~testapp+v1')'" ;;
-esac
+echo "== 9. another registry (unreachable): asked by its name, the Pod's ErrImagePull event, nothing pulled from this one =="
+# Asked of THAT registry, by its name (it is not there: unreachable), never
+# of this node's instead.
+[ -z "$(wal_last '/image-digests/other.example+5000~testapp+v1')" ] \
+  || fail "foreign reference resolved: '$(wal_last '/image-digests/other.example+5000~testapp+v1')'"
 E="$(wal_last /events/default/pod-foreign.ErrImagePull)"
-python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["reason"]=="ErrImagePull" and e["type"]=="Warning" and e["involvedObject"]["name"]=="foreign", e' "$E" \
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["reason"]=="ErrImagePull" and e["type"]=="Warning" and e["involvedObject"]["name"]=="foreign" and "other.example:5000/testapp:v1\": the registry could not be reached" in e["message"], e' "$E" \
   || fail "no ErrImagePull event: '$E'"
-[ -z "$(wal_last /pod-resolved/pod-foreign)" ] && [ -z "$(terminal pod-foreign)" ] || fail "a refused Pod ran"
+[ -z "$(wal_last /pod-resolved/pod-foreign)" ] && [ -z "$(terminal pod-foreign)" ] || fail "a Pod whose registry is unreachable ran"
 [ "$(grep -c 'manifests/v1 ' "$D/reg.log")" = 1 ] || fail "the foreign reference was asked of this registry"
 echo "   $(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["message"])' "$E")"
 
@@ -440,4 +441,4 @@ ran pod-inp2 "$DMAN" hello-from-image
 ran pod-img-1 "$DMAN" hello-from-image
 echo "   pod-latest2 (Always) -> v2; pod-inp2 (IfNotPresent) -> the cached v1; pod-img-1 still names v1"
 
-echo "== E2E green: pods with image= ONLY — tags resolved to digests (index→platform manifest→config+layers), assembled per digest (whiteouts + /dev), argv from the image config, RAN; tag change, :latest Always, host:port and digest references, a foreign registry refused =="
+echo "== E2E green: pods with image= ONLY — tags resolved to digests (index→platform manifest→config+layers), assembled per digest (whiteouts + /dev), argv from the image config, RAN; tag change, :latest Always, host:port and digest references, another registry asked by its own name =="

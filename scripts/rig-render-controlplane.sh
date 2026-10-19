@@ -155,7 +155,7 @@ volume = podplane and os.path.exists(os.path.join(volume_dir, "flxa.hex"))
 # so the store's per-write cost has to fall (a run-block cache; the plan's
 # A4) before the pod plane runs on this board.
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
-          "/volume-binds/,/image-,/volume-ops/")
+          "/volume-binds/,/image-,/volume-ops/,/np-status/")
 if podplane:
     sub('      scope: ""\n      scoped: ""\n',
         f'      scope: "{node}"\n      scoped: "{SCOPED}"\n')
@@ -188,7 +188,13 @@ facts = (f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"fluxor",'
 # Its address: the board's (status.addresses InternalIP, hence its Pods'
 # hostIP/podIP), the one the driver and the render's peer address use.
 board_ip = os.environ.get("NANOCLOUD_RIG_IP", "192.168.1.9")
+# Its capacity, what the scheduler fits requests against: the Pi 5's four
+# cores and the memory its Pods are given — the kernel's state arena (1 GiB),
+# not the board's DRAM.
+capacity = os.environ.get("NANOCLOUD_RIG_CAPACITY",
+                          '"cpu":"4","memory":"1048576Ki","pods":"110"')
 lease = (m.group(1).replace("__NODE_NAME__", node).replace("__NODE_FACTS__", facts)
+         .replace("__NODE_CAPACITY__", capacity)
          .replace("__NODE_ADDRESS__", board_ip).rstrip("\n") + "\n")
 
 # The board's disk FIRST, as lattice's own pi5 graphs declare it: the store
@@ -253,6 +259,16 @@ kube_edges = "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs
 if podplane:
     extra.append("  # ── The pod plane: packaging/debian/fluxor-podlifecycle.yaml, its graph-pod slice ──\n")
     pod = "".join(kept_mods).rstrip("\n") + "\n"
+    # The node's Service enforcement (fluxor-proxy.yaml's net_apply, as
+    # nanocloud-graph.sh splices it into a node): the proxy rows as the
+    # board's packet filter, its node ports DNATed at the board's address.
+    proxy = open(f"{root}/packaging/debian/fluxor-proxy.yaml").read()
+    m = re.search(r"(  - name: px_apply\n(?:    .*\n)+)", proxy)
+    if not m:
+        sys.exit("render: fluxor-proxy.yaml has no px_apply")
+    pod += m.group(1).replace('    table: "proxy"\n',
+                              f'    table: "proxy"\n    node_address: "{board_ip}"\n')
+    kube_edges += "  - from: px_apply.status\n    to: px_apply.changes\n"
     if images:
         pod = pod.replace('    blobs: "/var/lib/nanocloud.io/image/blobs"\n', '    blobs: "/blobs"\n')
     extra.append(pod)
@@ -262,7 +278,8 @@ if images:
     pull = open(f"{root}/packaging/debian/fluxor-imagepull.yaml").read()
     pull_mods = pull[pull.index("modules:\n") + len("modules:\n"):pull.index("\nwiring:")]
     pull_mods = (pull_mods.replace('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"')
-                 .replace('dir: "/var/lib/nanocloud.io/image/blobs"', 'dir: "/blobs"'))
+                 .replace('dir: "/var/lib/nanocloud.io/image/blobs"', 'dir: "/blobs"')
+                 .replace("__NODE_FACTS__", facts))
     extra.append("  # ── The image plane: packaging/debian/fluxor-imagepull.yaml, behind tls ──\n")
     extra.append(pull_mods.rstrip("\n") + "\n")
     extra.append("  - name: fetch_tls\n    type: tls\n    mode: 0\n    alpn_h1_only: 1\n"

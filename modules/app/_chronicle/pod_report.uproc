@@ -59,7 +59,9 @@
 //                    or the pull's reason while its image is fetched again;
 //                    phase Running once it has run, Pending before
 //   Pending          waiting — ErrImagePull / ImagePullBackOff while its pull
-//                    fails (/pod-wait/), ContainerCreating otherwise
+//                    fails (/pod-wait/), CreateContainerConfigError when the
+//                    node refused it (/sandbox-status/ `refused`, why),
+//                    ContainerCreating otherwise
 //   Terminating      the container as it is; never ready (a Pod being
 //                    deleted leaves its Service's endpoints)
 //
@@ -293,6 +295,27 @@ module nanocloud.podreport {
                v17: ";lwhy=", v18: r.lwhy, v19: ";ltr=", v20: r.ltrw,
                v21: ";ltf=", v22: r.ltfw, v23: ";t0=", v24: r.t0w,
                v25: ";trdy=", v26: r.trdyw, v27: ";digest=", v28: r.digest };
+    // Not created, as upstream's kubelet would not create it
+    // (CreateContainerConfigError: a missing ConfigMap or Secret, a
+    // securityContext the node cannot give, runAsNonRoot and a root user):
+    // the reason is the sandbox's refusal (pod_project.uproc).
+    when r.state == "refused" && (r.phase == "Pending" || r.phase == "Restarting") ->
+      pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,
+               v1: "phase=", v2: "Pending", v3: ";pod=", v4: r.pod,
+               v5: ";rst=", v6: int("0" + r.rst), v7: ";ready=false;started=false;cr=False;crr=ContainersNotReady;st=waiting;why=CreateContainerConfigError;msg=", v8: r.scode,
+               v9: ";code=;tr=;tf=;lcode=", v10: r.lcode, v11: ";lwhy=", v12: r.lwhy,
+               v13: ";ltr=", v14: r.ltrw, v15: ";ltf=", v16: r.ltfw,
+               v17: ";t0=", v18: r.t0w, v19: ";trdy=", v20: r.trdyw,
+               v21: ";digest=", v22: r.digest };
+    // Failed before it ran: an init container failed for good
+    // (pod_lifecycle.uproc), and this container never starts.
+    when r.phase == "Failed" && r.tf == "" ->
+      pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,
+               v1: "phase=", v2: "Failed", v3: ";pod=", v4: r.pod,
+               v5: ";rst=", v6: int("0" + r.rst), v7: ";ready=false;started=false;cr=False;crr=PodCompleted;st=waiting;why=PodInitializing;msg=;code=;tr=;tf=;lcode=", v8: r.lcode,
+               v9: ";lwhy=", v10: r.lwhy, v11: ";ltr=", v12: r.ltrw,
+               v13: ";ltf=", v14: r.ltfw, v15: ";t0=", v16: r.t0w,
+               v17: ";trdy=", v18: r.trdyw, v19: ";digest=", v20: r.digest };
     // Pending: its container is being created.
     default ->
       pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,

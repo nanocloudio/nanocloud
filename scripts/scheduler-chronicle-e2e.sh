@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # The scheduler as a Chronicle graph: least-loaded placement, one Pod per pass.
 #   bind   the FIRST unbound Pod (where spec.nodeName=, index 0) JOIN
-#          /ready-nodes/ picked by the fewest Pods bound to it -> PATCH
-#          spec.nodeName; then the Scheduled event
-# The argmin is a fold over the nodes, measured from the Pods themselves at
-# pick time; it lives in the source (join_pick), and the decision sees one
-# record with the winner in it.
+#          /ready-nodes/ picked by the scheduler's filters and scores
+#          (store_source `sched`) -> merge-patch spec.nodeName; then the
+#          Scheduled event
+# The pick is a fold over the nodes, measured from the Pods themselves at
+# pick time; it lives in the source, and the decision sees one record with
+# the winner in it. The full surface (taints, affinity, resources,
+# priority, preemption, cordon) is scripts/scheduler-api-e2e.sh's.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +18,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_source store_effect store_big; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -70,56 +72,9 @@ print(n)
 PY
 }
 
-for e in bd rc; do
-  v="$(nc_decision "$ROOT/modules/app/_chronicle/scheduler.uproc" $e)"
-  [ -n "$v" ] || { echo "FAIL: scheduler.uproc $e did not compile"; exit 1; }
-  eval "DEC_$(echo $e | tr a-z A-Z)=\"$v\""
-done
-cat >"$D/graph.yaml" <<YAML
-target: linux
-tick_us: 1000
-scheduler:
-  accept_cycles: true
-modules:
-  # the ready-nodes projection (the DaemonSet chain's, shared in production)
-  - name: nodes
-    type: store_source
-    prefix: "/nodes/"
-    paths: "status.ready"
-  - name: mark
-    type: store_effect
-    decision: {hex: "$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"}
-    key_prefix: "/ready-nodes/"
-  # bind: the first unbound pod, the least-loaded ready node
-  - name: unbound
-    type: store_source
-    prefix: "/pods/"
-    where: "spec.nodeName="
-    count: 1
-    join: "/ready-nodes/"
-    join_pick: "mincount:/pods/:spec.nodeName"
-    join_fit: "spec.nodeSelector:/nodes/:metadata.labels"
-    watch: "/ready-nodes/,/nodes/"
-  - name: patch
-    type: store_effect
-    decision: {hex: "${DEC_BD}"}
-    key_prefix: "/pods/"
-  - name: events
-    type: store_effect
-    decision: {hex: "${DEC_RC}"}
-    key_prefix: "/events/"
-wiring:
-  - from: nodes.status
-    to: nodes.changes
-  - from: nodes.record_out
-    to: mark.request_in
-  - from: unbound.status
-    to: unbound.changes
-  - from: unbound.record_out
-    to: patch.request_in
-  - from: patch.response_out
-    to: events.request_in
-YAML
+# The production chain (sc_*) and the ready-nodes projection it reads,
+# extracted from the shipped control plane.
+python3 "$ROOT/scripts/extract-fixture.py" "$D/graph.yaml" - sc_ ds_nodes ds_mark >/dev/null
 run() { # run <seconds>
   nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
@@ -181,5 +136,11 @@ run 10
 [ "$(node_of pod-g)" = "node-1" ] || fail "pod-g selects arm64 + the ABI (node-1), bound to '$(node_of pod-g)'"
 [ -n "$(node_of pod-h)" ] || fail "pod-h has an empty selector: any node fits, yet it is unbound"
 echo "   pod-0 unbound (no node has its ABI); pod-f -> node-2, pod-g -> node-1, pod-h -> $(node_of pod-h)"
+WHY="0/2 nodes are available: 2 node(s) didn't match Pod's node affinity/selector."
+case "$(store_last /pods/default/pod-0)" in *'"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"'"$WHY"'"'*) ;;
+  *) fail "pod-0 lacks PodScheduled=False/Unschedulable: $(store_last /pods/default/pod-0)" ;; esac
+case "$(store_last /events/default/pod-0.FailedScheduling.0)" in *'"reason":"FailedScheduling"'*"$WHY"*'"type":"Warning"'*) ;;
+  *) fail "no FailedScheduling event for pod-0: $(store_last /events/default/pod-0.FailedScheduling.0)" ;; esac
+echo "   pod-0: PodScheduled=False/Unschedulable, FailedScheduling: $WHY"
 
-echo "== E2E green: the scheduler as params — an argmin join, one bind per pass, a spread that emerges, nodeSelector fit =="
+echo "== E2E green: the scheduler as params — a pick over the nodes, one bind per pass, a spread that emerges, nodeSelector fit, FailedScheduling =="

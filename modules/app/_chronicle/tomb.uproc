@@ -15,7 +15,9 @@
 //           entry go together, carrying what the tomb was (its uid, its
 //           node) to the step after
 //   ex_any  the same, for a graph that carries nothing on (the API plane)
-//   spec    a Pod's tomb gone -> DELETE /~node/<node>/pod-specs/<uid>
+//   spec    a Pod's tomb gone -> DELETE_FAMILY /~node/<node>/pod-specs/<uid>:
+//           the uid's record and every <uid>~… of its other containers
+//           (store_effect: one listing of the uid's prefix)
 //
 // A Pod's node spec (pod_specs.uproc) says `desired=deleted` while its tomb
 // lives — rewritten from the tomb's index, so a node catching up still reads
@@ -70,6 +72,7 @@ module nanocloud.tomb {
   enum NOOP = 0;
   enum DELETE = 4;
   enum DROP_EACH = 18;
+  enum DELETE_FAMILY = 20;
 
   decision expire(r: tb.Rec) -> tb.Act {
     when r.deadline > 0 && r.now >= r.deadline ->
@@ -84,13 +87,13 @@ module nanocloud.tomb {
     default ->
       tb.Drop { cid: r.seq, op: NOOP, key: "", names: "" };
   }
-  // A Pod's tomb, gone: its node spec goes with it. `has` guards the carry:
+  // A Pod's tomb, gone: its node specs go with it — every container's. `has` guards the carry:
   // another collection's tomb names no uid or node, and a `when` that read
   // an absent field would fail closed rather than decide.
   decision spec(g: tb.Gone) -> tb.Del {
     when has(g.c_key) && g.c_key.startsWith("pods/") && has(g.c_uid) && g.c_uid != ""
          && has(g.c_node) && g.c_node != "" ->
-      tb.Del { cid: g.cid, op: DELETE, key: g.c_node + "/pod-specs/" + g.c_uid };
+      tb.Del { cid: g.cid, op: DELETE_FAMILY, key: g.c_node + "/pod-specs/" + g.c_uid };
     default ->
       tb.Del { cid: g.cid, op: NOOP, key: "" };
   }

@@ -247,8 +247,12 @@ fn sch_first_path(list: &[u8]) -> &[u8] {
 // ── Views ────────────────────────────────────────────────────────────────
 //
 //   view.<name>=tpl:<template>        read as a JSON template over the object
-//   view.<name>=text:<prefix>|<path>  read as the text stored at
-//                                     `<prefix><the object's value at path>`
+//   view.<name>=text:<lit>|<path>[|<lit>|<path>…]
+//                                     read as the text stored at the key the
+//                                     literals and the object's values at the
+//                                     paths make, in turn: a Pod's log is
+//                                     `/~node/|spec.nodeName|/sandbox-logs/|
+//                                     metadata.uid`, its node's own record
 //   write.<name>=<path>,…             a write through the view changes these
 //                                     paths only (the object's revision rides
 //                                     along as the write's precondition)
@@ -260,7 +264,8 @@ fn sch_first_path(list: &[u8]) -> &[u8] {
 /// How a view reads.
 enum SchView<'a> {
     Template(&'a [u8]),
-    Text(&'a [u8], &'a [u8]),
+    /// `<lit>|<path>|<lit>|<path>…`, the key's parts in turn.
+    Text(&'a [u8]),
     Whole,
 }
 
@@ -284,8 +289,8 @@ fn sch_view<'a>(sch: &'a [u8], name: &[u8]) -> SchView<'a> {
         return SchView::Template(t);
     }
     if let Some(t) = d.strip_prefix(b"text:") {
-        if let Some(bar) = t.iter().position(|&b| b == b'|') {
-            return SchView::Text(&t[..bar], &t[bar + 1..]);
+        if !t.iter().all(|&b| b != b'|') {
+            return SchView::Text(t);
         }
     }
     SchView::Whole

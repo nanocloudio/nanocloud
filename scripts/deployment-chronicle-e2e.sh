@@ -25,7 +25,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_scan store_effect store_big store_stamped decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -93,20 +93,23 @@ scheduler:
   accept_cycles: true
 modules:
   - name: store_source
+    type: store_scan
     prefix: "/deployments.apps/"
-    paths: "spec,spec.replicas,spec.template.metadata.labels,metadata.uid"
+    paths: "spec!hash,spec.replicas,metadata.uid"
     hash: "spec.template"
   - name: current
-    type: store_effect
+    type: store_stamped
     decision: {hex: "${DEC_RD}"}
     key_prefix: "/replicasets.apps/"
-    paths: "metadata.labels.pod-template-hash,spec"
+    paths: "metadata.labels.pod-template-hash,spec!hash"
   - name: history
-    type: store_effect
+    type: store_big
     decision: {hex: "${DEC_ARCH}"}
     key_prefix: "/controllerrevisions.apps/"
   - name: apply
-    type: store_effect
+    type: store_big
+    stamp: 1
+    schema: "create=metadata.uid:uuid,metadata.creationTimestamp:now;keep=metadata.uid,metadata.creationTimestamp"
     decision: {hex: "${DEC_WR}"}
     key_prefix: "/replicasets.apps/"
   - name: events
@@ -182,4 +185,52 @@ PREV="$(store_last /controllerrevisions.apps/default/web/previous)"
 has "$PREV" '"image":"nginx"' '"replicas":5' || fail "previous revision not archived: '$PREV'"
 echo "   hash $H1 -> $H2; previous (nginx) archived at /controllerrevisions.apps/default/web/previous"
 
-echo "== E2E green: Deployment -> ReplicaSet as params — projection, PUT-if-changed, scale, rollout history, events =="
+echo "== 5. a REAL template: past the decision scratch and past a record =="
+# A Deployment as users write them — env, ports, resources, annotations — its
+# pod template well over 4 KiB. The chain once carried the spec through the
+# decisions' 512 B scratch (no ReplicaSet past ~430 B of spec); it now carries
+# digests and the writers splice the bytes from the stored objects.
+big() { # big <image> -> the Deployment document
+  python3 - "$1" <<'PY2'
+import json, sys
+img = sys.argv[1]
+env = [{"name": "APP_SETTING_%02d" % i, "value": "value-%s-%02d-abcdefghijklmnopqrstuvwxyz" % (img, i)} for i in range(48)]
+tmpl = {"metadata": {"labels": {"app": "big", "tier": "backend"},
+                     "annotations": {"example.com/note-%d" % i: "annotation text number %d" % i for i in range(8)}},
+        "spec": {"containers": [{"name": "big", "image": img, "env": env,
+                                 "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]}}
+assert len(json.dumps(tmpl, separators=(",", ":"))) >= 4096
+print(json.dumps({"metadata": {"name": "big", "namespace": "default", "uid": "big-uid"},
+                  "spec": {"replicas": 2, "selector": {"matchLabels": {"app": "big"}}, "template": tmpl}},
+                 separators=(",", ":")))
+PY2
+}
+store_put "/deployments.apps/default/big" "$(big nginx)"
+run 5
+BIG="$(store_last /replicasets.apps/default/big)"
+printf '%s' "$BIG" | python3 -c '
+import json, sys
+rs = json.load(sys.stdin)
+t = rs["spec"]["template"]
+assert rs["kind"] == "ReplicaSet" and rs["spec"]["replicas"] == 2, rs.get("kind")
+assert len(t["spec"]["containers"][0]["env"]) == 48 and t["spec"]["containers"][0]["image"] == "nginx"
+l = rs["metadata"]["labels"]
+assert l["app"] == "big" and l["tier"] == "backend" and len(l["pod-template-hash"]) == 8, l
+assert rs["metadata"]["ownerReferences"][0]["uid"] == "big-uid", rs["metadata"]["ownerReferences"]
+assert rs["metadata"].get("uid"), "not stamped"
+' || fail "the large Deployment projected no (or a wrong) ReplicaSet: '${BIG:0:200}'"
+echo "   ${#BIG}-byte ReplicaSet: template whole, labels + hash, owned, stamped"
+BW1="$(store_writes /replicasets.apps/default/big)"
+run 4
+BW2="$(store_writes /replicasets.apps/default/big)"
+[ "$BW1" = "$BW2" ] || fail "a quiet pass rewrote the large ReplicaSet ($BW1 -> $BW2 writes)"
+echo "   a quiet pass spends no revision ($BW1 write(s))"
+store_put "/deployments.apps/default/big" "$(big httpd)"
+run 5
+BIG2="$(store_last /replicasets.apps/default/big)"
+case "$BIG2" in *'"image":"httpd"'*'value-httpd-47'*) ;; *) fail "the large ReplicaSet did not roll: '${BIG2:0:200}'" ;; esac
+BPREV="$(store_last /controllerrevisions.apps/default/big/previous)"
+case "$BPREV" in *'"image":"nginx"'*'value-nginx-47'*) ;; *) fail "the large previous spec was not archived whole: '${BPREV:0:200}'" ;; esac
+echo "   rolled to httpd; the ${#BPREV}-byte previous spec archived whole"
+
+echo "== E2E green: Deployment -> ReplicaSet as params — projection, PUT-if-changed, scale, rollout history, events, templates of any size =="

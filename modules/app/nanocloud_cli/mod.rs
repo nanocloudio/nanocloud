@@ -849,6 +849,128 @@ unsafe fn cmd_scale(
     }
 }
 
+/// `pause|resume <ns/name>` — nanocloud's own pause (Kubernetes has none):
+/// the Pod's `nanocloud.io/paused: "true"` annotation set, or removed, by a
+/// read-modify-write as `scale` does. Its node freezes every container of
+/// it (the cgroup freezer) and thaws them when the annotation goes; a paused
+/// Pod is still Running, never restarted for it, its run clock stopped.
+/// `pause|resume <sandbox id>` (no `/`) asks one sandbox directly, through
+/// `/sandbox-pause/<id>`, as `exec` and `logs` address one.
+unsafe fn cmd_pause(sys: &Store, target: &[u8], pause: bool, out: &mut [u8]) -> (usize, i32) {
+    let verb: &[u8] = if pause { b"paused" } else { b"resumed" };
+    if target.iter().all(|&c| c != b'/') {
+        let mut key = [0u8; MAX_KEY];
+        let klen = build_key(b"/sandbox-pause/", target, &mut key);
+        if klen == 0 {
+            return (append(out, 0, b"error: name too long\n"), 1);
+        }
+        let ask: &[u8] = if pause { b"pause" } else { b"resume" };
+        if !done(put_value(sys, &key[..klen], ask)) {
+            return (append(out, 0, b"error: pause write failed\n"), 1);
+        }
+        let mut p = append(out, 0, b"sandbox \"");
+        p = append(out, p, target);
+        p = append(out, p, b"\" ");
+        p = append(out, p, verb);
+        return (append(out, p, b"\n"), 0);
+    }
+    let mut key = [0u8; MAX_KEY];
+    let klen = build_key(PODS_PREFIX, target, &mut key);
+    if klen == 0 {
+        return (append(out, 0, b"error: name too long\n"), 1);
+    }
+    let mut val = [0u8; MAX_VALUE];
+    let Some(vlen) = get_value(sys, &key[..klen], &mut val) else {
+        let mut p = append(out, 0, b"error: not found: ");
+        p = append(out, p, &key[..klen]);
+        return (append(out, p, b"\n"), 1);
+    };
+    let mut doc = [0u8; MAX_VALUE];
+    let n = set_paused(&val[..vlen], pause, &mut doc);
+    if n == 0 {
+        return (
+            append(
+                out,
+                0,
+                b"error: the Pod has no metadata, or would not fit\n",
+            ),
+            1,
+        );
+    }
+    if done(put_value(sys, &key[..klen], &doc[..n])) {
+        let mut p = append(out, 0, b"pod \"");
+        p = append(out, p, target);
+        p = append(out, p, b"\" ");
+        p = append(out, p, verb);
+        (append(out, p, b"\n"), 0)
+    } else {
+        (append(out, 0, b"error: pause write failed\n"), 1)
+    }
+}
+
+/// The Pod document with its `nanocloud.io/paused` annotation `"true"`
+/// (`pause`) or gone; its length in `out` (0: no metadata, or past `out`).
+fn set_paused(doc: &[u8], pause: bool, out: &mut [u8]) -> usize {
+    let Some(mi) = j_obj_get(doc, 0, b"metadata") else {
+        return 0;
+    };
+    let Some(ai) = j_obj_get(doc, mi, b"annotations") else {
+        if !pause {
+            return j_cp(out, 0, doc);
+        }
+        let n = j_insert(
+            doc,
+            b"metadata",
+            b"\"annotations\":{\"nanocloud.io/paused\":\"true\"}",
+            out,
+        );
+        return if n >= out.len() { 0 } else { n };
+    };
+    let ae = j_skip(doc, ai);
+    let ann = match doc.get(ai..ae) {
+        Some(a) if a.first() == Some(&b'{') => a,
+        _ => return 0,
+    };
+    // The annotations again, without ours, then ours when pausing.
+    let mut p = j_cp(out, 0, doc.get(..ai).unwrap_or(&[]));
+    p = j_cp(out, p, b"{");
+    let mut first = true;
+    if pause {
+        p = j_cp(out, p, b"\"nanocloud.io/paused\":\"true\"");
+        first = false;
+    }
+    let mut i = j_ws(ann, 1);
+    while ann.get(i) == Some(&b'"') {
+        let ks = i;
+        let ke = j_skip(ann, ks);
+        let key = ann.get(ks + 1..ke.saturating_sub(1)).unwrap_or(&[]);
+        let c = j_ws(ann, ke);
+        if ann.get(c) != Some(&b':') {
+            return 0;
+        }
+        let vs = j_ws(ann, c + 1);
+        let ve = j_skip(ann, vs);
+        if key != b"nanocloud.io/paused" {
+            if !first {
+                p = j_cp(out, p, b",");
+            }
+            first = false;
+            p = j_cp(out, p, ann.get(ks..ve).unwrap_or(&[]));
+        }
+        i = j_ws(ann, ve);
+        if ann.get(i) == Some(&b',') {
+            i = j_ws(ann, i + 1);
+        }
+    }
+    p = j_cp(out, p, b"}");
+    p = j_cp(out, p, doc.get(ae..).unwrap_or(&[]));
+    if p >= out.len() {
+        0
+    } else {
+        p
+    }
+}
+
 /// `logs <id>` — print the sandbox's captured stdout/stderr (published by
 /// the sandbox runtime at `/sandbox-logs/<id>`). One-shot; `logs -f` streams instead.
 unsafe fn cmd_logs(sys: &Store, id: &[u8], out: &mut [u8]) -> (usize, i32) {
@@ -862,6 +984,26 @@ unsafe fn cmd_logs(sys: &Store, id: &[u8], out: &mut [u8]) -> (usize, i32) {
         Some(vlen) if vlen > 0 => (append(out, 0, &val[..vlen]), 0),
         _ => (append(out, 0, b"(no logs)\n"), 0),
     }
+}
+
+/// Every log byte the sandbox `id` ever wrote (`/sandbox-log-n/<id>`, the
+/// sandbox runtime's tally), 0 when none is kept.
+unsafe fn log_tally(st: &Store, id: &[u8]) -> u64 {
+    let mut key = [0u8; MAX_KEY];
+    let kl = build_key(b"/sandbox-log-n/", id, &mut key);
+    let mut v = [0u8; 24];
+    let n = if kl == 0 {
+        0
+    } else {
+        get_value(st, &key[..kl], &mut v).unwrap_or(0)
+    };
+    let mut t: u64 = 0;
+    for &b in v.get(..n).unwrap_or(&[]) {
+        if b.is_ascii_digit() {
+            t = t.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+        }
+    }
+    t
 }
 
 /// Is a sandbox status doc (`state=<label>;code=<n>`) in a terminal state? A
@@ -879,7 +1021,9 @@ fn status_is_terminal(doc: &[u8]) -> bool {
     label == b"exited" || label == b"failed" || label == b"killed" || label == b"destroyed"
 }
 
-/// One step of `logs -f`: emit any log bytes past `stream_off`, then stop once
+/// One step of `logs -f`: emit any log bytes past `stream_off` (an offset in
+/// the whole stream, so a tail trimmed meanwhile is neither re-sent nor
+/// misread), then stop once
 /// the sandbox status is terminal (or the step backstop trips). Returns the
 /// module_step result (0 = keep streaming, STEP_DONE = finished).
 unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
@@ -899,15 +1043,34 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
     } else {
         get_value(&st, &key[..klen], &mut val).unwrap_or(0)
     };
-    if st.waiting() {
-        // Not answered yet (`EAGAIN`): not an empty log — asked next step.
+    // Where the bounded tail sits in the whole stream: every byte ever
+    // written (/sandbox-log-n/), read on both sides of the tail so the two
+    // agree (a write between them is read again next step).
+    let t1 = log_tally(&st, id);
+    let t2 = if klen == 0 {
+        t1
+    } else {
+        let mut again = [0u8; MAX_VALUE];
+        let n2 = get_value(&st, &key[..klen], &mut again).unwrap_or(0);
+        if n2 != vlen {
+            return 0;
+        }
+        log_tally(&st, id)
+    };
+    if st.waiting() || t1 != t2 {
+        // Not answered yet (`EAGAIN`), or written meanwhile: asked next step.
         return 0;
     }
-    let off = (s.stream_off as usize).min(vlen);
-    if vlen > off && s.out_chan >= 0 {
-        let _ = (sys.channel_write)(s.out_chan, val[off..vlen].as_ptr(), vlen - off);
+    // No tally (a log written before it was kept): the tail is the stream.
+    let total = if t1 < vlen as u64 { vlen as u64 } else { t1 };
+    let start = total - vlen as u64;
+    // Bytes the tail no longer holds were missed, not re-sent.
+    let from = u64::from(s.stream_off).max(start);
+    if total > from && s.out_chan >= 0 {
+        let at = (from - start) as usize;
+        let _ = (sys.channel_write)(s.out_chan, val[at..vlen].as_ptr(), vlen - at);
     }
-    s.stream_off = vlen as u32;
+    s.stream_off = total.min(u64::from(u32::MAX)) as u32;
 
     // Terminal? then flush is complete — latch exit 0 and finish.
     let mut skey = [0u8; MAX_KEY];
@@ -1406,6 +1569,7 @@ fn cmd_help(out: &mut [u8]) -> usize {
           \x20 rollout status|undo <ns/name>   deployment rollout status / rollback\n\
           \x20 logs [-f] <id>                  a sandbox's stdout/stderr (-f = follow)\n\
           \x20 exec [-it] <id> [--] <command>  run a command inside a sandbox (-it = pty)\n\
+          \x20 pause|resume <ns/name>|<id>    freeze / thaw a Pod (nanocloud.io/paused) or a sandbox\n\
           \x20 ca                              print the cluster CA certificate\n\
           \x20 token <serviceaccount> [<ns>]  mint a ServiceAccount token (JWT)\n\
           \x20 diagnostics                     object counts across every resource\n\
@@ -1677,6 +1841,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             &mut out,
                             0,
                             b"error: scale needs <resource> <ns/name> <replicas>\n",
+                        ),
+                        1,
+                    )
+                }
+            } else if sub == b"pause" || sub == b"resume" {
+                if argc >= 2 {
+                    let (s1, e1) = argv[1];
+                    cmd_pause(st, &arec[s1..e1], sub == b"pause", &mut out)
+                } else {
+                    (
+                        append(
+                            &mut out,
+                            0,
+                            b"error: pause/resume needs <ns/name> or <sandbox id>\n",
                         ),
                         1,
                     )

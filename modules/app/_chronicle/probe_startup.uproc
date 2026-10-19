@@ -1,0 +1,135 @@
+// A container's startup probe as params (probe.uproc's third kind, in a
+// document of its own: the probe document is at its rule limit). Its state
+// is /probe-rt-s/<uid> — probe.uproc's record, verdict 2 until the probe has
+// passed (1) or failed for good (0) — attempted over the same exec seam,
+// folded by probe_collect.uproc, published there as gating readiness (not
+// ready until it passed) and liveness (not live once it failed: the
+// lifecycle restarts the container); probe.uproc holds the container's
+// liveness and readiness probes back until it has passed.
+//
+//   seed  a spec that names a startup probe gets its record (create-only),
+//         after the other two kinds' seeds (the carry names the command)
+//   tick  attempted while undecided: when due, timed out at its deadline,
+//         failed for good past failureThreshold; started over (2) with every
+//         run of the container; dropped when the spec stops naming it
+module nanocloud.probe_startup {
+
+  message Ctx {
+    uid: string = 30;
+    rcmd: string = 31;
+    scmd: string = 32;
+  }
+  message Ctx2 {
+    uid: string = 30;
+    act: int = 31;
+    cmd: string = 32;
+    w: string = 33;
+  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum CREATE = 8;
+
+  message SeedCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    key2: string = 17;
+    v1: string = 4;
+    ctx: Ctx = 254;
+  }
+  message SeedReply {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision seed_s(s: SeedReply) -> SeedCall {
+    when has(s.ctx.scmd) && s.ctx.scmd != "" ->
+      SeedCall { cid: s.cid, op: CREATE, key: "/probe-rt-s/", key2: s.ctx.uid,
+                 v1: "inflight=0;due=0;deadline=0;seq=0;fails=0;oks=0;verdict=2;fail_n=1;succ_n=1", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } };
+    default ->
+      SeedCall { cid: s.cid, op: NOOP, key: "", key2: "", v1: "", ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } };
+  }
+
+  message Tick {
+    seq: int = 1;
+    key: string = 3;
+    inflight: int = 50;
+    due: int = 51;
+    deadline: int = 52;
+    pseq: int = 53;
+    fails: int = 54;
+    oks: int = 55;
+    verdict: int = 56;
+    now: int = 58;
+    cmd: string = 70;
+    period: int = 71;
+    timeout: int = 72;
+    fail_n: int = 73;
+    succ_n: int = 74;
+    delay: int = 75;
+    state: string = 80;
+    sseq: string = 90;     // /probe-rt-s/ seq: empty with no startup probe
+    sverd: int = 91;       //   its verdict
+  }
+  message RtCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+    v3: string = 6;
+    v4: int = 7;
+    v5: string = 8;
+    v6: int = 9;
+    v7: string = 10;
+    v8: int = 11;
+    v9: string = 12;
+    v10: int = 13;
+    ctx: Ctx2 = 254;
+  }
+  // The startup probe: verdict 2 until it has passed (1) or failed for good
+  // (0); it is attempted only while undecided, and starts over (2) with
+  // every run of the container.
+  decision tick_s(t: Tick) -> RtCall {
+    when t.cmd == "" ->
+      RtCall { cid: t.seq, op: DELETE, key: t.key, v1: "", ctx: Ctx2 { uid: t.key, act: 4, cmd: "", w: "s" } };
+    when t.state != "running" && (t.inflight == 1 || t.fails != 0 || t.oks != 0 || t.verdict != 2) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;due=0;deadline=0;fails=0;oks=0;verdict=2", ctx: Ctx2 { uid: t.key, act: 3, cmd: "", w: "s" } };
+    when t.state != "running" || (t.verdict != 2 && t.inflight == 0) ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "s" } };
+    when t.inflight == 0 && t.due == 0 && t.delay > 0 ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "due=", v2: t.now + t.delay * 1000, ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "s" } };
+    when t.inflight == 0 && t.now >= t.due ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=1;deadline=", v2: t.now + math.greatest(t.timeout, 1) * 1000,
+               v3: ";due=", v4: t.now + (t.period + 10 * (1 - math.least(t.period, 1))) * 1000,
+               v5: ";seq=", v6: t.pseq + 1,
+               v7: ";fail_n=", v8: t.fail_n + 3 * (1 - math.least(t.fail_n, 1)),
+               v9: ";succ_n=", v10: math.greatest(t.succ_n, 1), ctx: Ctx2 { uid: t.key, act: 1, cmd: t.cmd, w: "s" } };
+    when t.inflight == 1 && t.now >= t.deadline && t.fails + 1 >= math.greatest(t.fail_n, 1) ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=0", ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "s" } };
+    when t.inflight == 1 && t.now >= t.deadline ->
+      RtCall { cid: t.seq, op: MERGE, key: t.key,
+               v1: "inflight=0;fails=", v2: t.fails + 1, v3: ";oks=0;verdict=", v4: t.verdict, ctx: Ctx2 { uid: t.key, act: 2, cmd: "", w: "s" } };
+    default ->
+      RtCall { cid: t.seq, op: NOOP, key: "", v1: "", ctx: Ctx2 { uid: t.key, act: 0, cmd: "", w: "s" } };
+  }
+
+  transformation psr(s: SeedReply) -> SeedReply { SeedReply { cid: s.cid, status: s.status, ctx: Ctx { uid: s.ctx.uid, rcmd: s.ctx.rcmd, scmd: s.ctx.scmd } } }
+  transformation pt(t: Tick) -> Tick {
+    Tick { seq: t.seq, key: t.key, inflight: t.inflight, due: t.due, deadline: t.deadline,
+           pseq: t.pseq, fails: t.fails, oks: t.oks, verdict: t.verdict, now: t.now,
+           cmd: t.cmd, period: t.period, timeout: t.timeout, fail_n: t.fail_n,
+           succ_n: t.succ_n, delay: t.delay, state: t.state, sseq: t.sseq, sverd: t.sverd }
+  }
+  pipeline sd_s(s: SeedReply) -> SeedCall { call x = psr(s); call y = seed_s(x); return y; }
+  pipeline tk_s(t: Tick) -> RtCall { call x = pt(t); call y = tick_s(x); return y; }
+  entry sd_s = sd_s;
+  entry tk_s = tk_s;
+  provenance revision "probe-startup" toolchain "chronicle-authoring";
+}

@@ -1,0 +1,179 @@
+// ResourceQuota as params: what each quota's namespace uses, kept current —
+// the `.status` `kubectl describe quota` prints, and the figures admission
+// (admission_k8s.uproc `ad_q`) refuses a create by.
+//
+//   used    /resourcequotas/<ns>/<q> expanded over spec.hard's members
+//           (store_source `{}`): each resource it limits -> COUNT (a sum,
+//           `count_where` answering a weight) of what the namespace holds:
+//             pods, count/pods            Pods not terminal
+//             requests.cpu|cpu, requests.memory|memory, limits.cpu,
+//             limits.memory               their Pods' requests or limits
+//                                         (`!reqcpu`…: millicores, bytes)
+//             services, configmaps, secrets, persistentvolumeclaims,
+//             count/<resource>            the objects
+//           -> /quota-used/<ns>/<q>/<resource> `h=<hard>;u=<used>` (a
+//           `count/` resource spelt `count~`), and its status member at
+//           /quota-json/<ns>/<q>/<resource> `"<resource>":"<used>"`
+//   status  /resourcequotas/ + its members (list_children) -> PATCH status
+//           {hard, used}, put-if-changed
+//   gc      a resource record whose quota is gone -> both records dropped
+//
+// A resource the quota names that is none of those is not tracked (and not
+// enforced): services.nodeports, requests.storage, ….
+module nanocloud.quota {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum PATCH = 5;
+  enum COUNT = 12;
+  enum DROP_EACH = 18;
+
+  // carried by: qt.Count, qt.Counted, qt.Put, qt.Put_
+  message QCtx {
+    key: string = 1;      // "<ns>/<quota>"
+    rk: string = 2;       // the resource, as the quota names it
+    mode: string = 3;     // n | rc | rm | lc | lm | all
+    h: int = 4;           // its hard limit, in the mode's unit
+  }
+  message qt.Hard {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<quota>"
+    rk: string = 21;      // the member: the resource
+    hm: int = 50;         // spec.hard.<resource> as millis (cpu)
+    hb: int = 51;         // ... as units (memory, counts)
+    ns: string = 28;
+  }
+  message qt.Count {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: QCtx = 254;
+  }
+  decision q0(h: qt.Hard) -> qt.Count {
+    when h.rk == "pods" || h.rk == "count/pods" ->
+      qt.Count { cid: h.seq, op: COUNT, key: "pods/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "n", h: h.hb } };
+    when h.rk == "requests.cpu" || h.rk == "cpu" ->
+      qt.Count { cid: h.seq, op: COUNT, key: "pods/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "rc", h: h.hm } };
+    when h.rk == "requests.memory" || h.rk == "memory" ->
+      qt.Count { cid: h.seq, op: COUNT, key: "pods/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "rm", h: h.hb } };
+    when h.rk == "limits.cpu" ->
+      qt.Count { cid: h.seq, op: COUNT, key: "pods/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "lc", h: h.hm } };
+    when h.rk == "limits.memory" ->
+      qt.Count { cid: h.seq, op: COUNT, key: "pods/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "lm", h: h.hb } };
+    when h.rk == "services" || h.rk == "configmaps" || h.rk == "secrets" || h.rk == "persistentvolumeclaims" ->
+      qt.Count { cid: h.seq, op: COUNT, key: h.rk + "/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "all", h: h.hb } };
+    when h.rk.startsWith("count/") && h.rk != "count/" ->
+      qt.Count { cid: h.seq, op: COUNT, key: h.rk.substring(6) + "/" + h.ns + "/", ctx: QCtx { key: h.key, rk: h.rk, mode: "all", h: h.hb } };
+    default ->
+      qt.Count { cid: h.seq, op: NOOP, key: "", ctx: QCtx { key: h.key, rk: h.rk, mode: "", h: 0 } };
+  }
+  // One child of what is counted, and what it weighs: 1 an object, a Pod
+  // while not terminal, or its requests or limits.
+  message qt.Obj {
+    phase: string = 40;   // status.phase
+    rc: int = 50; rm: int = 51; lc: int = 52; lm: int = 53;   // `.!reqcpu`…
+    ctx: QCtx = 254;
+  }
+  message qt.Keep {
+    k: int = 1;
+  }
+  decision weigh(o: qt.Obj) -> qt.Keep {
+    when o.ctx.mode == "all" -> qt.Keep { k: 1 };
+    when o.phase == "Succeeded" || o.phase == "Failed" -> qt.Keep { k: 0 };
+    when o.ctx.mode == "n" -> qt.Keep { k: 1 };
+    when o.ctx.mode == "rc" -> qt.Keep { k: o.rc };
+    when o.ctx.mode == "rm" -> qt.Keep { k: o.rm };
+    when o.ctx.mode == "lc" -> qt.Keep { k: o.lc };
+    when o.ctx.mode == "lm" -> qt.Keep { k: o.lm };
+    default -> qt.Keep { k: 0 };
+  }
+  message qt.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: QCtx = 254;
+  }
+  message qt.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8;
+    ctx: QCtx = 254;
+  }
+  decision q1(c: qt.Counted) -> qt.Put {
+    when c.status == 200 && has(c.n) && c.ctx.mode != "" ->
+      qt.Put { cid: c.cid, op: PUT, key: c.ctx.key + "/" + c.ctx.rk.replace("/", "~"),
+               v1: "h=", v2: c.ctx.h, v3: ";u=", v4: c.n, ctx: QCtx { key: c.ctx.key, rk: c.ctx.rk, mode: c.ctx.mode, h: c.n } };
+    default ->
+      qt.Put { cid: c.cid, op: NOOP, key: "", ctx: QCtx { key: c.ctx.key, rk: c.ctx.rk, mode: "", h: 0 } };
+  }
+  // The status member: cpu as a quantity (whole cores, else millicores),
+  // the rest as the number it is. (`h` now carries the count.)
+  message qt.Wrote {
+    cid: int = 1;
+    status: int = 2;
+    ctx: QCtx = 254;
+  }
+  decision q2(w: qt.Wrote) -> qt.Put {
+    when w.ctx.mode == "" ->
+      qt.Put { cid: w.cid, op: NOOP, key: "" };
+    when (w.ctx.mode == "rc" || w.ctx.mode == "lc") && w.ctx.h % 1000 != 0 ->
+      qt.Put { cid: w.cid, op: PUT, key: w.ctx.key + "/" + w.ctx.rk.replace("/", "~"),
+               v1: "\"" + w.ctx.rk + "\":\"", v2: w.ctx.h, v3: "m\"" };
+    when w.ctx.mode == "rc" || w.ctx.mode == "lc" ->
+      qt.Put { cid: w.cid, op: PUT, key: w.ctx.key + "/" + w.ctx.rk.replace("/", "~"),
+               v1: "\"" + w.ctx.rk + "\":\"", v2: w.ctx.h / 1000, v3: "\"" };
+    default ->
+      qt.Put { cid: w.cid, op: PUT, key: w.ctx.key + "/" + w.ctx.rk.replace("/", "~"),
+               v1: "\"" + w.ctx.rk + "\":\"", v2: w.ctx.h, v3: "\"" };
+  }
+
+  // ---- status ----
+  message qt.Quota {
+    seq: int = 1;
+    key: string = 3;
+    hard: string = 4;     // spec.hard, as written
+    used: string = 56;    // the members (list_children, values)
+  }
+  message qt.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+  }
+  decision st(q: qt.Quota) -> qt.Set {
+    when q.hard == "" ->
+      qt.Set { cid: q.seq, op: PATCH, key: q.key, path: "status", v1: "{\"hard\":{},\"used\":{}}" };
+    default ->
+      qt.Set { cid: q.seq, op: PATCH, key: q.key, path: "status",
+               v1: "{\"hard\":", v2: q.hard, v3: ",\"used\":{", v4: q.used, v5: "}}" };
+  }
+
+  // ---- gc ----
+  message qt.Rec {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<quota>/<resource>"
+    quid: string = 70;    // its quota's uid (`related`, the parent)
+  }
+  message qt.Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision gc(r: qt.Rec) -> qt.Drop {
+    when r.quid == "" ->
+      qt.Drop { cid: r.seq, op: DROP_EACH, key: r.key, v1: "quota-used,quota-json" };
+    default ->
+      qt.Drop { cid: r.seq, op: NOOP, key: "" };
+  }
+
+  pipeline q0_p(h: qt.Hard) -> qt.Count { call x = q0(h); return x; }
+  pipeline weigh_p(o: qt.Obj) -> qt.Keep { call x = weigh(o); return x; }
+  pipeline q1_p(c: qt.Counted) -> qt.Put { call x = q1(c); return x; }
+  pipeline q2_p(w: qt.Wrote) -> qt.Put { call x = q2(w); return x; }
+  pipeline st_p(q: qt.Quota) -> qt.Set { call x = st(q); return x; }
+  pipeline gc_p(r: qt.Rec) -> qt.Drop { call x = gc(r); return x; }
+  provenance revision "quota" toolchain "chronicle-authoring";
+}

@@ -172,7 +172,16 @@ for i in 0 1; do
   case "$POD" in *'"kind":"Pod"'*) ;; *) fail "pod web-$i lacks its kind: ${POD:0:200}" ;; esac
   case "$POD" in *'"app":"web"'*) ;; *) fail "pod web-$i lacks the template's labels: ${POD:0:200}" ;; esac
   case "$POD" in *'"pod-template-hash"'*) ;; *) fail "pod web-$i lacks pod-template-hash: ${POD:0:200}" ;; esac
+  # The hash is the ReplicaSet's, never empty: a rollout and the selectors
+  # tell this template's Pods from another's by it.
+  RSH="$(printf '%s' "$RS" | sed -n 's/.*"pod-template-hash":"\([0-9a-f]*\)".*/\1/p')"
+  case "$POD" in *"\"pod-template-hash\":\"$RSH\""*) [ ${#RSH} = 8 ] || fail "ReplicaSet hash '$RSH' is not 8 hex digits" ;;
+    *) fail "pod web-$i's pod-template-hash is not its ReplicaSet's ($RSH): ${POD:0:300}" ;; esac
 done
+r="$(api GET '/api/v1/namespaces/default/pods?labelSelector=app%3Dweb')"
+n="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("items",[])))' 2>/dev/null || echo 0)"
+[ "$n" = 2 ] || fail "kubectl get pods -l app=web lists $n Pods, not 2"
+echo "   both Pods hashed as their ReplicaSet ($RSH); -l app=web lists them"
 # And the API reads the controllers' ReplicaSet back under the same key.
 r="$(api GET /apis/apps/v1/namespaces/default/replicasets/web)"
 case "$r" in 200\|*'"name":"web"'*) echo "   GET replicasets/web -> 200" ;; *) fail "GET replicaset through the API: ${r:0:160}" ;; esac

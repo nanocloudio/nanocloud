@@ -71,6 +71,11 @@ struct ReadNag {
     said_ms: core::cell::Cell<u64>,
     said: core::cell::Cell<bool>,
     quiet: core::cell::Cell<u32>,
+    /// The same, for a value past the reader's buffer: a module that reads
+    /// such values whole on its heap meets one on every walk past it.
+    past_ms: core::cell::Cell<u64>,
+    past: core::cell::Cell<bool>,
+    past_quiet: core::cell::Cell<u32>,
 }
 
 impl ReadNag {
@@ -79,8 +84,51 @@ impl ReadNag {
             said_ms: core::cell::Cell::new(0),
             said: core::cell::Cell::new(false),
             quiet: core::cell::Cell::new(0),
+            past_ms: core::cell::Cell::new(0),
+            past: core::cell::Cell::new(false),
+            past_quiet: core::cell::Cell::new(0),
         }
     }
+}
+
+/// Say a value past the reader's buffer — refused, never read cut — at
+/// ERROR, with the module and the key, at most once per [`REFUSAL_SAY_MS`]
+/// per module. A reader with a heap reads it whole next (store_stamped,
+/// store_big) and meets one on every walk past it: said each time, that is
+/// a log storm that slows every module of the process.
+unsafe fn say_past_buffer(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) {
+    let now = dev_millis(sys);
+    if nag.past.get() && now.wrapping_sub(nag.past_ms.get()) < REFUSAL_SAY_MS {
+        nag.past_quiet.set(nag.past_quiet.get().saturating_add(1));
+        return;
+    }
+    let quiet = nag.past_quiet.get();
+    nag.past.set(true);
+    nag.past_ms.set(now);
+    nag.past_quiet.set(0);
+    let mut b = [0u8; 384];
+    let mut n = 0usize;
+    let mut put = |part: &[u8]| {
+        for &c in part {
+            if let Some(slot) = b.get_mut(n) {
+                *slot = c;
+                n += 1;
+            }
+        }
+    };
+    let mut d = [0u8; 20];
+    put(b"[store] module=");
+    let idx = dev_self_index(sys);
+    if idx < 0 {
+        put(b"-");
+    }
+    put(nag_digits(u64::from(idx.unsigned_abs()), &mut d));
+    put(b" GET ");
+    put(key);
+    put(b": value larger than the reader's buffer - REFUSED, not truncated (read whole where this module has a heap; ");
+    put(nag_digits(u64::from(quiet), &mut d));
+    put(b" more since the last said)");
+    dev_log(sys, 1, b.as_ptr(), n);
 }
 
 /// A read the store refused with `rc`, as [`refused`] classifies it. An

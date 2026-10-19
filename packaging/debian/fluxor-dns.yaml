@@ -1,108 +1,28 @@
-# dns-chain graph: the endpoints chain + the DNS zone, both as Chronicle params
-# on one shared store — services + ready pods become endpoints, and endpoints
-# become the cluster DNS zone. /dns/<name>.<ns>.svc.cluster.local A-records fall
-# straight out of the store. The cluster-dns bundle then serves the zone.
+# The cluster's DNS (modules/app/cluster_dns): `<svc>.<ns>.svc.cluster.local`
+# answered from the store as the API keeps it — a Service's ClusterIP, or a
+# headless Service's ready backends from its Endpoints document (the
+# endpoints chain's, fluxor-endpoints.yaml) — and every other name forwarded
+# to the node's resolver. Nothing is projected for it: an answer is read
+# where the Service is, so it is never staler than the Service.
+#
+# The control plane splices it in (nanocloud-graph.sh, installed as dns.yaml),
+# with the node's DNS port (NANOCLOUD_DNS_PORT, 53) and its upstream (the
+# first nameserver of its resolv.conf; NANOCLOUD_DNS_UPSTREAM).
 target: linux
 tick_us: 1000
 
-# The per-module self-edges below (change-sink allocators) are deliberate
-# 1-node cycles.
-scheduler:
-  accept_cycles: true
+platform:
+  net: {}
 
 modules:
-  # Endpoints is PARAMS: Services JOIN the namespace's Pods with the label
-  # selector as the join predicate and the probe runner's readiness overriding
-  # the static field -> /endpointslices/<ns>/<svc>/<pod>; a slice whose Pod is
-  # gone is pruned; and list_children over the slices materialises
-  # /endpoints/<ns>/<svc> = "<pod>=<ip>,…" — the document the consumers parse,
-  # unchanged. Params from modules/app/_chronicle/endpoints.uproc.
-  - name: ep_pairs
-    type: store_source
-    prefix: "/services/"
-    paths: "spec.selector"
-    join: "/pods/"
-    join_scoped: 2
-    join_match: "metadata.labels:spec.selector"
-    join_paths: "status.conditions[type=Ready].status,status.podIP,metadata.uid"
-    watch: "/pods/,/probe-status/"
-  - name: ep_probe
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/endpoints.uproc ak
-    decision: {hex: "01050000000c000100023e00000012000021001a000000560001000201000000400100000010010000000000000040020000000100023e000000400300000001000203000000010002150000000100023c0000000100023d0000000100024100000042051e1f20212240fe000000411900000052000100020100000040010000001000000000000000004002000000120000400300000001000203000000010002150000000100023c0000000100023d0000000100024100000042051e1f20212240fe00000041"}
-    key_prefix: "/probe-status/"
-    flat: 1
-    paths: "ready"
-  - name: ep_slices
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/endpoints.uproc sl
-    decision: {hex: "02160000004200010002fe00000002220000001201003120010002fe000000022100000012000021300100020200000010c800000000000000203001000228000000120100312030001400000057000100020100000040010000001003000000000000004002000000010002fe000000021e00000040030000001201002f4011000000010002fe000000021f0000004012000000010002fe0000000221000000400400000041170000004a00010002fe00000002220000001201003120010002fe000000022100000012000021300100020200000010c8000000000000002130010002fe0000000220000000120400547275652030001400000057000100020100000040010000001003000000000000004002000000010002fe000000021e00000040030000001201002f4011000000010002fe000000021f0000004012000000010002fe0000000221000000400400000041120000004e000100020100000040010000001004000000000000004002000000010002fe000000021e00000040030000001201002f4011000000010002fe000000021f0000004012000000120000400400000041"}
-    key_prefix: "/endpointslices/"
-  - name: ep_sl_source
-    type: store_source
-    prefix: "/endpointslices/"
-    watch: "/pods/"
-  - name: ep_podexists
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/endpoints.uproc ex
-    decision: {hex: "00130000004b0001000201000000400100000010020000000000000040020000000100021c00000040030000001201002f40110000000100021d00000040120000000100020300000042011e40fe00000041"}
-    key_prefix: "/pods/"
-  - name: ep_collect
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/endpoints.uproc pr
-    decision: {hex: "010500000012000100020200000010940100000000000020000c00000034000100020100000040010000001004000000000000004002000000010002fe000000021e00000040030000001200004004000000410a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000400400000041"}
-    key_prefix: "/endpointslices/"
-  - name: ep_svcs
-    type: store_source
-    prefix: "/services/"
-    paths: "spec.selector"
-    list_children: "/endpointslices/"
-    child_sep: "/"
-    watch: "/endpointslices/"
-  - name: ep_write
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/endpoints.uproc dc
-    decision: {hex: "02050000000c000100020400000012000020000a0000002b0001000201000000400100000010000000000000000040020000001200004003000000120000400400000041050000000c000100023800000012000020000b0000002f0001000201000000400100000010040000000000000040020000000100020300000040030000001200004004000000410c0000003300010002010000004001000000100300000000000000400200000001000203000000400300000001000238000000400400000041"}
-    key_prefix: "/endpoints/"
-  # The DNS zone is PARAMS: one record per Service, its key assembled from four
-  # parts and its value the ready addresses decorated as `a=<ip>` while the
-  # children are walked. Params from modules/app/_chronicle/service_dns.uproc.
-  - name: dns_src
-    type: store_source
-    prefix: "/endpoints/"
-    list_children: "/endpointslices/"
-    child_sep: "/"
-    list_values: 1
-    list_item: "a="
-    list_join: ";"
-    watch: "/endpointslices/"
-  - name: dns_write
-    type: store_effect
-    # chronicle-source: modules/app/_chronicle/service_dns.uproc project
-    decision: {hex: "0013000000620001000201000000400100000010030000000000000040020000000100021d00000040030000001201002e40110000000100021c00000040120000001212002e7376632e636c75737465722e6c6f63616c401900000001000238000000400400000041"}
-    key_prefix: "/dns/"
+  - name: cluster_dns
+    type: cluster_dns
+    port: 53
+    zone: "cluster.local"
+    ttl: 5
 
-# Self-edges: each module's own output feeds its `changes` input, allocating a
-# module-owned channel the store's namespace.change SUBSCRIBE pushes onto. The
-# module never writes this output; it drains pushed events from the input.
 wiring:
-  - from: ep_pairs.status
-    to: ep_pairs.changes
-  - from: ep_pairs.record_out
-    to: ep_probe.request_in
-  - from: ep_probe.response_out
-    to: ep_slices.request_in
-  - from: ep_sl_source.status
-    to: ep_sl_source.changes
-  - from: ep_sl_source.record_out
-    to: ep_podexists.request_in
-  - from: ep_podexists.response_out
-    to: ep_collect.request_in
-  - from: ep_svcs.status
-    to: ep_svcs.changes
-  - from: ep_svcs.record_out
-    to: ep_write.request_in
-  - from: dns_src.status
-    to: dns_src.changes
-  - from: dns_src.record_out
-    to: dns_write.request_in
+  - from: linux_net.net_out
+    to: cluster_dns.net_in
+  - from: cluster_dns.net_out
+    to: linux_net.net_in

@@ -14,7 +14,9 @@
 //   a[]#             COUNT: the number of elements, as decimal.
 //   a[k=v&k2=v2].b   SELECT: member `b` of the FIRST element whose members
 //                    equal the given values — an image index's entry for one
-//                    platform. Empty when none matches.
+//                    platform. `k?=v` is a member absent or equal to `v`
+//                    (`platform.variant?=v8`: an arm64 entry that names no
+//                    variant, or v8). Empty when none matches.
 //
 // A dotted segment may be a decimal array index (`layers.0.digest`), as
 // everywhere in `json.rs`. Anything else is a plain path. Bounded: at most
@@ -196,6 +198,14 @@ fn jq(doc: &[u8], query: &[u8], out: &mut [u8]) -> Option<usize> {
         let all =
             pred.split(|&c| c == b'&')
                 .all(|cond| match cond.iter().position(|&c| c == b'=') {
+                    // `k?=v`: the member absent, or equal (an index entry's
+                    // `platform.variant`, which most entries leave out).
+                    Some(e) if e > 0 && cond.get(e - 1) == Some(&b'?') => {
+                        match jq_plain(el, &cond[..e - 1]) {
+                            None => true,
+                            Some(v) => v == &cond[e + 1..],
+                        }
+                    }
                     Some(e) => jq_plain(el, &cond[..e]) == Some(&cond[e + 1..]),
                     None => false,
                 });

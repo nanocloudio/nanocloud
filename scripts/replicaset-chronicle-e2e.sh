@@ -34,7 +34,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_scan store_effect store_big store_stamped decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -90,8 +90,11 @@ scheduler:
   accept_cycles: true
 modules:
   - name: store_source
+    type: store_scan
     prefix: "/replicasets.apps/"
-    paths: "spec.template.spec,metadata.labels.pod-template-hash,metadata.labels,metadata.uid"
+    # Digests and identity only: the template is SPLICED by apply from the
+    # stored ReplicaSet, whatever its size.
+    paths: "metadata.labels.pod-template-hash,metadata.uid"
     expand: "spec.replicas"
     expand_tail: 4
     # ...and past the highest EXISTING child, whatever the count: a surplus far
@@ -102,19 +105,21 @@ modules:
     watch: "/pods/"
   # Stage 1 — the PREDECESSOR, so a rollout proceeds strictly in ordinal order.
   - name: prevget
-    type: store_effect
+    type: store_stamped
     decision: {hex: "${DEC_PREV}"}
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 2 — THIS ordinal, carrying the predecessor verdict.
   - name: selfget
-    type: store_effect
+    type: store_stamped
     decision: {hex: "${DEC_ASK}"}
     key_prefix: "/pods/"
     paths: "metadata.labels.pod-template-hash"
   # Stage 3 — create, delete, roll, or nothing.
   - name: apply
-    type: store_effect
+    type: store_big
+    stamp: 1
+    schema: "create=metadata.uid:uuid,metadata.creationTimestamp:now;keep=metadata.uid,metadata.creationTimestamp"
     decision: {hex: "${DEC_ACT}"}
     key_prefix: "/pods/"
   # Stage 4 — record what stage 3 did. The write's own reply carries the tag,
@@ -320,5 +325,50 @@ if n < 600:
     sys.exit(1)
 print(f"   {n} Pods — the expansion resumed where it blocked, and the tail was reached")
 PY2
+
+big_tmpl() { # big_tmpl <app> <image> -> a pod template past 4 KiB (env, ports, resources, annotations)
+  python3 - "$1" "$2" <<'PYT'
+import json, sys
+app, img = sys.argv[1], sys.argv[2]
+env = [{"name": "APP_SETTING_%02d" % i, "value": "value-%s-%02d-abcdefghijklmnopqrstuvwxyz" % (img, i)} for i in range(48)]
+t = {"metadata": {"labels": {"app": app, "tier": "backend"},
+                  "annotations": {"example.com/note-%d" % i: "annotation text number %d" % i for i in range(8)}},
+     "spec": {"containers": [{"name": app, "image": img, "env": env,
+                              "ports": [{"name": "http", "containerPort": 8080}],
+                              "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]}}
+s = json.dumps(t, separators=(",", ":"))
+assert len(s) >= 4096, len(s)
+print(s)
+PYT
+}
+echo "== 8. a REAL pod template (> 4 KiB): Pods carry it whole, with the template's labels and the hash =="
+# The chain once carried the template (and the labels) through the
+# decisions' 512 B scratch: past it no Pod was made, and Pods came out
+# labelled only {"pod-template-hash": ""}. It now carries the hash and
+# the writer splices labels, annotations and spec from the ReplicaSet.
+store_put "/replicasets.apps/default/big" "{\"metadata\":{\"name\":\"big\",\"namespace\":\"default\",\"uid\":\"rs-big-uid\",\"labels\":{\"app\":\"big\",\"pod-template-hash\":\"abcd1234\"}},\"spec\":{\"replicas\":2,\"template\":$(big_tmpl big nginx)}}"
+run 6
+for i in 0 1; do
+  store_last "/pods/default/big-$i" | python3 -c '
+import json, sys
+p = json.load(sys.stdin); m = p["metadata"]
+assert m["labels"] == {"pod-template-hash": "abcd1234", "app": "big", "tier": "backend"}, m["labels"]
+assert len(m["annotations"]) == 8, m.get("annotations")
+assert m["ownerReferences"][0]["uid"] == "rs-big-uid", m["ownerReferences"]
+assert m.get("uid"), "not stamped"
+c = p["spec"]["containers"][0]
+assert c["image"] == "nginx" and len(c["env"]) == 48, c["image"]
+' || fail "big-$i is missing or wrong: '$(store_last "/pods/default/big-$i" | cut -c1-200)'"
+done
+echo "   big-0, big-1: the whole template, labels app/tier + pod-template-hash, annotations, owned, stamped"
+store_put "/replicasets.apps/default/big" "{\"metadata\":{\"name\":\"big\",\"namespace\":\"default\",\"uid\":\"rs-big-uid\",\"labels\":{\"app\":\"big\",\"pod-template-hash\":\"ef015678\"}},\"spec\":{\"replicas\":2,\"template\":$(big_tmpl big httpd)}}"
+run 10
+for i in 0 1; do
+  case "$(store_last "/pods/default/big-$i")" in
+    *'"pod-template-hash":"ef015678"'*'"image":"httpd"'*) : ;;
+    *) fail "big-$i did not roll to the new large template" ;;
+  esac
+done
+echo "   rolled: both Pods on the new large template"
 
 echo "== E2E green: ReplicaSet convergence as N independent decisions — no set-shaped op, only contract ops that already exist =="

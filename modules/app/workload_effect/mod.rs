@@ -647,9 +647,47 @@ fn spawn_src(buf: &mut [u8], req: &[u8]) -> Option<usize> {
     p = at + 2 + decode_text(wd, buf.get_mut(at + 2..)?)?;
     p = end_part(buf, at, p)?;
     // user
+    let mut ub = [0u8; 160];
+    let ul = decode_text(frame_bytes(req, 18), &mut ub)?;
     let at = p;
-    p = at + 2 + decode_text(frame_bytes(req, 18), buf.get_mut(at + 2..)?)?;
+    p = at + 2 + compose_user(ub.get(..ul)?, buf.get_mut(at + 2..)?)?;
     end_part(buf, at, p)
+}
+
+/// The user a container runs as, from field 18: the image's User alone, or
+/// `<the image's User>/<runAsUser>/<runAsGroup>` (pod_project) composed as
+/// upstream's runtime does — a runAsUser replaces the image's user (with
+/// runAsGroup as its group, else the one its passwd entry names), a
+/// runAsGroup alone keeps the image's uid (root when it names none) with
+/// that group.
+fn compose_user(raw: &[u8], out: &mut [u8]) -> Option<usize> {
+    let Some(s1) = raw.iter().position(|&c| c == b'/') else {
+        return copy_into(out, 0, raw);
+    };
+    let base = raw.get(..s1)?;
+    let rest = raw.get(s1 + 1..)?;
+    let s2 = rest.iter().position(|&c| c == b'/')?;
+    let ruid = rest.get(..s2)?;
+    let rgid = rest.get(s2 + 1..)?;
+    if !ruid.is_empty() {
+        let p = copy_into(out, 0, ruid)?;
+        if rgid.is_empty() {
+            return Some(p);
+        }
+        let p = copy_into(out, p, b":")?;
+        return copy_into(out, p, rgid);
+    }
+    if rgid.is_empty() {
+        return copy_into(out, 0, base);
+    }
+    let uid = match base.iter().position(|&c| c == b':') {
+        Some(c) => base.get(..c)?,
+        None => base,
+    };
+    let uid: &[u8] = if uid.is_empty() { b"0" } else { uid };
+    let p = copy_into(out, 0, uid)?;
+    let p = copy_into(out, p, b":")?;
+    copy_into(out, p, rgid)
 }
 
 /// One `%XX`-escaped token or entry decoded into `out`. None when it does

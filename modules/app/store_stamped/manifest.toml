@@ -6,14 +6,18 @@ hardware_targets = ["bcm2712", "linux"]
 # never rebuilt.)
 timer_class = "agnostic"
 
-# Store stamped — store_effect with a small heap, for a controller's writer
-# whose whole-object writes follow a document `schema` (`stamp = 1`): a
-# Pod or ReplicaSet it creates is stamped with a uid and creationTimestamp,
-# and keeps them when rewritten, as an object the API created does. The
-# stamp builds the object on the heap; store_effect has none, and store_big's
-# 16 MiB is sized for staged request bodies, not a controller's objects. A
-# separate module TYPE, not a variant: one graph image carries one build of a
-# type. Params, ports and frame are store_effect's; see its manifest.
+# Store stamped — store_effect with a 4 MiB heap: one controller object on
+# it at a time. A writer whose whole-object writes follow a document
+# `schema` (`stamp = 1`): a Pod or ReplicaSet it creates is stamped with a
+# uid and creationTimestamp, and keeps them when rewritten, as an object the
+# API created does — the stamp builds the object on the heap. And a READER of
+# controller objects past a record (a Pod with a real template): its GET
+# projections and COUNT predicates read the object whole there, up to the
+# API's largest (3 MiB), where store_effect would answer them empty. A write
+# that SPLICES a template (fields 70/71) holds more at once and is
+# store_big's (16 MiB). store_effect has none. A separate module TYPE, not a variant: one graph
+# image carries one build of a type. Params, ports and frame are
+# store_effect's; see its manifest.
 
 [[variant]]
 name     = "full"

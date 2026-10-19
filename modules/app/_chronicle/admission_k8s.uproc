@@ -1,0 +1,399 @@
+// Admission as Kubernetes states it, after the body is in hand (se_body): a
+// ResourceQuota's limits, and a Pod's Eviction against its disruption
+// budgets. Four stages in the API's request chain, between se_body and the
+// writer:
+//
+//   ad_q    a create of a namespaced object -> COUNT the quotas of its
+//           namespace it would exceed (/quota-used/<ns>/<quota>/<resource>
+//           `h=<hard>;u=<used>`, kept by quota.uproc): pods and count/pods,
+//           requests.cpu|cpu, requests.memory|memory, limits.cpu,
+//           limits.memory (the Pod's own, from se_body's `!reqcpu`…), and
+//           services, configmaps, secrets, persistentvolumeclaims and
+//           count/<resource> — one object each. A Pod that states no
+//           request (or limit) a quota tracks is refused, as upstream
+//           refuses it.
+//   ev_get  POST …/pods/<name>/eviction -> GET the Pod (its labels, projected
+//           from the Pod read whole: one past a record answers no value)
+//   ev_cnt  -> COUNT the PodDisruptionBudgets of its namespace that select it
+//           (`count_sel`; the COUNT names the last at 46) — upstream supports
+//           one
+//   ev_pdb  -> GET that budget's disruptionsAllowed
+//   ev_dec  -> while it allows one: spend it — a JSON Patch that TESTS the
+//           figure read and replaces it with one less, so two evictions in
+//           flight cannot both spend the last disruption (the second's test
+//           fails, and it is refused as upstream refuses a lost race)
+//   ad_fin  the verdict: 403 Forbidden "exceeded quota"; an eviction 404 when
+//           the Pod is gone, 500 when more than one budget selects it, 429
+//           TooManyRequests when its budget allows no disruption (or another
+//           eviction spent it first), else the request becomes the Pod's
+//           DELETE; otherwise the request passes as it came.
+//
+// Every stage passes admission's record through untouched: se_body's name,
+// the admitted status and object, and the request's carry.
+module nanocloud.admissionk8s {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum COUNT = 12;
+  enum PENDING = 0;
+  enum M_DELETE = 7;
+
+  // carried by: ak.Q, ak.QDone, ak.Get, ak.Got, ak.Cnt
+  message QCtx {
+    res: string = 1;      // the resource created ("pods", "deployments.apps")
+    ns: string = 2;
+    cpu: int = 3;         // a Pod's requests and limits (millicores, bytes)
+    mem: int = 4;
+    lcpu: int = 5;
+    lmem: int = 6;
+    qn: int = 7;          // quotas it would exceed
+    ev: string = 8;       // "1": an eviction
+    pod: string = 9;      // the evicted Pod, "<ns>/<name>"
+    gst: int = 10;        // the evicted Pod's GET status
+    np: int = 11;         // the budgets that select it
+    pdb: string = 12;     // the one that does (`count` names it at 46)
+  }
+
+  // se_body's answer: admission's record, the body's name and sizes, and the
+  // Pod's requests and limits (`ints`, from the body).
+  message ak.In {
+    name: string = 40;
+    dsize: int = 50; bsize: int = 51;
+    rcpu: int = 52; rmem: int = 53; lcpu: int = 54; lmem: int = 55;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  message ak.Q {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    name: string = 40;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  decision qa(a: ak.In) -> ak.Q {
+    // A namespaced object's key has three slashes, `/<res>/<ns>/…`; every
+    // cut below is of a key that has them (a `when` evaluates all its terms,
+    // and a cut past the end would drop the request).
+    when a.c_verb == "create" && a.status == 200 && a.c_verdict == PENDING && !a.c_key.contains("#eviction")
+         && size(a.c_key) - size(a.c_key.replace("/", "")) >= 3 && a.c_key.startsWith("/") ->
+      ak.Q { cid: a.c_cid, op: COUNT,
+             key: "quota-used/" + a.c_key.substring(1).substring(a.c_key.substring(1).indexOf("/") + 1).substring(0, a.c_key.substring(1).substring(a.c_key.substring(1).indexOf("/") + 1).indexOf("/")) + "/",
+             name: a.name, status: a.status, object: a.object,
+             c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+             c_name: a.c_name, c_reason: a.c_reason, c_verb: a.c_verb, d38: a.dsize, d39: a.bsize,
+             ctx: QCtx { res: a.c_key.substring(1).substring(0, a.c_key.substring(1).indexOf("/")),
+                         ns: "", cpu: a.rcpu, mem: a.rmem, lcpu: a.lcpu, lmem: a.lmem,
+                         qn: 0, ev: "", pod: "", gst: 0, np: 0, pdb: "" } };
+    default ->
+      ak.Q { cid: a.c_cid, op: NOOP, key: "",
+             name: a.name, status: a.status, object: a.object,
+             c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+             c_name: a.c_name, c_reason: a.c_reason, c_verb: a.c_verb, d38: a.dsize, d39: a.bsize,
+             ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "", pod: "", gst: 0, np: 0, pdb: "" } };
+  }
+
+  // One quota's resource (/quota-used/<ns>/<quota>/<resource>, `count/`
+  // spelt `count~`), and whether the object created would take it past its
+  // hard limit.
+  message ak.Used {
+    tail: string = 3;     // "<quota>/<resource>"
+    h: int = 50;
+    u: int = 51;
+    ctx: QCtx = 254;
+  }
+  message ak.Keep {
+    k: int = 1;
+  }
+  decision qx(p: ak.Used) -> ak.Keep {
+    when p.ctx.res == "pods" && (p.tail.substring(p.tail.indexOf("/") + 1) == "pods" || p.tail.substring(p.tail.indexOf("/") + 1) == "count~pods")
+         && p.u + 1 > p.h -> ak.Keep { k: 1 };
+    when p.ctx.res == "pods" && (p.tail.substring(p.tail.indexOf("/") + 1) == "requests.cpu" || p.tail.substring(p.tail.indexOf("/") + 1) == "cpu")
+         && (p.ctx.cpu == 0 || p.u + p.ctx.cpu > p.h) -> ak.Keep { k: 1 };
+    when p.ctx.res == "pods" && (p.tail.substring(p.tail.indexOf("/") + 1) == "requests.memory" || p.tail.substring(p.tail.indexOf("/") + 1) == "memory")
+         && (p.ctx.mem == 0 || p.u + p.ctx.mem > p.h) -> ak.Keep { k: 1 };
+    when p.ctx.res == "pods" && p.tail.substring(p.tail.indexOf("/") + 1) == "limits.cpu"
+         && (p.ctx.lcpu == 0 || p.u + p.ctx.lcpu > p.h) -> ak.Keep { k: 1 };
+    when p.ctx.res == "pods" && p.tail.substring(p.tail.indexOf("/") + 1) == "limits.memory"
+         && (p.ctx.lmem == 0 || p.u + p.ctx.lmem > p.h) -> ak.Keep { k: 1 };
+    when p.ctx.res != "pods" && p.ctx.res != "" && p.tail.substring(p.tail.indexOf("/") + 1) == p.ctx.res
+         && p.u + 1 > p.h -> ak.Keep { k: 1 };
+    when p.ctx.res != "" && p.tail.substring(p.tail.indexOf("/") + 1) == "count~" + p.ctx.res
+         && p.u + 1 > p.h -> ak.Keep { k: 1 };
+    default -> ak.Keep { };
+  }
+
+  // ---- eviction ----
+  message ak.QDone {
+    cid: int = 1;
+    status: int = 2;      // the COUNT's (204 when none was asked)
+    n: int = 45;
+    name: string = 40;
+    astatus: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  message ak.Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    name: string = 40;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  // ev_get's ask: the Pod's labels are PROJECTED (`paths:
+  // metadata.labels`, at 40), read whole on the heap whatever the Pod's size
+  // — a Pod past a record answers no value, and a budget judged on its value
+  // would see no labels and select nothing. So the body's name rides the
+  // carry (35) instead of 40, where the projection lands.
+  message ak.GetP {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    name: string = 35;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  decision eg(q: ak.QDone) -> ak.GetP {
+    when q.c_verb == "create" && q.astatus == 200 && q.c_verdict == PENDING
+         && q.c_key.startsWith("/pods/") && q.c_key.contains("#eviction") ->
+      ak.GetP { cid: q.cid, op: GET, key: "pods/" + q.c_key.substring(6, q.c_key.indexOf("#")),
+               name: q.name, status: q.astatus, object: q.object,
+               c_cid: q.c_cid, c_method: q.c_method, c_key: q.c_key, c_verdict: q.c_verdict,
+               c_name: q.c_name, c_reason: q.c_reason, c_verb: q.c_verb, d38: q.d38, d39: q.d39,
+               ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "1",
+                           pod: q.c_key.substring(6, q.c_key.indexOf("#")), gst: 0, np: 0, pdb: "" } };
+    when q.status == 200 && has(q.n) ->
+      ak.GetP { cid: q.cid, op: NOOP, key: "",
+               name: q.name, status: q.astatus, object: q.object,
+               c_cid: q.c_cid, c_method: q.c_method, c_key: q.c_key, c_verdict: q.c_verdict,
+               c_name: q.c_name, c_reason: q.c_reason, c_verb: q.c_verb, d38: q.d38, d39: q.d39,
+               ctx: QCtx { res: q.ctx.res, ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: q.n, ev: "", pod: "", gst: 0, np: 0, pdb: "" } };
+    default ->
+      ak.GetP { cid: q.cid, op: NOOP, key: "",
+               name: q.name, status: q.astatus, object: q.object,
+               c_cid: q.c_cid, c_method: q.c_method, c_key: q.c_key, c_verdict: q.c_verdict,
+               c_name: q.c_name, c_reason: q.c_reason, c_verb: q.c_verb, d38: q.d38, d39: q.d39,
+               ctx: QCtx { res: q.ctx.res, ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "", pod: "", gst: 0, np: 0, pdb: "" } };
+  }
+  message ak.Got {
+    cid: int = 1;
+    status: int = 2;      // the Pod's GET
+    labels: string = 40;  // its metadata.labels (`paths`), whatever its size
+    name: string = 35;
+    astatus: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  message ak.Cnt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    pod: string = 47;     // the Pod's labels, for `count_sel` (`@47`)
+    name: string = 40;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  decision ec(g: ak.Got) -> ak.Cnt {
+    when g.ctx.ev == "1" && g.status == 200 ->
+      ak.Cnt { cid: g.cid, op: COUNT, key: "poddisruptionbudgets/" + g.ctx.pod.substring(0, g.ctx.pod.indexOf("/")) + "/",
+               pod: g.labels, name: g.name, status: g.astatus, object: g.object,
+               c_cid: g.c_cid, c_method: g.c_method, c_key: g.c_key, c_verdict: g.c_verdict,
+               c_name: g.c_name, c_reason: g.c_reason, c_verb: g.c_verb, d38: g.d38, d39: g.d39,
+               ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "1", pod: g.ctx.pod, gst: 200, np: 0, pdb: "" } };
+    when g.ctx.ev == "1" ->
+      ak.Cnt { cid: g.cid, op: NOOP, key: "", pod: "",
+               name: g.name, status: g.astatus, object: g.object,
+               c_cid: g.c_cid, c_method: g.c_method, c_key: g.c_key, c_verdict: g.c_verdict,
+               c_name: g.c_name, c_reason: g.c_reason, c_verb: g.c_verb, d38: g.d38, d39: g.d39,
+               ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "1", pod: g.ctx.pod, gst: g.status, np: 0, pdb: "" } };
+    default ->
+      ak.Cnt { cid: g.cid, op: NOOP, key: "", pod: "",
+               name: g.name, status: g.astatus, object: g.object,
+               c_cid: g.c_cid, c_method: g.c_method, c_key: g.c_key, c_verdict: g.c_verdict,
+               c_name: g.c_name, c_reason: g.c_reason, c_verb: g.c_verb, d38: g.d38, d39: g.d39,
+               ctx: g.ctx };
+  }
+  // A budget that selects the Pod.
+  message ak.Pdb {
+    selected: string = 48;  // `count_sel`
+  }
+  decision pb(p: ak.Pdb) -> ak.Keep {
+    when p.selected == "1" -> ak.Keep { k: 1 };
+    default -> ak.Keep { };
+  }
+  message ak.Sel {
+    cid: int = 1;
+    status: int = 2;      // the COUNT's (204 when none was asked)
+    n: int = 45;          // budgets that select the Pod
+    last: string = 46;    // the (last) one
+    name: string = 40;
+    astatus: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  decision ep(e: ak.Sel) -> ak.Get {
+    when e.ctx.ev == "1" && e.ctx.gst == 200 && e.status == 200 && has(e.n) && e.n == 1 ->
+      ak.Get { cid: e.cid, op: GET, key: "poddisruptionbudgets/" + e.ctx.pod.substring(0, e.ctx.pod.indexOf("/") + 1) + e.last,
+               name: e.name, status: e.astatus, object: e.object,
+               c_cid: e.c_cid, c_method: e.c_method, c_key: e.c_key, c_verdict: e.c_verdict,
+               c_name: e.c_name, c_reason: e.c_reason, c_verb: e.c_verb, d38: e.d38, d39: e.d39,
+               ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "1", pod: e.ctx.pod, gst: 200, np: 1,
+                           pdb: e.ctx.pod.substring(0, e.ctx.pod.indexOf("/") + 1) + e.last } };
+    when e.ctx.ev == "1" && e.ctx.gst == 200 && e.status == 200 && has(e.n) ->
+      ak.Get { cid: e.cid, op: NOOP, key: "",
+               name: e.name, status: e.astatus, object: e.object,
+               c_cid: e.c_cid, c_method: e.c_method, c_key: e.c_key, c_verdict: e.c_verdict,
+               c_name: e.c_name, c_reason: e.c_reason, c_verb: e.c_verb, d38: e.d38, d39: e.d39,
+               ctx: QCtx { res: "", ns: "", cpu: 0, mem: 0, lcpu: 0, lmem: 0, qn: 0, ev: "1", pod: e.ctx.pod, gst: 200, np: e.n, pdb: "" } };
+    default ->
+      ak.Get { cid: e.cid, op: NOOP, key: "",
+               name: e.name, status: e.astatus, object: e.object,
+               c_cid: e.c_cid, c_method: e.c_method, c_key: e.c_key, c_verdict: e.c_verdict,
+               c_name: e.c_name, c_reason: e.c_reason, c_verb: e.c_verb, d38: e.d38, d39: e.d39,
+               ctx: e.ctx };
+  }
+  // The budget read: spend one disruption, conditional on the figure read.
+  message ak.Budget {
+    cid: int = 1;
+    status: int = 2;
+    allowed: int = 50;    // status.disruptionsAllowed (`ints`)
+    name: string = 40;
+    astatus: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  message ak.Spend {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8;
+    name: string = 40;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  enum PATCH_JSON = 14;
+  decision ed(b: ak.Budget) -> ak.Spend {
+    when b.ctx.ev == "1" && b.ctx.np == 1 && b.status == 200 && b.allowed > 0 ->
+      ak.Spend { cid: b.cid, op: PATCH_JSON, key: "poddisruptionbudgets/" + b.ctx.pdb,
+                 v1: "[{\"op\":\"test\",\"path\":\"/status/disruptionsAllowed\",\"value\":", v2: b.allowed,
+                 v3: "},{\"op\":\"replace\",\"path\":\"/status/disruptionsAllowed\",\"value\":", v4: b.allowed - 1, v5: "}]",
+                 name: b.name, status: b.astatus, object: b.object,
+                 c_cid: b.c_cid, c_method: b.c_method, c_key: b.c_key, c_verdict: b.c_verdict,
+                 c_name: b.c_name, c_reason: b.c_reason, c_verb: b.c_verb, d38: b.d38, d39: b.d39, ctx: b.ctx };
+    default ->
+      ak.Spend { cid: b.cid, op: NOOP, key: "",
+                 name: b.name, status: b.astatus, object: b.object,
+                 c_cid: b.c_cid, c_method: b.c_method, c_key: b.c_key, c_verdict: b.c_verdict,
+                 c_name: b.c_name, c_reason: b.c_reason, c_verb: b.c_verb, d38: b.d38, d39: b.d39, ctx: b.ctx };
+  }
+
+  // ---- the verdict ----
+  message ak.Done {
+    cid: int = 1;
+    status: int = 2;      // the budget's spend (204 when none was asked)
+    name: string = 40;
+    astatus: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+    d38: int = 38; d39: int = 39;
+    ctx: QCtx = 254;
+  }
+  message ak.Admitted {
+    name: string = 40;
+    dsize: int = 50; bsize: int = 51;
+    status: int = 60;
+    object: string = 61;
+    c_cid: int = 30; c_method: int = 31; c_key: string = 32; c_verdict: int = 33;
+    c_name: string = 34; c_reason: string = 36; c_verb: string = 37;
+  }
+  // The answers are templates with their holes REPLACED (one copy each):
+  // a chain of `+` copies the growing text every time, and the decision's
+  // scratch is 512 bytes.
+  decision fin(d: ak.Done) -> ak.Admitted {
+    when d.ctx.qn > 0 && d.name != "" ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 403,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"@R \\\"@N\\\" is forbidden: exceeded quota\",\"reason\":\"Forbidden\",\"details\":{\"name\":\"@N\",\"kind\":\"@R\"},\"code\":403}".replace("@R", d.ctx.res).replace("@N", d.name),
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    // An inline body's name is the key's last segment (before its marks).
+    when d.ctx.qn > 0 && d.c_key.substring(0, d.c_key.indexOf("#") + (size(d.c_key) + 1) * (1 - math.least(1, d.c_key.indexOf("#") + 1))).substring(d.c_key.substring(0, d.c_key.indexOf("#") + (size(d.c_key) + 1) * (1 - math.least(1, d.c_key.indexOf("#") + 1))).lastIndexOf("/") + 1) != "" ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 403,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"@R \\\"@N\\\" is forbidden: exceeded quota\",\"reason\":\"Forbidden\",\"details\":{\"name\":\"@N\",\"kind\":\"@R\"},\"code\":403}".replace("@R", d.ctx.res).replace("@N", d.c_key.substring(0, d.c_key.indexOf("#") + (size(d.c_key) + 1) * (1 - math.least(1, d.c_key.indexOf("#") + 1))).substring(d.c_key.substring(0, d.c_key.indexOf("#") + (size(d.c_key) + 1) * (1 - math.least(1, d.c_key.indexOf("#") + 1))).lastIndexOf("/") + 1)),
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    when d.ctx.qn > 0 ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 403,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"@R is forbidden: exceeded quota\",\"reason\":\"Forbidden\",\"details\":{\"kind\":\"@R\"},\"code\":403}".replace("@R", d.ctx.res),
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    when d.ctx.ev == "1" && d.ctx.gst != 200 ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 404,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"pods \\\"@N\\\" not found\",\"reason\":\"NotFound\",\"details\":{\"name\":\"@N\",\"kind\":\"pods\"},\"code\":404}".replace("@N", d.ctx.pod.substring(d.ctx.pod.indexOf("/") + 1)),
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    when d.ctx.ev == "1" && d.ctx.np > 1 ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 500,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.\",\"reason\":\"InternalError\",\"code\":500}",
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    when d.ctx.ev == "1" && d.ctx.np == 1 && d.status != 200 ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 429,
+                    object: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"Cannot evict pod as it would violate the pod's disruption budget.\",\"reason\":\"TooManyRequests\",\"details\":{\"causes\":[{\"reason\":\"DisruptionBudget\",\"message\":\"The disruption budget needs more healthy pods to allow this eviction.\"}]},\"code\":429}",
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+    when d.ctx.ev == "1" ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: 200, object: "",
+                    c_cid: d.c_cid, c_method: M_DELETE, c_key: "/pods/" + d.ctx.pod, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: "delete" };
+    default ->
+      ak.Admitted { name: d.name, dsize: d.d38, bsize: d.d39, status: d.astatus, object: d.object,
+                    c_cid: d.c_cid, c_method: d.c_method, c_key: d.c_key, c_verdict: d.c_verdict,
+                    c_name: d.c_name, c_reason: d.c_reason, c_verb: d.c_verb };
+  }
+
+  pipeline qa_p(a: ak.In) -> ak.Q { call x = qa(a); return x; }
+  pipeline qx_p(p: ak.Used) -> ak.Keep { call x = qx(p); return x; }
+  pipeline eg_p(q: ak.QDone) -> ak.GetP { call x = eg(q); return x; }
+  pipeline ec_p(g: ak.Got) -> ak.Cnt { call x = ec(g); return x; }
+  pipeline pb_p(p: ak.Pdb) -> ak.Keep { call x = pb(p); return x; }
+  pipeline ep_p(e: ak.Sel) -> ak.Get { call x = ep(e); return x; }
+  pipeline ed_p(b: ak.Budget) -> ak.Spend { call x = ed(b); return x; }
+  pipeline fin_p(d: ak.Done) -> ak.Admitted { call x = fin(d); return x; }
+  provenance revision "admission-k8s" toolchain "chronicle-authoring";
+}

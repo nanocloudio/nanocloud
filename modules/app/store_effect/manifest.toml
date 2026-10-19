@@ -60,6 +60,15 @@ hardware_targets = ["bcm2712", "linux"]
 #             nine; a tenth path is not projected, and a decision reading
 #             its field would silently produce nothing
 #     28      expected revision (i64) for REPLACE / a conditional DELETE
+#     70,71   SPLICE: a write's value with subtrees copied from a STORED
+#             document — 70 the source key's tail, 71
+#             `<prefix>|<at>=<path>[;<at>=<path>…]` (each subtree before value
+#             part <at>, 0 = after the last; `<path>.*` its members, a leading
+#             `,` a comma when there are any; a missing whole subtree is
+#             `null`). A controller's template is as large as its user makes
+#             it: the decision names where the bytes are, never carries them.
+#             Needs a heap (store_big): 413 without room, 404 when the source
+#             is gone.
 #     59      reply: the key's store revision (i64, 0 = absent), every reply,
 #             when `revision = 1`
 # Ops: 0 NOOP, 1 GET, 2 EXISTS, 3 PUT (204 when unchanged), 4 DELETE,
@@ -85,6 +94,9 @@ hardware_targets = ["bcm2712", "linux"]
 # expected revision in field 28 the merge is into THAT record: 409 when it
 # moved or is gone, so a merge never recreates a record another writer
 # removed.
+# `append_tally = "<from>:<to>"`: an APPEND (11) to `<from><rest>` also adds
+# the bytes it appended to the decimal count at `<to><rest>` — every byte ever
+# written, which the tail ring no longer says (a Pod's log, followed).
 # 12 COUNT (the key is a PREFIX; answers 200 with the number of keys under it
 # at field 45). `count_where` (a decision container, `{hex: …}`) counts only the children a decision
 # keeps: each child is handed to it as a reply would answer it — field 3 the
@@ -110,6 +122,14 @@ hardware_targets = ["bcm2712", "linux"]
 # Key parts (3, 17, 18, 25..27) may be INTEGERS and render as decimal, like
 # value parts: an allocator keys its claim by the address it computed. `ints`
 # paths take `.` (the whole value) and `!<mod>` (`.!ip4`), as in store_source.
+# COUNT: a `count_where` message whose field 1 is a number counts the child
+# THAT much (a sum: a Pod's requests); the last child counted is named at 46.
+# `count_sel = "<selector>|<labels>"`: the predicate also sees "1" at 48 when
+# the label selector selects the labels — each side `@<n>[.<path>]` (the
+# request's field n, or a path in it) or a path into the child.
+# `doc = <n>`: a NOOP's `ints` project from the request's own field n (a body
+# handed inline), where a GET's project from what the store answered.
+# A dotted path segment in double quotes is one key, dots and all.
 timer_class = "agnostic"
 
 # The fused decision (`decision` param) runs Chronicle's engine with the whole

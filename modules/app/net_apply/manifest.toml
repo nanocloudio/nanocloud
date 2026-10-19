@@ -24,10 +24,16 @@ hardware_targets = ["bcm2712", "linux"]
 #                    protos=<P>,…     (aligned to ports; `-`/"" = TCP)
 #     -> one ALLOW/DROP record per (peer × port)
 #   kind=isolate     dir=in|out  subj=<ip>[/<n>]           -> one ISOLATE
-#   kind=dnat        vip=<ip>  vports=<p>,…  tports=<p>,…  protos=<P>,…
-#                    backend=<ip>
+#   kind=dnat        vip=<ip>  vports=<p>,…  tports=<p|name>,…  protos=<P>,…
+#                    backend=<ip>  pnames=<name>,…  pnums=<p>,…
 #     -> one DNAT per port with this backend; the platform merges records
-#        naming the same (proto, vip, port) into one balanced service
+#        naming the same (proto, vip, port) into one balanced service. A
+#        targetPort that is a name is the backend Pod's port of that name
+#        (pnames/pnums, aligned); a backend without it gets no rule for it.
+#        `nports=<p>,…` (aligned, `-` for none): the same backend at this
+#        node's `node_address` and each node port (NodePort);
+#        `lbip=<ip>`: the same backend at that address and each port
+#        (LoadBalancer)
 #   anything else is skipped and counted.
 # A row set that does not fit the table is NOT applied: the previous table
 # stands, and the status says why. Half a policy is a policy nobody wrote.

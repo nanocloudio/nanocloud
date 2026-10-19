@@ -345,6 +345,20 @@ wait_for 30 "the worker never received a write made after it joined" \
   sh -c "redis-cli -p $((BASE + 5)) --raw GET /configmaps/default/after-join 2>/dev/null | grep -q after-join"
 echo "   kubectl lists the worker; a later write reaches it"
 
+echo "== 6b. a Pod on the worker: kubectl logs reads its output through the plane's API =="
+# The worker records its sandbox's output in its own records
+# (/~node/worker/sandbox-logs/<uid>); the API's log view reads the Pod's
+# node's, not the plane's own.
+printf '%s' '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"echo-w","namespace":"default"},"spec":{"nodeName":"worker","restartPolicy":"Never","containers":[{"name":"c","command":["/bin/sh","-c","echo ran-on-the-worker; echo second-line"]}]}}' \
+  | k create --validate=false -f - >/dev/null || fail "the operator could not create a Pod on the worker"
+logs_hold() { [ "$(k logs echo-w 2>/dev/null)" = "$(printf 'ran-on-the-worker\nsecond-line')" ]; }
+wait_for 90 "kubectl logs never returned the worker's Pod output (got '$(k logs echo-w 2>&1 | head -3)')" logs_hold
+[ "$(k logs echo-w --tail=1)" = second-line ] || fail "kubectl logs --tail=1 of the worker's Pod: '$(k logs echo-w --tail=1 2>&1)'"
+UIDW="$(k get pod echo-w -o jsonpath='{.metadata.uid}')"
+[ -n "$(redis-cli -p "$((BASE + 5))" --raw GET "/~node/worker/sandbox-logs/$UIDW" 2>/dev/null)" ] \
+  || fail "the output is not in the worker's own records"
+echo "   kubectl logs echo-w: the worker's record of it (/~node/worker/sandbox-logs/$UIDW); --tail=1: second-line"
+
 echo "== 7. the worker restarts: certified again (fresh), and back in the group =="
 OLD="$(k get --raw "$DEV/replica-1.server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["certificate"])')"
 stop worker

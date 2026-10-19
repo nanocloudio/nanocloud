@@ -1,0 +1,149 @@
+// An image being removed (image_gc.uproc): the requests that name it (gj)
+// and its layers' blobs (gl).
+//   gj   (/image-digests/<rk> joined with /image-gc/) a request naming it
+//        -> /image-requests/<rk>, /image-digests/<rk>, /image-index/<rk>
+//        removed: a Pod that asks for the reference again pulls it again
+//   gl   (/image-gc/<m> phase=layers, a record per layer) no other image's
+//        mark names the layer -> its blob dropped through the pull's own
+//        queue (/image-fetch-q/d-<hex>: http_fetch unlinks the file, then
+//        its marker goes, image.uproc); then /image-layer-ok/<m>-<i> —
+//        the drop queued first, so a cut between the two leaves a mark that
+//        drops it again, never a blob nothing drops
+// Its own module for the parser's bounds; see image_gc.uproc.
+module nanocloud.image_gcl {
+
+  message Cj {
+    rk: string = 30;
+  }
+  message Cl {
+    m: string = 30;
+    hex: string = 31;
+    idx: string = 32;      // the layer's index
+  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum COUNT = 12;
+
+  // ── gj ──
+  message Req {
+    seq: int = 1;
+    key: string = 3;       // <rk>
+    digest: string = 4;
+    gone: string = 21;     // the image being removed (/image-gc/<m>)
+  }
+  message WJ {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    ctx: Cj = 254;
+  }
+  decision gj1(r: Req) -> WJ {
+    when r.digest != "" && r.digest == r.gone ->
+      WJ { cid: r.seq, op: DELETE, key: "/image-requests/", k2: r.key, ctx: Cj { rk: r.key } };
+    default ->
+      WJ { cid: r.seq, op: NOOP, key: "", k2: "", ctx: Cj { rk: "" } };
+  }
+  message DoneJ {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Cj = 254;
+  }
+  decision gj2(d: DoneJ) -> WJ {
+    when d.ctx.rk != "" -> WJ { cid: d.cid, op: DELETE, key: "/image-digests/", k2: d.ctx.rk, ctx: d.ctx };
+    default -> WJ { cid: d.cid, op: NOOP, key: "", k2: "", ctx: d.ctx };
+  }
+  decision gj3(d: DoneJ) -> WJ {
+    when d.ctx.rk != "" -> WJ { cid: d.cid, op: DELETE, key: "/image-index/", k2: d.ctx.rk, ctx: d.ctx };
+    default -> WJ { cid: d.cid, op: NOOP, key: "", k2: "", ctx: d.ctx };
+  }
+
+  // ── gl ──
+  // A COUNT walk's child: another image's mark naming this layer.
+  message LayerOk {
+    tail: string = 3;      // <m>-<i>
+    hex: string = 40;
+    c_m: string = 30;
+    c_hex: string = 31;
+  }
+  message Keep {
+    k: int = 1;
+  }
+  decision cw_layer(c: LayerOk) -> Keep {
+    when c.hex == c.c_hex && !c.tail.startsWith(c.c_m + "-") -> Keep { k: 1 };
+    default -> Keep {};
+  }
+  message Lay {
+    seq: int = 1;
+    key: string = 3;       // <m>
+    hex: string = 4;       // layers.#
+    phase: string = 5;
+    idx: string = 21;      // its index, as digits
+  }
+  message AskL {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_m: string = 30;
+    c_hex: string = 31;
+    ctx: Cl = 254;
+  }
+  decision gl1(l: Lay) -> AskL {
+    when l.phase == "layers" && l.hex.size() == 64 ->
+      AskL { cid: l.seq, op: COUNT, key: "/image-layer-ok/", c_m: l.key, c_hex: l.hex, ctx: Cl { m: l.key, hex: l.hex, idx: l.idx } };
+    default ->
+      AskL { cid: l.seq, op: NOOP, key: "", c_m: "", c_hex: "", ctx: Cl { m: "", hex: "", idx: "" } };
+  }
+  message GotL {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: Cl = 254;
+  }
+  message WL {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5;
+    c_next: string = 39;
+    ctx: Cl = 254;
+  }
+  decision gl2(g: GotL) -> WL {
+    when g.ctx.m != "" && g.status == 200 && g.n == 0 ->
+      WL { cid: g.cid, op: MERGE, key: "/image-fetch-q/d-", k2: g.ctx.hex, v1: "kind=d;name=", v2: g.ctx.hex, c_next: "drop", ctx: g.ctx };
+    when g.ctx.m != "" && g.status == 200 ->
+      WL { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", c_next: "keep", ctx: g.ctx };
+    default ->
+      WL { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", c_next: "", ctx: g.ctx };
+  }
+  message DoneL {
+    cid: int = 1;
+    status: int = 2;
+    c_next: string = 39;
+    ctx: Cl = 254;
+  }
+  decision gl3(d: DoneL) -> WL {
+    when (d.c_next == "keep" || (d.c_next == "drop" && d.status >= 200 && d.status < 300)) && d.ctx.idx != "" ->
+      WL { cid: d.cid, op: DELETE, key: "/image-layer-ok/" + d.ctx.m + "-", k2: d.ctx.idx, v1: "", v2: "", c_next: "", ctx: d.ctx };
+    default ->
+      WL { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", c_next: "", ctx: d.ctx };
+  }
+
+  pipeline gc_cw_layer(c: LayerOk) -> Keep { call y = cw_layer(c); return y; }
+  pipeline gc_j1(r: Req) -> WJ { call y = gj1(r); return y; }
+  pipeline gc_j2(d: DoneJ) -> WJ { call y = gj2(d); return y; }
+  pipeline gc_j3(d: DoneJ) -> WJ { call y = gj3(d); return y; }
+  pipeline gc_l1(l: Lay) -> AskL { call y = gl1(l); return y; }
+  pipeline gc_l2(g: GotL) -> WL { call y = gl2(g); return y; }
+  pipeline gc_l3(d: DoneL) -> WL { call y = gl3(d); return y; }
+  entry gc_cw_layer = gc_cw_layer;
+  entry gc_j1 = gc_j1;
+  entry gc_j2 = gc_j2;
+  entry gc_j3 = gc_j3;
+  entry gc_l1 = gc_l1;
+  entry gc_l2 = gc_l2;
+  entry gc_l3 = gc_l3;
+  provenance revision "image-gc-refs" toolchain "chronicle-authoring";
+}

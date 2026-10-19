@@ -1,0 +1,62 @@
+name = "cluster_dns"
+version = "0.1.0"
+description = "The cluster's DNS: Service names answered from the store, every other name forwarded"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# What kube-dns answers, read where the API keeps it — nothing is projected
+# for it, so an answer is never staler than the store it is read from:
+#
+#   <svc>.<ns>.svc.<zone>  A
+#       a Service with a ClusterIP: that address (`spec.clusterIP`);
+#       a headless one (`clusterIP: None`): the address of every ready
+#       backend, from its Endpoints document (`/endpoints/<ns>/<svc>`,
+#       "<pod>=<ip>,…", the endpoints chain's);
+#       an ExternalName Service: a CNAME to `spec.externalName`, whatever
+#       the type asked;
+#       no such Service: NXDOMAIN
+#   _<port>._<proto>.<svc>.<ns>.svc.<zone>  SRV
+#       the Service's port of that name and protocol (`_tcp`, `_udp`):
+#       priority 0, weight 100, the port, the Service's own name as target —
+#       or, headless, one per ready backend, its targetPort (a numbered
+#       one; else the port) at `<a-b-c-d>.<svc>.<ns>.svc.<zone>`
+#   <a-b-c-d>.<svc>.<ns>.svc.<zone>  A
+#       a headless Service's backend at that address; NXDOMAIN otherwise
+#   any other type of an existing name: NOERROR with no answer
+#   any other name in <zone>: NXDOMAIN
+#
+# Every name outside the zone is forwarded to `upstream` (the node's own
+# resolver, rendered from its resolv.conf) and its answer relayed, the
+# client's transaction id restored; with no upstream it is REFUSED. One
+# question per query, opcode QUERY; answers are authoritative, at `ttl`.
+#
+# With `address` (where Pods reach it: the control plane's address), it is
+# kept at `/cluster-dns` once the port is bound — the nameserver a Pod's
+# resolv.conf names (`_shared/poddns.rs`).
+#
+# A read the store answers EAGAIN holds the query and asks again on a later
+# step — never answered as absent.
+timer_class = "wall_clock"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 16384
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+required = true
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+[observability]
+exempt = "control-plane resolver — discrete queries answered from the store, not a sustained byte data path"

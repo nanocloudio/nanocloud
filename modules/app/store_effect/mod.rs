@@ -32,6 +32,7 @@ include!("../_shared/jsonq.rs");
 include!("../_shared/moment.rs");
 include!("../_shared/tomb.rs");
 include!("../_shared/jsonpatch.rs");
+include!("../_shared/labelsel.rs");
 include!("../_shared/views.rs");
 include!("../_shared/fieldset.rs");
 include!("../_shared/docschema.rs");
@@ -133,6 +134,48 @@ const OP_EXISTS_ANY: i64 = 10;
 /// `append_cap` bytes — a bounded tail ring (a workload's output, a pty's). An
 /// unbounded append would grow an object without limit.
 const OP_APPEND: i64 = 11;
+/// `append_tally`'s count beside an APPEND to `key`: `n` more bytes.
+unsafe fn append_tally(sys: &Store, tally: &[u8], key: &[u8], n: usize) {
+    let Some(c) = tally.iter().position(|&b| b == b':') else {
+        return;
+    };
+    let (from, to) = (
+        tally.get(..c).unwrap_or(&[]),
+        tally.get(c + 1..).unwrap_or(&[]),
+    );
+    let Some(rest) = key.strip_prefix(from) else {
+        return;
+    };
+    let mut tk = [0u8; MAX_KEY];
+    let tl = to.len() + rest.len();
+    let Some(dst) = tk.get_mut(..tl) else {
+        return;
+    };
+    for (d, &b) in dst.iter_mut().zip(to.iter().chain(rest.iter())) {
+        *d = b;
+    }
+    let mut cur = [0u8; 24];
+    let had = get_value(sys, &tk[..tl], &mut cur).unwrap_or(0);
+    let mut v: u64 = 0;
+    for &b in cur.get(..had).unwrap_or(&[]) {
+        if b.is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+        }
+    }
+    v = v.saturating_add(n as u64);
+    let mut d = [0u8; 20];
+    let mut i = d.len();
+    loop {
+        i -= 1;
+        d[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 || i == 0 {
+            break;
+        }
+    }
+    let _ = put_value(sys, &tk[..tl], d.get(i..).unwrap_or(&[]));
+}
+
 /// Count the keys under the prefix `key` (a bounded walk); the number comes
 /// back at field 45 (i64) — a quota's "how many are there".
 const OP_COUNT: i64 = 12;
@@ -161,6 +204,17 @@ const OP_TAKE: i64 = 17;
 /// collections; when its spec is gone they all go, in one step, and none is
 /// left for a chain to read as a Pod that still exists. Answers 200.
 const OP_DROP_EACH: i64 = 18;
+/// A key and its FAMILY — every `<key>~…` that exists — written alike: PUT
+/// (put-if-changed) the value at `<key>` and at each of them. A Pod's
+/// containers are one node spec each, `<uid>` and `<uid>~c<n>` /
+/// `<uid>~i<n>` (_shared/podres.rs); a Pod deleted outright is known by its
+/// uid alone (its tomb's index), and every container it had is told so in
+/// one step, by one listing of the uid's prefix, whatever their count. 200
+/// when something was written, 204 when nothing changed.
+const OP_PUT_FAMILY: i64 = 19;
+/// A key and its family gone: delete-if-present every `<key>~…`, then
+/// `<key>` (`_shared/tomb.rs` `drop_family`). Answers 200.
+const OP_DELETE_FAMILY: i64 = 20;
 /// Request fields `echo` may carry through (see the param).
 const ECHO_MAX: usize = 8;
 
@@ -236,6 +290,9 @@ struct State {
     /// value for a delete). A `ttl` chain expires it.
     tomb: [u8; 48],
     tomb_len: u8,
+    /// `tomb_ms`: how long a tomb stays, ms (default `TOMB_MS`) — a Pod's
+    /// node specs live as long (tomb.uproc).
+    tomb_ms: u32,
     /// `blob = <prefix>`: a PUT/CREATE/REPLACE whose value is `sha256:<hex>`
     /// writes the STAGED body at `<prefix><hex>` instead (a request body the
     /// HTTP server staged because it outgrew a record). Needs a heap: the
@@ -274,6 +331,12 @@ struct State {
     stamp: u32,
     /// OP_APPEND's ring size (bytes kept).
     append_cap: u32,
+    /// `append_tally = "<from>:<to>"`: an APPEND to `<from><rest>` also adds
+    /// the bytes it appended to the decimal count at `<to><rest>` — every
+    /// byte ever written, which a ring trimmed to its tail no longer says, so
+    /// a follower tells new bytes from old (a Pod's log, `logs -f`).
+    append_tally: [u8; 96],
+    append_tally_len: u8,
     /// `echo = "a,b,…"`: request fields carried into the reply under their own
     /// numbers, like 30..39 — for a chain whose carry range is spent and whose
     /// next stage still needs the request's own fields.
@@ -301,6 +364,22 @@ struct State {
     cw_cont: [u8; CW_CONT],
     cw_len: u16,
     cw_fault: u8,
+    /// `count_sel = "<selector>|<labels>"`: a COUNT's predicate also sees,
+    /// at field 48, "1" when the label selector selects the labels (else
+    /// "") — each side either `@<n>` (field n of the request, as the fused
+    /// decision built it) or a dotted path into the child: a PodDisruption
+    /// Budget's `spec.selector` against a Pod's labels, or a Pod's
+    /// `metadata.labels` under a budget's selector. Upstream's reading: an
+    /// empty selector selects everything, an absent one nothing.
+    count_sel: [u8; 96],
+    count_sel_len: u8,
+    /// `doc = <n>`: a NOOP's answer projects its `ints` from the request's
+    /// own field n — a document the record already carries (a body handed
+    /// inline) — where any other op projects from what the store answered
+    /// (a body staged in the store, read back by a GET). Its `paths` stay
+    /// empty: a name read off an inline body would be one the request's key
+    /// already holds.
+    doc: u32,
     /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`];
     /// `wall = 2` also the recordable moment at [`MOMENT_FIELD`].
     wall: u32,
@@ -442,17 +521,34 @@ fn flat_field<'a>(value: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Split one dotted path into segments.
+/// Split one dotted path into segments. A segment in double quotes is ONE
+/// key, dots and all — `metadata.annotations."batch.kubernetes.io/x"`: a
+/// Kubernetes label or annotation key is a DNS prefix, and has dots.
 fn split_dots<'a>(spec: &'a [u8], segs: &mut [&'a [u8]; 6]) -> usize {
     let mut n = 0usize;
     let mut s2 = 0usize;
     while s2 <= spec.len() && n < segs.len() {
-        let e2 = spec[s2..]
-            .iter()
-            .position(|&b| b == b'.')
-            .map(|i| s2 + i)
-            .unwrap_or(spec.len());
-        segs[n] = &spec[s2..e2];
+        let quoted = spec.get(s2) == Some(&b'"');
+        let (seg, e2) = if quoted {
+            let open = s2 + 1;
+            let close = spec
+                .get(open..)
+                .and_then(|r| r.iter().position(|&b| b == b'"'))
+                .map(|i| open + i)
+                .unwrap_or(spec.len());
+            (
+                spec.get(open..close).unwrap_or(&[]),
+                (close + 1).min(spec.len()),
+            )
+        } else {
+            let e2 = spec[s2..]
+                .iter()
+                .position(|&b| b == b'.')
+                .map(|i| s2 + i)
+                .unwrap_or(spec.len());
+            (&spec[s2..e2], e2)
+        };
+        segs[n] = seg;
         n += 1;
         if e2 >= spec.len() {
             break;
@@ -460,6 +556,18 @@ fn split_dots<'a>(spec: &'a [u8], segs: &mut [&'a [u8]; 6]) -> usize {
         s2 = e2 + 1;
     }
     n
+}
+
+/// Decimal bytes → u64 (saturating); stops at the first non-digit.
+fn parse_dec_u64(b: &[u8]) -> u64 {
+    let mut v: u64 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+    }
+    v
 }
 
 /// Decimal bytes → u32; stops at the first non-digit.
@@ -551,6 +659,30 @@ fn reply_projected(
     proj: &Projection,
 ) -> usize {
     reply_projected_from(out, cid, status, value, value, carry, proj)
+}
+
+/// One EMPTY field per `paths` entry, at 40.., appended to the reply of
+/// `n` bytes in `out`: the layout a projection keeps when it has nothing to
+/// read. The new length (`n` when a field does not fit).
+fn reply_paths_empty(out: &mut [u8], n: usize, paths: &[u8]) -> usize {
+    let mut p = n;
+    let mut fno = 40u8;
+    for one in paths.split(|&b| b == b',') {
+        if one.is_empty() || fno >= 50 {
+            continue;
+        }
+        match put_field(out, p, fno, TY_BYTES, &[]) {
+            Some(q) => {
+                p = q;
+                if let Some(c) = out.get_mut(0) {
+                    *c = c.wrapping_add(1);
+                }
+            }
+            None => return p,
+        }
+        fno += 1;
+    }
+    p
 }
 
 /// [`reply_projected`] whose projections are read from `value` while the
@@ -710,7 +842,8 @@ fn reply_projected_from(
                 }
                 None => raw,
             };
-            let v = parse_dec_bytes(raw) as i64;
+            // u64, not u32: a projection may be a time in milliseconds.
+            let v = parse_dec_u64(raw).min(i64::MAX as u64) as i64;
             let Some(q) = put_field(out, p, fno, TY_I64, &v.to_le_bytes()) else {
                 return n0;
             };
@@ -763,8 +896,227 @@ unsafe fn put_guarded(sys: &Store, key: &[u8], value: &[u8]) -> (bool, bool) {
         if &cur[..n] == value {
             return (true, false);
         }
+    } else if value.len() > cur.len() {
+        // A value past the stack (a spliced template) is compared on the
+        // heap: rewriting an unchanged object would spend a revision, wake
+        // every watch on it, and loop a controller that writes it.
+        if let Some((p, n)) = read_whole(sys, key, value.len() + 1) {
+            let same = core::slice::from_raw_parts(p, n) == value;
+            heap_free(sys, p);
+            if same {
+                return (true, false);
+            }
+        }
     }
     (done(put_value(sys, key, value)), true)
+}
+
+/// SPLICE (request fields 70 and 71): a write whose value carries subtrees
+/// copied from a STORED document rather than through the record. A
+/// controller's object is mostly its owner's template — a Deployment's spec,
+/// a ReplicaSet's pod template — and a template is as large as its user
+/// makes it: carried through a decision it overflows the 512 B scratch, past
+/// a record it cannot cross at all. So the decision names WHERE the bytes
+/// are, and this connector copies them, whatever their size.
+///   70  the source key's tail (bytes)
+///   71  `<prefix>|<at>=<path>[;<at>=<path>…]`: the source is `<prefix><70>`;
+///       each `<path>`'s subtree goes in before value part `<at>` (a value
+///       part field number; 0 = after the last). `<path>.*` is an object's
+///       MEMBERS (braces stripped, empty for none); a leading `,` writes a
+///       comma before what it splices when there is anything to splice — a
+///       member list joined after a literal member. A whole subtree that is
+///       not there splices `null`.
+/// The value is assembled on the heap (store_stamped, store_big): a build
+/// without one answers 413. A source that is gone answers 404 and writes
+/// nothing; one that could not be read now holds the record.
+const F_SPLICE_SRC: u8 = 70;
+const F_SPLICE: u8 = 71;
+/// Subtrees one write may splice.
+const SPLICE_MAX: usize = 6;
+
+/// A value part rendered: bytes as they are, an integer as decimal.
+fn part_bytes<'a>(req: &'a [u8], f: u8, digits: &'a mut [u8; 21]) -> &'a [u8] {
+    match frame_field(req, f) {
+        Some((TY_BYTES, part)) => part,
+        Some((TY_I64, b)) if b.len() == 8 => {
+            let v = i64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+            let mut d = [0u8; 20];
+            let n = dec(v.unsigned_abs(), &mut d);
+            let mut at = 0usize;
+            if v < 0 {
+                digits[0] = b'-';
+                at = 1;
+            }
+            for (dst, &c) in digits.iter_mut().skip(at).zip(d.iter().take(n)) {
+                *dst = c;
+            }
+            digits.get(..at + n).unwrap_or(&[])
+        }
+        _ => &[],
+    }
+}
+
+/// An object's members, braces and surrounding whitespace stripped.
+fn splice_members(sub: &[u8]) -> &[u8] {
+    let t = sub.trim_ascii();
+    match (t.first(), t.last()) {
+        (Some(b'{'), Some(b'}')) if t.len() >= 2 => {
+            t.get(1..t.len() - 1).unwrap_or(&[]).trim_ascii()
+        }
+        _ => &[],
+    }
+}
+
+/// The value of a splicing write, assembled on the heap: `Ok((heap, len))`,
+/// or the status to answer instead (the source is read whole through the
+/// journal, so a held write splices the same bytes when asked again).
+unsafe fn splice_value(sys: &Store, req: &[u8], spec: &[u8]) -> Result<(*mut u8, usize), i64> {
+    let bar = spec.iter().position(|&b| b == b'|').ok_or(400i64)?;
+    let prefix = spec.get(..bar).unwrap_or(&[]);
+    let items = spec.get(bar + 1..).unwrap_or(&[]);
+    let tail = match frame_field(req, F_SPLICE_SRC) {
+        Some((TY_BYTES, t)) if !t.is_empty() => t,
+        _ => return Err(400),
+    };
+    let mut kb = [0u8; MAX_KEY];
+    let kl = prefix.len() + tail.len();
+    let Some(dst) = kb.get_mut(..kl) else {
+        return Err(400);
+    };
+    for (d, &b) in dst.iter_mut().zip(prefix.iter().chain(tail.iter())) {
+        *d = b;
+    }
+    let src = &kb[..kl];
+    // Read LIVE, outside the journal. What a held write's replay must
+    // reproduce is the write itself — the journal checks its value's length
+    // and digest — not the whole source: a controller's object moves while
+    // its Pod's create is held (a Job's status, patched as the Job starts),
+    // and recorded, that move broke the journal (DIVERGED, the write never
+    // asked again, the node's writes wedged behind it). A source whose
+    // spliced subtrees did not move splices the same bytes; one whose
+    // template moved builds another value, which the journal refuses.
+    if sys.silent() {
+        return Err(503);
+    }
+    let (dp, dn) = match read_whole_rev_live(sys.table(), sys.nag(), src, DOC_MAX) {
+        Got::Found((p, n, _)) => (p, n),
+        // Not answered yet: the record is held and served again.
+        Got::Pending => {
+            sys.wait();
+            return Err(503);
+        }
+        // Gone, or past the heap.
+        Got::Absent => return Err(if exists(sys, src) { 413 } else { 404 }),
+    };
+    let doc = core::slice::from_raw_parts(dp, dn);
+    // (at, comma, bytes) for each item.
+    let mut cuts: [(u8, bool, &[u8]); SPLICE_MAX] = [(0, false, &[]); SPLICE_MAX];
+    let mut nc = 0usize;
+    for item in items.split(|&b| b == b';') {
+        let Some(eq) = item.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        let mut at = 0u32;
+        for &c in item.get(..eq).unwrap_or(&[]) {
+            if c.is_ascii_digit() {
+                at = at * 10 + u32::from(c - b'0');
+            }
+        }
+        let mut path = item.get(eq + 1..).unwrap_or(&[]);
+        let comma = path.first() == Some(&b',');
+        if comma {
+            path = path.get(1..).unwrap_or(&[]);
+        }
+        let members = path.ends_with(b".*");
+        if members {
+            path = path.get(..path.len() - 2).unwrap_or(&[]);
+        }
+        let mut segs: [&[u8]; 6] = [&[]; 6];
+        let ns = split_dots(path, &mut segs);
+        let sub = j_sub(doc, &segs[..ns]).or_else(|| j_path(doc, &segs[..ns]));
+        let bytes: &[u8] = match (sub, members) {
+            (Some(s), true) => splice_members(s),
+            (None, true) => &[],
+            (Some(s), false) => s,
+            (None, false) => b"null",
+        };
+        if let Some(c) = cuts.get_mut(nc) {
+            *c = (at.min(255) as u8, comma && !bytes.is_empty(), bytes);
+            nc += 1;
+        }
+    }
+    let cuts = &cuts[..nc];
+    let fields = (4u8..=16).chain(80u8..=99);
+    let mut total = 0usize;
+    for f in fields.clone().chain(core::iter::once(0u8)) {
+        for &(_, comma, b) in cuts.iter().filter(|c| c.0 == f) {
+            total += usize::from(comma) + b.len();
+        }
+        if f != 0 {
+            let mut d = [0u8; 21];
+            total += part_bytes(req, f, &mut d).len();
+        }
+    }
+    let p = heap_alloc(sys.table(), total.max(1) as u32);
+    if p.is_null() {
+        heap_free(sys.table(), dp);
+        return Err(413);
+    }
+    let mut o = 0usize;
+    let put = |src: &[u8], o: &mut usize| {
+        if *o + src.len() <= total {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), p.add(*o), src.len());
+            *o += src.len();
+        }
+    };
+    for f in fields.chain(core::iter::once(0u8)) {
+        for &(_, comma, b) in cuts.iter().filter(|c| c.0 == f) {
+            if comma {
+                put(b",", &mut o);
+            }
+            put(b, &mut o);
+        }
+        if f != 0 {
+            let mut d = [0u8; 21];
+            put(part_bytes(req, f, &mut d), &mut o);
+        }
+    }
+    heap_free(sys.table(), dp);
+    Ok((p, o))
+}
+
+/// PATCH (op 5) of an object past a record: read whole and edited on the
+/// heap, written put-if-changed. 413 without a heap (or past it), 400 when
+/// the path names nothing settable, else the write's status.
+unsafe fn patch_whole(sys: &Store, key: &[u8], segs: &[&[u8]], val: &[u8]) -> i64 {
+    let Some((cp, cn)) = read_whole(sys, key, DOC_MAX) else {
+        return if sys.waiting() { 503 } else { 413 };
+    };
+    let cur = core::slice::from_raw_parts(cp, cn);
+    let room = cn + val.len() + segs.iter().map(|g| g.len()).sum::<usize>() + 16;
+    let wp = heap_alloc(sys.table(), room as u32);
+    if wp.is_null() {
+        heap_free(sys.table(), cp);
+        return 413;
+    }
+    let work = core::slice::from_raw_parts_mut(wp, room);
+    let el = match segs {
+        [a] => j_set_top(cur, a, val, work),
+        [a, b] => j_set2(cur, a, b, val, work),
+        _ => 0,
+    };
+    let status = if el == 0 {
+        400
+    } else {
+        match put_guarded(sys, key, work.get(..el).unwrap_or(&[])) {
+            (false, _) => 500,
+            (true, true) => 200,
+            (true, false) => 204,
+        }
+    };
+    heap_free(sys.table(), wp);
+    heap_free(sys.table(), cp);
+    status
 }
 
 /// `wild = "18,26,24"` → up to six key-part field numbers.
@@ -876,11 +1228,18 @@ unsafe fn count_child(
     value: &[u8],
     carry: &[(u8, u8, &[u8])],
     proj: &Projection,
-) -> Option<bool> {
+    selected: Option<bool>,
+) -> Option<i64> {
     let mut frame = [0u8; BUF];
-    let n = reply_projected_from(&mut frame, cid, 200, tail, value, carry, proj);
+    let mut n = reply_projected_from(&mut frame, cid, 200, tail, value, carry, proj);
     if n == 0 {
         return None;
+    }
+    // `count_sel`'s verdict, at 48.
+    if let Some(sel) = selected {
+        let v: &[u8] = if sel { b"1" } else { b"" };
+        n = put_field(&mut frame, n, 48, TY_BYTES, v)?;
+        frame[0] = frame[0].wrapping_add(1);
     }
     let mut fields = [dec::Field {
         number: 0,
@@ -896,7 +1255,79 @@ unsafe fn count_child(
     let mut spent = 0u64;
     let cont = &s.cw_cont[..s.cw_len as usize];
     dec::run_decision_metered(cont, &params, &mut builder, &mut scratch, &mut spent).ok()?;
-    Some(!builder.message().fields.is_empty())
+    // A message counts the child; one whose field 1 is a number counts it
+    // THAT much — a sum (a Pod's requests), where a count is a sum of ones.
+    let msg = builder.message();
+    if msg.fields.is_empty() {
+        return Some(0);
+    }
+    let weight = msg
+        .fields
+        .iter()
+        .find(|f| f.number == 1)
+        .map_or(1, |f| match f.value {
+            dec::Value::Int(v) => v,
+            _ => 1,
+        });
+    Some(weight)
+}
+
+/// `count_sel` over one child: the selector and the labels, each from the
+/// request (`@<n>`) or the child (a dotted path), judged as upstream reads
+/// a label selector. None when `count_sel` is not set.
+fn count_sel_of(s: &State, req: &[u8], child: &[u8]) -> Option<bool> {
+    if s.count_sel_len == 0 {
+        return None;
+    }
+    let spec = s.count_sel.get(..s.count_sel_len as usize).unwrap_or(&[]);
+    let bar = spec.iter().position(|&b| b == b'|')?;
+    // `@<n>` is the request's field n; `@<n>.<path>` a path inside it (a
+    // document the request carries).
+    let side = |one: &'_ [u8]| -> Option<&'_ [u8]> {
+        let num_path = one.strip_prefix(b"@")?;
+        let dot = num_path
+            .iter()
+            .position(|&b| b == b'.')
+            .unwrap_or(num_path.len());
+        let mut n = 0u32;
+        for &c in num_path.get(..dot).unwrap_or(&[]) {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + u32::from(c - b'0');
+        }
+        let v = match frame_field(req, n.min(255) as u8) {
+            Some((TY_BYTES, v)) => v,
+            _ => return None,
+        };
+        match num_path.get(dot + 1..) {
+            Some(path) if !path.is_empty() => {
+                let mut segs: [&[u8]; 6] = [&[]; 6];
+                let ns = split_dots(path, &mut segs);
+                j_sub(v, &segs[..ns])
+            }
+            _ => Some(v),
+        }
+    };
+    let sel_spec = spec.get(..bar).unwrap_or(&[]);
+    let lab_spec = spec.get(bar + 1..).unwrap_or(&[]);
+    let from_child = |path: &[u8]| -> Option<&[u8]> {
+        let mut segs: [&[u8]; 6] = [&[]; 6];
+        let ns = split_dots(path, &mut segs);
+        j_sub(child, &segs[..ns])
+    };
+    let sel = if sel_spec.first() == Some(&b'@') {
+        side(sel_spec)
+    } else {
+        from_child(sel_spec)
+    };
+    let labels = if lab_spec.first() == Some(&b'@') {
+        side(lab_spec)
+    } else {
+        from_child(lab_spec)
+    };
+    let sel = sel.filter(|v| !v.is_empty() && jp_kind(v) == b'{');
+    Some(sk_selects(sel, labels.unwrap_or(b"{}")))
 }
 
 /// The fused decision decided nothing for a record: it read a field the
@@ -1657,8 +2088,9 @@ fn same_identity(a: &[u8], b: &[u8], sch: &[u8]) -> bool {
 
 /// store_big — this source built with `big` — takes a heap arena: a staged
 /// request body read whole to be written, or an object past a record read
-/// whole to be projected. store_stamped (`stamp_heap`) takes a small one for
-/// the stamped writes of a controller's objects. store_effect takes none.
+/// whole to be projected, or a template spliced into a controller's write.
+/// store_stamped (`stamp_heap`) takes a smaller one: one controller object
+/// read whole, or stamped. store_effect takes none.
 #[allow(
     unexpected_cfgs,
     reason = "`big` and `stamp_heap` are store_big's and store_stamped's features; this file is also store_effect, whose build declares neither"
@@ -1670,18 +2102,22 @@ mod arena {
     pub extern "C" fn module_arena_size() -> u32 {
         16 << 20
     }
-    /// store_stamped: a controller's object stamped and kept on the heap —
-    /// the object, the stamp patch and the stored object it keeps from, at
-    /// the largest object a write carries, with room to spare.
+    /// store_stamped: ONE controller object on the heap at a time — read
+    /// whole to be projected (a Pod's hash, a ReplicaSet's spec digest), or
+    /// stamped and kept from the stored one: an object up to `DOC_MAX`, the
+    /// API's largest (a whole read grows in place on a fresh heap). A write
+    /// that SPLICES a template (`splice_value`) holds its source, the value
+    /// and the stamp's copies at once, and is store_big's.
     #[cfg(feature = "stamp_heap")]
     #[no_mangle]
     #[link_section = ".text.module_arena_size"]
     pub extern "C" fn module_arena_size() -> u32 {
-        512 << 10
+        4 << 20
     }
 }
 
-/// How long a deleted object's last state stays for a watch to carry.
+/// How long a deleted object's last state stays for a watch to carry
+/// (`tomb_ms`, default).
 const TOMB_MS: u64 = 300_000;
 
 /// Leave `value` as `key`'s tombstone (see `tomb`). A tomb past a record
@@ -1700,7 +2136,8 @@ unsafe fn leave_tomb(s: &State, sys: &Store, key: &[u8], value: &[u8]) {
     // The deadline as a moment (`_shared/tomb.rs`), drawn through the
     // journal: a held delete asks again the tomb it first asked.
     let mut moment = [0u8; 64];
-    let ml = tomb_deadline(sys, TOMB_MS, &mut moment);
+    let ttl = u64::from(s.tomb_ms);
+    let ml = tomb_deadline(sys, ttl, &mut moment);
     let deadline = moment.get(..ml).unwrap_or(&[]);
     // Sequential appends, never an array of byte-string literals: such an
     // array's pointers are not relocated in a PIC module.
@@ -1728,7 +2165,7 @@ unsafe fn leave_tomb(s: &State, sys: &Store, key: &[u8], value: &[u8]) {
     l = append(v, l, b"}");
     // Its expiry index first ([`put_tomb_at`]): no tomb without the entry
     // that ends it.
-    if put_tomb_at(sys, &s.tomb[..tl], key, deadline, TOMB_MS, value) {
+    if put_tomb_at(sys, &s.tomb[..tl], key, deadline, ttl, value, None) {
         let _ = put_value(sys, &tk[..tl + key.len()], v.get(..l).unwrap_or(&[]));
     }
     if !heap.is_null() {
@@ -1864,8 +2301,19 @@ mod params_def {
                 if n > 0 { ptr_copy(s.tomb.as_mut_ptr(), d, n); }
             };
 
+        // How long a tomb stays, ms (default TOMB_MS).
+        48, tomb_ms, u32, 300000
+            => |s, d, len| { s.tomb_ms = super::p_u32(d, len, 0, super::TOMB_MS as u32).max(1); };
+
         16, append_cap, u32, 1024
             => |s, d, len| { s.append_cap = super::p_u32(d, len, 0, 1024); };
+
+        47, append_tally, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 0 } else { len };
+                s.append_tally_len = n as u8;
+                if n > 0 { ptr_copy(s.append_tally.as_mut_ptr(), d, n); }
+            };
 
         17, echo, str, 0
             => |s, d, len| {
@@ -1910,6 +2358,16 @@ mod params_def {
         // The per-child decision OP_COUNT counts by, a `blob` like `decision`.
         21, count_where, blob, 0
             => |s, d, len| { s.cw_in.take(&mut s.cw_cont, core::slice::from_raw_parts(d, len)); };
+
+        46, doc, u32, 0
+            => |s, d, len| { s.doc = super::p_u32(d, len, 0, 0); };
+
+        45, count_sel, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 0 } else { len };
+                s.count_sel_len = n as u8;
+                if n > 0 { ptr_copy(s.count_sel.as_mut_ptr(), d, n); }
+            };
 
         22, wall, u32, 0
             => |s, d, len| { s.wall = super::p_u32(d, len, 0, 0); };
@@ -1974,6 +2432,8 @@ pub unsafe extern "C" fn module_new(
         s.cw_in = dec::BlobIn::new();
         s.cw_len = 0;
         s.cw_fault = 0;
+        s.count_sel_len = 0;
+        s.doc = 0;
         s.wall = 0;
         s.tomb_len = 0;
         s.blob_len = 0;
@@ -2240,6 +2700,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         } else {
             value
         };
+        // SPLICE (`splice_value`): subtrees copied from a stored document.
+        let mut spliced: *mut u8 = core::ptr::null_mut();
+        let mut splice_status = 0i64;
+        let value: &[u8] = match frame_field(req, F_SPLICE) {
+            Some((TY_BYTES, spec)) if !spec.is_empty() && op != OP_NOOP => {
+                match splice_value(sys, req, spec) {
+                    Ok((p, n)) => {
+                        spliced = p;
+                        core::slice::from_raw_parts(p, n)
+                    }
+                    Err(st) => {
+                        splice_status = st;
+                        value
+                    }
+                }
+            }
+            _ => value,
+        };
         // The graph configures WHERE this connector writes; a record carries the
         // key TAIL (what `store_source` emits), so the convention stays in the
         // deployment rather than in a decision that would have to concatenate.
@@ -2387,11 +2865,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // each branch that knows it; 0 = absent or not asked.
         let mut rev: u64 = 0;
         let flen = if op == OP_NOOP {
-            reply_projected(&mut out, cid, 204, &[], carry, &proj)
+            // `doc`: the record's own document is what a NOOP's ints read.
+            match frame_field(req, s.doc.min(255) as u8) {
+                Some((TY_BYTES, doc)) if s.doc != 0 => {
+                    let ints_only = Projection {
+                        paths: &[],
+                        ints: proj.ints,
+                        flat: proj.flat,
+                        hash: &[],
+                    };
+                    let n = reply_projected_from(&mut out, cid, 204, &[], doc, carry, &ints_only);
+                    // The paths, empty, at their numbers: a layout that
+                    // shifted would be misread.
+                    reply_paths_empty(&mut out, n, proj.paths)
+                }
+                _ => reply_projected(&mut out, cid, 204, &[], carry, &proj),
+            }
         } else if staged_bad {
             // The body it names is gone (collected) or could not be held:
             // writing the reference itself as the object would be a lie.
             reply_projected(&mut out, cid, 500, &[], carry, &proj)
+        } else if splice_status != 0 {
+            // What it splices from is gone, or could not be held: a write
+            // without its template would be another object.
+            reply_projected(&mut out, cid, splice_status, &[], carry, &proj)
         } else if key.is_empty() {
             // A request that names no key is malformed, not a 404: answering
             // 404 would let a caller mistake a broken frame for an absent
@@ -2856,7 +3353,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if cl.is_none() {
                         // Unreadable is not absent: an object past a record
                         // exists, and a caller told 404 would take it as gone.
-                        let status = if exists(sys, key) { 413 } else { 404 };
+                        // Where this build has a heap (store_stamped,
+                        // store_big) it is patched there: a controller's
+                        // status lands on its object whatever the size of
+                        // the template it carries.
+                        let status = if !exists(sys, key) {
+                            404
+                        } else {
+                            patch_whole(sys, key, &segs[..ns], val)
+                        };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else if el == 0 {
                         s.malformed = s.malformed.wrapping_add(1);
@@ -2881,6 +3386,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut walk = ListWalk::new(key);
                     let mut n = 0i64;
                     let mut bad = s.cw_fault != 0;
+                    // The last child the predicate kept (its key tail):
+                    // answered at 46 — WHICH one, when the count is one.
+                    let mut last = [0u8; MAX_KEY];
+                    let mut last_len = 0usize;
                     while !bad {
                         let Some(k) = walk.next(sys) else {
                             break;
@@ -2897,14 +3406,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         match get_value(sys, child, &mut v) {
                             Some(vl) => {
                                 let tail = child.get(key.len()..).unwrap_or(&[]);
-                                match count_child(s, cid, tail, &v[..vl], carry, &proj) {
-                                    Some(true) => n += 1,
-                                    Some(false) => {}
+                                let selected = count_sel_of(s, req, &v[..vl]);
+                                match count_child(s, cid, tail, &v[..vl], carry, &proj, selected) {
+                                    Some(w) => {
+                                        if w != 0 {
+                                            last_len = tail.len().min(MAX_KEY);
+                                            for (d, &c) in last.iter_mut().zip(tail.iter()) {
+                                                *d = c;
+                                            }
+                                        }
+                                        n = n.saturating_add(w);
+                                    }
                                     None => bad = true,
                                 }
                             }
-                            // Gone since it was listed: not there to count.
-                            None => bad = exists(sys, child),
+                            // Past the stack: counted from a heap copy where
+                            // this build has one (store_stamped, store_big) —
+                            // a Pod with a real template is a Pod. Gone since
+                            // it was listed: not there to count.
+                            None if exists(sys, child) => match read_whole(sys, child, DOC_MAX) {
+                                Some((p, pn)) => {
+                                    let doc = core::slice::from_raw_parts(p, pn);
+                                    let tail = child.get(key.len()..).unwrap_or(&[]);
+                                    let selected = count_sel_of(s, req, doc);
+                                    let got =
+                                        count_child(s, cid, tail, doc, carry, &proj, selected);
+                                    heap_free(sys, p);
+                                    match got {
+                                        Some(w) => {
+                                            if w != 0 {
+                                                last_len = tail.len().min(MAX_KEY);
+                                                for (d, &c) in last.iter_mut().zip(tail.iter()) {
+                                                    *d = c;
+                                                }
+                                            }
+                                            n = n.saturating_add(w);
+                                        }
+                                        None => bad = true,
+                                    }
+                                }
+                                None => bad = true,
+                            },
+                            None => {}
                         }
                     }
                     let status = if bad || walk.failed { 500 } else { 200 };
@@ -2913,7 +3456,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         match put_field(&mut out, q, 45, TY_I64, &n.to_le_bytes()) {
                             Some(q2) => {
                                 out[0] += 1;
-                                q2
+                                match put_field(
+                                    &mut out,
+                                    q2,
+                                    46,
+                                    TY_BYTES,
+                                    last.get(..last_len).unwrap_or(&[]),
+                                ) {
+                                    Some(q3) => {
+                                        out[0] += 1;
+                                        q3
+                                    }
+                                    None => q2,
+                                }
                             }
                             None => 0,
                         }
@@ -2944,6 +3499,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     } else {
                         500
                     };
+                    if status == 200 {
+                        append_tally(
+                            sys,
+                            &s.append_tally[..s.append_tally_len as usize],
+                            key,
+                            value.len(),
+                        );
+                    }
                     reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
                 OP_PUT if s.stamp != 0 && key.last() != Some(&b'/') && jp_kind(value) == b'{' => {
@@ -3015,6 +3578,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let _ = done(delete_value(sys, one));
                         }
                     }
+                    reply_projected(&mut out, cid, 200, &[], carry, &proj)
+                }
+                OP_PUT_FAMILY => {
+                    let mut ok = true;
+                    let mut wrote = false;
+                    let (o, w) = put_guarded(sys, key, value);
+                    ok &= o;
+                    wrote |= w;
+                    let mut pre = [0u8; MAX_KEY];
+                    let pn = append(&mut pre, 0, key);
+                    let pn = append(&mut pre, pn, b"~");
+                    if pn == key.len() + 1 {
+                        let mut walk = ListWalk::new(pre.get(..pn).unwrap_or(&[]));
+                        let mut k = [0u8; MAX_KEY];
+                        while let Some(one) = walk.next(sys) {
+                            let kl = one.len().min(MAX_KEY);
+                            for (d, &c) in k.iter_mut().zip(one.iter()) {
+                                *d = c;
+                            }
+                            let (o, w) = put_guarded(sys, k.get(..kl).unwrap_or(&[]), value);
+                            ok &= o;
+                            wrote |= w;
+                        }
+                        ok &= !walk.failed;
+                    }
+                    let status = if !ok {
+                        500
+                    } else if wrote {
+                        200
+                    } else {
+                        204
+                    };
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
+                }
+                OP_DELETE_FAMILY => {
+                    drop_family(sys, key);
                     reply_projected(&mut out, cid, 200, &[], carry, &proj)
                 }
                 OP_TAKE => {
@@ -3116,6 +3715,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         };
         if !staged.is_null() {
             heap_free(sys, staged);
+        }
+        if !spliced.is_null() {
+            heap_free(sys, spliced);
         }
         if s.journal.held() {
             // A write of this record is undecided: nothing is answered, and

@@ -4,25 +4,31 @@
 //
 // Four stages, because a PUT-if-changed with rollout history is three store
 // operations that depend on one read:
-//   read     GET the current ReplicaSet (hash + spec projected)
+//   read     GET the current ReplicaSet (hashes projected)
 //   archive  on a template change, PUT the old spec to controllerrevisions
 //   write    PUT the ReplicaSet, unless nothing changed
 //   record   the ScalingReplicaSet event, from the write's own reply
+//
+// The SPEC never rides the chain. A real Deployment's template (env,
+// volumes, probes, resources) is kilobytes: carried in the context it
+// overflowed the decision's 512 B scratch (no ReplicaSet past ~430 B of
+// spec), and past a record it cannot cross at all. The chain carries the
+// spec's DIGEST to decide with, and the writers SPLICE the bytes from the
+// stored object (store_effect fields 70/71) — the archive from the current
+// ReplicaSet, the write from the Deployment — whatever their size.
 module nanocloud.deployment {
 
   // The context each chain here carries across its effects: ONE nested
   // message in the reserved carry field (254), echoed unchanged by every
-  // connector. Inner numbers are the old carry-through numbers, so every
-  // module that hands a context on agrees on it.
+  // connector. Small and bounded: names and digests, never the spec.
   // carried by: dp.Read, dp.Cur, dp.Arch, dp.Arched, dp.Write, dp.Written
   message Ctx {
     key: string = 30;
-    spec: string = 31;
-    hash: string = 32;
+    shash: string = 31;   // FNV-1a of the Deployment's spec
+    hash: string = 32;    // FNV-1a of spec.template: the pod-template-hash
     evt: string = 33;
     ns: string = 34;
     name: string = 35;
-    labels: string = 36;  // spec.template.metadata.labels, an opaque subtree
     ouid: string = 37;    // the Deployment's metadata.uid: its ReplicaSet's controller reference
   }
 
@@ -30,10 +36,9 @@ module nanocloud.deployment {
     seq: int = 1;
     rev: int = 2;
     key: string = 3;      // "<ns>/<name>" — the ReplicaSet has the SAME tail
-    spec: string = 4;     // spec, an opaque subtree — becomes the RS spec
+    shash: string = 4;    // spec!hash — the spec's digest, never its bytes
     replicas: string = 5; // spec.replicas; empty = not a projectable Deployment
-    labels: string = 6;   // spec.template.metadata.labels, an opaque subtree
-    uid: string = 7;      // metadata.uid, the ReplicaSet's controller reference
+    uid: string = 6;      // metadata.uid, the ReplicaSet's controller reference
     ns: string = 28;      // the key's namespace segment — NOT metadata.namespace,
     name: string = 29;    // which a CLI-written document does not carry
     hash: string = 27;    // FNV-1a of spec.template, from the source
@@ -51,23 +56,26 @@ module nanocloud.deployment {
     cid: int = 1;
     status: int = 2;
     value: string = 3;
-    cur_hash: string = 40; // metadata.labels.pod-template-hash on the current RS
-    cur_spec: string = 41; // its spec
+    cur_hash: string = 40;  // metadata.labels.pod-template-hash on the current RS
+    cur_shash: string = 41; // spec!hash: its spec's digest (a spliced copy of
+                            // the Deployment's, so equal digests = equal specs)
     ctx: Ctx = 254;
   }
 
   // Stage 2: archive the previous spec on a template change. The verdict for
-  // the WRITE is decided here too, from the same read, and rides as `c_evt`:
+  // the WRITE is decided here too, from the same read, and rides as `evt`:
   //   create  no ReplicaSet yet
   //   roll    template changed (hash differs) — archive first
   //   scale   same template, spec differs (a replicas edit)
   //   ""      nothing changed — the write stage does nothing
+  // The archive's value is SPLICED from the current ReplicaSet: its spec.
   message dp.Arch {
     cid: int = 1;
     op: int = 2;
     key: string = 3;    // "<ns>/<name>" under /controllerrevisions.apps/
     xk: string = 17;    // "/previous"
-    v1: string = 4;     // the old spec
+    src: string = 70;   // splice source: "<ns>/<name>"
+    splice: string = 71;
     ctx: Ctx = 254;
   }
   message dp.Arched {
@@ -77,7 +85,9 @@ module nanocloud.deployment {
     ctx: Ctx = 254;
   }
 
-  // Stage 3: the ReplicaSet document, as value parts the connector joins.
+  // Stage 3: the ReplicaSet document, as value parts the connector joins,
+  // with the template's labels (members) and the Deployment's spec SPLICED
+  // in before p12 and p13 (fields 15 and 16).
   message dp.Write {
     cid: int = 1;
     op: int = 2;
@@ -85,7 +95,10 @@ module nanocloud.deployment {
     p1: string = 4;   p2: string = 5;   p3: string = 6;
     p4: string = 7;   p5: string = 8;   p6: string = 9;
     p7: string = 10;  p8: string = 11;  p9: string = 12;
-    p10: string = 13; p11: string = 14;
+    p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    src: string = 70;
+    splice: string = 71;
     ctx: Ctx = 254;
   }
   message dp.Written {
@@ -114,20 +127,22 @@ module nanocloud.deployment {
   decision read(d: dp.Dep) -> dp.Read {
     // A Deployment must declare spec.replicas to project a ReplicaSet.
     when d.replicas == "" ->
-      dp.Read { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name, labels: d.labels, ouid: d.uid } };
+      dp.Read { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, shash: d.shash, hash: d.hash, ns: d.ns, name: d.name, ouid: d.uid } };
     default ->
-      dp.Read { cid: d.seq, op: GET, key: d.key, ctx: Ctx { key: d.key, spec: d.spec, hash: d.hash, ns: d.ns, name: d.name, labels: d.labels, ouid: d.uid } };
+      dp.Read { cid: d.seq, op: GET, key: d.key, ctx: Ctx { key: d.key, shash: d.shash, hash: d.hash, ns: d.ns, name: d.name, ouid: d.uid } };
   }
 
   decision archive(c: dp.Cur) -> dp.Arch {
     when c.status == 404 ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "create", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels, ouid: c.ctx.ouid } };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", ctx: Ctx { key: c.ctx.key, shash: c.ctx.shash, hash: c.ctx.hash, evt: "create", ns: c.ctx.ns, name: c.ctx.name, ouid: c.ctx.ouid } };
     when c.status == 200 && c.cur_hash != c.ctx.hash ->
-      dp.Arch { cid: c.cid, op: PUT, key: c.ctx.key, xk: "/previous", v1: c.cur_spec, ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "roll", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels, ouid: c.ctx.ouid } };
-    when c.status == 200 && c.cur_spec != c.ctx.spec ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "scale", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels, ouid: c.ctx.ouid } };
+      dp.Arch { cid: c.cid, op: PUT, key: c.ctx.key, xk: "/previous",
+                src: c.ctx.key, splice: "/replicasets.apps/|0=spec",
+                ctx: Ctx { key: c.ctx.key, shash: c.ctx.shash, hash: c.ctx.hash, evt: "roll", ns: c.ctx.ns, name: c.ctx.name, ouid: c.ctx.ouid } };
+    when c.status == 200 && c.cur_shash != c.ctx.shash ->
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", ctx: Ctx { key: c.ctx.key, shash: c.ctx.shash, hash: c.ctx.hash, evt: "scale", ns: c.ctx.ns, name: c.ctx.name, ouid: c.ctx.ouid } };
     default ->
-      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", v1: "", ctx: Ctx { key: c.ctx.key, spec: c.ctx.spec, hash: c.ctx.hash, evt: "", ns: c.ctx.ns, name: c.ctx.name, labels: c.ctx.labels, ouid: c.ctx.ouid } };
+      dp.Arch { cid: c.cid, op: NOOP, key: "", xk: "", ctx: Ctx { key: c.ctx.key, shash: c.ctx.shash, hash: c.ctx.hash, evt: "", ns: c.ctx.ns, name: c.ctx.name, ouid: c.ctx.ouid } };
   }
 
   decision write(a: dp.Arched) -> dp.Write {
@@ -135,20 +150,8 @@ module nanocloud.deployment {
       dp.Write { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: a.ctx.key, evt: "", ns: a.ctx.ns, name: a.ctx.name } };
     // The ReplicaSet names its kind (a client decodes nothing without
     // apiVersion and kind) and carries the template's labels beside the
-    // hash, as the ReplicaSet controller labels it.
-    when a.ctx.labels != "" && a.ctx.labels != "{}" ->
-      dp.Write { cid: a.cid, op: PUT, key: a.ctx.key,
-                 p1: "{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"metadata\":{\"name\":\"",
-                 p2: a.ctx.name,
-                 p3: "\",\"namespace\":\"",
-                 p4: a.ctx.ns,
-                 p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"",
-                 p6: a.ctx.name,
-                 p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}],\"labels\":{\"pod-template-hash\":\"",
-                 p8: a.ctx.hash,
-                 p9: "\"," + a.ctx.labels.substring(1, a.ctx.labels.size() - 1) + "}},\"spec\":",
-                 p10: a.ctx.spec,
-                 p11: "}", ctx: Ctx { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, name: a.ctx.name } };
+    // hash, as the ReplicaSet controller labels it. A template without
+    // labels splices no members, and no comma before them.
     default ->
       dp.Write { cid: a.cid, op: PUT, key: a.ctx.key,
                  p1: "{\"apiVersion\":\"apps/v1\",\"kind\":\"ReplicaSet\",\"metadata\":{\"name\":\"",
@@ -157,11 +160,16 @@ module nanocloud.deployment {
                  p4: a.ctx.ns,
                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"",
                  p6: a.ctx.name,
-                 p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}],\"labels\":{\"pod-template-hash\":\"",
-                 p8: a.ctx.hash,
-                 p9: "\"}},\"spec\":",
-                 p10: a.ctx.spec,
-                 p11: "}", ctx: Ctx { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, name: a.ctx.name } };
+                 p7: "\",\"uid\":\"",
+                 p8: a.ctx.ouid,
+                 p9: "\",\"controller\":true,\"blockOwnerDeletion\":true}],\"labels\":{\"pod-template-hash\":\"",
+                 p10: a.ctx.hash,
+                 p11: "\"",
+                 p12: "}},\"spec\":",
+                 p13: "}",
+                 src: a.ctx.key,
+                 splice: "/deployments.apps/|15=,spec.template.metadata.labels.*;16=spec",
+                 ctx: Ctx { key: a.ctx.key, evt: a.ctx.evt, ns: a.ctx.ns, name: a.ctx.name } };
   }
 
   // One event for every change, as the module records it: k8s says
@@ -186,11 +194,11 @@ module nanocloud.deployment {
 
   transformation pass_dep(d: dp.Dep) -> dp.Dep {
     dp.Dep { seq: d.seq, rev: d.rev, key: d.key, ns: d.ns, name: d.name,
-             spec: d.spec, replicas: d.replicas, hash: d.hash }
+             shash: d.shash, replicas: d.replicas, uid: d.uid, hash: d.hash }
   }
   transformation pass_cur(c: dp.Cur) -> dp.Cur {
     dp.Cur { cid: c.cid, status: c.status, value: c.value,
-             cur_hash: c.cur_hash, cur_spec: c.cur_spec, ctx: c.ctx }
+             cur_hash: c.cur_hash, cur_shash: c.cur_shash, ctx: c.ctx }
   }
   transformation pass_arched(a: dp.Arched) -> dp.Arched {
     dp.Arched { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }

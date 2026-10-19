@@ -20,6 +20,7 @@
 //   @sum(path:k)       the sum of member k over them
 //   @age(path)         the time since the RFC 3339 timestamp at path, as
 //                      kubectl's HumanDuration prints it
+//   @jobstatus()       a Job's STATUS as kubectl prints it
 //
 // Every cell is a string, pre-rendered, so a client prints it as sent.
 
@@ -267,15 +268,42 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
                 .find(|e| j_get1(e, b"type").map(unq) == Some(b"Ready"))
                 .and_then(|e| j_get1(e, b"status"))
                 .map(unq);
-            put(
-                out,
-                at,
-                match status {
-                    Some(b"True") => b"Ready",
-                    Some(b"False") => b"NotReady",
-                    _ => b"Unknown",
-                },
-            )
+            let word: &[u8] = match status {
+                Some(b"True") => b"Ready",
+                Some(b"False") => b"NotReady",
+                _ => b"Unknown",
+            };
+            // A cordoned node (spec.unschedulable) says so, as kubectl does.
+            let cordoned = tbl_at(obj, b"spec.unschedulable") == Some(&b"true"[..]);
+            put(out, at, word) && (!cordoned || put(out, at, b",SchedulingDisabled"))
+        }
+        // kubectl's job STATUS (printJob): Failed, Complete, Suspended —
+        // the first of those conditions True — else Running.
+        b"jobstatus" => {
+            fn unq(v: &[u8]) -> &[u8] {
+                if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+                    &v[1..v.len() - 1]
+                } else {
+                    v
+                }
+            }
+            let list = tbl_sub(obj, b"status.conditions").unwrap_or(b"[]");
+            let holds = |t: &[u8]| {
+                jp_elems(list).any(|e| {
+                    j_get1(e, b"type").map(unq) == Some(t)
+                        && j_get1(e, b"status").map(unq) == Some(&b"True"[..])
+                })
+            };
+            let word: &[u8] = if holds(b"Failed") {
+                b"Failed"
+            } else if holds(b"Complete") {
+                b"Complete"
+            } else if holds(b"Suspended") {
+                b"Suspended"
+            } else {
+                b"Running"
+            };
+            put(out, at, word)
         }
         // kubectl's pod STATUS (printPod): the phase, or the Pod's own
         // reason, overridden by the last container's waiting reason

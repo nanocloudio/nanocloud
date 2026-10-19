@@ -28,6 +28,7 @@ MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
 PORT=5391
 AUTH_PORT=5392   # the same images, behind a Bearer challenge
 REALM_PORT=5393  # that challenge's token realm — another authority
+OTHER_PORT=5394  # another registry a reference names: asked by its own name
 
 . "$ROOT/scripts/fluxor-env.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then
@@ -42,11 +43,13 @@ done
 D="$(mktemp -d /tmp/nc-imgfetch-XXXXXX)"
 REG_PID=""
 AUTH_PID=""
+OTHER_PID=""
 RUNTIME_PID=""
 cleanup() {
   [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true
   [ -n "$REG_PID" ] && kill "$REG_PID" 2>/dev/null || true
   [ -n "$AUTH_PID" ] && kill "$AUTH_PID" 2>/dev/null || true
+  [ -n "$OTHER_PID" ] && kill "$OTHER_PID" 2>/dev/null || true
   rm -rf "$D"
 }
 trap cleanup EXIT
@@ -142,10 +145,11 @@ DCFG="$(sed -n 3p "$D/reg/digests.txt")"
 NCFG="$(sed -n 4p "$D/reg/digests.txt")"
 echo "   layers: $D1 (100K), $D2 (tiny); config: $DCFG ($NCFG B)"
 
-echo "== 2. start the registry stub (:$PORT) =="
+echo "== 2. start the registry stub (:$PORT), and another registry (:$OTHER_PORT) =="
 # Registry stub: GET /v2/<repo>/manifests/<tag> and /v2/<repo>/blobs/sha256:<hex>,
 # Content-Length framing, Connection: close (what http_fetch speaks).
-python3 - "$D/reg" "$PORT" >"$D/reg.log" 2>&1 <<'PY' &
+registry_stub() { # registry_stub <port> <log>
+python3 - "$D/reg" "$1" >"$2" 2>&1 <<'PY' &
 import http.server, os, socketserver, sys
 d, port = sys.argv[1], int(sys.argv[2])
 manifest = open(os.path.join(d, "manifest.json"), "rb").read()
@@ -200,10 +204,16 @@ class S(socketserver.ThreadingTCPServer):
 with S(("127.0.0.1", port), H) as srv:
     srv.serve_forever()
 PY
+}
+registry_stub "$PORT" "$D/reg.log"
 REG_PID=$!
-for i in $(seq 1 40); do
-  python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break
-  sleep 0.1
+registry_stub "$OTHER_PORT" "$D/other.log"
+OTHER_PID=$!
+for p in "$PORT" "$OTHER_PORT"; do
+  for i in $(seq 1 40); do
+    python3 -c "import socket;socket.create_connection(('127.0.0.1',$p),timeout=0.2).close()" 2>/dev/null && break
+    sleep 0.1
+  done
 done
 
 echo "== 3. the packaged image-pull graph, pointed at the stub and a temp cache =="
@@ -222,10 +232,13 @@ settle() { # settle <rk> <seconds> — resolved, every layer cached and marked
   done
   return 1
 }
-run_until() { # run_until <config> <modules> <name> <seconds>
+run_until() { # run_until <config> <modules> "<name>…" <seconds>
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$1" --modules "$2" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
-  settle "$3" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$3 never settled: digest '$(wal_last "/image-digests/$3")'"; }
+  local n
+  for n in $3; do
+    settle "$n" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$n never settled: digest '$(wal_last "/image-digests/$n")'"; }
+  done
   sleep 1
   kill "$RUNTIME_PID" 2>/dev/null || true
   wait "$RUNTIME_PID" 2>/dev/null || true
@@ -245,7 +258,10 @@ MD="$(cat "$D/reg/mdigest.txt")"
   || fail "the tag did not resolve to the manifest's digest: '$(wal_last /image-digests/testapp+latest)'"
 echo "   testapp:latest -> digest ${MD:0:12}… (the body's own sha256)"
 man="$(wal_last "/image-manifests/$MD")"
-[ "$man" = "repo=testapp;layers=$D1,$D2;sizes=102400,18;config=$DCFG;configsize=$NCFG;n=2" ] \
+# Where it came from rides on the manifest, for its config and its layers:
+# this node's registry (asked where the graph dials), the credentials' name,
+# and the pull whose Pods' imagePullSecrets apply.
+[ "$man" = "repo=testapp;layers=$D1,$D2;sizes=102400,18;config=$DCFG;configsize=$NCFG;n=2;host=;reg=localhost:$PORT;auth=testapp+latest" ] \
   || fail "manifest record wrong: got '$man'"
 echo "   manifest: $man"
 # The config blob is fetched + digest-verified like a layer, but lands as the
@@ -271,19 +287,23 @@ echo "== 7. a tag that names an INDEX: the arm64/linux entry, fetched by digest;
 wal_put "/image-requests/testapp+multi" "reg=;repo=testapp;tag=multi;pin="
 # A digest pin: fetched by that digest and verified against it.
 wal_put "/image-requests/testapp@$MD" "reg=;repo=testapp;tag=;pin=sha256:$MD"
-# Another registry than this node's: refused, never asked of this one.
-wal_put "/image-requests/other.example+5000~testapp+v1" "reg=other.example:5000;repo=testapp;tag=v1;pin="
-run_until "$D/config.bin" "$D/modules.bin" testapp+multi 20
+# Another registry than this node's: asked of THAT registry, by its name —
+# never of this one instead.
+wal_put "/image-requests/localhost+$OTHER_PORT~testapp+latest" "reg=localhost:$OTHER_PORT;repo=testapp;tag=latest;pin="
+run_until "$D/config.bin" "$D/modules.bin" "testapp+multi localhost+$OTHER_PORT~testapp+latest" 20
 [ "$(wal_last /image-index/testapp+multi)" = "digest=sha256:$MD" ] || fail "index: '$(wal_last /image-index/testapp+multi)'"
 [ "$(dig_of testapp+multi)" = "$MD" ] || fail "multi resolved to '$(wal_last /image-digests/testapp+multi)'"
 [ "$(dig_of "testapp@$MD")" = "$MD" ] || fail "pinned digest: '$(wal_last "/image-digests/testapp@$MD")'"
 grep -q "GET /v2/testapp/manifests/sha256:$MD " "$D/reg.log" || fail "the pin was not fetched by digest"
-case "$(wal_last /image-digests/other.example+5000~testapp+v1)" in
-  "refused=registry other.example:5000 is not this node's registry localhost:$PORT"*) : ;;
-  *) fail "foreign registry: '$(wal_last /image-digests/other.example+5000~testapp+v1)'" ;;
+[ "$(dig_of "localhost+$OTHER_PORT~testapp+latest")" = "$MD" ] \
+  || fail "another registry's reference: '$(wal_last "/image-digests/localhost+$OTHER_PORT~testapp+latest")'"
+grep -q "GET /v2/testapp/manifests/latest " "$D/other.log" || fail "the other registry was not asked"
+[ "$(grep -c "GET /v2/testapp/manifests/latest " "$D/reg.log")" = 1 ] || fail "another registry's reference was asked of this one"
+case "$(wal_last "/image-manifests/$MD")" in
+  *";host=localhost:$OTHER_PORT;reg=localhost:$OTHER_PORT;"*|*";host=;reg=localhost:$PORT;"*) : ;;
+  *) fail "manifest source: '$(wal_last "/image-manifests/$MD")'" ;;
 esac
-grep -q "manifests/v1" "$D/reg.log" && fail "a foreign reference was pulled from this registry"
-echo "   foreign registry refused: $(wal_last /image-digests/other.example+5000~testapp+v1 | cut -c1-80)…"
+echo "   localhost:$OTHER_PORT/testapp:latest -> asked of localhost:$OTHER_PORT by name, sha256:${MD:0:12}…"
 echo "   pin sha256:${MD:0:12}… fetched by digest and verified"
 [ "$(grep -c "blobs/sha256:$D1" "$D/reg.log" || true)" = "$N1" ] || fail "a cached layer was fetched again"
 [ -z "$(python3 - "$D/store.log" <<'PY'

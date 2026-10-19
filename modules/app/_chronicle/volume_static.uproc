@@ -1,0 +1,135 @@
+// Statically provisioned PersistentVolumes, bound as upstream's binder binds
+// a pre-bound pair: a PersistentVolume naming its claim (`spec.claimRef`), or
+// a PersistentVolumeClaim naming its volume (`spec.volumeName`, the volume
+// naming no other claim). A volume whose source is a directory on the node —
+// `hostPath` or `local` — becomes the claim's record, `/volumes/<ns>/<claim>`
+// `path=<dir>;pv=<volume>`, which volume.uproc binds into every Pod that
+// mounts the claim, as it does an encrypted volume's mount; and the claim's
+// status says Bound. (An encrypted volume is provisioned and bound by
+// volume_provision.uproc, its claim record written by its attach pipeline.)
+//
+//   pv     /persistentvolumes/<pv> with a claimRef and a directory
+//          -> PUT /volumes/<ns>/<claim>, then the claim's status.phase Bound
+//   pvc    /persistentvolumeclaims/<ns>/<claim> with spec.volumeName -> GET
+//          the volume -> the same, when the volume names no other claim
+// A claim's record is written, never withdrawn here: a volume deleted from
+// under a claim leaves it bound to what it was, as upstream's leaves the
+// claim Bound to a volume that is gone (Lost) until it is deleted.
+module nanocloud.volume_static {
+
+  // carried by: vs.Put, vs.Done, vs.Get, vs.Got
+  message Ctx {
+    ns: string = 30;
+    claim: string = 31;
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum PATCH = 5;
+
+  message vs.Pv {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // the volume's name
+    cns: string = 4;       // spec.claimRef.namespace
+    cname: string = 5;     // spec.claimRef.name
+    hpath: string = 6;     // spec.hostPath.path
+    lpath: string = 7;     // spec.local.path
+  }
+  message vs.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    ctx: Ctx = 254;
+  }
+  decision pv(p: vs.Pv) -> vs.Put {
+    when p.cns != "" && p.cname != "" && p.hpath != "" ->
+      vs.Put { cid: p.seq, op: PUT, key: p.cns, k2: "/", k3: p.cname, v1: "path=", v2: p.hpath, v3: ";pv=", v4: p.key,
+               ctx: Ctx { ns: p.cns, claim: p.cname } };
+    when p.cns != "" && p.cname != "" && p.lpath != "" ->
+      vs.Put { cid: p.seq, op: PUT, key: p.cns, k2: "/", k3: p.cname, v1: "path=", v2: p.lpath, v3: ";pv=", v4: p.key,
+               ctx: Ctx { ns: p.cns, claim: p.cname } };
+    default ->
+      vs.Put { cid: p.seq, op: NOOP, key: "", k2: "", k3: "", v1: "", ctx: Ctx { ns: "", claim: "" } };
+  }
+
+  message vs.Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  message vs.Patch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    v1: string = 4;
+    path: string = 19;
+  }
+  // The claim's status: Bound, once its record is written (store_effect
+  // PATCH: the value placed verbatim, a JSON string; unchanged spends no
+  // revision).
+  decision bound(d: vs.Done) -> vs.Patch {
+    when (d.status == 200 || d.status == 204) && has(d.ctx.claim) && d.ctx.claim != "" ->
+      vs.Patch { cid: d.cid, op: PATCH, key: d.ctx.ns, k2: "/", k3: d.ctx.claim, v1: "\"Bound\"", path: "status.phase" };
+    default ->
+      vs.Patch { cid: d.cid, op: NOOP, key: "", k2: "", k3: "", v1: "", path: "" };
+  }
+
+  message vs.Pvc {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // "<ns>/<claim>"
+    vname: string = 4;     // spec.volumeName
+    ns: string = 28;
+    name: string = 29;
+  }
+  message vs.Get {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  decision ask(c: vs.Pvc) -> vs.Get {
+    when c.vname != "" ->
+      vs.Get { cid: c.seq, op: GET, key: c.vname, ctx: Ctx { ns: c.ns, claim: c.name } };
+    default ->
+      vs.Get { cid: c.seq, op: NOOP, key: "", ctx: Ctx { ns: "", claim: "" } };
+  }
+  message vs.Got {
+    cid: int = 1;
+    status: int = 2;
+    hpath: string = 40;    // the volume's spec.hostPath.path
+    lpath: string = 41;    //   spec.local.path
+    cns: string = 42;      //   spec.claimRef.namespace
+    cname: string = 43;    //   spec.claimRef.name
+    ctx: Ctx = 254;
+  }
+  decision claim(g: vs.Got) -> vs.Put {
+    when g.status == 200 && (g.cname == "" || (g.cname == g.ctx.claim && g.cns == g.ctx.ns)) && g.hpath != "" ->
+      vs.Put { cid: g.cid, op: PUT, key: g.ctx.ns, k2: "/", k3: g.ctx.claim, v1: "path=", v2: g.hpath, v3: ";pv=", v4: "",
+               ctx: g.ctx };
+    when g.status == 200 && (g.cname == "" || (g.cname == g.ctx.claim && g.cns == g.ctx.ns)) && g.lpath != "" ->
+      vs.Put { cid: g.cid, op: PUT, key: g.ctx.ns, k2: "/", k3: g.ctx.claim, v1: "path=", v2: g.lpath, v3: ";pv=", v4: "",
+               ctx: g.ctx };
+    default ->
+      vs.Put { cid: g.cid, op: NOOP, key: "", k2: "", k3: "", v1: "", ctx: Ctx { ns: "", claim: "" } };
+  }
+
+  pipeline vs_pv(p: vs.Pv) -> vs.Put { call x = pv(p); return x; }
+  pipeline vs_bound(d: vs.Done) -> vs.Patch { call x = bound(d); return x; }
+  pipeline vs_ask(c: vs.Pvc) -> vs.Get { call x = ask(c); return x; }
+  pipeline vs_claim(g: vs.Got) -> vs.Put { call x = claim(g); return x; }
+  entry vs_pv = vs_pv;
+  entry vs_bound = vs_bound;
+  entry vs_ask = vs_ask;
+  entry vs_claim = vs_claim;
+  provenance revision "volume-static" toolchain "chronicle-authoring";
+}

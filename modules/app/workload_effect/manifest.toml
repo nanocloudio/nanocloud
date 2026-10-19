@@ -24,7 +24,10 @@ hardware_targets = ["bcm2712", "linux"]
 #                 14 env (`NAME=VALUE`, `,`-separated, each escaped; a later
 #                 entry overrides an earlier of its name)  15 host (HOSTNAME)
 #                 16 wd (the cwd)  17 iwd (the cwd when 16 is empty)
-#                 18 user (`uid[:gid]` | `name[:group]`) — the process gets
+#                 18 user (`uid[:gid]` | `name[:group]`, or
+#                 `<that>/<runAsUser>/<runAsGroup>`: composed as upstream's
+#                 runtime composes a securityContext with the image's User,
+#                 a runAsGroup alone keeping the image's uid) — the process gets
 #                 exactly HOSTNAME, that env and a default PATH when it names
 #                 none, never the runtime's environment; 14-18 escaped `%XX`
 #                 19 cpu (millicores)  20 mem (bytes)  21 eph (bytes): the

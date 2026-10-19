@@ -4,8 +4,8 @@
 // A reference is resolved to a DIGEST, and everything pulled is keyed by
 // it: a tag names a manifest only until it is moved, a digest names it for
 // good. So a request (/image-requests/<rk>: reg, repo, tag, pin) is done
-// when /image-digests/<rk> says which manifest it names — `digest=<hex>`, or
-// `refused=<why>` for one this node does not pull — and the manifest, its
+// when /image-digests/<rk> says which manifest it names — `digest=<hex>` —
+// and the manifest, its
 // config, its layers' markers and its rootfs are all /…/<hex>. <rk> is the
 // reference's store-key spelling (`!ikey`, shared by every Pod that may use
 // what is cached), or one Pod's uid when its imagePullPolicy is Always: its
@@ -20,12 +20,17 @@
 //
 //   qm   /image-requests/<rk> with no /image-digests/<rk> -> the manifest row,
 //        by tag — or by digest, pinned or once an index has named the
-//        platform manifest (/image-index/<rk>) — or, for a reference that
-//        names another registry than this node's (the source's `label`),
-//        /image-digests/<rk> refused=…: never pulled from this one instead
+//        platform manifest (/image-index/<rk>). Every row names where it is
+//        asked (`host`: a reference naming another registry than this
+//        node's, the source's `label`, is asked of THAT registry, by its
+//        name; empty: where the graph dials), the registry whose credentials
+//        answer a challenge (`reg`) and the pull whose Pods' imagePullSecrets
+//        are offered (`auth`, image_auth.uproc); the manifest record keeps
+//        them for its config and layer rows
 //   qc   a manifest whose config is not recorded -> the config row
-//   le,lr each layer of a manifest (the flat list, expanded): present in the
-//        blob cache -> /image-layer-ok/<hex>-<i>; absent -> the layer row
+//   lm,le,lr each layer of a manifest (the flat list, expanded), the manifest
+//        still there (image GC removes it first): present in the blob cache
+//        -> /image-layer-ok/<m>-<i> (hex=<hex>); absent -> the layer row
 //   fq   a queue row -> the GET: a manifest or config answered as the JSON
 //        members this needs (and the body's own digest), a layer landed as
 //        a sha256-verified file. Each names the record that means it is
@@ -33,11 +38,13 @@
 //        the wire. A row backing off (`due` ahead) is not asked yet
 //   ans  the answer -> /image-manifests/<hex> (repo, layers, sizes, config,
 //        configsize, n; kind=workload for a fluxor workload image),
-//        /image-index/<rk> (an index: the arm64/linux entry),
+//        /image-index/<rk> (an index: the entry for the node's platform —
+//        none for it is the pull's failure, "no matching manifest for …"),
 //        /image-config/<hex> (the runtime contract, escaped lists),
 //        /image-blobs/<hex>; a 304 deletes the row
 //   tg   a manifest recorded -> /image-digests/<rk> digest=<hex>: the
-//        request resolved, after what it names exists
+//        request resolved, after what it names exists; a dropped blob's row
+//        (`d-<hex>`, image GC) done -> the row removed
 //   bo   (image_back.uproc) a GET that failed (no answer from the
 //        registry — connect, TLS or a transport failure — or an HTTP
 //        refusal: 5xx, 404, 401, …) -> the
@@ -67,6 +74,9 @@ module nanocloud.image {
     repo: string = 32;
     size: string = 33;
     at: string = 34;
+    host: string = 35;     // the registry dialled ("": this node's)
+    reg: string = 36;      // the registry's name (its credentials')
+    auth: string = 37;     // the pull whose Pods' secrets apply (<rk>)
   }
   // carried by: Get, Ans
   message Ctx2 {
@@ -78,6 +88,10 @@ module nanocloud.image {
     fails: int = 35;       // the row's failures so far
     now: int = 36;         // when it was asked (the source's clock)
     of: string = 37;       // a layer's manifest (the pull it fails)
+    plat: string = 38;     // the platform an index is read for (linux/arm64/v8)
+    host: string = 39;
+    reg: string = 40;
+    auth: string = 41;
   }
   enum NOOP = 0;
   enum GET = 1;
@@ -87,6 +101,7 @@ module nanocloud.image {
   enum MERGE = 6;
   enum REPLY = 1;
   enum FILE = 2;
+  enum DROP = 3;
 
   // ---- the queue writers ----
   message Req {
@@ -106,34 +121,50 @@ module nanocloud.image {
     k2: string = 17;
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
     v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
-    v11: string = 14; v12: string = 15;
+    v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80; v15: string = 81;
+    v16: string = 82;
   }
+  // The manifest row: by the digest an index named, by a pinned digest, or
+  // by tag. Every row names where it is asked (`host`: the reference's own
+  // registry, dialled by its name; empty for this node's, dialled where the
+  // graph says), whose credentials answer a challenge (`reg`: the registry's
+  // name, a Secret's `auths` key) and whose Pods' imagePullSecrets offer
+  // them (`auth`: this request, <rk>).
   decision qm(r: Req) -> Row {
-    // Another registry's image is not this registry's: refused, visibly
-    // (the Pod's event, pod_image.uproc), never fetched from here instead.
-    when r.reg != "" && r.reg != r.lbl ->
-      Row { cid: r.seq, op: PUT, key: "/image-digests/", k2: r.key,
-            v1: "refused=registry ", v2: r.reg, v3: " is not this node's registry ", v4: r.lbl,
-            v5: " (no other registry is configured)", v6: "", v7: "", v8: "", v9: "", v10: "",
-            v11: "", v12: "" };
+    when r.digest.startsWith("sha256:") && r.digest.size() == 71 && r.reg != "" && r.reg != r.lbl ->
+      Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
+            v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";digest=",
+            v6: r.digest.substring(7), v7: ";path=/v2/", v8: r.repo, v9: "/manifests/", v10: r.digest,
+            v11: ";reg=", v12: r.reg, v13: ";host=", v14: r.reg, v15: ";auth=", v16: r.key };
     when r.digest.startsWith("sha256:") && r.digest.size() == 71 ->
       Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
             v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";digest=",
             v6: r.digest.substring(7), v7: ";path=/v2/", v8: r.repo, v9: "/manifests/", v10: r.digest,
-            v11: "", v12: "" };
+            v11: ";reg=", v12: r.lbl, v13: ";host=", v14: "", v15: ";auth=", v16: r.key };
+    when r.pin.startsWith("sha256:") && r.pin.size() == 71 && r.reg != "" && r.reg != r.lbl ->
+      Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
+            v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";digest=",
+            v6: r.pin.substring(7), v7: ";path=/v2/", v8: r.repo, v9: "/manifests/", v10: r.pin,
+            v11: ";reg=", v12: r.reg, v13: ";host=", v14: r.reg, v15: ";auth=", v16: r.key };
     when r.pin.startsWith("sha256:") && r.pin.size() == 71 ->
       Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
             v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";digest=",
             v6: r.pin.substring(7), v7: ";path=/v2/", v8: r.repo, v9: "/manifests/", v10: r.pin,
-            v11: "", v12: "" };
+            v11: ";reg=", v12: r.lbl, v13: ";host=", v14: "", v15: ";auth=", v16: r.key };
+    when r.tag != "" && r.reg != "" && r.reg != r.lbl ->
+      Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
+            v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";path=/v2/",
+            v6: r.repo, v7: "/manifests/", v8: r.tag, v9: ";reg=", v10: r.reg,
+            v11: ";host=", v12: r.reg, v13: ";auth=", v14: r.key, v15: "", v16: "" };
     when r.tag != "" ->
       Row { cid: r.seq, op: MERGE, key: "/image-fetch-q/m-", k2: r.key,
             v1: "kind=m;name=", v2: r.key, v3: ";repo=", v4: r.repo, v5: ";path=/v2/",
-            v6: r.repo, v7: "/manifests/", v8: r.tag, v9: "", v10: "", v11: "", v12: "" };
+            v6: r.repo, v7: "/manifests/", v8: r.tag, v9: ";reg=", v10: r.lbl,
+            v11: ";host=", v12: "", v13: ";auth=", v14: r.key, v15: "", v16: "" };
     default ->
       Row { cid: r.seq, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
-            v11: "", v12: "" };
+            v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
   }
 
   message Man {
@@ -142,17 +173,21 @@ module nanocloud.image {
     repo: string = 4;
     config: string = 5;
     csize: string = 6;
+    host: string = 7;
+    reg: string = 8;
+    auth: string = 9;
   }
   decision qc(m: Man) -> Row {
     when m.config == "" ->
       Row { cid: m.seq, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
-            v11: "", v12: "" };
+            v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
     default ->
       Row { cid: m.seq, op: MERGE, key: "/image-fetch-q/c-", k2: m.key,
             v1: "kind=c;name=", v2: m.key, v3: ";path=/v2/", v4: m.repo,
             v5: "/blobs/sha256:", v6: m.config, v7: ";digest=", v8: m.config,
-            v9: ";size=", v10: m.csize, v11: "", v12: "" };
+            v9: ";size=", v10: m.csize, v11: ";host=", v12: m.host, v13: ";reg=", v14: m.reg,
+            v15: ";auth=", v16: m.auth };
   }
 
   message Lay {
@@ -161,6 +196,9 @@ module nanocloud.image {
     repo: string = 4;
     hex: string = 5;       // layers.#
     size: string = 6;      // sizes.#
+    host: string = 7;
+    reg: string = 8;
+    auth: string = 9;
     at: string = 21;       // the index, as digits
   }
   message Ask {
@@ -170,16 +208,25 @@ module nanocloud.image {
     k2: string = 17;
     ctx: Ctx = 254;
   }
-  decision le(l: Lay) -> Ask {
+  // The manifest still there: a layer is marked for a manifest that is, and
+  // a record scanned before image GC removed it marks nothing after.
+  decision lm(l: Lay) -> Ask {
     when l.hex == "" ->
-      Ask { cid: l.seq, op: NOOP, key: "", k2: "", ctx: Ctx { name: "", hex: "", repo: "", size: "", at: "" } };
+      Ask { cid: l.seq, op: NOOP, key: "", k2: "", ctx: Ctx { name: "", hex: "", repo: "", size: "", at: "", host: "", reg: "", auth: "" } };
     default ->
-      Ask { cid: l.seq, op: EXISTS, key: "/image-blobs/", k2: l.hex, ctx: Ctx { name: l.key, hex: l.hex, repo: l.repo, size: l.size, at: l.at } };
+      Ask { cid: l.seq, op: EXISTS, key: "/image-manifests/", k2: l.key,
+            ctx: Ctx { name: l.key, hex: l.hex, repo: l.repo, size: l.size, at: l.at, host: l.host, reg: l.reg, auth: l.auth } };
   }
   message Have {
     cid: int = 1;
     status: int = 2;
     ctx: Ctx = 254;
+  }
+  decision le(h: Have) -> Ask {
+    when h.status == 200 && h.ctx.hex != "" ->
+      Ask { cid: h.cid, op: EXISTS, key: "/image-blobs/", k2: h.ctx.hex, ctx: h.ctx };
+    default ->
+      Ask { cid: h.cid, op: NOOP, key: "", k2: "", ctx: Ctx { name: "", hex: "", repo: "", size: "", at: "", host: "", reg: "", auth: "" } };
   }
   message Row2 {
     cid: int = 1;
@@ -190,28 +237,32 @@ module nanocloud.image {
     k4: string = 25;
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
     v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
-    v11: string = 14; v12: string = 15;
+    v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80; v15: string = 81;
+    v16: string = 82; v17: string = 83; v18: string = 84;
   }
+  // A cached layer is marked present for its manifest, naming the layer —
+  // what image GC counts a blob's other users by (image_gc.uproc).
   decision lr(h: Have) -> Row2 {
     when h.status == 200 ->
       Row2 { cid: h.cid, op: PUT, key: "/image-layer-ok/", k2: h.ctx.name, k3: "-", k4: h.ctx.at,
-             v1: "1", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
-             v11: "", v12: "" };
+             v1: "hex=", v2: h.ctx.hex, v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+             v11: "", v12: "", v13: "", v14: "", v15: "", v16: "", v17: "", v18: "" };
     when h.status == 404 ->
       Row2 { cid: h.cid, op: MERGE, key: "/image-fetch-q/l-", k2: h.ctx.hex, k3: "", k4: "",
              v1: "kind=l;name=", v2: h.ctx.hex, v3: ";path=/v2/", v4: h.ctx.repo,
              v5: "/blobs/sha256:", v6: h.ctx.hex, v7: ";digest=", v8: h.ctx.hex,
-             v9: ";size=", v10: h.ctx.size, v11: ";of=", v12: h.ctx.name };
+             v9: ";size=", v10: h.ctx.size, v11: ";of=", v12: h.ctx.name,
+             v13: ";host=", v14: h.ctx.host, v15: ";reg=", v16: h.ctx.reg, v17: ";auth=", v18: h.ctx.auth };
     default ->
       Row2 { cid: h.cid, op: NOOP, key: "", k2: "", k3: "", k4: "",
              v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
-             v11: "", v12: "" };
+             v11: "", v12: "", v13: "", v14: "", v15: "", v16: "", v17: "", v18: "" };
   }
 
   // ---- the fetch ----
   message Q {
     seq: int = 1;
-    key: string = 3;       // the row: m-<n>, c-<n>, l-<hex>
+    key: string = 3;       // the row: m-<n>, c-<n>, l-<hex>, d-<hex>
     kind: string = 4;
     name: string = 5;
     path: string = 6;
@@ -219,6 +270,10 @@ module nanocloud.image {
     repo: string = 8;
     ssize: string = 9;     // size, as text (carried to the marker)
     of: string = 10;       // a layer's manifest
+    host: string = 11;     // the registry dialled ("": this node's)
+    reg: string = 12;      // the registry's name, for its credentials
+    auth: string = 13;     // the pull whose Pods' imagePullSecrets apply
+    facts: string = 49;    // the node's labels (`"kubernetes.io/arch":"arm64",…`)
     size: int = 50;
     fails: int = 51;       // failures so far (0: none)
     due: int = 52;         // not asked again before this (0: now)
@@ -235,35 +290,68 @@ module nanocloud.image {
     skip2: string = 22;
     size: int = 13;
     q0: string = 14; q1: string = 15; q2: string = 16; q3: string = 17; q4: string = 18; q5: string = 19;
-    q6: string = 20;
+    q6: string = 20; q7: string = 21;
+    host: string = 23;
+    reg: string = 24;
+    auth: string = 25;
     ctx: Ctx2 = 254;
   }
+  // A manifest is asked with the node's own platform: an index (a tag for
+  // several platforms) answers with the digest of its first entry for linux
+  // and the node's architecture (`kubernetes.io/arch` in the source's
+  // `facts`, arm64 when the render stated none) — arm64 taking a `v8`
+  // variant or none, as containerd matches it — and how many entries it
+  // has, so an index with none for this node is told apart from an answer
+  // that is not a manifest.
   decision fq(q: Q) -> Get {
     // Backing off: not yet. A deadline further ahead than the longest delay
     // was set by a clock that restarted with the node, and is due now.
     when q.due > q.now && q.due - q.now <= 300000 ->
       Get { cid: q.seq, sink: 0, path: "", accept: "", file: "", sha: "", skip: "", skip2: "",
-            size: 0, q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", q6: "",
-            ctx: Ctx2 { q: "", kind: "", name: "", repo: "", size: "", fails: 0, now: 0, of: "" } };
+            size: 0, q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", q6: "", q7: "", host: "", reg: "", auth: "",
+            ctx: Ctx2 { q: "", kind: "", name: "", repo: "", size: "", fails: 0, now: 0, of: "", plat: "", host: "", reg: "", auth: "" } };
+    when q.kind == "m" && q.facts.indexOf("\"kubernetes.io/arch\":\"") >= 0 && !q.facts.substring(math.least(q.facts.size(), math.greatest(0, q.facts.indexOf("\"kubernetes.io/arch\":\"")) + 22)).startsWith("arm64\"") ->
+      Get { cid: q.seq, sink: REPLY, path: q.path,
+            accept: "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
+            file: "", sha: q.digest, skip: "/image-digests/", skip2: q.name, size: 0,
+            q0: "layers[].digest!tag", q1: "layers[].size", q2: "config.digest!tag",
+            q3: "config.size", q4: "manifests[platform.architecture=" + q.facts.substring(math.least(q.facts.size(), math.greatest(0, q.facts.indexOf("\"kubernetes.io/arch\":\"")) + 22)).substring(0, math.greatest(0, q.facts.substring(math.least(q.facts.size(), math.greatest(0, q.facts.indexOf("\"kubernetes.io/arch\":\"")) + 22)).indexOf("\""))) + "&platform.os=linux].digest",
+            q5: "layers[]#", q6: "artifactType", q7: "manifests[]#", host: q.host, reg: q.reg, auth: q.auth,
+            ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
+                        plat: "linux/" + q.facts.substring(math.least(q.facts.size(), math.greatest(0, q.facts.indexOf("\"kubernetes.io/arch\":\"")) + 22)).substring(0, math.greatest(0, q.facts.substring(math.least(q.facts.size(), math.greatest(0, q.facts.indexOf("\"kubernetes.io/arch\":\"")) + 22)).indexOf("\""))), host: q.host, reg: q.reg, auth: q.auth } };
     when q.kind == "m" ->
       Get { cid: q.seq, sink: REPLY, path: q.path,
             accept: "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
             file: "", sha: q.digest, skip: "/image-digests/", skip2: q.name, size: 0,
             q0: "layers[].digest!tag", q1: "layers[].size", q2: "config.digest!tag",
-            q3: "config.size", q4: "manifests[platform.architecture=arm64&platform.os=linux].digest",
-            q5: "layers[]#", q6: "artifactType", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of } };
+            q3: "config.size", q4: "manifests[platform.architecture=arm64&platform.os=linux&platform.variant?=v8].digest",
+            q5: "layers[]#", q6: "artifactType", q7: "manifests[]#", host: q.host, reg: q.reg, auth: q.auth,
+            ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
+                        plat: "linux/arm64/v8", host: q.host, reg: q.reg, auth: q.auth } };
     when q.kind == "c" ->
       Get { cid: q.seq, sink: REPLY, path: q.path, accept: "",
             file: "", sha: q.digest, skip: "/image-config/", skip2: q.name, size: q.size,
             q0: "config.Entrypoint[]", q1: "config.Cmd[]", q2: "config.Env[]",
-            q3: "config.WorkingDir!esc", q4: "config.User!esc", q5: "", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of } };
+            q3: "config.WorkingDir!esc", q4: "config.User!esc", q5: "", q6: "", q7: "", host: q.host, reg: q.reg, auth: q.auth,
+            ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
+                        plat: "", host: q.host, reg: q.reg, auth: q.auth } };
     when q.kind == "l" ->
       Get { cid: q.seq, sink: FILE, path: q.path, accept: "",
             file: q.name, sha: q.digest, skip: "/image-blobs/", skip2: q.name, size: q.size,
-            q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of } };
+            q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", q6: "", q7: "", host: q.host, reg: q.reg, auth: q.auth,
+            ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
+                        plat: "", host: q.host, reg: q.reg, auth: q.auth } };
+    // A blob image GC dropped (image_gc.uproc): its file removed from the
+    // cache by the connector that keeps it, no byte on the wire.
+    when q.kind == "d" && q.name.size() == 64 ->
+      Get { cid: q.seq, sink: DROP, path: "", accept: "", file: q.name, sha: "", skip: "", skip2: "", size: 0,
+            q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", q6: "", q7: "", host: "", reg: "", auth: "",
+            ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: "", size: "", fails: q.fails, now: q.now, of: "",
+                        plat: "", host: "", reg: "", auth: "" } };
     default ->
       Get { cid: q.seq, sink: 0, path: "", accept: "", file: "", sha: "", skip: "", skip2: "",
-            size: 0, q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", ctx: Ctx2 { q: "", kind: "", name: "", repo: "", size: "", fails: 0, now: 0, of: "" } };
+            size: 0, q0: "", q1: "", q2: "", q3: "", q4: "", q5: "", q6: "", q7: "", host: "", reg: "", auth: "",
+            ctx: Ctx2 { q: "", kind: "", name: "", repo: "", size: "", fails: 0, now: 0, of: "", plat: "", host: "", reg: "", auth: "" } };
   }
 
   message Ans {
@@ -272,6 +360,7 @@ module nanocloud.image {
     sha: string = 5;       // the body's own sha256 (a manifest's digest)
     a0: string = 40; a1: string = 41; a2: string = 42; a3: string = 43; a4: string = 44; a5: string = 45;
     a6: string = 46;       // artifactType
+    a7: string = 47;       // an index's entries, counted
     ctx: Ctx2 = 254;
   }
   // carried by: Put, Done, Back, Fail — the request a manifest resolves;
@@ -286,6 +375,7 @@ module nanocloud.image {
     st: int = 36;          // the answer's status (0: no answer at all)
     fails: int = 37;       // the row's failures, this one counted
     now: int = 38;
+    why: string = 39;      // the failure in words, when the status does not say it
   }
   message Put {
     cid: int = 1;
@@ -294,13 +384,14 @@ module nanocloud.image {
     k2: string = 17;
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
     v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13; v11: string = 14; v12: string = 15;
+    v13: string = 16; v14: string = 80; v15: string = 81; v16: string = 82; v17: string = 83; v18: string = 84;
     ctx: Ctx3 = 254;
   }
   decision ans(a: Ans) -> Put {
     when a.status == 304 ->
       Put { cid: a.cid, op: DELETE, key: "/image-fetch-q/", k2: a.ctx.q,
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0 } };
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0, why: "" } };
     // A fluxor workload image (its FLXA, then a `.fmod` per module): marked,
     // so it is staged as a pack rather than assembled into a rootfs.
     when a.status == 200 && a.ctx.kind == "m" && a.a0 != "" && a.sha.size() == 64
@@ -308,25 +399,40 @@ module nanocloud.image {
       Put { cid: a.cid, op: PUT, key: "/image-manifests/", k2: a.sha,
             v1: "repo=", v2: a.ctx.repo, v3: ";layers=", v4: a.a0, v5: ";sizes=", v6: a.a1,
             v7: ";config=", v8: a.a2, v9: ";configsize=", v10: a.a3, v11: ";kind=workload;n=", v12: a.a5,
-            ctx: Ctx3 { rk: a.ctx.name, dig: a.sha, q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0 } };
+            v13: ";host=", v14: a.ctx.host, v15: ";reg=", v16: a.ctx.reg, v17: ";auth=", v18: a.ctx.auth,
+            ctx: Ctx3 { rk: a.ctx.name, dig: a.sha, q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
     when a.status == 200 && a.ctx.kind == "m" && a.a0 != "" && a.sha.size() == 64 ->
       Put { cid: a.cid, op: PUT, key: "/image-manifests/", k2: a.sha,
             v1: "repo=", v2: a.ctx.repo, v3: ";layers=", v4: a.a0, v5: ";sizes=", v6: a.a1,
             v7: ";config=", v8: a.a2, v9: ";configsize=", v10: a.a3, v11: ";n=", v12: a.a5,
-            ctx: Ctx3 { rk: a.ctx.name, dig: a.sha, q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0 } };
+            v13: ";host=", v14: a.ctx.host, v15: ";reg=", v16: a.ctx.reg, v17: ";auth=", v18: a.ctx.auth,
+            ctx: Ctx3 { rk: a.ctx.name, dig: a.sha, q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
     when a.status == 200 && a.ctx.kind == "m" && a.a4 != "" ->
       Put { cid: a.cid, op: PUT, key: "/image-index/", k2: a.ctx.name,
             v1: "digest=", v2: a.a4, v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0 } };
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0, why: "" } };
     when a.status == 200 && a.ctx.kind == "c" ->
       Put { cid: a.cid, op: PUT, key: "/image-config/", k2: a.ctx.name,
             v1: "entrypoint=", v2: a.a0, v3: ";cmd=", v4: a.a1, v5: ";env=", v6: a.a2,
             v7: ";workdir=", v8: a.a3, v9: ";user=", v10: a.a4, v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0 } };
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
     when a.status == 200 && a.ctx.kind == "l" ->
       Put { cid: a.cid, op: PUT, key: "/image-blobs/", k2: a.ctx.name,
             v1: "size=", v2: a.ctx.size, v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.of, bad: "", ok: "1", st: a.status, fails: 0, now: 0 } };
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.of, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
+    // A dropped blob's file is gone (or was): its marker goes, then its row.
+    when a.status == 200 && a.ctx.kind == "d" && a.ctx.name.size() == 64 ->
+      Put { cid: a.cid, op: DELETE, key: "/image-blobs/", k2: a.ctx.name,
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: "", bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
+    // An index with no entry for this node's platform: the pull fails, and
+    // says which platform it has none for (upstream's words); it is asked
+    // again with the backoff, as the tag may be pushed for it later.
+    when a.status == 200 && a.ctx.kind == "m" && a.a0 == "" && a.a4 == "" && a.a7 != "" && a.a7 != "0" && a.ctx.q != "" ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: 0, fails: a.ctx.fails + 1, now: a.ctx.now,
+                        why: "no matching manifest for " + a.ctx.plat + " in the manifest list entries" } };
     // Anything else asked and not served — no answer (status 0: the
     // registry unreachable, the TLS handshake or the transfer failed), an
     // HTTP refusal, a body that is not what was asked — fails the GET:
@@ -336,19 +442,19 @@ module nanocloud.image {
     when a.ctx.q != "" && a.ctx.kind == "m" ->
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now } };
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now, why: "" } };
     when a.ctx.q != "" && a.ctx.kind == "c" ->
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now } };
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now, why: "" } };
     when a.ctx.q != "" ->
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.of, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now } };
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.of, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now, why: "" } };
     default ->
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
-            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0 } };
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0, why: "" } };
   }
   // The manifest's write answered (200 written, 204 already there): the
   // request names it. Written after the manifest, so a reader that finds the
@@ -367,6 +473,9 @@ module nanocloud.image {
     ctx: Ctx3 = 254;
   }
   decision tg(d: Done) -> Tag {
+    // A dropped blob's marker is gone: its row is done.
+    when d.ctx.q.startsWith("d-") && d.ctx.ok == "1" && (d.status == 200 || d.status == 204 || d.status == 404) ->
+      Tag { cid: d.cid, op: DELETE, key: "/image-fetch-q/", k2: d.ctx.q, v1: "", v2: "", ctx: d.ctx };
     when (d.status == 200 || d.status == 204) && d.ctx.rk != "" && d.ctx.dig != "" ->
       Tag { cid: d.cid, op: PUT, key: "/image-digests/", k2: d.ctx.rk, v1: "digest=", v2: d.ctx.dig, ctx: d.ctx };
     default ->
@@ -375,22 +484,28 @@ module nanocloud.image {
   transformation t_req(r: Req) -> Req {
     Req { seq: r.seq, key: r.key, reg: r.reg, repo: r.repo, tag: r.tag, pin: r.pin, lbl: r.lbl, digest: r.digest }
   }
-  transformation t_man(m: Man) -> Man { Man { seq: m.seq, key: m.key, repo: m.repo, config: m.config, csize: m.csize } }
-  transformation t_lay(l: Lay) -> Lay { Lay { seq: l.seq, key: l.key, repo: l.repo, hex: l.hex, size: l.size, at: l.at } }
+  transformation t_man(m: Man) -> Man {
+    Man { seq: m.seq, key: m.key, repo: m.repo, config: m.config, csize: m.csize, host: m.host, reg: m.reg, auth: m.auth }
+  }
+  transformation t_lay(l: Lay) -> Lay {
+    Lay { seq: l.seq, key: l.key, repo: l.repo, hex: l.hex, size: l.size, host: l.host, reg: l.reg, auth: l.auth, at: l.at }
+  }
   transformation t_have(h: Have) -> Have {
     Have { cid: h.cid, status: h.status, ctx: h.ctx }
   }
   transformation t_q(q: Q) -> Q {
     Q { seq: q.seq, key: q.key, kind: q.kind, name: q.name, path: q.path, digest: q.digest,
-        repo: q.repo, ssize: q.ssize, of: q.of, size: q.size, fails: q.fails, due: q.due, now: q.now }
+        repo: q.repo, ssize: q.ssize, of: q.of, host: q.host, reg: q.reg, auth: q.auth, facts: q.facts,
+        size: q.size, fails: q.fails, due: q.due, now: q.now }
   }
   transformation t_ans(a: Ans) -> Ans {
     Ans { cid: a.cid, status: a.status, sha: a.sha, a0: a.a0, a1: a.a1, a2: a.a2, a3: a.a3, a4: a.a4, a5: a.a5,
-          a6: a.a6, ctx: a.ctx }
+          a6: a.a6, a7: a.a7, ctx: a.ctx }
   }
   pipeline im_qm(r: Req) -> Row { call x = t_req(r); call y = qm(x); return y; }
   pipeline im_qc(m: Man) -> Row { call x = t_man(m); call y = qc(x); return y; }
-  pipeline im_le(l: Lay) -> Ask { call x = t_lay(l); call y = le(x); return y; }
+  pipeline im_lm(l: Lay) -> Ask { call x = t_lay(l); call y = lm(x); return y; }
+  pipeline im_le(h: Have) -> Ask { call x = t_have(h); call y = le(x); return y; }
   pipeline im_lr(h: Have) -> Row2 { call x = t_have(h); call y = lr(x); return y; }
   pipeline im_fq(q: Q) -> Get { call x = t_q(q); call y = fq(x); return y; }
   transformation t_done(d: Done) -> Done { Done { cid: d.cid, status: d.status, ctx: d.ctx } }
@@ -398,6 +513,7 @@ module nanocloud.image {
   pipeline im_tg(d: Done) -> Tag { call x = t_done(d); call y = tg(x); return y; }
   entry im_qm = im_qm;
   entry im_qc = im_qc;
+  entry im_lm = im_lm;
   entry im_le = im_le;
   entry im_lr = im_lr;
   entry im_fq = im_fq;

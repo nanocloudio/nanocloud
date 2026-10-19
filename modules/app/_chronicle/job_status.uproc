@@ -1,0 +1,158 @@
+// A Job's .status and the end of its Pods, from its state at /job-ctl/
+// (job.uproc keeps that record).
+//
+//   status  /job-ctl/<ns>/<job> -> PATCH the Job's status, put-if-changed:
+//           active, succeeded, failed, ready, startTime, completionTime (a
+//           completed Job's only), completedIndexes (an Indexed one's, once
+//           complete), and the conditions upstream writes — Complete with
+//           SuccessCriteriaMet, Failed with FailureTarget (reason
+//           BackoffLimitExceeded or DeadlineExceeded), Suspended True/False.
+//           What `kubectl wait --for=condition=complete` reads.
+//   kill    a Job's active Pod -> GET its Job's /job-ctl/ -> DELETE it while
+//           the Job is suspended or finished (the deleting node leaves the
+//           Pod's tomb, which tells its node)
+//
+// Times are moments rendered by the source (`!wjts`): a JSON time, or null
+// while the node's clock is not trusted — never 1970.
+module nanocloud.jobstatus {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum DELETE = 4;
+  enum PATCH = 5;
+
+  message jb.St {
+    seq: int = 1;
+    key: string = 3;
+    a: string = 4;
+    s: string = 5;
+    f: string = 6;
+    r: string = 7;
+    fin: string = 8;
+    sp: string = 9;
+    t0: string = 10;      // JSON times (or null)
+    tf: string = 11;
+    ts: string = 12;
+    md: string = 13;
+    c: string = 14;
+    juid: string = 15;    // the Job's uid, as its /job-ctl/ record keeps it
+  }
+  message jb.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    v1: string = 4;  v2: string = 5;  v3: string = 6;  v4: string = 7;
+    v5: string = 8;  v6: string = 9;  v7: string = 10; v8: string = 11;
+    v9: string = 12; v10: string = 13; v11: string = 14; v12: string = 15;
+    v13: string = 16;
+    v14: string = 80; v15: string = 81; v16: string = 82; v17: string = 83;
+    v18: string = 84; v19: string = 85; v20: string = 86; v21: string = 87;
+    v22: string = 88; v23: int = 89; v24: string = 90;
+  }
+  decision st(j: jb.St) -> jb.Set {
+    when j.juid == "" || j.a == "" ->
+      jb.Set { cid: j.seq, op: NOOP, key: "", path: "" };
+    when j.fin == "Complete" && j.md == "Indexed" && int("0" + j.c) >= 1 ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0, v11: ",\"completionTime\":", v12: j.tf,
+               v13: ",\"conditions\":[{\"type\":\"SuccessCriteriaMet\",\"status\":\"True\",\"reason\":\"CompletionsReached\",\"message\":\"Reached expected number of succeeded pods\",\"lastProbeTime\":",
+               v14: j.tf, v15: ",\"lastTransitionTime\":", v16: j.tf,
+               v17: "},{\"type\":\"Complete\",\"status\":\"True\",\"reason\":\"CompletionsReached\",\"message\":\"Reached expected number of succeeded pods\",\"lastProbeTime\":",
+               v18: j.tf, v19: ",\"lastTransitionTime\":", v20: j.tf,
+               v22: "}],\"completedIndexes\":\"0-", v23: int("0" + j.c) - 1, v24: "\"}" };
+    when j.fin == "Complete" ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0, v11: ",\"completionTime\":", v12: j.tf,
+               v13: ",\"conditions\":[{\"type\":\"SuccessCriteriaMet\",\"status\":\"True\",\"reason\":\"CompletionsReached\",\"message\":\"Reached expected number of succeeded pods\",\"lastProbeTime\":",
+               v14: j.tf, v15: ",\"lastTransitionTime\":", v16: j.tf,
+               v17: "},{\"type\":\"Complete\",\"status\":\"True\",\"reason\":\"CompletionsReached\",\"message\":\"Reached expected number of succeeded pods\",\"lastProbeTime\":",
+               v18: j.tf, v19: ",\"lastTransitionTime\":", v20: j.tf, v21: "}]}" };
+    when j.fin == "BackoffLimitExceeded" ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0,
+               v13: ",\"conditions\":[{\"type\":\"FailureTarget\",\"status\":\"True\",\"reason\":\"BackoffLimitExceeded\",\"message\":\"Job has reached the specified backoff limit\",\"lastProbeTime\":",
+               v14: j.tf, v15: ",\"lastTransitionTime\":", v16: j.tf,
+               v17: "},{\"type\":\"Failed\",\"status\":\"True\",\"reason\":\"BackoffLimitExceeded\",\"message\":\"Job has reached the specified backoff limit\",\"lastProbeTime\":",
+               v18: j.tf, v19: ",\"lastTransitionTime\":", v20: j.tf, v21: "}]}" };
+    when j.fin == "DeadlineExceeded" ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0,
+               v13: ",\"conditions\":[{\"type\":\"FailureTarget\",\"status\":\"True\",\"reason\":\"DeadlineExceeded\",\"message\":\"Job was active longer than specified deadline\",\"lastProbeTime\":",
+               v14: j.tf, v15: ",\"lastTransitionTime\":", v16: j.tf,
+               v17: "},{\"type\":\"Failed\",\"status\":\"True\",\"reason\":\"DeadlineExceeded\",\"message\":\"Job was active longer than specified deadline\",\"lastProbeTime\":",
+               v18: j.tf, v19: ",\"lastTransitionTime\":", v20: j.tf, v21: "}]}" };
+    when j.sp == "1" ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r,
+               v13: ",\"conditions\":[{\"type\":\"Suspended\",\"status\":\"True\",\"reason\":\"JobSuspended\",\"message\":\"Job suspended\",\"lastProbeTime\":",
+               v14: j.ts, v15: ",\"lastTransitionTime\":", v16: j.ts, v21: "}]}" };
+    when j.sp == "0" ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0,
+               v13: ",\"conditions\":[{\"type\":\"Suspended\",\"status\":\"False\",\"reason\":\"JobResumed\",\"message\":\"Job resumed\",\"lastProbeTime\":",
+               v14: j.ts, v15: ",\"lastTransitionTime\":", v16: j.ts, v21: "}]}" };
+    default ->
+      jb.Set { cid: j.seq, op: PATCH, key: j.key, path: "status",
+               v1: "{\"active\":", v2: j.a, v3: ",\"succeeded\":", v4: j.s, v5: ",\"failed\":", v6: j.f,
+               v7: ",\"ready\":", v8: j.r, v9: ",\"startTime\":", v10: j.t0, v21: "}" };
+  }
+
+  // ---------------------------------------------------------------- kill ----
+  // carried by: jb.Ask, jb.Got
+  message KCtx {
+    pod: string = 30;     // "<ns>/<pod>"
+  }
+  message jb.KPod {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<pod>"
+    owner: string = 4;    // metadata.ownerReferences.0.name (a Job's: the source's `where`)
+    phase: string = 5;
+    del: string = 6;
+    ns: string = 28;
+  }
+  message jb.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: KCtx = 254;
+  }
+  message jb.Got {
+    cid: int = 1;
+    status: int = 2;
+    fin: string = 40;     // the Job's /job-ctl/ record (`paths`)
+    sp: string = 41;
+    ctx: KCtx = 254;
+  }
+  message jb.Kill {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  decision kq(p: jb.KPod) -> jb.Ask {
+    when p.owner != "" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" ->
+      jb.Ask { cid: p.seq, op: GET, key: "job-ctl/" + p.ns + "/" + p.owner, ctx: KCtx { pod: p.key } };
+    default ->
+      jb.Ask { cid: p.seq, op: NOOP, key: "", ctx: KCtx { pod: "" } };
+  }
+  decision kd(g: jb.Got) -> jb.Kill {
+    when g.status == 200 && g.ctx.pod != "" && (g.fin != "" || g.sp == "1") ->
+      jb.Kill { cid: g.cid, op: DELETE, key: "pods/" + g.ctx.pod };
+    default ->
+      jb.Kill { cid: g.cid, op: NOOP, key: "" };
+  }
+
+  pipeline st_p(j: jb.St) -> jb.Set { call x = st(j); return x; }
+  pipeline kq_p(p: jb.KPod) -> jb.Ask { call x = kq(p); return x; }
+  pipeline kd_p(g: jb.Got) -> jb.Kill { call x = kd(g); return x; }
+  entry st_p = st_p;
+  entry kq_p = kq_p;
+  entry kd_p = kd_p;
+  provenance revision "job-status" toolchain "chronicle-authoring";
+}

@@ -9,10 +9,10 @@
 #           404 -> DELETE
 #
 # The cross product is the SOURCE's (`join`) — the set-shaped sibling of the
-# count `expand` gave ReplicaSet — and nodeName is spliced into the template
-# through a `.*` members projection: the VM cannot open a brace, the source
-# can, once.
-# so "spec equal and hash equal" is "document equal".
+# count `expand` gave ReplicaSet. The decisions carry names and the
+# template's digest only; the writer SPLICES the template's labels,
+# annotations and spec (nodeName first) from the stored DaemonSet, whatever
+# their size.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +23,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_source store_scan store_effect store_big decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -77,77 +77,10 @@ print(n)
 PY
 }
 
-DEC_RDY="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
-DEC_PRB="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" prb)"
-DEC_MK="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" mk)"
-DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" ask_p)"
-DEC_PRN="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" prn)"
-for v in "$DEC_RDY" "$DEC_PRB" "$DEC_MK" "$DEC_ASK" "$DEC_PRN"; do
-  [ -n "$v" ] || { echo "FAIL: a daemonset.uproc entry did not compile"; exit 1; }
-done
-cat >"$D/graph.yaml" <<YAML
-target: linux
-tick_us: 1000
-scheduler:
-  accept_cycles: true
-modules:
-  # ready: the readiness projection
-  - name: nodes
-    type: store_source
-    prefix: "/nodes/"
-    paths: "status.ready"
-  - name: mark
-    type: store_effect
-    decision: {hex: "${DEC_RDY}"}
-    key_prefix: "/ready-nodes/"
-  # place: DaemonSets x ready Nodes
-  - name: ds_source
-    type: store_source
-    prefix: "/daemonsets.apps/"
-    paths: "spec.template.spec.*,metadata.uid"
-    join: "/ready-nodes/"
-    watch: "/ready-nodes/,/pods/"
-  - name: exists
-    type: store_effect
-    decision: {hex: "${DEC_PRB}"}
-    key_prefix: "/pods/"
-  - name: apply
-    type: store_effect
-    decision: {hex: "${DEC_MK}"}
-    key_prefix: "/pods/"
-  # prune: DaemonSet Pods on Nodes no longer ready
-  - name: pods
-    type: store_source
-    prefix: "/pods/"
-    paths: "metadata.ownerReferences.0.kind,spec.nodeName"
-    watch: "/ready-nodes/"
-  - name: known
-    type: store_effect
-    decision: {hex: "${DEC_ASK}"}
-    key_prefix: "/ready-nodes/"
-  - name: collect
-    type: store_effect
-    decision: {hex: "${DEC_PRN}"}
-    key_prefix: "/pods/"
-wiring:
-  - from: nodes.status
-    to: nodes.changes
-  - from: nodes.record_out
-    to: mark.request_in
-  - from: ds_source.status
-    to: ds_source.changes
-  - from: ds_source.record_out
-    to: exists.request_in
-  - from: exists.response_out
-    to: apply.request_in
-  - from: pods.status
-    to: pods.changes
-  - from: pods.record_out
-    to: known.request_in
-  - from: known.response_out
-    to: collect.request_in
-YAML
-
+# The chain as production runs it: the ds_ nodes of fluxor-controlplane.yaml
+# and their baked params (checked against daemonset.uproc by
+# chronicle-param-drift-e2e.sh).
+python3 "$ROOT/scripts/extract-fixture.py" "$D/graph.yaml" - ds_ >/dev/null
 run() { # run <seconds>
   nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
@@ -212,5 +145,50 @@ PY2
 run 6
 has "$(store_last /pods/default/log-node-1)" '"nodeName":"node-1"' || fail "log-node-1 not recreated"
 echo "   log-node-1 recreated"
+
+echo "== 5. a REAL template (> 4 KiB): each Pod carries it whole, labelled as upstream labels them =="
+BIG="$(python3 - <<'PYB'
+import json
+env = [{"name": "AGENT_SETTING_%02d" % i, "value": "value-%02d-abcdefghijklmnopqrstuvwxyz0123456789" % i} for i in range(48)]
+tmpl = {"metadata": {"labels": {"app": "agent", "tier": "node"},
+                     "annotations": {"example.com/note-%d" % i: "annotation %d of the agent" % i for i in range(8)}},
+        "spec": {"containers": [{"name": "agent", "image": "agent", "env": env,
+                                 "resources": {"requests": {"cpu": "50m", "memory": "32Mi"}}}],
+                 "tolerations": [{"operator": "Exists"}]}}
+assert len(json.dumps(tmpl, separators=(",", ":"))) >= 4096
+print(json.dumps({"apiVersion": "apps/v1", "kind": "DaemonSet",
+                  "metadata": {"name": "agent", "namespace": "default", "uid": "a9e5d000-0000-4000-8000-00000000a9e5"},
+                  "spec": {"selector": {"matchLabels": {"app": "agent"}}, "template": tmpl}},
+                 separators=(",", ":")))
+PYB
+)"
+store_put "/daemonsets.apps/default/agent" "$BIG"
+run 8
+python3 - "$(store_last /pods/default/agent-node-1)" "$(store_last /pods/default/agent-node-3)" "$BIG" <<'PYC' || fail "the large DaemonSet's Pods are not its template whole: $(store_last /pods/default/agent-node-1 | head -c 400)"
+import json, sys
+a, b, ds = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3])
+t = ds["spec"]["template"]
+hashes = set()
+for p, node in ((a, "node-1"), (b, "node-3")):
+    m = p["metadata"]
+    h = m["labels"].pop("controller-revision-hash")
+    assert len(h) == 8, h
+    hashes.add(h)
+    assert m["labels"] == t["metadata"]["labels"], m["labels"]
+    assert m["annotations"] == t["metadata"]["annotations"], m["annotations"]
+    r = m["ownerReferences"][0]
+    assert (r["kind"], r["name"], r["uid"], r["controller"]) == ("DaemonSet", "agent", ds["metadata"]["uid"], True), r
+    spec = dict(p["spec"])
+    assert spec.pop("nodeName") == node
+    assert spec == t["spec"], spec
+assert len(hashes) == 1
+print("   controller-revision-hash", hashes.pop())
+PYC
+echo "   agent-node-1, agent-node-3: the whole template (48 env, tolerations), its labels + controller-revision-hash, its annotations, owned"
+store_put "/nodes/node-3" '{"metadata":{"name":"node-3"},"status":{"ready":false}}'
+run 6
+[ -z "$(store_last /pods/default/agent-node-3)" ] || fail "agent-node-3 (a Pod past 4 KiB) was not pruned when node-3 went not-ready"
+[ -n "$(store_last /pods/default/agent-node-1)" ] || fail "agent-node-1 should remain"
+echo "   node-3 not ready: agent-node-3 (past 4 KiB) pruned, agent-node-1 kept"
 
 echo "== E2E green: DaemonSet as params — readiness projection, join-expanded create-if-absent, prune on node loss =="

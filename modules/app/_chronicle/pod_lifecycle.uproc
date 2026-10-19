@@ -16,6 +16,8 @@
 //   /sandbox-status/    state code                               (the world)
 //   /probe-status/      live                                     (liveness)
 //   /sandboxes/         cmd                    (does the artifact exist yet)
+//   /pod-init/<pod uid> failed                 (an init container failed
+//                                               for good: the Pod Failed)
 module nanocloud.podlifecycle {
 
   // The context each chain here carries across its effects: ONE nested
@@ -61,6 +63,9 @@ module nanocloud.podlifecycle {
     // boot describes a workload the restart already ended.
     boot: string = 110;
     sboot: string = 120;
+    // /pod-init/<pod uid> failed: an init container of the Pod failed and
+    // its restartPolicy (Never) does not run it again.
+    ifail: string = 130;
   }
 
   // The transition, as a MERGE of the fields that changed — never a PUT: this
@@ -92,6 +97,10 @@ module nanocloud.podlifecycle {
   // restart branch, so a pod being killed can never be relaunched by its
   // restartPolicy.
   decision step(d: pl.Rt) -> pl.Step {
+    // An init container failed for good: what waits behind it never runs,
+    // and the Pod has Failed, as upstream's does.
+    when d.desired != "deleted" && d.graph == "" && d.sb_cmd == "" && has(d.ifail) && d.ifail != "" ->
+      pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "", pod: "Failed", kill: "", rst: d.restarts, metal: "", podkey: d.pod } };
     // The artifact is not resolved yet (an image still pulling): report
     // Pending and project NO sandbox. What says so is the SANDBOX's argv,
     // not the spec's command: a container's command is only half of what an
@@ -225,7 +234,7 @@ module nanocloud.podlifecycle {
             restarts: d.restarts, was_terminal: d.was_terminal, now: d.now,
             cmd: d.cmd, desired: d.desired, restart: d.restart, rootfs: d.rootfs,
             graph: d.graph, grace: d.grace, state: d.state, code: d.code,
-            live: d.live, sb_cmd: d.sb_cmd }
+            live: d.live, sb_cmd: d.sb_cmd, ifail: d.ifail }
   }
   pipeline st(d: pl.Rt) -> pl.Step {
     call x = pass_rt(d);

@@ -62,6 +62,8 @@ struct State {
     table_len: u16,
     status_key: [u8; MAX_PARAM],
     status_key_len: u16,
+    node_addr: [u8; 16],
+    node_addr_len: u8,
     /// The status record owed to the store: written, and asked again each
     /// step until the store has decided it.
     status_val: [u8; 128],
@@ -108,6 +110,13 @@ mod params_def {
                 let n = if len > MAX_PARAM { 0 } else { len };
                 s.status_key_len = n as u16;
                 if n > 0 { ptr_copy(s.status_key.as_mut_ptr(), d, n); }
+            };
+
+        4, node_address, str, 0
+            => |s, d, len| {
+                let n = if len > 16 { 0 } else { len };
+                s.node_addr_len = n as u8;
+                if n > 0 { ptr_copy(s.node_addr.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -225,6 +234,13 @@ fn parse_port(b: &[u8]) -> Option<u16> {
     (1..=65535).contains(&v).then_some(v as u16)
 }
 
+/// The port a Pod names `name`: its `containerPort` in `nums`, aligned with
+/// `names` (`spec.containers.0.ports[].name` / `.containerPort`).
+fn named_port(names: &[u8], nums: &[u8], name: &[u8]) -> Option<u16> {
+    let i = names.split(|&c| c == b',').position(|n| n == name)?;
+    parse_port(nth(nums, i))
+}
+
 /// Kubernetes' protocol names; absent means TCP. SCTP has no rule here.
 fn parse_proto(b: &[u8]) -> Option<u8> {
     match b {
@@ -275,7 +291,23 @@ fn dir_of(b: &[u8]) -> Option<u8> {
 }
 
 /// Encode one row. False when the row is not one this grammar knows.
-fn encode(row: &[u8], out: &mut Out) -> bool {
+/// One DNAT record: `(proto, addr, port)` to `be:tport`.
+fn dnat(out: &mut Out, proto: u8, addr: u32, port: u16, be: u32, tport: u16) {
+    let len = wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND;
+    let mut r = [0u8; 2 + wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND];
+    r[0] = wire::rule::DNAT;
+    r[1] = len as u8;
+    r[2] = proto;
+    r[3..7].copy_from_slice(&addr.to_be_bytes());
+    r[7..9].copy_from_slice(&port.to_be_bytes());
+    r[9] = 1;
+    r[10..14].copy_from_slice(&be.to_be_bytes());
+    r[14..16].copy_from_slice(&tport.to_be_bytes());
+    out.push(&r);
+}
+
+/// Encode one row; `node` is this node's address (its node ports' target).
+fn encode(row: &[u8], out: &mut Out, node: Option<u32>) -> bool {
     let get = |t: &[u8]| field(row, t).unwrap_or(&[]);
     match get(b"kind=") {
         k @ (b"allow" | b"drop") => {
@@ -368,22 +400,25 @@ fn encode(row: &[u8], out: &mut Out) -> bool {
                 let tport = if tp.is_empty() || tp == b"-" {
                     vport
                 } else {
-                    match parse_port(tp) {
+                    // A number, or a name the backend's Pod gives a port
+                    // (its `pnames`/`pnums`); a name it does not have
+                    // leads nowhere on this backend.
+                    match parse_port(tp).or_else(|| named_port(get(b"pnames="), get(b"pnums="), tp))
+                    {
                         Some(p) => p,
-                        None => continue, // a named targetPort: unresolvable here
+                        None => continue,
                     }
                 };
-                let len = wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND;
-                let mut r = [0u8; 2 + wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND];
-                r[0] = wire::rule::DNAT;
-                r[1] = len as u8;
-                r[2] = proto;
-                r[3..7].copy_from_slice(&vip.to_be_bytes());
-                r[7..9].copy_from_slice(&vport.to_be_bytes());
-                r[9] = 1;
-                r[10..14].copy_from_slice(&be.to_be_bytes());
-                r[14..16].copy_from_slice(&tport.to_be_bytes());
-                out.push(&r);
+                dnat(out, proto, vip, vport, be, tport);
+                // The node's own address at the port's nodePort, and the
+                // load-balancer address at the port: the same backend.
+                let np = nth(get(b"nports="), i);
+                if let (Some(node), Some(np)) = (node, parse_port(np)) {
+                    dnat(out, proto, node, np, be, tport);
+                }
+                if let Some(lb) = parse_ip4(get(b"lbip=")) {
+                    dnat(out, proto, lb, vport, be, tport);
+                }
             }
             true
         }
@@ -450,6 +485,7 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
     let store = Store::plain(sys, &s.nag);
     let mut walk = ListWalk::new(&prefix[..prefix_len]);
     let mut skipped = 0u32;
+    let node = parse_ip4(&s.node_addr[..s.node_addr_len as usize]);
     while let Some(key) = walk.next(&store) {
         let mut k = [0u8; MAX_KEY];
         let kl = key.len().min(MAX_KEY);
@@ -458,7 +494,7 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
         let Some(n) = get_value(&store, &k[..kl], &mut row) else {
             continue;
         };
-        if !encode(&row[..n], &mut out) {
+        if !encode(&row[..n], &mut out, node) {
             skipped += 1;
         }
         if out.full {
@@ -581,6 +617,7 @@ pub unsafe extern "C" fn module_new(
         s.prefix_len = 0;
         s.table_len = 0;
         s.status_key_len = 0;
+        s.node_addr_len = 0;
         s.applied_hash = 0;
         s.applied_any = 0;
         s.applied = 0;

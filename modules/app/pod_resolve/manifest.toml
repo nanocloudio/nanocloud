@@ -1,0 +1,84 @@
+name = "pod_resolve"
+version = "0.1.0"
+description = "A scheduled Pod's containers as the node's asks — environment, command, user, volumes and order resolved by Kubernetes' rules"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The kubelet's half of a container's spec, done once on the control plane
+# (`_shared/podres.rs` is the transcription; this module is its I/O). A
+# container's environment is not a field of the Pod but a function of other
+# objects — ConfigMaps, Secrets, the namespace's Services, the node, the Pod's
+# own metadata — with `$(VAR)` expansion through it and through the command,
+# which no projection modifier can compute (each sees one value) and no
+# decision can (no iteration, 512-byte scratch). So the store_source walking
+# /pods/ hands each Pod here, and this reads what its containers name and
+# writes each container's node record.
+#
+# In (`request_in`, the control plane's store_source record over /pods/,
+# `ps_pods`): 3 the key `<ns>/<name>`, 4 metadata.uid, 5 spec.nodeName,
+# 8 metadata.deletionTimestamp, 9 spec.runtimeClassName. A Pod not yet
+# scheduled, or graph-backed (`runtimeClassName: fluxor`, whose record
+# pod_specs.uproc writes), is not this module's. Every record is passed on
+# unchanged at `forward_out` to that decision, which shares the source (one
+# store subscription for both).
+#
+# Out (`request_out`, store_effect requests, key_prefix `/`): one PUT
+# per container — `~node/<node>/pod-specs/<uid>` for the first app container,
+# `<uid>~c<n>` for app container n, `<uid>~i<n>` for init container n — the
+# flat record `node image pull restart grace desired cmd args env workdir
+# cpu mem eph pod rp_cmd ruid rgid nonroot volumes gate ctr paused cfgerr`
+# (see podres.rs); and each container's probes as `<node>/pod-probes/<id>`
+# (`rp_*` readiness, `lp_*` liveness, `sp_*` startup: an exec command, or an
+# httpGet / tcpSocket as the node's dialer runs it), deleted when it has
+# none; and a StatefulSet's Pod's claims (a volumeMount naming one of the
+# set's volumeClaimTemplates: `<template>-<pod>`) CREATEd from the template
+# when not there yet. A PUT that changes nothing is 204 and spends no revision,
+# so a Pod resolved again (every /pods/ change) costs a read, not a write. A
+# Pod with a container waiting on a ConfigMap or Secret is kept and resolved
+# again every 3 s, so it starts once that exists — at no store subscription
+# of its own. A container
+# Kubernetes would not create (a missing ConfigMap, a security setting the
+# node cannot give) carries `cfgerr`, and the node reports it as
+# CreateContainerConfigError instead of running it.
+#
+# A store read that answers EAGAIN is never absence: the Pod is resolved
+# again from its first container on a later step.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+required = true
+
+[[ports]]
+name = "forward_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+# The namespace's Services, listed.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[observability]
+exempt = "control-plane connector — discrete records in, store writes out"

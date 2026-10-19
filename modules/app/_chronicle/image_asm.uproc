@@ -1,17 +1,41 @@
 // Assembling a pulled image into a rootfs as params, over the sandbox seam.
 //
-//   as1  every layer of /image-manifests/<n> present (/image-layer-ok/<n>-*
-//        counted against n) and no /image-rootfs/<n> yet -> the assembly job
-//        at /sandboxes/img-asm-<n> (`/bin/sh <script> <rootfs>/<n> <blobs>
-//        <layer hex…>`); the job's terminal status -> /image-rootfs/<n>
-//        state=ready|failed
-//   as2  after the job is written -> /image-rootfs/<n> state=assembling;
-//        after the verdict -> the job rewritten phase=delete
+//   as1  what /image-manifests/<n> and its job stand at says what is next:
+//        - every layer present (/image-layer-ok/<n>-* counted against n) and
+//          no rootfs yet (or one due a retry: `state=retry`), its job gone
+//          -> the assembly job at /sandboxes/img-asm-<n> (`/bin/sh <script>
+//          <rootfs>/<n> <blobs> <layer hex…>`); a job left from an attempt
+//          before -> deleted first
+//        - the job's verdict, while `state=assembling`:
+//            exit 0  -> /image-rootfs/<n> `path=…;state=ready`
+//            exit 65 (a cached layer missing, or not its digest: the cache,
+//                    not the image) -> /image-blob-bad/asm-<n> naming every
+//                    layer: image_heal.uproc drops their markers and the
+//                    rootfs record, so the pull fetches them again and the
+//                    assembly runs again once they are back
+//            else    (the node: a rootfs it cannot write, a tar it cannot
+//                    run, a layer that is not a tar) -> `state=failed;
+//                    code=<exit>`, retried with a growing delay
+//   as2  -> the job rewritten `phase=delete` after any verdict; after a
+//        start, /image-rootfs/<n> MERGEd `state=assembling` (its failures
+//        kept, for the next delay)
+//   as3  after a failure -> `fails=<n>;due=<when>` merged into the rootfs
+//        record: the next attempt not before 10 s x 2^(n-1), at most 300 s —
+//        the kubelet's image pull backoff, the one image_back.uproc keeps;
+//        after a success -> /image-pull-failed/<n> removed
+//   as4  after a failure -> /image-pull-failed/<n> (fails, code, why): the
+//        Pods waiting on the image are told — ErrImagePull, then
+//        ImagePullBackOff with the count (pod_image.uproc), as for a pull
+//   ar   (its own source, /image-rootfs/ with the `due` timer) a failed
+//        record whose time has come -> `state=retry`, which as1 starts
+//
 // A workload image (`kind=workload`) is not assembled: once every layer is
 // cached, /image-rootfs/<n> is `path=pack:<n>;state=ready` at once.
 // The script and the two directories come from /config/image
-// (`script=;rootfs=;blobs=`) when it exists, else the packaged paths. A
-// `failed` record is terminal-visible; deleting it re-triggers.
+// (`script=;rootfs=;blobs=`) when it exists, else the packaged paths.
+// No failure is the last word, and nothing needs deleting by hand: the
+// assembly is asked again until it serves, and a corrupt cache is fetched
+// again.
 module nanocloud.image_asm {
 
   // The context each chain here carries across its effects: ONE nested
@@ -20,15 +44,20 @@ module nanocloud.image_asm {
   // module that hands a context on agrees on it.
   // carried by: Job, Did
   message Ctx {
-    next: string = 30;
+    next: string = 30;     // start | ready | bad | fail | "" — what as2..as4 do
     name: string = 31;
     root: string = 32;
     script: string = 33;
     blobs: string = 34;
     layers: string = 35;
+    code: string = 36;     // the job's exit code, as it said it
+    fails: int = 37;       // the failures, this one counted
+    now: int = 38;
   }
   enum NOOP = 0;
   enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
 
   // ---- assembly ----
   message As {
@@ -36,9 +65,12 @@ module nanocloud.image_asm {
     key: string = 3;
     layers: string = 4;    // layers!argv — space-separated
     kind: string = 5;      // `workload`: a fluxor workload image
+    lcsv: string = 6;      // layers, as the manifest lists them
     have: int = 22;        // /image-layer-ok/<n>-* present
     n: int = 50;
+    now: int = 58;
     st: string = 70;       // /image-rootfs/<n> state
+    fails: int = 71;       //   its failures so far
     js: string = 80;       // the job's state
     jc: string = 81;       // and exit code
     script: string = 90;   // /config/image
@@ -61,38 +93,75 @@ module nanocloud.image_asm {
     when has(a.kind) && a.kind == "workload" && a.st == "" && a.n > 0 && a.have >= a.n ->
       Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
             v1: "path=pack:", v2: a.key, v3: ";state=ready", v4: "", v5: "", v6: "",
-            v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+            v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
     when has(a.kind) && a.kind == "workload" ->
       Job { cid: a.seq, op: NOOP, key: "", k2: "",
-            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
-    when a.st == "" && a.n > 0 && a.have >= a.n && a.script != "" ->
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
+    // Due (no rootfs yet, or a retry): its job, once the last one is gone.
+    when (a.st == "" || a.st == "retry") && a.n > 0 && a.have >= a.n && (a.js == "" || a.js == "destroyed") && a.script != "" ->
       Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
             v1: "cmd=/bin/sh ", v2: a.script, v3: " ", v4: a.root, v5: "/", v6: a.key,
-            v7: " ", v8: a.blobs, v9: " ", v10: a.layers, v11: ";phase=start", ctx: Ctx { next: "mark", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
-    when a.st == "" && a.n > 0 && a.have >= a.n ->
+            v7: " ", v8: a.blobs, v9: " ", v10: a.layers, v11: ";phase=start",
+            ctx: Ctx { next: "start", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: "", fails: a.fails, now: a.now } };
+    when (a.st == "" || a.st == "retry") && a.n > 0 && a.have >= a.n && (a.js == "" || a.js == "destroyed") ->
       Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
             v1: "cmd=/bin/sh ", v2: "/usr/lib/nanocloud/assemble-image.sh", v3: " ",
             v4: "/var/lib/nanocloud.io/image/rootfs", v5: "/", v6: a.key,
-            v7: " ", v8: "/var/lib/nanocloud.io/image/blobs", v9: " ", v10: a.layers, v11: ";phase=start", ctx: Ctx { next: "mark", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+            v7: " ", v8: "/var/lib/nanocloud.io/image/blobs", v9: " ", v10: a.layers, v11: ";phase=start",
+            ctx: Ctx { next: "start", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: "", fails: a.fails, now: a.now } };
+    // Due, but an earlier attempt's job is still there: deleted first (its
+    // status would read as this attempt's verdict).
+    when (a.st == "" || a.st == "retry") && a.n > 0 && a.have >= a.n && a.script != "" ->
+      Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
+            v1: "cmd=/bin/sh ", v2: a.script, v3: " ", v4: a.root, v5: "/", v6: a.key,
+            v7: " ", v8: a.blobs, v9: " ", v10: a.layers, v11: ";phase=delete",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
+    when (a.st == "" || a.st == "retry") && a.n > 0 && a.have >= a.n ->
+      Job { cid: a.seq, op: PUT, key: "/sandboxes/img-asm-", k2: a.key,
+            v1: "cmd=/bin/sh ", v2: "/usr/lib/nanocloud/assemble-image.sh", v3: " ",
+            v4: "/var/lib/nanocloud.io/image/rootfs", v5: "/", v6: a.key,
+            v7: " ", v8: "/var/lib/nanocloud.io/image/blobs", v9: " ", v10: a.layers, v11: ";phase=delete",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
     when a.st == "assembling" && a.js == "exited" && a.jc == "0" && a.script != "" ->
       Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
             v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=ready",
-            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "ready", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: a.jc, fails: 0, now: a.now } };
     when a.st == "assembling" && a.js == "exited" && a.jc == "0" ->
       Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
             v1: "path=", v2: "/var/lib/nanocloud.io/image/rootfs", v3: "/", v4: a.key,
-            v5: ";state=ready", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+            v5: ";state=ready", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "ready", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: 0, now: a.now } };
+    // The cache is not what its markers say (a layer missing, or not its
+    // digest): every layer of the image dropped and fetched again
+    // (image_heal.uproc), which also drops the rootfs record — no backoff
+    // here, the fetch has its own.
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.lcsv != "" && a.script != "" ->
+      Job { cid: a.seq, op: PUT, key: "/image-blob-bad/asm-", k2: a.key,
+            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.lcsv, v5: ";at=;code=65",
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "bad", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: a.jc, fails: 1, now: a.now } };
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.lcsv != "" ->
+      Job { cid: a.seq, op: PUT, key: "/image-blob-bad/asm-", k2: a.key,
+            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.lcsv, v5: ";at=;code=65",
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "bad", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: 1, now: a.now } };
     when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") && a.script != "" ->
       Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
-            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=failed",
-            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers } };
+            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=failed;code=", v6: a.jc,
+            v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "fail", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: a.jc, fails: a.fails + 1, now: a.now } };
     when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") ->
       Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
             v1: "path=", v2: "/var/lib/nanocloud.io/image/rootfs", v3: "/", v4: a.key,
-            v5: ";state=failed", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "del", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers } };
+            v5: ";state=failed;code=", v6: a.jc, v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "fail", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: a.fails + 1, now: a.now } };
     default ->
       Job { cid: a.seq, op: NOOP, key: "", k2: "",
-            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
   }
   message Did {
     cid: int = 1;
@@ -100,29 +169,121 @@ module nanocloud.image_asm {
     ctx: Ctx = 254;
   }
   decision as2(d: Did) -> Job {
-    when d.status >= 200 && d.status < 300 && d.ctx.next == "mark" ->
-      Job { cid: d.cid, op: PUT, key: "/image-rootfs/", k2: d.ctx.name,
+    when d.status >= 200 && d.status < 300 && d.ctx.next == "start" ->
+      Job { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
             v1: "path=", v2: d.ctx.root, v3: "/", v4: d.ctx.name, v5: ";state=assembling",
-            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
-    when d.status >= 200 && d.status < 300 && d.ctx.next == "del" ->
+            v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: d.ctx };
+    when d.status >= 200 && d.status < 300 && (d.ctx.next == "ready" || d.ctx.next == "bad" || d.ctx.next == "fail") ->
       Job { cid: d.cid, op: PUT, key: "/sandboxes/img-asm-", k2: d.ctx.name,
             v1: "cmd=/bin/sh ", v2: d.ctx.script, v3: " ", v4: d.ctx.root, v5: "/", v6: d.ctx.name,
-            v7: " ", v8: d.ctx.blobs, v9: " ", v10: d.ctx.layers, v11: ";phase=delete", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+            v7: " ", v8: d.ctx.blobs, v9: " ", v10: d.ctx.layers, v11: ";phase=delete", ctx: d.ctx };
     default ->
       Job { cid: d.cid, op: NOOP, key: "", k2: "",
-            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "" } };
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
+            ctx: Ctx { next: "", name: "", root: "", script: "", blobs: "", layers: "", code: "", fails: 0, now: 0 } };
+  }
+
+  // A failed assembly's next attempt: not before 10 s x 2^(n-1), at most
+  // 300 s — the ladder IS the function, as image_back.uproc's is.
+  message Back {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7;
+    ctx: Ctx = 254;
+  }
+  decision as3(d: Did) -> Back {
+    when d.ctx.next == "fail" && d.ctx.fails <= 1 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 10000, ctx: d.ctx };
+    when d.ctx.next == "fail" && d.ctx.fails == 2 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 20000, ctx: d.ctx };
+    when d.ctx.next == "fail" && d.ctx.fails == 3 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 40000, ctx: d.ctx };
+    when d.ctx.next == "fail" && d.ctx.fails == 4 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 80000, ctx: d.ctx };
+    when d.ctx.next == "fail" && d.ctx.fails == 5 ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 160000, ctx: d.ctx };
+    when d.ctx.next == "fail" ->
+      Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 300000, ctx: d.ctx };
+    when d.ctx.next == "ready" ->
+      Back { cid: d.cid, op: DELETE, key: "/image-pull-failed/", k2: d.ctx.name, ctx: d.ctx };
+    default ->
+      Back { cid: d.cid, op: NOOP, key: "", k2: "", ctx: d.ctx };
+  }
+  // What the Pods waiting on the image are told: as a pull's failure is.
+  message Fail {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+  }
+  decision as4(d: Did) -> Fail {
+    when d.ctx.next == "fail" ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.code,
+             v5: ";why=", v6: "the image could not be assembled from its layers" };
+    when d.ctx.next == "bad" ->
+      Fail { cid: d.cid, op: PUT, key: "/image-pull-failed/", k2: d.ctx.name,
+             v1: "fails=", v2: d.ctx.fails, v3: ";code=", v4: d.ctx.code,
+             v5: ";why=", v6: "a cached layer was missing or not its digest: fetched again" };
+    default ->
+      Fail { cid: d.cid, op: NOOP, key: "", k2: "" };
+  }
+
+  // ---- the retry ----
+  message Due {
+    seq: int = 1;
+    key: string = 3;
+    st: string = 4;        // state
+    fails: int = 50;
+    due: int = 51;
+    now: int = 58;
+  }
+  message Mark {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4;
+  }
+  // A failed assembly whose delay is over is asked again. A deadline further
+  // ahead than the longest delay was set by a clock that restarted with the
+  // node, and is due now; so is a failure whose delay was never recorded.
+  decision ar(r: Due) -> Mark {
+    when r.st == "failed" && (r.due == 0 || r.now >= r.due || r.due - r.now > 300000) ->
+      Mark { cid: r.seq, op: MERGE, key: "/image-rootfs/", k2: r.key, v1: "state=retry" };
+    default ->
+      Mark { cid: r.seq, op: NOOP, key: "", k2: "", v1: "" };
   }
 
   transformation t_as(a: As) -> As {
-    As { seq: a.seq, key: a.key, layers: a.layers, kind: a.kind, have: a.have, n: a.n, st: a.st, js: a.js,
-         jc: a.jc, script: a.script, root: a.root, blobs: a.blobs }
+    As { seq: a.seq, key: a.key, layers: a.layers, kind: a.kind, lcsv: a.lcsv, have: a.have, n: a.n,
+         now: a.now, st: a.st, fails: a.fails, js: a.js, jc: a.jc, script: a.script, root: a.root,
+         blobs: a.blobs }
   }
   transformation t_did(d: Did) -> Did {
     Did { cid: d.cid, status: d.status, ctx: d.ctx }
   }
+  transformation t_due(r: Due) -> Due {
+    Due { seq: r.seq, key: r.key, st: r.st, fails: r.fails, due: r.due, now: r.now }
+  }
   pipeline im_as1(a: As) -> Job { call x = t_as(a); call y = as1(x); return y; }
   pipeline im_as2(d: Did) -> Job { call x = t_did(d); call y = as2(x); return y; }
+  pipeline im_as3(d: Did) -> Back { call x = t_did(d); call y = as3(x); return y; }
+  pipeline im_as4(d: Did) -> Fail { call x = t_did(d); call y = as4(x); return y; }
+  pipeline im_ar(r: Due) -> Mark { call x = t_due(r); call y = ar(x); return y; }
   entry im_as1 = im_as1;
   entry im_as2 = im_as2;
+  entry im_as3 = im_as3;
+  entry im_as4 = im_as4;
+  entry im_ar = im_ar;
   provenance revision "image-assemble" toolchain "chronicle-authoring";
 }

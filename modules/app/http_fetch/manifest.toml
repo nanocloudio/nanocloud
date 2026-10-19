@@ -99,6 +99,12 @@ max_record = 8192
 requires_contract = "storage.object"
 access = "read"
 
+# The `pull_auth` records a challenge's candidates are walked from: LISTed
+# under their prefix, read, never written or subscribed.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
 [[resources]]
 requires_contract = "fs"
 access = "write"

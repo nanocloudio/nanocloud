@@ -27,6 +27,7 @@ include!("../_shared/views.rs");
 include!("../_shared/json.rs");
 include!("../_shared/moment.rs");
 include!("../_shared/tomb.rs");
+include!("../_shared/podlive.rs");
 
 // lattice's JSON document wire, from its published source — the channel
 // contract its dialect reads, not restated here.
@@ -39,8 +40,8 @@ mod wire;
 
 use doc_exec::{
     FieldWriter, DIALECT_KUBERNETES, FLAG_DRY_RUN, FLAG_FORCE, OUT_BUSY, OUT_COMPACTED,
-    OUT_CONFLICT, OUT_EXISTS, OUT_INVALID, OUT_MALFORMED, OUT_NOT_FOUND, OUT_OK, OUT_OWNERSHIP,
-    OUT_TIMEOUT, OUT_TOO_LARGE, OUT_UNAVAILABLE, RFLAG_CREATED, RFLAG_HELD,
+    OUT_CONFLICT, OUT_EXISTS, OUT_INVALID, OUT_MALFORMED, OUT_NOT_FOUND, OUT_NO_COLLECTION, OUT_OK,
+    OUT_OWNERSHIP, OUT_TIMEOUT, OUT_TOO_LARGE, OUT_UNAVAILABLE, RFLAG_CREATED, RFLAG_HELD,
 };
 use doc_json::{
     JsonResponse, JR_ERROR, JR_TEXT, J_COLLECTION, J_DOC, J_ID, J_ID_PREFIX, J_IF_REVISION,
@@ -132,6 +133,23 @@ const PHASE_IDLE: u8 = 0;
 const PHASE_SEND: u8 = 1;
 const PHASE_WAIT: u8 = 2;
 
+/// A delete's collection bootstrap ([`State::boot`]). The executor keeps a
+/// collection's descriptor (its schema: the finalizer guard, the stamps)
+/// in its catalog, written by the first write through it — and only a
+/// write (a create, replace, patch or apply) may create it. An object a
+/// controller wrote straight to the store (store_stamped: a ReplicaSet's,
+/// StatefulSet's or Job's Pod) is under a collection the executor may
+/// never have been asked to write, and a delete there is answered "no
+/// collection", the object left where it was. So that answer creates the
+/// collection (a DRY-RUN merge patch of the same object: the dialect
+/// describes it, the executor creates the collection and writes no
+/// document) and asks the delete again, under the collection's guard.
+const BOOT_NONE: u8 = 0;
+/// The dry-run patch that creates the collection is in flight.
+const BOOT_CREATING: u8 = 1;
+/// The delete has been asked again: a second "no collection" is 503.
+const BOOT_RETRIED: u8 = 2;
+
 struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
@@ -195,6 +213,11 @@ struct State {
     timeouts: u32,
     /// Envelopes of answers no request awaited, drained and dropped.
     stale: u32,
+    /// The request's collection bootstrap ([`BOOT_NONE`]…), and whether
+    /// `req` is to be served again (the bootstrap's next message) instead
+    /// of a new request read.
+    boot: u8,
+    redo: u8,
 }
 
 fn frame_field(frame: &[u8], number: u8) -> Option<(u8, &[u8])> {
@@ -389,6 +412,7 @@ impl State {
         self.out_at = 0;
         self.out_len = p as u32;
         self.phase = PHASE_IDLE;
+        self.boot = BOOT_NONE;
     }
 
     /// Write what is owed of the last reply. True when nothing is owed.
@@ -609,19 +633,71 @@ impl State {
             return self.reply(400, &[]);
         }
         let coll = segs[0];
+        // A Pod's DELETE is graceful (_shared/podlive.rs): while anything of
+        // it runs on its node, it is MARKED — deletionTimestamp, the moment
+        // its grace ends, and deletionGracePeriodSeconds — a merge patch in
+        // place of the delete, and stays (Terminating) until its node has
+        // stopped it (pod_resolve deletes it then, outright). The grace is
+        // the request's DeleteOptions', else the Pod's own; 0 (`--force
+        // --grace-period=0`), or a Pod nothing of which runs, is deleted at
+        // once — its tomb stating the grace, which its node's specs carry
+        // (pod_specs.uproc `gone`).
+        let mut mark = [0u8; 160];
+        let mut mark_len = 0usize;
+        let pod_delete = op == OP_DELETE
+            && coll == b"pods"
+            && ns == 3
+            && view.is_empty()
+            && self.boot == BOOT_NONE;
         // A delete leaves the object's last state for the watch chain's
         // DELETED event BEFORE the delete: the chain reads the tomb when it
         // meets the delete in the change feed, which can be before this
         // node sees the answer. A delete that finds nothing, or is held by
         // a finalizer, leaves a tomb nothing reads; it expires.
-        if op == OP_DELETE && self.tomb_len > 0 && view.is_empty() {
+        // Left once: a delete asked again after its collection bootstrap
+        // has its tomb already.
+        if op == OP_DELETE
+            && (self.tomb_len > 0 || pod_delete)
+            && view.is_empty()
+            && self.boot == BOOT_NONE
+        {
+            let st = self.store();
             // SAFETY: storage.object reads through the loader's table.
-            if let Some((p, n)) = unsafe { read_whole(&self.store(), key, DOC_MAX) } {
+            if let Some((p, n)) = unsafe { read_whole(&st, key, DOC_MAX) } {
                 // SAFETY: `n` bytes read_whole filled at `p`, freed below.
                 let obj = unsafe { core::slice::from_raw_parts(p, n) };
-                self.leave_tomb(obj);
+                let how = if pod_delete {
+                    // SAFETY: storage reads and the clock through the
+                    // loader's table.
+                    unsafe { pod_delete_how(&st, obj, &value[..vl]) }
+                } else {
+                    PodDel::Outright(None)
+                };
+                match how {
+                    PodDel::Outright(g) => {
+                        if self.tomb_len > 0 {
+                            self.leave_tomb(obj, g);
+                        }
+                    }
+                    PodDel::Mark(g, until) => mark_len = mark_patch(g, until, &mut mark),
+                    PodDel::Already | PodDel::Wait => {}
+                }
                 // SAFETY: read_whole's allocation, no longer read.
                 unsafe { heap_free(self.sys(), p) };
+                match how {
+                    // Marked already: the delete is under way, as it was.
+                    PodDel::Already => return self.reply(200, &[]),
+                    // A read not answered yet: the request is held (the
+                    // journal) and served again; never a delete decided
+                    // without it.
+                    PodDel::Wait => {
+                        if !self.journal.held() {
+                            self.reply(503, &[]);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
             }
         }
         // A create whose key ends at the collection or namespace names no
@@ -670,6 +746,8 @@ impl State {
             &value[..vl]
         };
         let (dop, body_tag) = match op {
+            // A graceful Pod delete: the mark, a merge patch.
+            OP_DELETE if mark_len > 0 => (doc_exec::OP_PATCH_MERGE, J_PATCH),
             OP_CREATE => (doc_exec::OP_INSERT, J_DOC),
             OP_REPLACE => (doc_exec::OP_REPLACE, J_DOC),
             OP_PATCH_MERGE => (doc_exec::OP_PATCH_MERGE, J_PATCH),
@@ -678,7 +756,21 @@ impl State {
             OP_APPLY => (doc_exec::OP_APPLY, J_DOC),
             _ => (doc_exec::OP_DELETE, 0),
         };
-        let flags = if force { FLAG_FORCE } else { 0 } | if dry { FLAG_DRY_RUN } else { 0 };
+        let mut flags = if force { FLAG_FORCE } else { 0 } | if dry { FLAG_DRY_RUN } else { 0 };
+        // The collection bootstrap: the object merged with nothing, a dry
+        // run, so the executor creates the collection and stores nothing.
+        let creating = op == OP_DELETE && self.boot == BOOT_CREATING;
+        let (dop, body_tag, body): (u8, u8, &[u8]) = if creating {
+            flags = FLAG_DRY_RUN;
+            (doc_exec::OP_PATCH_MERGE, J_PATCH, b"{}")
+        } else if mark_len > 0 {
+            // Answered as the patch it is (no collection bootstrap: a patch
+            // creates its collection).
+            self.op = OP_PATCH_MERGE;
+            (dop, body_tag, mark.get(..mark_len).unwrap_or(&[]))
+        } else {
+            (dop, body_tag, body)
+        };
         let manager: &[u8] = if manager.is_empty() {
             b"unknown"
         } else {
@@ -686,7 +778,7 @@ impl State {
         };
         // The revision the request states (field 28); the one a body
         // states is the dialect's to read (`rv.if`, the schema's).
-        let expected = frame_i64(req, 28).filter(|r| *r > 0);
+        let expected = frame_i64(req, 28).filter(|r| *r > 0 && !creating);
         self.corr = self.corr.wrapping_add(1);
         let corr = self.corr;
         let n = {
@@ -845,7 +937,31 @@ impl State {
             // A late answer to a request that already timed out.
             return false;
         }
-        let status = status_of(a.outcome, a.flags, self.op);
+        // A delete under a collection the executor has no descriptor for:
+        // created, then the delete asked again ([`BOOT_CREATING`]).
+        if self.op == OP_DELETE {
+            let next = match (self.boot, a.outcome) {
+                (BOOT_NONE, OUT_NO_COLLECTION) => Some(BOOT_CREATING),
+                (BOOT_CREATING, _) => Some(BOOT_RETRIED),
+                _ => None,
+            };
+            if let Some(b) = next {
+                if b == BOOT_CREATING {
+                    let m = b"[store_doc] delete: the collection has no descriptor (its objects were written past the executor) - creating it";
+                    // SAFETY: logging through the loader's table.
+                    unsafe { dev_log(self.sys(), 2, m.as_ptr(), m.len()) };
+                }
+                self.boot = b;
+                self.redo = 1;
+                self.phase = PHASE_IDLE;
+                return true;
+            }
+        }
+        let status = match a.outcome {
+            // Still no collection after creating it: not decided, retry.
+            OUT_NO_COLLECTION if self.op == OP_DELETE => 503,
+            o => status_of(o, a.flags, self.op),
+        };
         let text = a.field(JR_TEXT).unwrap_or(&[]);
         // SAFETY: the clock through the loader's table.
         let took = unsafe { dev_millis(self.sys()) }.saturating_sub(self.sent_ms);
@@ -884,8 +1000,9 @@ impl State {
         true
     }
 
-    /// Leave `obj` as the deleted key's tombstone (store_big's `tomb`).
-    fn leave_tomb(&mut self, obj: &[u8]) {
+    /// Leave `obj` as the deleted key's tombstone (store_big's `tomb`);
+    /// `grace` the delete's, when it is a Pod's ([`pod_delete_how`]).
+    fn leave_tomb(&mut self, obj: &[u8], grace: Option<u64>) {
         let tl = self.tomb_len as usize;
         let kl = self.key_len as usize;
         if tl == 0 || obj.is_empty() || tl + kl > MAX_KEY {
@@ -925,6 +1042,7 @@ impl State {
                 deadline,
                 self.tomb_ms as u64,
                 obj,
+                grace,
             ) {
                 return;
             }
@@ -932,6 +1050,61 @@ impl State {
             let _ = put_value(&store, &tk[..tl + kl], v);
         }
     }
+}
+
+/// What a Pod's DELETE does ([`pod_delete_how`]).
+#[derive(Clone, Copy)]
+enum PodDel {
+    /// Deleted at once, its tomb stating this grace (`None`: not a Pod's).
+    Outright(Option<u64>),
+    /// Marked: this grace, ending at this moment (Unix ms).
+    Mark(u64, u64),
+    /// Marked already: the delete is where it was.
+    Already,
+    /// A read not answered yet: asked again.
+    Wait,
+}
+
+/// What a DELETE (its body `opts`: DeleteOptions, or an Eviction) does to
+/// the Pod `pod`, as upstream's API server and kubelet decide it between
+/// them (_shared/podlive.rs). A clock not trusted yet (a board before SNTP)
+/// cannot say when the grace ends: the Pod is deleted at once, its node
+/// still given the grace.
+unsafe fn pod_delete_how(st: &Store, pod: &[u8], opts: &[u8]) -> PodDel {
+    let asked = pl_asked(opts);
+    let grace = asked.unwrap_or_else(|| pl_own(pod));
+    if grace == 0 || !pl_waits(pod) {
+        return PodDel::Outright(Some(grace));
+    }
+    let marked = j_get2(pod, b"metadata", b"deletionTimestamp").is_some_and(|t| t != b"null");
+    if marked {
+        return PodDel::Already;
+    }
+    let node = j_get2(pod, b"spec", b"nodeName").unwrap_or(&[]);
+    let uid = j_get2(pod, b"metadata", b"uid").unwrap_or(&[]);
+    match pl_live(st, node, uid) {
+        None => PodDel::Wait,
+        Some(false) => PodDel::Outright(Some(grace)),
+        Some(true) => match mo_trusted_ms(st.table()) {
+            Some(now) => PodDel::Mark(grace, now.saturating_add(grace.saturating_mul(1000))),
+            None => PodDel::Outright(Some(grace)),
+        },
+    }
+}
+
+/// The mark of a graceful delete, a merge patch:
+/// `{"metadata":{"deletionTimestamp":"<until>","deletionGracePeriodSeconds":<grace>}}`.
+/// Its length.
+fn mark_patch(grace: u64, until: u64, out: &mut [u8; 160]) -> usize {
+    let mut ts = [0u8; 20];
+    pl_rfc3339(until, &mut ts);
+    let mut d = [0u8; 20];
+    let dn = mo_dec(grace, &mut d, 0);
+    let mut l = append(out, 0, b"{\"metadata\":{\"deletionTimestamp\":\"");
+    l = append(out, l, &ts);
+    l = append(out, l, b"\",\"deletionGracePeriodSeconds\":");
+    l = append(out, l, d.get(..dn).unwrap_or(&[]));
+    append(out, l, b"}}")
 }
 
 /// One envelope from `chan` into `buf`: `(type, payload length)`.
@@ -1076,6 +1249,8 @@ pub unsafe extern "C" fn module_new(
         s.dec_fault = 0;
         s.key_prefix_len = 0;
         s.tomb_len = 0;
+        s.boot = BOOT_NONE;
+        s.redo = 0;
         s.blob_len = 0;
         s.parts = wire::PartWriter::new(0, 0, 0);
         s.reasm = wire::Reassembly::new();
@@ -1155,7 +1330,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // and it never reads the next request (2026-10-18: one late 1 MiB
     // answer wedged every write behind it).
     s.drain_stale();
-    if s.held == 0 {
+    if s.redo != 0 {
+        // The same request, its next message (a collection bootstrap).
+        s.redo = 0;
+        s.journal.reset();
+    } else if s.held == 0 {
         let Some(n) = s.read_request() else {
             return 0;
         };

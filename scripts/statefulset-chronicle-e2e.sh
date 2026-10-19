@@ -13,7 +13,7 @@ if [ -z "${FLUXOR_RUNTIME:-}" ]; then
   FLUXOR_RUNTIME="$(nc_fluxor_runtime "$ROOT")"
 fi
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
-for m in store_source store_effect decision; do
+for m in store_scan store_effect store_big store_stamped decision; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod"; exit 1; }
 done
 
@@ -68,24 +68,27 @@ scheduler:
   accept_cycles: true
 modules:
   - name: store_source
+    type: store_scan
     prefix: "/statefulsets.apps/"
-    paths: "spec.template.spec,spec.replicas,metadata.uid"
+    paths: "spec.replicas,metadata.uid"
     expand: "spec.replicas"
     expand_tail: 2
     expand_over: "/pods/"
     watch: "/pods/"
   - name: nbget
-    type: store_effect
+    type: store_stamped
     decision: {hex: "${DEC_NB}"}
     key_prefix: "/pods/"
     # the neighbour's readiness: its Ready condition
     paths: "status.conditions[type=Ready].status"
   - name: selfget
-    type: store_effect
+    type: store_stamped
     decision: {hex: "${DEC_ASK}"}
     key_prefix: "/pods/"
   - name: apply
-    type: store_effect
+    type: store_big
+    stamp: 1
+    schema: "create=metadata.uid:uuid,metadata.creationTimestamp:now;keep=metadata.uid,metadata.creationTimestamp"
     decision: {hex: "${DEC_ACT}"}
     key_prefix: "/pods/"
 wiring:
@@ -178,5 +181,33 @@ run 8
 present /pods/default/db-0 || fail "db-0 should remain"
 for i in 1 2 4 5; do absent /pods/default/db-$i || fail "db-$i survived scale-down past the hole at db-3"; done
 echo "   db-5, db-4 above the hole, then db-2, db-1: all collected; db-0 kept"
+
+big_tmpl() { # big_tmpl <app> <image> -> a pod template past 4 KiB (env, ports, resources, annotations)
+  python3 - "$1" "$2" <<'PYT'
+import json, sys
+app, img = sys.argv[1], sys.argv[2]
+env = [{"name": "APP_SETTING_%02d" % i, "value": "value-%s-%02d-abcdefghijklmnopqrstuvwxyz" % (img, i)} for i in range(48)]
+t = {"metadata": {"labels": {"app": app, "tier": "backend"},
+                  "annotations": {"example.com/note-%d" % i: "annotation text number %d" % i for i in range(8)}},
+     "spec": {"containers": [{"name": app, "image": img, "env": env,
+                              "ports": [{"name": "http", "containerPort": 8080}],
+                              "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}}}]}}
+s = json.dumps(t, separators=(",", ":"))
+assert len(s) >= 4096, len(s)
+print(s)
+PYT
+}
+echo "== 6. a REAL pod template (> 4 KiB): db-0 carries it whole, labelled as the template says =="
+store_put "/statefulsets.apps/default/big" "{\"metadata\":{\"name\":\"big\",\"namespace\":\"default\",\"uid\":\"sts-big-uid\"},\"spec\":{\"replicas\":1,\"template\":$(big_tmpl big postgres)}}"
+run 5
+store_last /pods/default/big-0 | python3 -c '
+import json, sys
+p = json.load(sys.stdin); m = p["metadata"]
+assert m["labels"] == {"statefulset.kubernetes.io/pod-name": "big-0", "app": "big", "tier": "backend"}, m["labels"]
+assert len(m["annotations"]) == 8 and m["ownerReferences"][0]["uid"] == "sts-big-uid"
+c = p["spec"]["containers"][0]
+assert c["image"] == "postgres" and len(c["env"]) == 48
+' || fail "big-0 is missing or wrong: '$(store_last /pods/default/big-0 | cut -c1-200)'"
+echo "   big-0: the whole template, labelled (pod-name + template), annotated, owned"
 
 echo "== E2E green: StatefulSet as params — ordered bring-up on readiness, highest-first teardown, holes covered =="

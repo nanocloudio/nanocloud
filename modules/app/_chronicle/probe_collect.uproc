@@ -98,6 +98,8 @@ module nanocloud.probe_collect {
       RtGet { cid: r.seq, op: GET, key: "/probe-rt-l/", key2: r.uid, ctx: Ctx { uid: r.uid, w: "l", exit: r.exit } };
     when r.which == "probe-r" ->
       RtGet { cid: r.seq, op: GET, key: "/probe-rt-r/", key2: r.uid, ctx: Ctx { uid: r.uid, w: "r", exit: r.exit } };
+    when r.which == "probe-s" ->
+      RtGet { cid: r.seq, op: GET, key: "/probe-rt-s/", key2: r.uid, ctx: Ctx { uid: r.uid, w: "s", exit: r.exit } };
     default ->
       RtGet { cid: r.seq, op: NOOP, key: "", key2: "", ctx: Ctx { uid: r.uid, w: "", exit: r.exit } };
   }
@@ -145,6 +147,8 @@ module nanocloud.probe_collect {
     lverdict: int = 71;
     rseq: string = 80;     // present iff the readiness record exists
     rverdict: int = 81;
+    sseq: string = 90;     // present iff the startup record exists
+    sverdict: int = 91;    //   2 not yet, 1 started, 0 failed for good
   }
   message StatusCall {
     cid: int = 1;
@@ -155,9 +159,20 @@ module nanocloud.probe_collect {
     v3: string = 6;
     v4: int = 7;
   }
+  // A startup probe gates both: not ready until it has passed (`% 2`: 1
+  // only for 1), not live once it has failed for good (`least(…, 1)`: 0
+  // only for 0) — the lifecycle restarts the container then.
   decision publish(p: Pod) -> StatusCall {
-    when p.lseq == "" && p.rseq == "" ->
+    when p.lseq == "" && p.rseq == "" && p.sseq == "" ->
       StatusCall { cid: p.seq, op: DELETE, key: p.key, v1: "" };
+    when p.sseq != "" && p.lseq == "" && p.rseq == "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: math.least(p.sverdict, 1), v3: ";ready=", v4: p.sverdict % 2 };
+    when p.sseq != "" && p.lseq == "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: math.least(p.sverdict, 1), v3: ";ready=", v4: p.rverdict * (p.sverdict % 2) };
+    when p.sseq != "" && p.rseq == "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: p.lverdict * math.least(p.sverdict, 1), v3: ";ready=", v4: p.sverdict % 2 };
+    when p.sseq != "" ->
+      StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: p.lverdict * math.least(p.sverdict, 1), v3: ";ready=", v4: p.rverdict * (p.sverdict % 2) };
     when p.lseq == "" ->
       StatusCall { cid: p.seq, op: PUT, key: p.key, v1: "live=", v2: 1, v3: ";ready=", v4: p.rverdict };
     when p.rseq == "" ->
@@ -183,7 +198,8 @@ module nanocloud.probe_collect {
     SeamReply { cid: r.cid, status: r.status, ctx: Ctx { uid: r.ctx.uid, w: r.ctx.w, exit: r.ctx.exit, inf: r.ctx.inf, fails: r.ctx.fails, oks: r.ctx.oks, verdict: r.ctx.verdict, failn: r.ctx.failn, succn: r.ctx.succn, st: r.ctx.st } }
   }
   transformation ppod(p: Pod) -> Pod {
-    Pod { seq: p.seq, key: p.key, lseq: p.lseq, lverdict: p.lverdict, rseq: p.rseq, rverdict: p.rverdict }
+    Pod { seq: p.seq, key: p.key, lseq: p.lseq, lverdict: p.lverdict, rseq: p.rseq, rverdict: p.rverdict,
+          sseq: p.sseq, sverdict: p.sverdict }
   }
   transformation pg(g: Gone) -> Gone { Gone { seq: g.seq, key: g.key } }
   pipeline cl_get(r: Result) -> RtGet { call x = pres(r); call y = rt_get(x); return y; }

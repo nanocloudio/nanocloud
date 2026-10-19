@@ -149,6 +149,7 @@ graph() { # graph <with-node: 0|1>
     empty: 1
     label: "node-a"
     facts: '"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux","nanocloud.io/fluxor-abi":"d1579ff4"'
+    capacity: '"cpu":"4","memory":"8Gi","pods":"110"'
     now: 1
     due: "status.heartbeat+10000"
   - name: nl_renew
@@ -189,6 +190,8 @@ python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert d['status']['read
 python3 -c "import json,sys; l=json.loads(sys.argv[1])['metadata']['labels']; assert l=={'kubernetes.io/arch':'arm64','kubernetes.io/os':'linux','nanocloud.io/fluxor-abi':'d1579ff4'}, l" "$N" \
   || fail "node-a does not carry its facts as labels: '$N'"
 echo "   labels: arch, os and the fluxor ABI, from the render's facts"
+python3 -c "import json,sys; d=json.loads(sys.argv[1]); c={'cpu':'4','memory':'8Gi','pods':'110'}; assert d['status']['capacity']==c and d['status']['allocatable']==c" "$N" \
+  || fail "node-a does not report its capacity and allocatable: '$N'"
 [ "$(store_last /ready-nodes/node-a)" = "1" ] || fail "node-a not projected ready"
 has "$(store_last /node-seen/node-a)" "rev=" ";at=" || fail "the plane did not note node-a"
 echo "   /nodes/node-a ready, heartbeat stamped; /ready-nodes/node-a; /node-seen/node-a"

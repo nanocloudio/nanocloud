@@ -1,0 +1,158 @@
+// An image image GC marked (image_gc.uproc), removed phase by phase — gd:
+//   start   a Pod resolved to it after all -> state=ready again, the mark
+//           dropped; else its layers and rootfs path copied (phase=refs)
+//   refs    once no request names it (image_gcl.uproc removes them) -> the
+//           manifest, then its config and any failure record (phase=files)
+//   files   the rootfs directory removed through the fs contract (`im_rm`,
+//           fs_effect; a workload image's pack has none) (phase=layers)
+//   layers  once image_gcl.uproc has dropped every /image-layer-ok/<m>-*
+//           -> the rootfs record, the LRU entry, the mark
+// Its own module for the parser's bounds (eight entries a module); see
+// image_gc.uproc. Its context is its own; the next stage's work rides as
+// the flat carry `c_next` (39).
+module nanocloud.image_gcd {
+
+  message Cd {
+    m: string = 30;
+    at: string = 31;       // /image-lru-of/<m> at
+    path: string = 32;
+    layers: string = 33;
+    phase: string = 34;
+    n: int = 35;           // its layer marks left
+  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum COUNT = 12;
+  enum REMOVE = 1;
+
+  message Rm {
+    seq: int = 1;
+    key: string = 3;       // <m>
+    phase: string = 4;
+    layers: string = 5;    // copied at start
+    path: string = 6;
+    lok: int = 22;         // /image-layer-ok/<m>-* left
+    mlayers: string = 70;  // /image-manifests/<m> layers
+    rpath: string = 80;    // /image-rootfs/<m> path
+    at: string = 90;       // /image-lru-of/<m> at
+  }
+  message AskD {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_m: string = 30;
+    ctx: Cd = 254;
+  }
+  // start: is a Pod using it after all? refs: does a request still name it?
+  decision gd1(r: Rm) -> AskD {
+    when r.phase == "start" ->
+      AskD { cid: r.seq, op: COUNT, key: "/pod-resolved/", c_m: r.key,
+             ctx: Cd { m: r.key, at: r.at, path: r.rpath, layers: r.mlayers, phase: r.phase, n: 0 } };
+    when r.phase == "refs" ->
+      AskD { cid: r.seq, op: COUNT, key: "/image-digests/", c_m: r.key,
+             ctx: Cd { m: r.key, at: r.at, path: r.path, layers: r.layers, phase: r.phase, n: 0 } };
+    default ->
+      AskD { cid: r.seq, op: NOOP, key: "", c_m: "",
+             ctx: Cd { m: r.key, at: r.at, path: r.path, layers: r.layers, phase: r.phase, n: r.lok } };
+  }
+  message GotD {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;           // the COUNT's
+    ctx: Cd = 254;
+  }
+  message WD {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    c_next: string = 39;
+    ctx: Cd = 254;
+  }
+  decision gd2(g: GotD) -> WD {
+    when g.ctx.phase == "start" && g.status == 200 && g.n > 0 ->
+      WD { cid: g.cid, op: MERGE, key: "/image-rootfs/", k2: g.ctx.m, v1: "state=ready", v2: "", v3: "", v4: "",
+           c_next: "abort", ctx: g.ctx };
+    when g.ctx.phase == "start" && g.status == 200 ->
+      WD { cid: g.cid, op: MERGE, key: "/image-gc/", k2: g.ctx.m, v1: "phase=refs;layers=", v2: g.ctx.layers,
+           v3: ";path=", v4: g.ctx.path, c_next: "", ctx: g.ctx };
+    when g.ctx.phase == "refs" && g.status == 200 && g.n == 0 ->
+      WD { cid: g.cid, op: DELETE, key: "/image-manifests/", k2: g.ctx.m, v1: "", v2: "", v3: "", v4: "",
+           c_next: "refs", ctx: g.ctx };
+    when g.ctx.phase == "files" ->
+      WD { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", c_next: "files", ctx: g.ctx };
+    when g.ctx.phase == "layers" && g.ctx.n == 0 ->
+      WD { cid: g.cid, op: DELETE, key: "/image-rootfs/", k2: g.ctx.m, v1: "", v2: "", v3: "", v4: "",
+           c_next: "end", ctx: g.ctx };
+    default ->
+      WD { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", c_next: "", ctx: g.ctx };
+  }
+  message DoneD {
+    cid: int = 1;
+    status: int = 2;
+    c_next: string = 39;
+    ctx: Cd = 254;
+  }
+  decision gd3(d: DoneD) -> WD {
+    when d.c_next == "abort" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-gc/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+    when d.c_next == "refs" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-config/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+    when d.c_next == "end" && d.ctx.at != "" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-lru/" + d.ctx.at + "/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "",
+           c_next: d.c_next, ctx: d.ctx };
+    default ->
+      WD { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+  }
+  decision gd4(d: DoneD) -> WD {
+    when d.c_next == "refs" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-pull-failed/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+    when d.c_next == "end" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-lru-of/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+    default ->
+      WD { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", c_next: d.c_next, ctx: d.ctx };
+  }
+  // The rootfs directory, through the fs contract (fs_effect: only a direct
+  // child of its root). A workload image's pack has none.
+  message Fs {
+    cid: int = 1;
+    op: int = 2;
+    path: string = 3;
+    c_next: string = 39;
+    ctx: Cd = 254;
+  }
+  decision gd5(d: DoneD) -> Fs {
+    when d.c_next == "files" && d.ctx.path != "" && !d.ctx.path.startsWith("pack:") ->
+      Fs { cid: d.cid, op: REMOVE, path: d.ctx.path, c_next: d.c_next, ctx: d.ctx };
+    default ->
+      Fs { cid: d.cid, op: NOOP, path: "", c_next: d.c_next, ctx: d.ctx };
+  }
+  decision gd6(d: DoneD) -> WD {
+    when d.c_next == "refs" ->
+      WD { cid: d.cid, op: MERGE, key: "/image-gc/", k2: d.ctx.m, v1: "phase=files", v2: "", v3: "", v4: "", c_next: "", ctx: d.ctx };
+    // Removed (or nothing to remove); a path outside the effect's root is
+    // not removed, and not waited on.
+    when d.c_next == "files" && (d.status == 200 || d.status == 204 || d.status == 403) ->
+      WD { cid: d.cid, op: MERGE, key: "/image-gc/", k2: d.ctx.m, v1: "phase=layers", v2: "", v3: "", v4: "", c_next: "", ctx: d.ctx };
+    when d.c_next == "end" ->
+      WD { cid: d.cid, op: DELETE, key: "/image-gc/", k2: d.ctx.m, v1: "", v2: "", v3: "", v4: "", c_next: "", ctx: d.ctx };
+    default ->
+      WD { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", c_next: "", ctx: d.ctx };
+  }
+
+  pipeline gc_d1(r: Rm) -> AskD { call y = gd1(r); return y; }
+  pipeline gc_d2(g: GotD) -> WD { call y = gd2(g); return y; }
+  pipeline gc_d3(d: DoneD) -> WD { call y = gd3(d); return y; }
+  pipeline gc_d4(d: DoneD) -> WD { call y = gd4(d); return y; }
+  pipeline gc_d5(d: DoneD) -> Fs { call y = gd5(d); return y; }
+  pipeline gc_d6(d: DoneD) -> WD { call y = gd6(d); return y; }
+  entry gc_d1 = gc_d1;
+  entry gc_d2 = gc_d2;
+  entry gc_d3 = gc_d3;
+  entry gc_d4 = gc_d4;
+  entry gc_d5 = gc_d5;
+  entry gc_d6 = gc_d6;
+  provenance revision "image-gc-remove" toolchain "chronicle-authoring";
+}

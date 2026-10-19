@@ -95,6 +95,7 @@ tls → http ⇄ http_chain → kube_decode → kube_route → admit → kagi_ve
 | `ad_cnt` | store_effect | `admission.uproc ad_cnt` | COUNTs live objects when a create is quota'd |
 | `ad_dec` | pipeline | `admission.rd` + `admission.uproc ad_dec` | the policy applied: defaults in, required paths looked up |
 | `ad_ver` | decision | `admission.uproc ad_dec` | the object as admitted, or 403 |
+| `ad_q` … `ad_fin` | store_effect, decision | `admission_k8s.uproc` | after `se_body`: a create past a ResourceQuota is 403; a `pods/eviction` spends its PodDisruptionBudget's disruption (a tested JSON Patch) or is 429, else becomes the Pod's delete |
 | `se_probe` | store_effect | `apiplane.uproc probe` | GETs the object or LISTs the collection |
 | `se_act` | store_effect | `apiplane.uproc act` | the PUT, DELETE or NOOP the verb implied |
 | `reply` | decision | `apiplane.uproc reply` | the status and body the client receives |
@@ -217,11 +218,15 @@ Packet policy is the same shape with one more connector. The chains write
 rows; `net_apply` encodes them as a `net.policy` table and replaces it whole,
 and the platform realizes it — nftables on Linux, the packet filter on bare
 metal, a recorded no-op on wasm — with whether it is ENFORCED written to
-`/np-status/<table>`:
+`/np-status/<table>`. The chains run on the control plane; every node that
+runs Pods runs the two `net_apply`s for itself, its status in its own records
+(`/~node/<node>/np-status/<table>`). NetworkPolicy is opt-in
+(`NANOCLOUD_NETPOLICY=1`): its chain does not fit beside the image pull in a
+single node's runtime config arena (fluxor's `CONFIG_ARENA_SIZE`, 256 KiB):
 
 | Prefix | Params | Rows |
 | ------ | ------ | ---- |
-| `px_` | `proxy.uproc` | `/services/` JOIN their `/endpointslices/` → one DNAT row per (Service, ready backend), ports as aligned lists; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves |
+| `px_` | `proxy.uproc` | `/services/` JOIN their `/endpointslices/` → each backend's Pod read for its named ports → one DNAT row per (Service, ready backend), ports as aligned lists (with the node ports and the load-balancer address), a named targetPort resolved against that backend's Pod; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves. `px_alloc` (`svc_alloc`) gives NodePort and LoadBalancer Services their node ports and pool address, claimed create-only at `/ipam/nodeport/<port>` and `/ipam/lb/<u32>`, released when no longer held |
 | `np_` | `netpolicy.uproc` | `/networkpolicies/` JOIN `/pods/` by podSelector → `/np-sel/` selections → per-rule ALLOW rows and a per-direction ISOLATE (Kubernetes' policyTypes reading); a selector peer allows nothing it cannot name. Selections and rows pruned by digest and pod address, conditional on the revision judged |
 
 ### The controller chains
@@ -238,13 +243,18 @@ to the hex params a graph carries.
 | `rs_` | `replicaset.uproc` | ReplicaSet → exactly `replicas` Pods, ordinal by ordinal, rolled on a template-hash change |
 | `ds_` | `daemonset.uproc` | one node-pinned Pod per ready Node, pruned when a Node goes not-ready |
 | `st_` | `statefulset.uproc` | ordered identities: `<sts>-<i>` only once `<sts>-<i-1>` is ready; scale down highest-first |
-| `jb_` | `job.uproc` | run-to-completion: launch `completions` Pods once, count Succeeded, never recreate |
+| `jb_` | `job.uproc`, `job_launch.uproc`, `job_status.uproc` | Jobs to Kubernetes' semantics: the Job's state at `/job-ctl/` (its Pods counted, the start/finish/backoff moments as deadlines on the timer), Pods started within parallelism and completions (NonIndexed, Indexed), backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished, suspend, and the `.status` `kubectl wait` reads |
+| `cj_` | `cronjob.uproc`, `cronjob_status.uproc` | CronJobs: the schedule judged by the source (`cron`) against the trusted clock only, concurrencyPolicy, startingDeadlineSeconds, history limits, status active / lastScheduleTime / lastSuccessfulTime |
+| `pdb_` | `pdb.uproc` | PodDisruptionBudget status (the selector judged by `count_sel`) |
+| `q_` | `quota.uproc` | ResourceQuota usage (`{}` expansion over `spec.hard`, a COUNT that sums) and status |
+| `pc_` | `priority.uproc` | PriorityClass: system classes, the global default, a Pod's priority resolved |
+| `te_` | `scheduler.uproc` | the taint manager: NoExecute evictions, now or after `tolerationSeconds` |
 | `hp_` | `hpa.uproc` | `desired = ceil(R × currentCPU / targetCPU)` clamped `[min,max]`, patched onto the target |
 | `gc_` | `gc.uproc` | the ownerRef cascade, plus the Event count cap |
 | `ns_` | `namespace.uproc` | sweep every namespaced prefix of a Terminating namespace, then finalize |
-| `sc_` | `scheduler.uproc` | bind the first unbound Pod to the least-loaded ready Node, one per pass |
+| `sc_` | `scheduler.uproc` | bind the first placeable Pod of the highest priority to the node the source's pick (`sched`, `_shared/sched.rs`: cordon, affinity, taints, resources, pod (anti-)affinity, spread) chose, one per pass; FailedScheduling; preemption |
 | `rb_` | `rbac_rules.uproc`, `rbac_grants.uproc`, `rbac_prune.uproc` | Kubernetes RBAC: roles → per-rule and per-(verb × resource) rows, bindings → per-subject rows, their join → the grant index the API plane probes; stale rows pruned by the source object's digest |
-| `ep_` | `endpoints.uproc` | Services JOIN Pods by selector → per-pod slices → the folded `/endpoints/` document |
+| `ep_` | `endpoints.uproc` | Services JOIN Pods by selector → per-pod slices → the folded `/endpoints/` document; a slice whose Pod or Service is gone, and the document of a gone Service, pruned |
 | `pj_`, `pl_`, `pr_` | `pod_project.uproc`, `pod_lifecycle.uproc`, `pod_effect.uproc` | the kubelet's decision half: the sandbox artifact, the lifecycle state machine and its writes, and the prune of a runtime record whose spec is gone |
 | `pb_` | `probe.uproc`, `probe_collect.uproc` | liveness/readiness probes: per-probe state at `/probe-rt-<l\|r>/<uid>` whose `due`/`deadline` arm the kernel timer, exec attempts over the `/sandbox-exec/` seam, verdicts at `/probe-status/` (the lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates on `ready`) |
 | `pi_` | `pod_image.uproc` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
@@ -253,7 +263,6 @@ to the hex params a graph carries.
 | `tk_` | `sa_token.uproc` | a `/token-req/` → kagi's `token_mint` (via `kagi_mint`) → `/token-resp/` `token=<JWT>` |
 | `is_` | `ipam_svc.uproc` | ClusterIPs from 10.96.0.0/16: next-fit over a cursor, each address claimed create-only at `/ipam/svc/<u32>` (409 = taken, skip), PATCHed into `spec.clusterIP`; held addresses are claimed before allocation starts; a deleted Service's claim is released |
 | `ip_` | `ipam_pod.uproc`, `ipam_pod_release.uproc` | pod IPs from the `/ipam-pool` CIDR: the same claims, committed as a create-only `/ipam-lease/<id>`; a request whose sandbox is gone releases its lease, request and claim |
-| `dns_` | `service_dns.uproc` | each Service's ready backends as an A-record set at `<svc>.<ns>.svc.cluster.local`: a key of four parts and two literals the connector joins, and a value the walk decorates (`list_item: "a="`, `list_join: ";"`) as it reads the per-backend `/endpointslices/` children |
 | `wh_` | `webhook_validator.uproc` | Webhook validation: five comparisons in spec order as a first-hit decision, its message text as much the contract as its verdict → `/webhook-status/` |
 | — | `route.uproc` | the edge-route compile, below |
 | — | `route_validator.uproc` | first-error Route validation → `/route-status/` |
@@ -352,13 +361,15 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `store_effect` | `storage.object`, `storage.namespace` | the reads and writes a chain asks for — GET, CREATE, guarded PUT, PATCH, MERGE (conditional on a revision when one is given), REPLACE, APPEND, DELETE, LIST, COUNT (optionally of the children a `count_where` decision keeps), EXISTS and `EXISTS_ANY` — over a key assembled from record fields; a fused decision builds the request from the arriving record, given the wall clock when `wall` is set |
 | `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Six request inputs, so the runtime's chains feed it without a merge |
 | `net_apply` | `net_policy` (`0x1E`) | rows under a prefix → one `net.policy` table, replaced whole (a row set that does not fit is not applied); the platform's ENFORCED bit and the generation at `/np-status/<table>` |
+| `cluster_dns` | the net pair (datagram) | the cluster's DNS: `<svc>.<ns>.svc.cluster.local` answered from the store as the API keeps it — a Service's ClusterIP, a headless one's ready backends (its `/endpoints/` document), an ExternalName's CNAME, a named port's SRV, NXDOMAIN for no such Service — and every other name forwarded to the node's resolver |
+| `svc_alloc` | `storage.object`, `storage.namespace` | NodePort and LoadBalancer allocation: node ports and a pool address claimed create-only, written into the Service conditional on its revision, released when no longer held (one module rather than two `is_`-shaped chains: a chain per allocator costs ~3.5 KiB of the runtime's config arena, this ~50 bytes) |
 | `http_fetch` | net pair, `fs` | one GET at a time (behind `tls`, or plaintext); the answer comes back as the JSON members the record asked for (`a[].b` collect, `a[k=v].b` select), or lands as a sha256-verified file (optionally in Range chunks); a request whose result already exists is answered 304 without a byte on the wire |
 | `http_chain` | Wave's `http` (an exchange PROVIDER on an application route) | each exchange → one request envelope for a chain, a large body staged in the store; the chain's reply envelopes → the exchange's response, a watch held open, within the server's credit |
 | `http_effect` | an HTTP endpoint, in the graph or through Wave's `http` client (an exchange REQUESTER) | a record → one exchange (kagi's `certificate_endpoint`) → the answer, with chosen top-level JSON members lifted, as a record |
 | `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the verification key from `/authn-keys/sa` |
 | `kagi_mint` | kagi's `token_mint` (an exchange REQUESTER of the typed operation) | a record → the signed token as a record; names the signing key by vault label and stores the public half the mint announces at `/authn-keys/sa` |
 | `store_doc` | `storage.object` | the API writer's record adapter in front of lattice's JSON document dialect: each write leaves as one document request, and an object too large for the reply record is sent empty so the answer becomes a GET the watch chain serves |
-| `store_stamped` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a small heap, for a controller's writer: whole-object writes that follow a document `schema` are stamped with a uid and creationTimestamp, kept when rewritten, as an object the API created |
+| `store_stamped` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a small heap, for a controller's writer: whole-object writes that follow a document `schema` are stamped with a uid and creationTimestamp, kept when rewritten, as an object the API created; and a controller's reader or deleter of objects past a record (its projections, its COUNT predicates, a delete's tomb read whole) |
 | `store_big` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a heap, for the few nodes handling a document past a record: a body the HTTP front staged, and an object projected from a heap copy. Every other `store_effect` stays bounded |
 | `store_watch` | `storage.namespace`, `storage.object`, `timer` | `store_source`'s `events` mode with a heap — the watch connector: objects past one record streamed across records, and change batches past `EV_BUF` |
 | `kagi_storage_effect` | Kagi's storage-key service | a volume-key effect in, storage-key requests out, the typed outcome back as a record |
@@ -414,8 +425,9 @@ List/Watch:  the request chain registers the connection; the watch connector
              item or event into the reply stage on the connection wave holds
 
 Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices → the folded
-             /endpoints document → the dns_ chain projects the zone;
-             px_ rows → net_apply → the `proxy` net.policy table
+             /endpoints document, which cluster_dns answers headless names
+             from; px_ rows → each node's net_apply → its `proxy`
+             net.policy table
 
 Pod start:   apps/v1 PUT → dp_ → rs_ → Pods → sc_ binds → pj_/pl_ project
              /sandboxes/ → the im_ chains over http_fetch materialise the

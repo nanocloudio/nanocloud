@@ -68,6 +68,17 @@ module nanocloud.apiplane_reply {
     when w.c_verb == "delete" && w.status == 404 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 404,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404}", c_stream: 0, c_key: w.c_key };
+    // A delete's Success is decided before the write: a store that did not
+    // delete answers what it did, never Success over an object still there.
+    when w.c_verb == "delete" && w.status == 409 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 409,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Conflict\",\"code\":409,\"message\":\"the object has been modified; please apply your changes to the latest version and try again\"}", c_stream: 0, c_key: w.c_key };
+    when w.c_verb == "delete" && w.status == 503 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 503,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the store could not decide the delete in time; it may still be applied - retry\"}", c_stream: 0, c_key: w.c_key };
+    when w.c_verb == "delete" && w.status >= 400 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 500,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"InternalError\",\"code\":500}", c_stream: 0, c_key: w.c_key };
     when w.status == 201 ->
       Acted { cid: w.cid, status: 200, value: w.value, c_cid: w.c_cid, c_status: 201,
               c_answer: w.c_answer, c_stream: w.c_stream, c_key: w.c_key };

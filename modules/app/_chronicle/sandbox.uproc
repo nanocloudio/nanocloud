@@ -9,11 +9,14 @@
 //          naming volumes waits until each is bound, /volume-binds/), START a
 //          created one whose phase is start, DESTROY one whose phase is delete
 //   exec   /sandbox-exec/<id>/<req> with no result -> EXEC in sandbox <id>
+//          (an `@`-spelled probe is the node's dialer's, probe_dial)
 //   kill   /sandbox-kill/<id> sig=term|kill -> SIGNAL
 //   pause  /sandbox-pause/<id> pause|resume -> PAUSE / RESUME
 //   tty    /tty/<id>/<sid>/ctl open|close -> the pty session; /in -> its input
 //   ev     what the connector reports -> /sandbox-status/<id> (state, code)
-//          and the boot it holds under (/sandbox-boot-of/<id>), /sandbox-logs/<id> and /tty/…/out (bounded tails),
+//          and the boot it holds under (/sandbox-boot-of/<id>), /sandbox-logs/<id> and /tty/…/out (bounded tails;
+//          /sandbox-log-n/<id> every log byte ever written, the connector's
+//          `append_tally`),
 //          /sandbox-exec-result/ (+ -output/), /tty/…/status, /sandbox-boot;
 //          consumed pty input is cleared (conditional on its revision)
 //
@@ -179,8 +182,12 @@ module nanocloud.sandbox {
     phase: string = 80;    // exec: its desired phase — "" when there is no such sandbox
   }
   // An exec waits for its sandbox to be running; one for a sandbox that does
-  // not exist, or has ended, is answered (255) rather than left to hang.
+  // not exist, or has ended, is answered (255) rather than left to hang. An
+  // httpGet or tcpSocket probe (`@http …`, `@tcp …`) is the node's dialer's
+  // (probe_dial), not the sandbox's.
   decision exec(r: Req) -> Op {
+    when r.val.startsWith("@") ->
+      Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when r.phase != "" && r.phase != "delete" && (r.st == "" || r.st == "created") ->
       Op { cid: r.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->

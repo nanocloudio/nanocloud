@@ -89,9 +89,13 @@ rbac_crb "$D/store.log" admins admin ServiceAccount admin default
 rbac_crb "$D/store.log" listers listonly ServiceAccount lister default
 # `list` but NOT `watch` — the two are distinct Kubernetes verbs.
 rbac_clusterrole "$D/store.log" listonly "list,get" "pods"
-# A pod that RAN: its sandbox's output tail, recorded under its uid.
-put_text "/pods/default/logger" '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"logger","namespace":"default","uid":"0f5e7a2c-1111-4222-8333-444455556666"},"spec":{"containers":[{"name":"c","image":"busybox:1"}]}}'
-put_text "/sandbox-logs/0f5e7a2c-1111-4222-8333-444455556666" "$(printf 'one\ntwo\nthree\n')"
+# A pod that RAN: its sandbox's output tail, recorded by its node, in that
+# node's own records (/~node/<node>/), under its uid — and the same uid's
+# output in no node's records, and in another node's, which are not its log.
+put_text "/pods/default/logger" '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"logger","namespace":"default","uid":"0f5e7a2c-1111-4222-8333-444455556666"},"spec":{"nodeName":"node-b","containers":[{"name":"c","image":"busybox:1"}]}}'
+put_text "/~node/node-b/sandbox-logs/0f5e7a2c-1111-4222-8333-444455556666" "$(printf 'one\ntwo\nthree\n')"
+put_text "/sandbox-logs/0f5e7a2c-1111-4222-8333-444455556666" "$(printf 'unscoped\n')"
+put_text "/~node/node-c/sandbox-logs/0f5e7a2c-1111-4222-8333-444455556666" "$(printf 'elsewhere\n')"
 put_text "/pods/default/web-0" '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web-0","namespace":"default","labels":{"app":"web"},"finalizers":["a/one"]},"spec":{"containers":[{"name":"web","image":"nginx:1","ports":[{"containerPort":80}],"env":[{"name":"A","value":"1"}]},{"name":"side","image":"busybox:1"}]}}'
 echo "   seeded"
 
@@ -378,6 +382,12 @@ k logs logger --limit-bytes=5 >"$D/l3.out" 2>&1 || { cat "$D/l3.out"; fail "kube
 [ "$(cat "$D/l3.out")" = "$(printf 'one\nt')" ] || { cat -A "$D/l3.out"; fail "kubectl logs --limit-bytes=5"; }
 k logs web-0 >"$D/l4.out" 2>&1 || { cat "$D/l4.out"; fail "kubectl logs of a pod that never ran"; }
 [ ! -s "$D/l4.out" ] || { cat -A "$D/l4.out"; fail "a pod that never ran has output"; }
-echo "   logs: whole tail; --tail=2; --limit-bytes=5; a pod that never ran: empty"
+# `-f` is not streamed: the API answers what is recorded and ends the
+# response (store_source answers a log read as one GET), so kubectl prints
+# it and exits — never hangs, never streams what is written after.
+timeout 20 kubectl --kubeconfig "$D/kubeconfig" logs -f logger >"$D/l5.out" 2>&1 \
+  || { cat "$D/l5.out"; fail "kubectl logs -f did not end with the recorded output"; }
+[ "$(cat "$D/l5.out")" = "$(printf 'one\ntwo\nthree')" ] || { cat -A "$D/l5.out"; fail "kubectl logs -f: not the recorded output"; }
+echo "   logs: whole tail (its node's record, not another's); --tail=2; --limit-bytes=5; -f: the record, then the end; a pod that never ran: empty"
 
 echo "== E2E green: kubectl patch (strategic, merge, json), label, annotate, server-side apply with field ownership, the create stamps, finalizers, subresources, validating apply, server dry runs, Tables and logs =="

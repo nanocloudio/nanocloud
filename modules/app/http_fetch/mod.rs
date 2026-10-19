@@ -32,6 +32,7 @@ include!("../_shared/store.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonq.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
+include!("../_shared/regcred.rs");
 
 const OBJ_PUT: u32 = 0x1420;
 const OBJ_GET: u32 = 0x1421;
@@ -73,6 +74,10 @@ const CHAN_EINVAL: i32 = -22;
 
 const SINK_REPLY: i64 = 1;
 const SINK_FILE: i64 = 2;
+/// The file `<dir>/<file>` dropped from the cache: no byte on the wire.
+const SINK_DROP: i64 = 3;
+/// The provider's answer for a name that is not there.
+const FS_ENOENT: i32 = -2;
 
 const DEFAULT_PORT: u16 = 443;
 const MAX_AUTHORITY: usize = 96;
@@ -91,6 +96,16 @@ const TOKEN_MAX: usize = 4096;
 const TX_BUF_SIZE: usize = 1024 + TOKEN_MAX;
 /// `user:password` read from the `credentials` key.
 const MAX_CRED: usize = 256;
+/// A credential as `Authorization: Basic` carries it (`base64(user:password)`).
+const BASIC_MAX: usize = 384;
+/// A Secret as the API stores it, and its decoded registry config.
+const SECRET_MAX: usize = 4096;
+const SECRET_CONFIG_MAX: usize = 3072;
+/// The store prefix whose records name a pull's imagePullSecrets.
+const MAX_PULL_AUTH: usize = 64;
+/// The candidates a challenge is answered with, at most: a pull's Secrets,
+/// the node's credentials, and none.
+const MAX_CANDIDATES: u8 = 32;
 /// One answer to one query.
 const ANSWER: usize = 2048;
 const MAX_QUERIES: u8 = 8;
@@ -181,6 +196,10 @@ struct State {
     /// The store key whose value is `user:password` for the token realm.
     credentials: [u8; MAX_KEY],
     credentials_len: u16,
+    /// `pull_auth`: the store prefix whose records (`rk=<pull>;s=<ns>/<name>,…`)
+    /// name the imagePullSecrets of the Pods a request's pull (field 25) serves.
+    pull_auth: [u8; MAX_PULL_AUTH],
+    pull_auth_len: u8,
 
     phase: Phase,
     inflight: u8,
@@ -226,9 +245,33 @@ struct State {
     tx_len: u16,
     tx_sent: u16,
 
-    /// Bearer auth: the leg on the wire, whether this request has had its
-    /// one token fetch (re-armed by every 2xx), the token, and the realm of
-    /// the last challenge (its authority, port, and path with the query).
+    /// The request's own registry (field 23), dialled and named in its Host
+    /// header in place of `authority`; empty: `authority`.
+    host: [u8; MAX_AUTHORITY],
+    host_len: u8,
+    host_port: u16,
+    /// Whom the held token and Basic credential were won for: the request's
+    /// registry, its credentials' name and its pull (fields 23, 24, 25). A
+    /// request for another drops both — a token one Pod's Secret won never
+    /// rides a pull it was not offered for.
+    owner: u32,
+    /// The credential candidate in use (0: none yet; see `cand_cred`), and
+    /// the `Authorization: Basic` value it gave (empty: none).
+    cand: u8,
+    basic_len: u16,
+    basic: [u8; BASIC_MAX],
+    /// The origin asked Basic itself: the object request carries `basic`.
+    basic_on: u8,
+    /// A candidate's store read was not answered: the challenge (its
+    /// scheme) is answered again, with the same candidate, after a backoff.
+    cred_owed: u8,
+    /// Scratch for a Secret and its decoded registry config.
+    sec: [u8; SECRET_MAX],
+    sec_cfg: [u8; SECRET_CONFIG_MAX],
+    /// Auth: the leg on the wire, whether this request has had its one
+    /// refresh with the credential in use (re-armed by every 2xx), the
+    /// challenge (1 Bearer, 2 Basic), the token, and the realm of the last
+    /// Bearer challenge (its authority, port, and path with the query).
     leg: u8,
     auth_tried: u8,
     challenged: u8,
@@ -264,7 +307,7 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::{MAX_AUTHORITY, MAX_DIR, MAX_KEY};
+    use super::{MAX_AUTHORITY, MAX_DIR, MAX_KEY, MAX_PULL_AUTH};
 
     define_params! {
         State;
@@ -294,6 +337,13 @@ mod params_def {
                 let n = if len > MAX_KEY { 0 } else { len };
                 s.credentials_len = n as u16;
                 if n > 0 { ptr_copy(s.credentials.as_mut_ptr(), d, n); }
+            };
+
+        6, pull_auth, str, 0
+            => |s, d, len| {
+                let n = if len > MAX_PULL_AUTH { 0 } else { len };
+                s.pull_auth_len = n as u8;
+                if n > 0 { ptr_copy(s.pull_auth.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -423,6 +473,28 @@ fn authority(s: &State) -> &[u8] {
     &s.authority[..s.authority_len as usize]
 }
 
+/// Where the held request's object is asked, and its port: the request's
+/// own registry (field 23), or the configured `authority`.
+fn object_authority(s: &State) -> (&[u8], u16) {
+    if s.host_len > 0 {
+        (&s.host[..s.host_len as usize], s.host_port)
+    } else {
+        (authority(s), s.port)
+    }
+}
+
+/// FNV-1a over `parts`, each closed by 0xFF: whom a credential is for.
+fn owner_of(parts: [&[u8]; 3]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for p in parts {
+        for &c in p.iter().chain(core::iter::once(&0xFFu8)) {
+            h ^= c as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
 fn held(s: &State) -> &[u8] {
     &s.held[..s.held_len as usize]
 }
@@ -543,7 +615,18 @@ unsafe fn discard_step(s: &mut State) {
     let sys = &*s.syscalls;
     let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
     let n = file_path(s, &mut path);
-    if n > 0 && fs_pending((sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n)) {
+    let rc = if n > 0 {
+        (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n)
+    } else {
+        0
+    };
+    if n > 0 && fs_pending(rc) {
+        return;
+    }
+    // A drop asked for is done when the name is gone — removed now, or not
+    // there at all; any other refusal is the provider's to report (500).
+    if s.sink == SINK_DROP as u8 {
+        answer(s, if rc == 0 || rc == FS_ENOENT { 200 } else { 500 });
         return;
     }
     answer(s, s.final_status);
@@ -770,7 +853,6 @@ fn ranged(s: &State) -> bool {
 }
 
 unsafe fn build_request(s: &mut State) -> usize {
-    let sys = &*s.syscalls;
     // `tx_buf` is written while the request's parts are read from `s`.
     let st = s as *mut State;
     let tx = &mut (*st).tx_buf;
@@ -783,25 +865,15 @@ unsafe fn build_request(s: &mut State) -> usize {
         o = append(tx, o, b" HTTP/1.1\r\nHost: ");
         o = append(tx, o, host);
         o = append(tx, o, b"\r\nAccept: application/json");
-        // The realm's credentials, when the deployment gave a key for them;
-        // without, the token asked for is an anonymous one.
-        if s.credentials_len > 0 {
-            let key =
-                core::slice::from_raw_parts(s.credentials.as_ptr(), s.credentials_len as usize);
-            let mut cred = [0u8; MAX_CRED];
-            match get_value_live(sys, &(*st).nag, key, &mut cred) {
-                Got::Found(n) => {
-                    let mut b = [0u8; MAX_CRED.div_ceil(3) * 4];
-                    if let Some(bn) = b64_encode(&cred[..n], &mut b) {
-                        o = append(tx, o, b"\r\nAuthorization: Basic ");
-                        o = append(tx, o, &b[..bn]);
-                    }
-                }
-                // Not answered yet (`EAGAIN`): no request, rather than an
-                // anonymous one — the caller asks the leg again shortly.
-                Got::Pending => return 0,
-                Got::Absent => {}
-            }
+        // The credential in use (`cand_cred`); without one, the token
+        // asked for is an anonymous one.
+        if s.basic_len > 0 {
+            o = append(tx, o, b"\r\nAuthorization: Basic ");
+            o = append(
+                tx,
+                o,
+                core::slice::from_raw_parts(s.basic.as_ptr(), s.basic_len as usize),
+            );
         }
     } else {
         let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
@@ -811,12 +883,19 @@ unsafe fn build_request(s: &mut State) -> usize {
         o = append(tx, 0, b"GET ");
         o = append(tx, o, &path[..pl]);
         o = append(tx, o, b" HTTP/1.1\r\nHost: ");
-        o = append(tx, o, authority(&*st));
+        o = append(tx, o, object_authority(&*st).0);
         if !accept.is_empty() && accept.len() <= MAX_ACCEPT {
             o = append(tx, o, b"\r\nAccept: ");
             o = append(tx, o, accept);
         }
-        if s.token_len > 0 {
+        if s.basic_on == 1 && s.basic_len > 0 {
+            o = append(tx, o, b"\r\nAuthorization: Basic ");
+            o = append(
+                tx,
+                o,
+                core::slice::from_raw_parts(s.basic.as_ptr(), s.basic_len as usize),
+            );
+        } else if s.token_len > 0 {
             o = append(tx, o, b"\r\nAuthorization: Bearer ");
             o = append(
                 tx,
@@ -899,6 +978,7 @@ fn take_challenge(s: &mut State, v: &[u8]) -> bool {
     if v.len() < 7 || !v[..7].eq_ignore_ascii_case(b"Bearer ") {
         return false;
     }
+
     let params = &v[7..];
     let Some(realm) = auth_param(params, b"realm") else {
         return false;
@@ -1013,7 +1093,15 @@ unsafe fn parse_header(s: &mut State, end: usize) -> bool {
             s.chunked = 1;
         } else if name.eq_ignore_ascii_case(b"www-authenticate") {
             if s.status == 401 && s.leg == LEG_OBJECT && s.challenged == 0 {
-                s.challenged = take_challenge(s, v) as u8;
+                // Bearer (the OCI token flow: 1), or Basic asked of the
+                // origin itself (2).
+                s.challenged = if take_challenge(s, v) {
+                    1
+                } else if v.len() >= 5 && v[..5].eq_ignore_ascii_case(b"Basic") {
+                    2
+                } else {
+                    0
+                };
             }
         } else if name.eq_ignore_ascii_case(b"content-type") {
             let n = v.len().min(s.ctype.len());
@@ -1078,6 +1166,173 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
     true
 }
 
+/// How a challenge is answered: a token from a realm, or Basic to the origin.
+const CRED_BEARER: u8 = 1;
+const CRED_BASIC: u8 = 2;
+
+/// What `cand_cred` found for a candidate.
+#[derive(Clone, Copy, PartialEq)]
+enum Cand {
+    /// A credential, in `basic`.
+    Found,
+    /// None: the anonymous candidate (a Bearer realm's anonymous token).
+    Anon,
+    /// No such candidate: every one was offered.
+    Spent,
+    /// A store read was not answered yet (`EAGAIN`): asked again shortly.
+    Pending,
+}
+
+/// Candidate `idx` (1-based) for the held request, in the order a kubelet
+/// offers them: the imagePullSecrets of the Pods its pull serves (field 25,
+/// the `pull_auth` records naming it, each Secret's entry for the registry
+/// named by field 24 — `rc_basic_for`), then the node's own `credentials`,
+/// then none.
+unsafe fn cand_cred(s: &mut State, idx: u8) -> Cand {
+    let st = s as *mut State;
+    let sys = &*(*st).syscalls;
+    let h = core::slice::from_raw_parts((*st).held.as_ptr(), (*st).held_len as usize);
+    // The selector and the registry's name, copied off the held record.
+    let mut sel = [0u8; MAX_KEY];
+    let sl = append(&mut sel, 0, frame_bytes(h, 25));
+    let mut reg = [0u8; MAX_AUTHORITY];
+    let rf = frame_bytes(h, 24);
+    let rl = if rf.is_empty() {
+        append(&mut reg, 0, object_authority(&*st).0)
+    } else {
+        append(&mut reg, 0, rf)
+    };
+    let (sel, reg) = (&sel[..sl], &reg[..rl]);
+    let mut count = 0u8;
+    if (*st).pull_auth_len > 0 && !sel.is_empty() {
+        let store = Store::plain(sys, &(*st).nag);
+        let prefix =
+            core::slice::from_raw_parts((*st).pull_auth.as_ptr(), (*st).pull_auth_len as usize);
+        let mut walk = ListWalk::new(prefix);
+        while let Some(key) = walk.next(&store) {
+            let mut rec = [0u8; 512];
+            let Some(rn) = get_value(&store, key, &mut rec) else {
+                if store.waiting() {
+                    return Cand::Pending;
+                }
+                continue;
+            };
+            let Some((ns, names)) = rc_record(&rec[..rn], sel) else {
+                continue;
+            };
+            for name in names.split(|&c| c == b',') {
+                if name.is_empty() {
+                    continue;
+                }
+                let mut sk = [0u8; MAX_KEY];
+                let mut kl = append(&mut sk, 0, b"/secrets/");
+                kl = append(&mut sk, kl, ns);
+                kl = append(&mut sk, kl, b"/");
+                kl = append(&mut sk, kl, name);
+                if kl == sk.len() {
+                    continue;
+                }
+                let Some(sn) = get_value(&store, &sk[..kl], &mut (*st).sec) else {
+                    if store.waiting() {
+                        return Cand::Pending;
+                    }
+                    continue;
+                };
+                let secret = core::slice::from_raw_parts((*st).sec.as_ptr(), sn);
+                if let Some(bn) = rc_basic_for(secret, reg, &mut (*st).sec_cfg, &mut (*st).basic) {
+                    count += 1;
+                    if count == idx {
+                        (*st).basic_len = bn as u16;
+                        return Cand::Found;
+                    }
+                }
+            }
+        }
+        if walk.pending || store.waiting() {
+            return Cand::Pending;
+        }
+    }
+    if (*st).credentials_len > 0 {
+        let key =
+            core::slice::from_raw_parts((*st).credentials.as_ptr(), (*st).credentials_len as usize);
+        let mut cred = [0u8; MAX_CRED];
+        match get_value_live(sys, &(*st).nag, key, &mut cred) {
+            Got::Found(n) => {
+                count += 1;
+                if count == idx {
+                    return match b64_encode(&cred[..n], &mut (*st).basic) {
+                        Some(bn) => {
+                            (*st).basic_len = bn as u16;
+                            Cand::Found
+                        }
+                        None => Cand::Spent,
+                    };
+                }
+            }
+            Got::Pending => return Cand::Pending,
+            Got::Absent => {}
+        }
+    }
+    if idx == count + 1 {
+        (*st).basic_len = 0;
+        return Cand::Anon;
+    }
+    Cand::Spent
+}
+
+/// Answer a challenge (`scheme`) with the credential in use, or (`advance`)
+/// the next candidate: a Bearer realm is asked for a token with it, a Basic
+/// origin is asked again with it. Every candidate offered answers 401.
+unsafe fn next_credential(s: &mut State, scheme: u8, advance: bool) {
+    s.auth_tried = 1;
+    let mut adv = advance || s.cand == 0;
+    loop {
+        if adv {
+            if s.cand >= MAX_CANDIDATES {
+                s.cand = 0;
+                s.token_len = 0;
+                s.basic_on = 0;
+                reply(s, 401);
+                return;
+            }
+            s.cand += 1;
+        }
+        match cand_cred(s, s.cand) {
+            Cand::Pending => {
+                // This same candidate, asked again shortly.
+                s.cred_owed = scheme;
+                s.backoff_ms = BACKOFF_INIT_MS;
+                s.state_start_ms = dev_millis(&*s.syscalls);
+                s.phase = Phase::Backoff;
+                return;
+            }
+            Cand::Spent => {
+                log(s, 1, b"[http_fetch] no credential the registry accepts");
+                s.cand = 0;
+                s.token_len = 0;
+                s.basic_on = 0;
+                reply(s, 401);
+                return;
+            }
+            // Basic is not answered with nothing: the next one.
+            Cand::Anon if scheme == CRED_BASIC => adv = true,
+            Cand::Found | Cand::Anon => break,
+        }
+    }
+    if scheme == CRED_BEARER {
+        s.basic_on = 0;
+        s.token_len = 0;
+        s.leg = LEG_TOKEN;
+        begin(s);
+        return;
+    }
+    s.basic_on = 1;
+    s.token_len = 0;
+    if restart(s) {
+        begin(s);
+    }
+}
+
 /// The response body is complete: verify and answer, or chain the next chunk.
 unsafe fn body_done(s: &mut State) {
     close_conn(s);
@@ -1102,7 +1357,8 @@ unsafe fn body_done(s: &mut State) {
         if tok.is_empty() || tok.len() > TOKEN_MAX || tok.iter().any(|&c| c <= b' ' || c >= 0x7f) {
             log(s, 1, b"[http_fetch] the realm gave no token");
             s.body_fill = 0;
-            reply(s, 401);
+            // The credential in use won none: the next one is offered.
+            next_credential(s, CRED_BEARER, true);
             return;
         }
         let n = tok.len();
@@ -1114,15 +1370,19 @@ unsafe fn body_done(s: &mut State) {
         }
         return;
     }
-    if s.status == 401 && s.challenged == 1 && s.auth_tried == 0 {
-        // The origin wants a token (none held, or the held one is spent or
-        // for another scope): one fetch from the realm it named, then the
-        // request again.
-        s.auth_tried = 1;
-        s.token_len = 0;
-        s.leg = LEG_TOKEN;
+    if s.status == 401 && s.challenged != 0 {
+        // The origin wants credentials: a token from the realm its Bearer
+        // challenge named, or Basic of its own. The credential in use is
+        // offered again once after a 2xx (a token spent mid-transfer); any
+        // other refusal moves on to the next candidate, and none left
+        // answers the 401.
         s.body_fill = 0;
-        begin(s);
+        let scheme = if s.challenged == 1 {
+            CRED_BEARER
+        } else {
+            CRED_BASIC
+        };
+        next_credential(s, scheme, s.auth_tried != 0 || s.cand == 0);
         return;
     }
     let ok = if ranged(s) { 206 } else { 200 };
@@ -1406,7 +1666,7 @@ unsafe fn admit(s: &mut State) {
 unsafe fn start(s: &mut State) {
     let sys = &*s.syscalls;
     let sink = frame_i64(held(s), 2).unwrap_or(0);
-    if sink != SINK_REPLY && sink != SINK_FILE {
+    if sink != SINK_REPLY && sink != SINK_FILE && sink != SINK_DROP {
         s.held_len = 0;
         return; // the decision's filter
     }
@@ -1426,6 +1686,45 @@ unsafe fn start(s: &mut State) {
     s.file_step = FO_IDLE;
     s.spill_off = 0;
     s.spill_len = 0;
+    s.cred_owed = 0;
+    // A file dropped from the cache: its UNLINK, asked until it decides.
+    if s.sink == SINK_DROP as u8 {
+        s.final_status = 200;
+        s.phase = Phase::Discard;
+        return;
+    }
+    // Where it is asked: the request's own registry, or `authority`.
+    let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
+    let host = frame_bytes(h, 23);
+    s.host_len = 0;
+    if !host.is_empty() {
+        match Target::parse(host) {
+            Some((_, p)) if host.len() <= MAX_AUTHORITY => {
+                ptr_copy(s.host.as_mut_ptr(), host.as_ptr(), host.len());
+                s.host_len = host.len() as u8;
+                s.host_port = p.unwrap_or(DEFAULT_PORT);
+            }
+            _ => {
+                reply(s, 400);
+                return;
+            }
+        }
+    }
+    // A token or a Basic credential won for another registry, credentials'
+    // name or pull is not this request's.
+    let who = owner_of([frame_bytes(h, 23), frame_bytes(h, 24), frame_bytes(h, 25)]);
+    if who != s.owner {
+        s.owner = who;
+        s.token_len = 0;
+        s.basic_len = 0;
+        s.basic_on = 0;
+        s.cand = 0;
+    }
+    // Nothing won and held: the candidates are offered from the first again
+    // (a Pod may have brought credentials since the last refusal).
+    if s.token_len == 0 && s.basic_on == 0 {
+        s.cand = 0;
+    }
     // Already there: answered without a byte on the wire.
     let mut k = [0u8; MAX_KEY];
     let (a, b) = (frame_bytes(held(s), 12), frame_bytes(held(s), 22));
@@ -1521,7 +1820,14 @@ pub unsafe extern "C" fn module_new(
         s.authority_over = 0;
         s.dir_len = 0;
         s.credentials_len = 0;
+        s.pull_auth_len = 0;
         s.token_len = 0;
+        s.host_len = 0;
+        s.owner = 0;
+        s.cand = 0;
+        s.basic_len = 0;
+        s.basic_on = 0;
+        s.cred_owed = 0;
         s.leg = LEG_OBJECT;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
@@ -1590,7 +1896,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let (dial, port) = if s.leg == LEG_TOKEN {
                     (&s.realm_auth[..s.realm_auth_len as usize], s.realm_port)
                 } else {
-                    (authority(s), s.port)
+                    object_authority(s)
                 };
                 let n = match Target::parse(dial) {
                     Some((target, _)) => write_connect_to(
@@ -1638,7 +1944,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             Phase::Fsync => fsync_step(s),
             Phase::Discard => discard_step(s),
             Phase::Backoff => {
-                if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms {
+                if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms
+                    && s.cred_owed != 0
+                {
+                    let scheme = s.cred_owed;
+                    s.cred_owed = 0;
+                    next_credential(s, scheme, false);
+                } else if dev_millis(sys).wrapping_sub(s.state_start_ms) >= s.backoff_ms {
                     // A retried file starts again from what is on disk: the
                     // Range position when chunked, else from nothing. A
                     // token leg is asked again as it was.

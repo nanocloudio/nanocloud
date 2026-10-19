@@ -10,17 +10,29 @@
 #
 # Idempotent: re-running rebuilds the rootfs from scratch (a half-assembled
 # dir from a crashed run is discarded).
+#
+# Exit 65 (EX_DATAERR) says the CACHE is wrong — a layer missing, or not the
+# bytes its digest names (a cut write, a power cut, a disk): every layer is
+# checked before anything is extracted, and image_asm.uproc has the image's
+# layers dropped and fetched again. Any other failure is the node's (a
+# rootfs it cannot write, a layer that is not a tar) and is retried with a
+# growing delay.
 set -eu
 
 R="$1"; B="$2"; shift 2
 [ $# -ge 1 ] || { echo "no layers" >&2; exit 2; }
+
+# 0. The cache is what its markers say, before anything is built from it.
+for d in "$@"; do
+  [ -f "$B/$d" ] || { echo "missing blob $d" >&2; exit 65; }
+  [ "$(sha256sum "$B/$d" | cut -d' ' -f1)" = "$d" ] || { echo "blob $d is not its digest" >&2; exit 65; }
+done
 
 rm -rf "$R"
 mkdir -p "$R"
 
 # 1. Layers in manifest order.
 for d in "$@"; do
-  [ -f "$B/$d" ] || { echo "missing blob $d" >&2; exit 3; }
   tar -xzf "$B/$d" -C "$R"
 done
 

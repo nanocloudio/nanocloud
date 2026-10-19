@@ -108,6 +108,21 @@ def sub(old, new, text=None):
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
           "/volume-binds/,/image-,/volume-ops/,/blobs/,/fetch-q/")
 sub('      scope: ""\n      scoped: ""\n', f'      scope: "{node}"\n      scoped: "{SCOPED}"\n')
+# The controllers no Pod here needs, left out (WN_DROP: name prefixes), so
+# the graph stays inside the runtime's config arena.
+import os
+DROP = tuple(os.environ.get("WN_DROP", "jb_ cj_ pc_ hp_ sn_ dv_ dss_ ip_ ns_ q_ pdb_ te_ gc_").split())
+if DROP:
+    head, rest = g.split("modules:\n", 1)
+    cmods, cwire = rest.split("\nwiring:\n", 1)
+    cblocks = re.split(r"(?m)^(?=  - name: )", cmods)
+    dropped = {b.split()[2] for b in cblocks if b.startswith("  - name: ") and b.split()[2].startswith(DROP)}
+    cmods = "".join(b for b in cblocks if not (b.startswith("  - name: ") and b.split()[2] in dropped))
+    def gone(b):
+        f = re.match(r"  - from: (\S+)\n    to: (\S+)", b)
+        return bool(f) and (f.group(1).split(".")[0] in dropped or f.group(2).split(".")[0] in dropped)
+    cwire = "".join(b for b in re.split(r"(?m)^(?=  - from: )", cwire) if not gone(b))
+    g = head + "modules:\n" + cmods.rstrip("\n") + "\n\nwiring:\n" + cwire
 def parts(path):
     y = open(path).read()
     mods = y[y.index("modules:\n") + len("modules:\n"):y.index("\nwiring:")]

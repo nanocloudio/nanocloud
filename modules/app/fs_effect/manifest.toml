@@ -1,0 +1,56 @@
+name = "fs_effect"
+version = "0.1.0"
+description = "A chain's filesystem effect: a directory tree (or a file) under a configured root removed through the fs contract, resumably"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# What image GC (image_gc.uproc) removes an assembled rootfs with: a
+# directory's whole tree, walked and removed entry by entry through the fs
+# contract (OPENDIR / READDIR / UNLINK / RMDIR — the contract offers no
+# recursive removal, by design: the caller drives the walk and sees each
+# step). It decides nothing; what to remove is the chain's.
+#
+# In (`request_in`, a Chronicle record): 1 cid, 2 op (0 NOOP: answered 204,
+#   nothing touched; 1 REMOVE), 3 the path, 30..39 and 254 carry.
+# Out (`response_out`): 1 cid, 2 status — 200 gone (removed now, or not
+#   there at all), 204 NOOP, 403 not a direct child of `root`, 500 the
+#   provider refused a step, 414 a name too long to address — 3 how many
+#   entries were removed (i64), and the carry, echoed.
+#
+# `root` (required) bounds it: a path is removed only when it is
+# `<root>/<one name>`, a name of plain characters. Nothing is followed: a
+# symlink is removed as a name (READLINK first, for the path itself; a
+# listing's links are entries like files), and only what READDIR reports as
+# a directory is descended into. A tree deeper than a path the provider
+# takes is moved up, a branch at a time, to a short name beside the path's
+# own top (`<path>/.gc<n>`) and walked from there.
+#
+# Resumable and bounded: each step makes at most `budget` fs calls, and an
+# `EAGAIN` or `EINPROGRESS` is asked again on a later step, unchanged — the
+# walk resumes at the directory it was in, listed afresh. One request at a
+# time; the next waits in the channel.
+timer_class = "agnostic"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+required = true
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "a control-plane effect connector — discrete request/answer records, not a data path"

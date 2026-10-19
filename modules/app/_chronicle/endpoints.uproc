@@ -8,7 +8,9 @@
 //           status.podIP as the node reports it — the node's own address for
 //           a Pod that shares its network (pod_status.uproc), where a Pod
 //           listening on a port is reached
-//   prune   a slice whose pod is gone
+//   prune   a slice whose pod is gone, or whose Service is (related ^1)
+//   gone    an /endpoints/ document whose Service is gone is deleted,
+//           conditional on the revision judged
 //   doc     /services/ with list_children over /endpointslices/ ->
 //           /endpoints/<ns>/<svc> = "<pod>=<ip>,…" — the consumers' document,
 //           unchanged; a materialised view of the slices
@@ -67,6 +69,19 @@ module nanocloud.endpoints {
     key: string = 3;      // "<ns>/<svc>/<pod>"
     ns: string = 28;
     pod: string = 29;
+    svc: string = 70;     // its Service's metadata.name now (related ^1)
+  }
+  message ep.Doc {        // an /endpoints/ document and its Service now
+    seq: int = 1;
+    rev: int = 2;         // the document's revision (source `rev = 1`)
+    key: string = 3;      // "<ns>/<svc>"
+    svc: string = 70;     // the Service's metadata.name (related)
+  }
+  message ep.Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
   }
   message ep.Exists {
     cid: int = 1;
@@ -122,12 +137,16 @@ module nanocloud.endpoints {
       ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod, v1: "" };
   }
 
+  // No Service: ask nothing, and say so to the prune (`hit`), which deletes
+  // the slice as it does a vanished pod's.
   decision exists(s: ep.Sl) -> ep.Exists {
+    when s.svc == "" ->
+      ep.Exists { cid: s.seq, op: NOOP, key: "", sep: "", pod: "", ctx: Ctx { key: s.key, hit: "gone" } };
     default ->
       ep.Exists { cid: s.seq, op: EXISTS, key: s.ns, sep: "/", pod: s.pod, ctx: Ctx { key: s.key } };
   }
   decision prune(k: ep.Known) -> ep.Act {
-    when k.status == 404 ->
+    when k.status == 404 || k.ctx.hit == "gone" ->
       ep.Act { cid: k.cid, op: DELETE, key: k.ctx.key, v1: "" };
     default ->
       ep.Act { cid: k.cid, op: NOOP, key: "", v1: "" };
@@ -149,8 +168,16 @@ module nanocloud.endpoints {
   transformation pass_probe(a: ep.Probe) -> ep.Probe {
     ep.Probe { cid: a.cid, status: a.status, value: a.value, pready: a.pready, ctx: a.ctx }
   }
+  decision gone(d: ep.Doc) -> ep.Del {
+    when d.svc == "" -> ep.Del { cid: d.seq, op: DELETE, key: d.key, rev: d.rev };
+    default -> ep.Del { cid: d.seq, op: NOOP, key: "", rev: 0 };
+  }
+
   transformation pass_sl(s: ep.Sl) -> ep.Sl {
-    ep.Sl { seq: s.seq, rev: s.rev, key: s.key, ns: s.ns, pod: s.pod }
+    ep.Sl { seq: s.seq, rev: s.rev, key: s.key, ns: s.ns, pod: s.pod, svc: s.svc }
+  }
+  transformation pass_doc(d: ep.Doc) -> ep.Doc {
+    ep.Doc { seq: d.seq, rev: d.rev, key: d.key, svc: d.svc }
   }
   transformation pass_known(k: ep.Known) -> ep.Known {
     ep.Known { cid: k.cid, status: k.status, value: k.value, ctx: k.ctx }
@@ -187,6 +214,12 @@ module nanocloud.endpoints {
   entry sl = sl;
   entry ex = ex;
   entry pr = pr;
+  pipeline gn(d: ep.Doc) -> ep.Del {
+    call x = pass_doc(d);
+    call y = gone(x);
+    return y;
+  }
   entry dc = dc;
+  entry gn = gn;
   provenance revision "endpoints-join" toolchain "chronicle-authoring";
 }

@@ -59,10 +59,10 @@ flowchart TD
     TLS --> Http["http<br/>HTTP/1.1 + k8s JSON"]
     Http --> Pipe["request chain (params): decode → verify → authorize<br/>→ admit → read → write → reply"]
     Pipe --> Store
-    Store --> Ctrl["controller chains (params): deployment, replicaset,<br/>daemonset, statefulset, job, hpa, gc, namespace, scheduler"]
+    Store --> Ctrl["controller chains (params): deployment, replicaset,<br/>daemonset, statefulset, job, cronjob, hpa, gc, namespace,<br/>scheduler, priority, disruption budget, quota"]
     Ctrl --> Store
     Store --> Node["pod-lifecycle chain → sandbox chain → workload_effect → workload contract"]
-    Store --> Net["endpoints chain, IPAM chains, service_dns,<br/>proxy/netpolicy chains → net.policy,<br/>route compiler"]
+    Store --> Net["endpoints chain, IPAM chains, cluster_dns,<br/>proxy/netpolicy chains → net.policy,<br/>route compiler"]
 ```
 
 Every arrow into or out of the store is a contract call, and no stage addresses
@@ -96,20 +96,47 @@ one: the control plane, replica 0, alone, and its own node — its cluster.env
 says `NANOCLOUD_PODS=1`, so it registers itself in `/nodes/`, keeps its lease
 and runs the Pods scheduled onto it.
 
-Images are pulled from one registry per node: `NANOCLOUD_REGISTRY` (default
-`registry.nanocloud.io:5000`), dialled at `NANOCLOUD_REGISTRY_ADDR`, over TLS
-authenticated by the CA at `NANOCLOUD_REGISTRY_CA` (DER, default
+A bare image reference means the node's registry: `NANOCLOUD_REGISTRY`
+(default `registry.nanocloud.io:5000`), dialled at `NANOCLOUD_REGISTRY_ADDR`,
+over TLS authenticated by the CA at `NANOCLOUD_REGISTRY_CA` (DER, default
 `/etc/nanocloud.io/certs/ca.der`; without it the node pulls nothing and says
-so when its graph renders). A bare reference means that registry; one naming
-another registry is refused — the Pod stays Pending with an `ErrImagePull`
-event — never pulled from this one instead. A tag is resolved to its
+so when its graph renders). A reference naming another registry is pulled
+from that registry, dialled by its own name — over TLS it must be one the
+node's `tls` client trusts and may name (the default render pins the node
+registry's CA and name, so another registry's handshake fails: an
+`ErrImagePull` saying it could not be reached). A tag is resolved to its
 manifest digest and everything pulled is keyed by the digest; the Pod runs
-the digest it resolved. `imagePullPolicy` is honoured with upstream's
-defaults (`Always` for `:latest` or no tag: the tag is asked again for each
-Pod; `IfNotPresent` otherwise; `Never`: only what is cached). Registry
-credentials, when the registry asks for them, are the store key
-`/registry-auth/<registry host>` (`user:password`); a Pod's
-`imagePullSecrets` are not read.
+the digest it resolved. An image index (a multi-arch tag) is read for the
+node's own platform — linux and its `kubernetes.io/arch` label (arm64 takes
+a `v8` variant or none) — and an index with nothing for it is the Pod's
+`ErrImagePull` ("no matching manifest for linux/arm64/v8 in the manifest
+list entries"), retried with the backoff. `imagePullPolicy` is honoured with
+upstream's defaults (`Always` for `:latest` or no tag: the tag is asked again
+for each Pod; `IfNotPresent` otherwise; `Never`: only what is cached).
+
+Credentials: a registry that asks for them (a Bearer token from its realm,
+or Basic) is offered, in turn until one serves, the Pod's
+`imagePullSecrets` — or, when it states none, its ServiceAccount's —
+(`kubernetes.io/dockerconfigjson` or `kubernetes.io/dockercfg` Secrets, each
+one's entry for the registry), then the node's own at the store key
+`/registry-auth/<registry host>` (`user:password`), then none. As upstream's
+kubelet does by default (its `ensureImagePullCredentials` is alpha and off),
+an image already on the node is not authorized again: an `IfNotPresent` Pod
+runs it whatever credentials it brings, and a pull Pods share is asked with
+the credentials of every Pod waiting on it. A Pod that must be refused what
+it cannot pull itself states `imagePullPolicy: Always`: its pull is its own,
+with its own credentials, and a 401 is its `ErrImagePull`.
+
+A failed rootfs assembly is retried with the pull's backoff (10 s doubling
+to 300 s) and said on the Pod (`ErrImagePull`, then `ImagePullBackOff`); a
+cached layer found missing or not its digest is fetched again. Images are
+garbage-collected as a kubelet does: past `gc_high` images held (in the
+store record `/config/image`; default 20) the least recently used ones no
+Pod uses are removed — records, rootfs directory and the blobs no other
+image holds — down to `gc_low` (15), none unused for less than `gc_min` ms
+(120000), and with `gc_max` set any unused that long; never one in use or
+being pulled. Disk thresholds are not offered: the fs contract states no
+free space.
 `/usr/bin/nanocloud` is a busybox-style symlink to `fluxor`, so `nanocloud <cmd>`
 dispatches the `nanocloud_cli` applet.
 
@@ -210,7 +237,7 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 
 | Group | Resources |
 | ----- | --------- |
-| core/v1 | pods (+ `pods/log`, `pods/status`), services, endpoints, configmaps, secrets, serviceaccounts (+ `serviceaccounts/token`), events, persistentvolumeclaims, persistentvolumes, namespaces, nodes, resourcequotas |
+| core/v1 | pods (+ `pods/log`, `pods/status`, `pods/eviction`), services, endpoints, configmaps, secrets, serviceaccounts (+ `serviceaccounts/token`), events, persistentvolumeclaims, persistentvolumes, namespaces, nodes, resourcequotas |
 | apps/v1 | deployments, replicasets, statefulsets, daemonsets |
 | batch/v1 | jobs, cronjobs |
 | rbac.authorization.k8s.io/v1 | roles, clusterroles, rolebindings, clusterrolebindings |
@@ -258,52 +285,255 @@ store changes, writing into the same reply stage.
 
 ### Kubernetes compatibility: what a container becomes
 
-A Pod's first container runs as one process (a Pod without an image runs its
+Every container of a Pod — its `initContainers` and its `containers` — runs as
+a process of its own, sharing the Pod's network (its node's, unless the Pod
+has an address of its own) and its volumes (a Pod without an image runs its
 command on the node, a Pod with `runtimeClassName: fluxor` as a module
-subgraph). What is honoured, and what is not yet:
+subgraph). The control plane resolves each container once it is scheduled
+(`pod_resolve`, `_shared/podres.rs`), as the kubelet does. What is honoured,
+and what is not yet:
 
-- **Image**: pulled, its rootfs the process's root (an isolated sandbox: the
-  node runs as root). Pending until pulled.
+- **Image**: pulled (the node's platform out of a multi-arch index;
+  `imagePullSecrets`, the ServiceAccount's, `imagePullPolicy`), its rootfs
+  the process's root (an isolated sandbox: the node runs as root). Pending
+  until pulled; a failed pull or assembly is retried with a backoff and said
+  on the Pod. Unused images are garbage-collected.
 - **command / args** against the image's Entrypoint / Cmd, by the Kubernetes
-  rules (both; command only; args only; neither).
-- **env**: exactly `HOSTNAME` (the Pod's name), the image's `Env`, the
-  container's `env` (`name`/`value`) overriding it in order, `HOME` from the
-  image's passwd, `PATH` defaulted when nothing sets it — nothing of the
-  node's own environment.
+  rules (both; command only; args only; neither), each `$(VAR)` expanded
+  against the container's environment (`$$` a literal `$`, an unknown name
+  left as written).
+- **env**: exactly `HOSTNAME` (the Pod's name), the image's `Env`, then the
+  namespace's Service links (`<SVC>_SERVICE_HOST`, `_SERVICE_PORT`,
+  `_SERVICE_PORT_<NAME>`, `<SVC>_PORT`, `_PORT_<p>_<PROTO>[_PROTO|_PORT|_ADDR]`;
+  the default namespace's `kubernetes` always, the rest unless
+  `enableServiceLinks: false`), `envFrom` (a ConfigMap, a Secret, `prefix`),
+  then `env` in order — `value` with `$(VAR)` expanded, or `valueFrom`
+  `configMapKeyRef`, `secretKeyRef`, `fieldRef` (`metadata.name`,
+  `.namespace`, `.uid`, `.labels['…']`, `.annotations['…']`,
+  `spec.nodeName`, `spec.serviceAccountName`, `status.podIP`, `status.hostIP`)
+  and `resourceFieldRef` (limits or requests, `divisor`, a limit not set read
+  as the node's allocatable) — a later definition overriding an earlier,
+  `HOME` from the image's passwd, `PATH` defaulted when nothing sets it;
+  nothing of the node's own environment. A ConfigMap or Secret that is
+  missing (and not `optional`) holds the container in
+  CreateContainerConfigError until it exists.
 - **workingDir**, else the image's `WorkingDir` (created), else `/`.
-- **User**: the image's `User` (`uid[:gid]`, or a name in the image's own
-  `/etc/passwd` and `/etc/group`).
+- **User**: `securityContext.runAsUser` / `runAsGroup` (the container's over
+  the Pod's; a `runAsGroup` alone keeps the image's uid), else the image's
+  `User` (`uid[:gid]`, or a name in the image's own `/etc/passwd` and
+  `/etc/group`). `runAsNonRoot` refuses a root user, and an image user given
+  as a name it cannot verify (CreateContainerConfigError).
+- **Volumes** (`volumes` + `volumeMounts`, `readOnly`): a
+  PersistentVolumeClaim (an encrypted Loam volume once attached and mounted on
+  the node, or a statically provisioned `hostPath`/`local` PersistentVolume
+  bound to it by `claimRef` or `volumeName`); an `emptyDir` (the Pod's own
+  directory on its node, kept across its containers' restarts, removed with
+  the Pod); a `configMap` or `secret` (each key a file, or `items` at their
+  paths, `defaultMode`/`mode`, `optional`, read-only); a `hostPath` (refused
+  under the namespace's Pod Security level `baseline` or `restricted`). A
+  StatefulSet's `volumeClaimTemplates` give each ordinal its own claim,
+  `<template>-<pod>`, created once and kept across the Pod's recreations.
+- **DNS**: `/etc/resolv.conf` by `dnsPolicy` (ClusterFirst: the cluster DNS,
+  the namespace's search path, `ndots:5`; Default: the node's file; None:
+  `dnsConfig` alone; `dnsConfig` merged as the kubelet merges it), unless a
+  container mounts its own. With no cluster DNS (`/cluster-dns` unset) a
+  ClusterFirst Pod gets the node's file, as the kubelet falls back.
+- **initContainers** run to completion in order before the app containers
+  start; one that fails is run again unless the Pod's restartPolicy is
+  `Never`, which fails the Pod.
 - **restartPolicy**: unset is `Always`, as the API server defaults it.
+- **Deletion** is graceful, as upstream's: `kubectl delete pod` marks a
+  running Pod (`deletionTimestamp`, `deletionGracePeriodSeconds`) and it
+  stays Terminating while its node stops every container — init, app and
+  sidecar alike — with SIGTERM, then SIGKILL once the grace is spent; it is
+  deleted once nothing of it runs, so `kubectl delete` waits for that. The
+  grace is `DeleteOptions.gracePeriodSeconds` (`--grace-period=N`, `--now`;
+  an Eviction's `deleteOptions`), else `terminationGracePeriodSeconds`,
+  else 30. `--force --grace-period=0` removes it at once and kills it; a
+  Pod nothing of which runs (unscheduled, terminal, never started) is
+  deleted at once. A controller's or the garbage collector's delete removes
+  the Pod at once and its node still gives it its own grace. A Pod whose
+  node never says its containers stopped is deleted 15 s past its grace.
+  Every node record of every container goes when the Pod's tomb ends.
 - **resources.limits**: `cpu` (cgroup `cpu.max`), `memory` (`memory.max`),
   `ephemeral-storage` (the Pod's own storage root's cap).
 - A command, an env, a working directory or a user too long for the record it
   crosses is refused and the Pod Fails — never run cut short.
-- **Probes**: an `exec` `readinessProbe` gates the Pod's Ready condition (and
-  so its Service endpoints and its controller's ready count); an `exec`
-  `livenessProbe` restarts it. Both run inside the sandbox, with
-  `periodSeconds`, `timeoutSeconds`, `failureThreshold`, `successThreshold`
-  and `initialDelaySeconds` as stated, upstream's defaults (10 s, 1 s, 3, 1,
-  0) when not. A Pod with no readiness probe is Ready while it runs.
+- **Probes**: `readinessProbe` gates the Pod's Ready condition (and so its
+  Service endpoints and its controller's ready count), `livenessProbe`
+  restarts it, `startupProbe` holds both back until it passes and restarts
+  the container when it fails — each an `exec` (run inside the sandbox), an
+  `httpGet` (status 200..399 passes; `HTTP` only, its `httpHeaders`) or a
+  `tcpSocket` (dialled from the node, a named port resolved against the
+  container's), with `periodSeconds`, `timeoutSeconds`, `failureThreshold`,
+  `successThreshold` and `initialDelaySeconds` as stated, upstream's
+  defaults (10 s, 1 s, 3, 1, 0) when not. A Pod with no readiness probe is
+  Ready while it runs.
 - **Status**: `status.phase`, `startTime`, `hostIP`/`podIP` (the node's
   address — a Pod shares its node's network unless it has an address of its
   own), the conditions PodScheduled, Initialized, ContainersReady and Ready,
   and `containerStatuses` (`ready`, `started`, `restartCount`, `imageID`,
   `state` and `lastState`, with the waiting reasons ContainerCreating,
-  ErrImagePull, ImagePullBackOff, CrashLoopBackOff, CreateContainerError and
-  CorruptImageLayer) — what `kubectl get pods`, `kubectl wait` and `kubectl
-  rollout status` read. A moment a node observes before its clock is trusted
-  (a board before SNTP) is null until the clock is, never 1970. ReplicaSet,
-  Deployment, StatefulSet and DaemonSet status count their Ready Pods; a
-  StatefulSet's and a DaemonSet's update strategy defaults to RollingUpdate.
+  ErrImagePull, ImagePullBackOff, CrashLoopBackOff, CreateContainerError,
+  CreateContainerConfigError and CorruptImageLayer) — what `kubectl get pods`,
+  `kubectl wait` and `kubectl rollout status` read. A moment a node observes
+  before its clock is trusted (a board before SNTP) is null until the clock
+  is, never 1970. ReplicaSet, Deployment, StatefulSet and DaemonSet status
+  count their Ready Pods; a StatefulSet's and a DaemonSet's update strategy
+  defaults to RollingUpdate.
+- **A Pod's own storage** — the root its workload's owner keeps, keyed by the
+  Pod's UID — is ephemeral, as an `emptyDir` is upstream: it survives a power
+  cut, but a Pod deleted or rescheduled (a new UID) starts empty. Data that
+  must outlive a Pod belongs in a PersistentVolumeClaim.
+- **Pause** (nanocloud's own; Kubernetes has none): the annotation
+  `nanocloud.io/paused: "true"` freezes every container of the Pod (the
+  cgroup freezer) and removing it thaws them; the Pod stays Running, is never
+  restarted for it, and its run clock stops. `nanocloud pause|resume
+  <ns/name>` sets and removes the annotation; `nanocloud pause|resume
+  <sandbox id>` asks one sandbox directly.
 
-Not implemented yet: `httpGet`, `tcpSocket` and `grpc` probes (a Pod
-declaring only those is treated as declaring none: Ready while it runs, never
-restarted by a probe), `startupProbe`, rolling a StatefulSet's or DaemonSet's
-Pods to a changed template, `securityContext` (`runAsUser`, `runAsGroup`, …), `$(VAR)`
-expansion in `command`/`args`/`env`, `env` from `valueFrom` (Secrets,
-ConfigMaps, the downward API — such entries are left out) and `envFrom`, the
-service environment variables (`<SVC>_SERVICE_HOST`, …), `resources.requests`
-(cpu shares), containers past the first, init containers.
+Not implemented yet: `grpc` and HTTPS `httpGet` probes (not run: a Pod
+declaring only those is Ready while it runs, never restarted by a probe);
+`securityContext.readOnlyRootFilesystem`, `supplementalGroups` and
+`privileged` (the node's runtime cannot give them: such a container is
+refused, CreateContainerConfigError, never run without them); `fsGroup`,
+capabilities, `allowPrivilegeEscalation` and seccomp (not applied);
+`subPath`, `downwardAPI` and `projected` volumes (refused); a ConfigMap or
+Secret volume is projected when its container starts, not updated in place;
+`containerStatuses` and `initContainerStatuses` for containers past the
+first (the Pod's phase and its one status entry are the first app
+container's); rolling a StatefulSet's or DaemonSet's Pods to a changed
+template; `resources.requests` (cpu shares).
+
+### Kubernetes compatibility: Services and the network
+
+The control plane runs the Service plane; every node that runs Pods enforces
+it in its own kernel:
+
+- **Endpoints**: a Service's ready Pods (by selector, gated by readiness
+  probes) as its Endpoints; a deleted Service's Endpoints go with it.
+- **ClusterIP**: allocated from 10.96.0.0/16; each node DNATs it to the ready
+  backends, balanced (nftables on Linux, `/~node/<node>/np-status/proxy`
+  saying whether it is enforced). A `targetPort` naming a port resolves
+  against each backend Pod's `containers[0].ports[].name`.
+- **NodePort**: every port of a NodePort or LoadBalancer Service gets a
+  `nodePort` from 30000-32767 (`NANOCLOUD_NODE_PORTS`) unless it names one;
+  each node DNATs its own address at that port.
+- **LoadBalancer**: with a pool (`NANOCLOUD_LB_POOL=<a.b.c.d>/<n>`), one
+  address of it, in `status.loadBalancer.ingress`, DNATed by every node.
+  Nothing announces the address (no ARP): the network must route it to a
+  node. Without a pool the Service stays pending, as upstream with no
+  load-balancer controller.
+- **DNS** on the control plane (port 53): `<svc>.<ns>.svc.cluster.local` is the
+  Service's ClusterIP, a headless Service's ready Pod addresses, an
+  ExternalName Service's CNAME, NXDOMAIN when there is no such Service;
+  `_<port>._<proto>.<svc>.<ns>.svc.cluster.local` the SRV of a named port
+  (headless: one per backend, at `<a-b-c-d>.<svc>.<ns>.svc.cluster.local`,
+  which resolves); every other name is forwarded to the node's own resolver.
+  The resolver's address is kept at `/cluster-dns`.
+- **NetworkPolicy** (`podSelector`, `namespaceSelector`, `ipBlock` with
+  `except`, ports, both directions) computed on the control plane and
+  enforced by each node — opt-in, `NANOCLOUD_NETPOLICY=1` in cluster.env: a
+  single node that also pulls images may not hold its chain in the runtime's
+  config arena.
+- **`kubectl logs`** (`--tail`, `--limit-bytes`) for a Pod on any node: its
+  node's record of the Pod's output. `-f` answers what is recorded and ends;
+  it does not stream: the node keeps a Pod's output as a bounded tail with
+  no count of the bytes it has seen, so nothing can tell a follower which
+  bytes are new once the tail is trimmed.
+
+Not implemented yet: a network namespace and address per Pod (a Pod shares
+its node's network, so its `podIP` is the node's, and a NetworkPolicy — as
+upstream for a `hostNetwork` Pod — does not constrain its traffic), a Pod's
+`dnsPolicy`/`dnsConfig` reaching its `/etc/resolv.conf` (`_shared/poddns.rs`
+computes the file by Kubernetes' rules; the Pod's volumes do not yet carry
+it, so its resolver is its image's or its node's), `sessionAffinity`,
+`externalTrafficPolicy`/`internalTrafficPolicy`, named ports in containers
+past the first, Pod DNS names (`<a-b-c-d>.<ns>.pod.cluster.local`).
+
+### Kubernetes compatibility: workloads, scheduling and policy
+
+The controllers and the scheduler are params (`modules/app/_chronicle/`),
+to Kubernetes' semantics:
+
+- **Jobs** (`job*.uproc`): `parallelism`, `completions` (NonIndexed Pods
+  `<job>-<i>`; Indexed `<job>-<index>-<attempt>`, the completion index their
+  annotation and label), `backoffLimit` with a backoff of 10 s doubling to
+  6 min, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`, `suspend`; and
+  the status `kubectl wait --for=condition=complete` reads — `active`,
+  `succeeded`, `failed`, `ready`, `startTime`, `completionTime`,
+  `completedIndexes` (once complete), the conditions Complete (with
+  SuccessCriteriaMet), Failed (with FailureTarget; BackoffLimitExceeded or
+  DeadlineExceeded) and Suspended. A finished or suspended Job's active Pods
+  are deleted; a deleted Job's Pods are collected.
+- **CronJobs** (`cronjob*.uproc`): `schedule` (the five standard fields,
+  names, steps, and @yearly … @hourly), `timeZone` (UTC and its aliases, or a
+  fixed `Etc/GMT±N`), `concurrencyPolicy` (Allow, Forbid, Replace),
+  `startingDeadlineSeconds`, `suspend`, `successfulJobsHistoryLimit` (3) and
+  `failedJobsHistoryLimit` (1); status `active`, `lastScheduleTime`,
+  `lastSuccessfulTime`. A schedule is judged only against a TRUSTED wall
+  clock: a board before SNTP runs nothing rather than a 1970 run.
+- **Templates of any size**: a Deployment's, ReplicaSet's, StatefulSet's,
+  DaemonSet's, Job's or CronJob's Pods (and a CronJob's Jobs) carry its
+  template whole, up to the API's 3 MiB object — the chains carry names and
+  digests, and the writer copies the template's labels, annotations and spec
+  from the stored object. A DaemonSet's Pods are labelled as upstream labels
+  them (the template's labels beside `controller-revision-hash`); a Job's
+  beside `batch.kubernetes.io/controller-uid`, `batch.kubernetes.io/job-name`,
+  `controller-uid` and `job-name`. Every reader of a workload object or a
+  Pod reads one past 4 KiB whole: the controllers' counts and status, the
+  scheduler's node load, a Service's endpoints, an eviction's budget.
+- **Deletes by controllers** (a ReplicaSet's or StatefulSet's scale-down or
+  roll, a DaemonSet's Pod on a node gone, the garbage collector, a Job's
+  TTL, a CronJob's history, a namespace's teardown, an Event's cap) leave
+  the tomb an API delete leaves: a watch's DELETED event carries the whole
+  object, whatever its size, and a Pod's node learns of the delete from it
+  and stops the Pod. A deleted Node takes its DaemonSet Pods with it and is
+  no longer scheduled to.
+- **Scheduler** (`scheduler.uproc` over the source's pick,
+  `_shared/sched.rs`): `kubectl cordon`/`uncordon` (`spec.unschedulable`),
+  nodeSelector and node affinity (required and preferred), taints and
+  tolerations (NoSchedule, PreferNoSchedule; NoExecute evicts an
+  intolerant bound Pod at once and a tolerating one after its
+  `tolerationSeconds`), requests (and limits standing for them) within the
+  node's `status.allocatable` — a node reports `capacity` and `allocatable`
+  from its render (`NANOCLOUD_NODE_CAPACITY`, default its CPUs, memory and
+  110 Pods) — pod affinity and anti-affinity on a `topologyKey`, and
+  `topologySpreadConstraints`. The pending are placed highest priority
+  first; a Pod nothing fits is Pending with PodScheduled=False, reason
+  Unschedulable, upstream's message (`0/2 nodes are available: 2
+  Insufficient cpu.`) and a FailedScheduling event; one of higher priority
+  preempts lower-priority Pods (Preempted events), sparing those a
+  PodDisruptionBudget protects as far as it can.
+- **PriorityClass** (`priority.uproc`): `priorityClassName` (else the
+  `globalDefault` class) resolves to `spec.priority` and
+  `spec.preemptionPolicy`; system-node-critical and system-cluster-critical
+  exist.
+- **PodDisruptionBudget** (`pdb.uproc`): `minAvailable` or
+  `maxUnavailable` (a number or a percentage); status `expectedPods`,
+  `currentHealthy`, `desiredHealthy`, `disruptionsAllowed`, the
+  DisruptionAllowed condition. The Eviction subresource (`pods/eviction`,
+  policy/v1) deletes a Pod only while its budget allows a disruption —
+  spent atomically, so two evictions cannot spend the last — and answers 429
+  otherwise: `kubectl drain` waits on it.
+- **ResourceQuota** (`quota.uproc`, `admission_k8s.uproc`): `pods`,
+  `requests.cpu`/`cpu`, `requests.memory`/`memory`, `limits.cpu`,
+  `limits.memory`, `services`, `configmaps`, `secrets`,
+  `persistentvolumeclaims` and `count/<resource>`, with `status.hard` and
+  `status.used` kept current; a create that would exceed one is Forbidden
+  ("exceeded quota"), and a Pod stating no request a quota tracks is refused.
+
+Not implemented yet: LimitRange; a time zone with daylight saving in a
+CronJob (the tz database is not carried: such a CronJob is not scheduled);
+`JOB_COMPLETION_INDEX` in an Indexed Job's Pods' environment; `podFailurePolicy`,
+`backoffLimitPerIndex` and `successPolicy`; a quota's scopes and
+`services.nodeports`/`requests.storage`; the symmetric half of
+anti-affinity (an existing Pod's anti-affinity keeping a new one away);
+admission resolving a Pod's priority at create (it is resolved just after,
+and the scheduler places no Pod before), and refusing an unknown class at
+create (such a Pod stays Pending, saying why); the quota's usage is counted
+just after each change, so creates racing within that moment can pass it
+together.
 
 ## Security
 
@@ -330,8 +560,9 @@ service environment variables (`<SVC>_SERVICE_HOST`, …), `resources.requests`
   grant index (`rbac_*.uproc`); a request is admitted only when a grant covers
   its namespace, verb and resource, and a deleted binding's grants are pruned.
 - **Admission before the store.** Every mutating request crosses the
-  admission decisions (`admission.uproc`), which validate required fields,
-  apply defaults and enforce per-resource quota against live counts.
+  admission decisions (`admission.uproc`, `admission_k8s.uproc`), which
+  validate required fields, apply defaults, enforce ResourceQuotas and judge
+  evictions against PodDisruptionBudgets.
 - **Device certificates.** A Device names the public key it holds; the
   `dv_` chain has kagi's `certificate_endpoint` certify it (through the generic
   `http_effect` connector) with its SPIFFE id in the SAN, and writes back the

@@ -3,7 +3,7 @@
 # really run — on a node in the shape a deb node runs: the control plane, its
 # kubelet's chains (fluxor-podlifecycle.yaml, whole: host sandboxes, probes,
 # image, lifecycle, status) and its image plane (fluxor-imagepull.yaml) on
-# one store scoped to node-1, plus the Endpoints chains (fluxor-endpoints.yaml)
+# one store scoped to node-1, with the Endpoints chains the control plane carries
 # — from an OCI image a registry stub serves:
 #
 #   /bin/ncsrv   a static binary: `serve <port> <delay-s>` listens after a
@@ -168,6 +168,20 @@ g = sub("    port: 7443\n", f"    port: {port}\n", g)
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
           "/volume-binds/,/image-,/volume-ops/,/blobs/,/fetch-q/")
 g = sub('      scope: ""\n      scoped: ""\n', f'      scope: "{node}"\n      scoped: "{SCOPED}"\n', g)
+# The controllers no Pod here needs, left out (name prefixes), so the graph
+# stays inside the runtime's config arena (as scripts/support/pod-node.sh).
+DROP = ("jb_", "cj_", "pc_", "hp_", "sn_", "dv_", "dss_", "ip_", "ns_", "q_", "pdb_", "te_", "gc_")
+head, rest = g.split("modules:\n", 1)
+cmods, cwire = rest.split("\nwiring:\n", 1)
+cblocks = re.split(r"(?m)^(?=  - name: )", cmods)
+dropped = {b.split()[2] for b in cblocks if b.startswith("  - name: ") and b.split()[2].startswith(DROP)}
+cmods = "".join(b for b in cblocks if not (b.startswith("  - name: ") and b.split()[2] in dropped))
+wblocks = re.split(r"(?m)^(?=  - from: )", cwire)
+def gone(b):
+    f = re.match(r"  - from: (\S+)\n    to: (\S+)", b)
+    return bool(f) and (f.group(1).split(".")[0] in dropped or f.group(2).split(".")[0] in dropped)
+cwire = "".join(b for b in wblocks if not gone(b))
+g = head + "modules:\n" + cmods.rstrip("\n") + "\n\nwiring:\n" + cwire
 def parts(path):
     y = open(path).read()
     mods = y[y.index("modules:\n") + len("modules:\n"):y.index("\nwiring:")]
@@ -186,11 +200,11 @@ iblocks, ipairs = parts(f"{root}/packaging/debian/fluxor-imagepull.yaml")
 img = "".join(iblocks)
 img = sub('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"', img)
 img = sub('dir: "/var/lib/nanocloud.io/image/blobs"', f'dir: "{blobs}"', img)
-eblocks, epairs = parts(f"{root}/packaging/debian/fluxor-endpoints.yaml")
+# Endpoints come with the control plane (its Service plane).
 mods, wiring = g.split("\nwiring:\n", 1)
-g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane, Endpoints ──\n" + kube.rstrip("\n") + "\n"
-     + img.rstrip("\n") + "\n" + "".join(eblocks).rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
-     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs + epairs))
+g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane ──\n" + kube.rstrip("\n") + "\n"
+     + img.rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
+     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs))
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
 PY

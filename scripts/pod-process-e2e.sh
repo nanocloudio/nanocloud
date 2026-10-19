@@ -153,6 +153,20 @@ g = sub("    port: 7443\n", f"    port: {port}\n", g)
 SCOPED = ("/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,"
           "/volume-binds/,/image-,/volume-ops/,/blobs/,/fetch-q/")
 g = sub('      scope: ""\n      scoped: ""\n', f'      scope: "{node}"\n      scoped: "{SCOPED}"\n', g)
+# The controllers no Pod here needs, left out (name prefixes), so the graph
+# stays inside the runtime's config arena (as scripts/support/pod-node.sh).
+DROP = ("jb_", "cj_", "pc_", "hp_", "sn_", "dv_", "dss_", "ip_", "ns_", "q_", "pdb_", "te_", "gc_")
+head, rest = g.split("modules:\n", 1)
+cmods, cwire = rest.split("\nwiring:\n", 1)
+cblocks = re.split(r"(?m)^(?=  - name: )", cmods)
+dropped = {b.split()[2] for b in cblocks if b.startswith("  - name: ") and b.split()[2].startswith(DROP)}
+cmods = "".join(b for b in cblocks if not (b.startswith("  - name: ") and b.split()[2] in dropped))
+wblocks = re.split(r"(?m)^(?=  - from: )", cwire)
+def gone(b):
+    f = re.match(r"  - from: (\S+)\n    to: (\S+)", b)
+    return bool(f) and (f.group(1).split(".")[0] in dropped or f.group(2).split(".")[0] in dropped)
+cwire = "".join(b for b in wblocks if not gone(b))
+g = head + "modules:\n" + cmods.rstrip("\n") + "\n\nwiring:\n" + cwire
 def parts(path):
     y = open(path).read()
     mods = y[y.index("modules:\n") + len("modules:\n"):y.index("\nwiring:")]
@@ -289,7 +303,7 @@ mem="$(sudo -n cat "/sys/fs/cgroup$cgl/memory.max" 2>/dev/null || true)"
 expect "cpu.max (250m)" "$cpu" "25000 100000"
 expect "memory.max (64Mi)" "$mem" "67108864"
 echo "   $cgl: cpu.max '$cpu', memory.max $mem"
-grep -q "compute_milli=250 memory_bytes=67108864 max_tasks=0 storage_bytes=1073741824" "$D/run.log" \
+grep -q "compute_milli=250 memory_bytes=67108864 max_tasks=4194304 storage_bytes=1073741824" "$D/run.log" \
   || fail "the runtime never admitted envpod's envelope with its storage cap: $(grep '\[workload\] host workload' "$D/run.log" | head -5)"
 echo "   admitted: compute_milli=250 memory_bytes=67108864 storage_bytes=1073741824 (ephemeral-storage 1Gi)"
 

@@ -1,0 +1,72 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# mod.rs is a SYMLINK to ../store_source/mod.rs: the same source, built with
+# `doc_heap`. (A symlink, not `entry = "../store_source/mod.rs"`: the build's
+# staleness check walks the module's own directory, so an entry outside it
+# never rebuilt.)
+timer_class = "wall_clock"
+
+# Store scan — store_source with a heap for the objects it scans.
+#
+# store_source reads each object into a fixed stack buffer and REFUSES one
+# past it (never reads it cut). A controller's source cannot: a Deployment,
+# ReplicaSet or StatefulSet carries its users' pod template — env, volumes,
+# probes, resources — and is routinely past 4 KiB. This build reads such an
+# object whole onto a 4 MiB heap arena (one object at a time, up to the
+# API's 3 MiB) and projects from it exactly as
+# store_source does. The template itself never rides the record: the writer
+# downstream SPLICES it from the stored object (store_effect fields 70/71).
+# A separate module TYPE, not a variant: one graph image carries one build of
+# a type, and every other store_source keeps bounded memory. Frame, params
+# and ports are store_source's; see its manifest.
+
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings", "doc_heap"]
+default  = true
+
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+# record_out is the PRIMARY output: `module_new` hands it over directly, so the
+# hot path never depends on resolving a port by index.
+[[ports]]
+name = "record_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 8192
+required = true
+# NOT declared `framed`. Whether this edge needs mailbox delivery is the
+# CONSUMER's property, not this port's: a Chronicle engine SELF-FRAMES over a
+# byte stream (io_core::admit_frame peeks, reads the length out of the header,
+# and consumes exactly that many bytes), so a mailbox channel breaks it — its
+# partial read is illegal there and records vanish silently. A consumer that
+# reads whole records instead (`debug`, this repo's modules) needs mailbox and
+# says so on its own INPUT port; a graph feeding such a consumer sets
+# `buffer_group` on the edge, as store-source-e2e.sh does.
+
+[[ports]]
+name = "status"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+# `due` arms a kernel timer fd for the earliest deadline in the records; the
+# kernel steps this module when it fires. A timer is an fd.
+[[resources]]
+requires_contract = "timer"
+access = "write"
+
+[observability]
+exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"

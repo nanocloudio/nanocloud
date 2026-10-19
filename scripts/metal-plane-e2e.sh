@@ -237,6 +237,68 @@ for p in pods["items"]:
     y = ctl(p)
     assert (y["kind"], y["uid"], y["apiVersion"]) == ("ReplicaSet", r["metadata"]["uid"], "apps/v1"), y
     assert p.get("kind") == "Pod" and p["metadata"].get("uid"), p["metadata"]
-print("   controller references: deployment", d["metadata"]["uid"][:8], "-> replicaset", r["metadata"]["uid"][:8], "->", len(pods["items"]), "pods")
+# Labelled as the template says, beside the ReplicaSet's own non-empty
+# pod-template-hash — what `kubectl get pods -l` and a rollout select on.
+h = r["metadata"]["labels"].get("pod-template-hash", "")
+assert len(h) == 8, r["metadata"]["labels"]
+for p in pods["items"]:
+    assert p["metadata"]["labels"] == {"app": "probes", "pod-template-hash": h}, p["metadata"]["labels"]
+print("   controller references: deployment", d["metadata"]["uid"][:8], "-> replicaset", r["metadata"]["uid"][:8], "->", len(pods["items"]), "pods, labelled app=probes, pod-template-hash", h)
 PY
-echo "== E2E green: on one node-scoped store, the plane's Pod became the node's subgraph and its phase came back, and a Deployment's Pods ran the same way =="
+
+echo "== 7. a Deployment with a REAL template (> 4 KiB): ReplicaSet, Pods Running, rolled to another =="
+# env, ports, resources, annotations: a template past the decisions' 512 B
+# scratch and past a record. The chain carries its digest; the writers
+# splice the bytes from the stored objects; the readers past a record
+# (store_scan, store_stamped) read them whole.
+bigdep() { # bigdep <variant>
+  python3 - "$1" <<'PYB'
+import json, sys
+v = sys.argv[1]
+env = [{"name": "APP_SETTING_%02d" % i, "value": "value-%s-%02d-abcdefghijklmnopqrstuvwxyz" % (v, i)} for i in range(48)]
+tmpl = {"metadata": {"labels": {"app": "bigweb", "tier": "backend"},
+                     "annotations": {"example.com/note-%d" % i: "annotation %d of template %s" % (i, v) for i in range(8)}},
+        "spec": {"runtimeClassName": "fluxor",
+                 "containers": [{"name": "probe", "image": "probe", "env": env,
+                                 "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}],
+                                 "resources": {"requests": {"cpu": "100m", "memory": "64Mi"},
+                                               "limits": {"cpu": "500m", "memory": "256Mi"}}}]}}
+assert len(json.dumps(tmpl, separators=(",", ":"))) >= 4096
+print(json.dumps({"apiVersion": "apps/v1", "kind": "Deployment",
+                  "metadata": {"name": "bigweb", "namespace": "default"},
+                  "spec": {"replicas": 2, "selector": {"matchLabels": {"app": "bigweb"}}, "template": tmpl}},
+                 separators=(",", ":")))
+PYB
+}
+bigwait() { # bigwait <variant>: 2 Running Pods on that template, labelled, hashed as their ReplicaSet
+  local ok=""
+  for _ in $(seq 120); do
+    RJ="$(api GET /apis/apps/v1/namespaces/default/replicasets/bigweb)"
+    PJ="$(api GET '/api/v1/namespaces/default/pods?labelSelector=app%3Dbigweb')"
+    if python3 - "$1" "${RJ#*|}" "${PJ#*|}" <<'PYW' 2>/dev/null; then ok=1; break; fi
+import json, sys
+v, r, pods = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+h = r["metadata"]["labels"]["pod-template-hash"]
+assert len(h) == 8 and r["spec"]["template"]["spec"]["containers"][0]["env"][47]["value"].startswith("value-" + v)
+run = [p for p in pods["items"] if p.get("status", {}).get("phase") == "Running"
+       and p["metadata"]["labels"] == {"app": "bigweb", "tier": "backend", "pod-template-hash": h}
+       and len(p["metadata"].get("annotations", {})) == 8
+       and p["spec"]["containers"][0]["env"][47]["value"].startswith("value-" + v)]
+assert len(run) == 2 and len(pods["items"]) == 2
+PYW
+    sleep 1
+  done
+  [ -n "$ok" ]
+}
+r="$(api POST /apis/apps/v1/namespaces/default/deployments "$(bigdep v1)")"
+case "$r" in 20[01]\|*) echo "   POST deployments/bigweb ($(bigdep v1 | wc -c) bytes) -> ${r%%|*}" ;; *) fail "POST bigweb: ${r:0:200}" ;; esac
+bigwait v1 || { printf '%s\n' "${PJ#*|}" | head -c 600; echo; fail "the large Deployment's Pods did not all reach Running, labelled and hashed"; }
+H1="$(printf '%s' "${RJ#*|}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["labels"]["pod-template-hash"])')"
+echo "   replicaset bigweb (hash $H1): 2 Pods Running, the whole template, labelled app=bigweb,tier=backend + hash"
+r="$(api PUT /apis/apps/v1/namespaces/default/deployments/bigweb "$(bigdep v2)")"
+case "$r" in 200\|*) echo "   PUT deployments/bigweb (template v2) -> 200" ;; *) fail "PUT bigweb: ${r:0:200}" ;; esac
+bigwait v2 || { printf '%s\n' "${PJ#*|}" | head -c 600; echo; fail "the large Deployment did not roll to its new template"; }
+H2="$(printf '%s' "${RJ#*|}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["labels"]["pod-template-hash"])')"
+[ "$H1" != "$H2" ] || fail "the template changed and the hash did not ($H1)"
+echo "   rolled: hash $H1 -> $H2, 2 Pods Running on the v2 template"
+echo "== E2E green: on one node-scoped store, the plane's Pod became the node's subgraph and its phase came back, and a Deployment's Pods ran the same way — a real-sized template too, labelled, rolled =="

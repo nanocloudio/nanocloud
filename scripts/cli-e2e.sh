@@ -52,6 +52,13 @@ with open(os.sys.argv[1],"wb") as f:
     rec(f,12,b"/np-status/netpolicy",b"enforced=1;rules=3;generation=7")
     rec(f,13,b"/persistentvolumeclaims/default/data",b'{"metadata":{"name":"data"},"spec":{"resources":{"requests":{"storage":"1Gi"}}}}')
     rec(f,14,b"/devices.nanocloud.io/default/sensor1",b'{"metadata":{"name":"sensor1"},"spec":{"kind":"sensor"}}')
+    # Pods to pause (one with annotations already) — for pause/resume.
+    rec(f,15,b"/pods/default/sleeper",b'{"metadata":{"name":"sleeper","namespace":"default"},"spec":{"containers":[{"name":"c","image":"i"}]}}')
+    rec(f,16,b"/pods/default/annot",b'{"metadata":{"name":"annot","namespace":"default","annotations":{"a.b/c":"d"}},"spec":{}}')
+    # A log whose tail was trimmed: 6 bytes written ("abcdef"), "cdef" kept.
+    rec(f,17,b"/sandbox-logs/pod-uid-2",b"cdef")
+    rec(f,18,b"/sandbox-log-n/pod-uid-2",b"6")
+    rec(f,19,b"/sandbox-status/pod-uid-2",b"state=exited;code=0")
 PY
 
 echo "== 2. build config + module table (cli stack expands cli_in/cli_out) =="
@@ -72,7 +79,7 @@ echo "== 3. nanocloud status =="
 run 0 status
 grep -qE "nodes:[[:space:]]+2"       "$D/out.txt" || fail "status nodes"
 grep -qE "deployments:[[:space:]]+1" "$D/out.txt" || fail "status deployments"
-grep -qE "pods:[[:space:]]+3"        "$D/out.txt" || fail "status pods"
+grep -qE "pods:[[:space:]]+5"        "$D/out.txt" || fail "status pods"
 sed 's/^/   /' "$D/out.txt"
 
 echo "== 4. nanocloud get pods =="
@@ -186,7 +193,7 @@ echo "   token armed + polled + timed out (exit 1); mint proven in sa-token-e2e"
 echo "== 18. store-native admin verbs: diagnostics / policy / volume / config / get devices =="
 run 0 diagnostics
 grep -q "control-plane store: reachable" "$D/out.txt" || fail "diagnostics missing health line"
-grep -qE "pods +2" "$D/out.txt" || fail "diagnostics wrong pod count: $(cat "$D/out.txt")"
+grep -qE "pods +4" "$D/out.txt" || fail "diagnostics wrong pod count: $(cat "$D/out.txt")"
 run 0 policy
 grep -q "allow-web" "$D/out.txt" || fail "policy did not list networkpolicies"
 grep -q "enforced=1;rules=3" "$D/out.txt" || fail "policy did not show the enforcement status"
@@ -230,6 +237,29 @@ env -C "$D2" "$FLUXOR_RUNTIME" --config "$D2/config.bin" --modules "$D2/modules.
   -- get pods </dev/null >"$D2/pods.txt" 2>/dev/null || true
 grep -qx "web-0" "$D2/pods.txt" || fail "restored store missing web-0: $(cat "$D2/pods.txt")"
 echo "   $(cat "$D2/apply.txt" | tr -d '\n') → restored store serves web-0"
+
+echo "== 21b. nanocloud pause|resume: the Pod's nanocloud.io/paused annotation, or one sandbox's ask =="
+run 0 pause default/sleeper
+grep -q 'pod "default/sleeper" paused' "$D/out.txt" || fail "pause sleeper"
+run 0 get pods default/sleeper
+grep -q '"nanocloud.io/paused":"true"' "$D/out.txt" || fail "sleeper not annotated"
+run 0 pause default/annot
+run 0 get pods default/annot
+grep -q '"annotations":{"nanocloud.io/paused":"true","a.b/c":"d"}' "$D/out.txt" || fail "annot's annotations: $(cat "$D/out.txt")"
+run 0 resume default/annot
+run 0 get pods default/annot
+grep -q '"annotations":{"a.b/c":"d"}' "$D/out.txt" || fail "resume kept or lost the wrong annotations: $(cat "$D/out.txt")"
+run 1 pause default/nope
+run 0 pause pod-uid-1
+[ "$(nc_replica_get "$D" /sandbox-pause/pod-uid-1)" = "pause" ] || fail "pause <sandbox id> did not ask the sandbox"
+run 0 resume pod-uid-1
+[ "$(nc_replica_get "$D" /sandbox-pause/pod-uid-1)" = "resume" ] || fail "resume <sandbox id> did not ask the sandbox"
+echo "   pause/resume <ns/name> (the annotation, others kept), <sandbox id> (/sandbox-pause/)"
+
+echo "== 21c. nanocloud logs -f: the stream from its offset (a trimmed tail is not misread) =="
+run 0 logs -f pod-uid-2
+[ "$(cat "$D/out.txt")" = "cdef" ] || fail "logs -f pod-uid-2: '$(cat "$D/out.txt")'"
+echo "   logs -f pod-uid-2: the kept tail (bytes 2..6 of 6), then the end with its sandbox"
 
 echo "== 22. errors: unknown command / resource exit non-zero; help exits 0 =="
 run 0 help

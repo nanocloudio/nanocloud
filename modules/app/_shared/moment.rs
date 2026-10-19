@@ -222,3 +222,68 @@ unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
     }
     (ttl.max(1).min(i64::MAX as u64) as i64, true)
 }
+
+/// A recorded moment PLUS `off` ms, as THIS boot's monotonic ms — a deadline
+/// measured from a moment a record kept (a Job's start plus its
+/// activeDeadlineSeconds, a failure plus its backoff), and whether it had to
+/// be re-based.
+///
+///   <unix ms>          the clock trusted now: the deadline on this boot's
+///                      monotonic clock — now, plus how far ahead it is, or
+///                      less how long ago it passed (never past now, so a
+///                      record read at `now` compares `now >= deadline`
+///                      truly however many ms the read took)
+///   m<mono>@<boot>     this boot's: `mono + off`
+///
+/// A moment this boot cannot say (another boot's monotonic time, a wall
+/// time while the clock is untrusted) is re-based to `off` past this boot's
+/// origin, as [`mo_due`] re-bases to its ttl: the wait runs again from the
+/// restart, never for ever and never cut short by a clock that means
+/// nothing here. An empty or malformed moment is 0 (none).
+unsafe fn mo_due_after(sys: &SyscallTable, src: &[u8], off: u64) -> (i64, bool) {
+    if src.is_empty() {
+        return (0, false);
+    }
+    if src.iter().all(|c| c.is_ascii_digit()) {
+        let mut wall = 0u64;
+        for &c in src.iter().take(19) {
+            wall = wall.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+        }
+        let wall = wall.saturating_add(off);
+        return match mo_trusted_ms(sys) {
+            Some(now_wall) => {
+                let now = dev_millis(sys);
+                let d = if wall <= now_wall {
+                    now.saturating_sub(now_wall - wall)
+                } else {
+                    now.saturating_add(wall - now_wall)
+                };
+                (d.max(1).min(i64::MAX as u64) as i64, false)
+            }
+            None => (off.max(1).min(i64::MAX as u64) as i64, true),
+        };
+    }
+    let Some(rest) = src.strip_prefix(b"m") else {
+        return (0, false);
+    };
+    let Some(at) = rest.iter().position(|&c| c == b'@') else {
+        return (0, false);
+    };
+    let (Some(mono_s), Some(boot_s)) = (rest.get(..at), rest.get(at + 1..)) else {
+        return (0, false);
+    };
+    if mono_s.is_empty() || mono_s.len() > 19 || !mono_s.iter().all(|c| c.is_ascii_digit()) {
+        return (0, false);
+    }
+    let mut mono = 0u64;
+    for &c in mono_s {
+        mono = mono.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+    }
+    let mut boot = [0u8; 40];
+    let bl = mo_boot(sys, &mut boot, 0);
+    if boot.get(..bl) == Some(boot_s) && boot_s != b"-" {
+        let d = mono.saturating_add(off);
+        return (d.max(1).min(i64::MAX as u64) as i64, false);
+    }
+    (off.max(1).min(i64::MAX as u64) as i64, true)
+}

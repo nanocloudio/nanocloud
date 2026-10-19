@@ -279,6 +279,31 @@ struct State {
     /// position: an unschedulable Pod holds no Pod behind it.
     join_fit: [u8; 96],
     join_fit_len: u8,
+    /// `sched = "<nodes prefix>:<pods prefix>[:<pdb prefix>]"` (sched.rs):
+    /// beside a `join` over the ready nodes' names and `count = 1`, the
+    /// scheduler's pick — the node the pending Pod goes to at 21, or none
+    /// and upstream's FailedScheduling message at 66; position 0 to the
+    /// first placeable Pod of the highest priority among them, -1 to one
+    /// nothing fits. `sched_preempt = 1`: the first unplaceable Pod of the
+    /// highest priority among those may preempt — one record per victim,
+    /// the node at 68 and the victim's `<ns>/<name>` at 69.
+    /// `sched_noexec = 1`: every object is a Pod, and 66 (i64) is what its
+    /// node's NoExecute taints do to it: 0 nothing, -1 evict now, else the
+    /// seconds it may stay.
+    sched: [u8; 128],
+    sched_len: u8,
+    sched_preempt: u32,
+    sched_noexec: u32,
+    /// The scan's placeable and unplaceable highest priorities (count pass),
+    /// whether position 0 and the preemption were given (emit pass).
+    sch_fit_max: i64,
+    sch_unfit_max: i64,
+    sch_zero: u8,
+    sch_pre: u8,
+    sch_prio: i64,
+    sch_fit: u8,
+    sch_ne: i64,
+    sch_out: SchOut,
     /// `now = 1`: field 58 is the monotonic clock in ms, read once per scan,
     /// on every record — so a decision compares "now >= deadline" as two
     /// integers. Reading the clock makes this instance `wall_clock` class.
@@ -452,6 +477,20 @@ struct State {
     /// members: arch, os, the fluxor ABI), which no store record says.
     facts: [u8; 192],
     facts_len: u8,
+    /// `capacity = <text>`: stamped at 46 beside `facts` — the node's
+    /// capacity as its render knows it (JSON members: cpu, memory, pods),
+    /// what its Node reports as status.capacity and allocatable.
+    capacity: [u8; 128],
+    capacity_len: u8,
+    /// `cron = "<schedule path>|<time zone path>"` (_shared/cron.rs): each
+    /// object's schedule judged against the TRUSTED wall clock — 160 the
+    /// latest scheduled minute at or before now, 161 the next after it, 162
+    /// now (Unix ms each); -1 at 160 for a schedule or zone that is not one.
+    /// While the clock is not trusted (a board before SNTP) all three are 0
+    /// — nothing is scheduled from a clock that means nothing — and the
+    /// source scans again `recheck` later. The next minute arms the timer.
+    cron: [u8; 96],
+    cron_len: u8,
     /// `address = <ip>`: stamped at 47 on every record beside `label` — the
     /// node's own address as its render knows it, which no store record
     /// says: what its Node advertises as its InternalIP, and so the hostIP
@@ -828,6 +867,20 @@ mod params_def {
         50, recheck, u32, 0
             => |s, d, len| { s.recheck = super::p_u32(d, len, 0, 0); };
 
+        55, cron, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 0 } else { len };
+                s.cron_len = n as u8;
+                if n > 0 { ptr_copy(s.cron.as_mut_ptr(), d, n); }
+            };
+
+        54, capacity, str, 0
+            => |s, d, len| {
+                let n = if len > 128 { 0 } else { len };
+                s.capacity_len = n as u8;
+                if n > 0 { ptr_copy(s.capacity.as_mut_ptr(), d, n); }
+            };
+
         49, address, str, 0
             => |s, d, len| {
                 let n = if len > 48 { 0 } else { len };
@@ -841,6 +894,19 @@ mod params_def {
                 s.join_fit_len = n as u8;
                 if n > 0 { ptr_copy(s.join_fit.as_mut_ptr(), d, n); }
             };
+
+        51, sched, str, 0
+            => |s, d, len| {
+                let n = if len > 128 { 0 } else { len };
+                s.sched_len = n as u8;
+                if n > 0 { ptr_copy(s.sched.as_mut_ptr(), d, n); }
+            };
+
+        52, sched_preempt, u32, 0
+            => |s, d, len| { s.sched_preempt = super::p_u32(d, len, 0, 0); };
+
+        53, sched_noexec, u32, 0
+            => |s, d, len| { s.sched_noexec = super::p_u32(d, len, 0, 0); };
     }
 }
 
@@ -955,8 +1021,7 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) ->
         return None;
     }
     if cut {
-        let m = b"[store_source] value larger than the buffer - REFUSED, not read cut";
-        dev_log(sys, 1, m.as_ptr(), m.len());
+        say_past_buffer(sys, &w.nag, key);
         return None;
     }
     Some(n as usize)
@@ -1346,16 +1411,34 @@ fn flat_field<'a>(value: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// Split one dotted path (`spec.to.name`) into segments for `j_path`.
+/// A segment in double quotes is ONE key, dots and all —
+/// `metadata.labels."kubernetes.io/hostname"`: a Kubernetes label or
+/// annotation key is a DNS prefix, and has dots.
 fn split_dots<'a>(spec: &'a [u8], segs: &mut [&'a [u8]; 6]) -> usize {
     let mut n = 0;
     let mut start = 0;
     while start <= spec.len() && n < segs.len() {
-        let end = spec[start..]
-            .iter()
-            .position(|&b| b == b'.')
-            .map(|i| start + i)
-            .unwrap_or(spec.len());
-        segs[n] = &spec[start..end];
+        let quoted = spec.get(start) == Some(&b'"');
+        let (seg, end) = if quoted {
+            let open = start + 1;
+            let close = spec
+                .get(open..)
+                .and_then(|r| r.iter().position(|&b| b == b'"'))
+                .map(|i| open + i)
+                .unwrap_or(spec.len());
+            (
+                spec.get(open..close).unwrap_or(&[]),
+                (close + 1).min(spec.len()),
+            )
+        } else {
+            let end = spec[start..]
+                .iter()
+                .position(|&b| b == b'.')
+                .map(|i| start + i)
+                .unwrap_or(spec.len());
+            (&spec[start..end], end)
+        };
+        segs[n] = seg;
         n += 1;
         if end >= spec.len() {
             break;
@@ -1411,6 +1494,65 @@ fn subst_index<'a>(
             b"#2" => *seg = s3,
             b"#3" => *seg = s4,
             _ => {}
+        }
+    }
+}
+
+/// `cron`: (latest scheduled at or before now, next after now, now) in Unix
+/// ms for the object `value`; all 0 while the clock is not trusted (and the
+/// scan marked unresolved, so `recheck` scans again); -1 first when the
+/// schedule or its zone is not one this reads.
+unsafe fn cron_of(s: &State, value: &[u8]) -> (i64, i64, i64) {
+    let spec = s.cron.get(..s.cron_len as usize).unwrap_or(&[]);
+    let (sp, zp) = match spec.iter().position(|&b| b == b'|') {
+        Some(i) => (
+            spec.get(..i).unwrap_or(&[]),
+            spec.get(i + 1..).unwrap_or(&[]),
+        ),
+        None => (spec, &[][..]),
+    };
+    let Some(now_ms) = mo_trusted_ms(&*s.syscalls) else {
+        s.unresolved.set(1);
+        return (0, 0, 0);
+    };
+    let read = |path: &[u8]| -> &[u8] {
+        if path.is_empty() {
+            return &[];
+        }
+        let mut segs: [&[u8]; 6] = [&[]; 6];
+        let ns = split_dots(path, &mut segs);
+        j_path(value, &segs[..ns]).unwrap_or(&[])
+    };
+    let now = (now_ms / 1000) as i64;
+    let (Some(c), Some(off)) = (cr_parse(read(sp)), cr_zone(read(zp))) else {
+        return (-1, 0, now_ms as i64);
+    };
+    let prev = cr_prev(&c, now, off).map_or(-1, |t| t.saturating_mul(1000));
+    let next = cr_next(&c, now, off).map_or(0, |t| t.saturating_mul(1000));
+    (prev, next, now_ms as i64)
+}
+
+/// The member key a `{}` expansion's record `i` stands for: the `i`-th
+/// member of the object the expansion walks. None for any other expansion.
+fn member_key<'a>(s: &State, value: &'a [u8], idx: Option<(i64, i64)>) -> Option<&'a [u8]> {
+    let (i, _) = idx?;
+    let spec = s.expand.get(..s.expand_len as usize)?;
+    let path = spec.strip_suffix(b"{}")?;
+    let mut segs: [&[u8]; 6] = [&[]; 6];
+    let ns = split_dots(path, &mut segs);
+    let obj = j_sub(value, &segs[..ns])?;
+    jp_members(obj)
+        .nth(usize::try_from(i).ok()?)
+        .map(|(k, _)| k)
+}
+
+/// `#` as the member key, ahead of [`subst_index`] (a `{}` expansion).
+fn subst_member<'a>(segs: &mut [&'a [u8]; 6], ns: usize, member: Option<&'a [u8]>) {
+    if let Some(mk) = member {
+        for seg in segs.iter_mut().take(ns) {
+            if *seg == b"#" {
+                *seg = mk;
+            }
         }
     }
 }
@@ -1474,6 +1616,64 @@ unsafe fn project(
         };
         p = q;
         n += 1;
+    }
+    if s.capacity_len > 0 {
+        let Some(q) = put_field(out, p, 46, TY_BYTES, &s.capacity[..s.capacity_len as usize])
+        else {
+            return 0;
+        };
+        p = q;
+        n += 1;
+    }
+    if s.cron_len > 0 {
+        let (prev, next, now) = cron_of(s, value);
+        for (f, v) in [(160u8, prev), (161u8, next), (162u8, now)] {
+            let Some(q) = put_field(out, p, f, TY_I64, &v.to_le_bytes()) else {
+                return 0;
+            };
+            p = q;
+            n += 1;
+        }
+        // 163: the latest scheduled time as RFC 3339 (a Job's
+        // cronjob-scheduled-timestamp), empty when there is none.
+        let mut dig = [0u8; 20];
+        let dl = if prev > 0 {
+            write_dec(&mut dig, prev as u64)
+        } else {
+            0
+        };
+        let mut ts = [0u8; 24];
+        let tl = pm_rfc3339(dig.get(..dl).unwrap_or(&[]), &mut ts).unwrap_or(0);
+        let Some(q) = put_field(out, p, 163, TY_BYTES, ts.get(..tl).unwrap_or(&[])) else {
+            return 0;
+        };
+        p = q;
+        n += 1;
+    }
+    if s.sched_len > 0 {
+        // The scheduler's verdict (sched.rs): 66 why nothing fits (or, for
+        // `sched_noexec`, what the node's NoExecute taints do, as a number),
+        // 68 and 69 a preemption's node and this record's victim.
+        if s.sched_noexec != 0 {
+            let Some(q) = put_field(out, p, 66, TY_I64, &s.sch_ne.to_le_bytes()) else {
+                return 0;
+            };
+            p = q;
+            n += 1;
+        } else {
+            let o = &s.sch_out;
+            for (f, b) in [
+                (66u8, o.msg.get(..o.ml).unwrap_or(&[])),
+                (68u8, o.nom.get(..o.nl).unwrap_or(&[])),
+                (69u8, o.victim()),
+            ] {
+                let Some(q) = put_field(out, p, f, TY_BYTES, b) else {
+                    return 0;
+                };
+                p = q;
+                n += 1;
+            }
+        }
     }
 
     // One field per `paths` entry, in order. Absent resolves to empty rather
@@ -1583,6 +1783,7 @@ unsafe fn project(
                 let mut ibufs = [[0u8; 20]; 5];
                 let mut segs: [&[u8]; 6] = [&[]; 6];
                 let ns = split_dots(one, &mut segs);
+                subst_member(&mut segs, ns, member_key(s, value, expand_idx));
                 subst_index(
                     &mut segs,
                     ns,
@@ -1600,14 +1801,9 @@ unsafe fn project(
             let mut modbuf = [0u8; 512];
             let got = match modifier {
                 Some(m) => {
-                    let n = if m == b"wall" {
-                        let n = mo_wall(&*s.syscalls, got, &mut modbuf);
-                        if n == 0 && got.first() == Some(&b'm') {
-                            s.unresolved.set(1);
-                        }
-                        n
-                    } else {
-                        apply_mod(m, got, &mut modbuf)
+                    let n = match moment_mod(s, m, got, &mut modbuf) {
+                        Some(n) => n,
+                        None => apply_mod(m, got, &mut modbuf),
                     };
                     &modbuf[..n]
                 }
@@ -1717,7 +1913,15 @@ unsafe fn project(
                     up = (prefix[prefix.len() - 1] - b'0') as usize;
                     prefix = &prefix[..prefix.len() - 2];
                 }
+                // `<prefix>~`: the tail up to its first `~` — the Pod a
+                // container's record (`<uid>~<container>`) belongs to.
                 let mut rel_tail = key_tail;
+                if prefix.len() > 1 && prefix.last() == Some(&b'~') {
+                    prefix = &prefix[..prefix.len() - 1];
+                    if let Some(t) = rel_tail.iter().position(|&b| b == b'~') {
+                        rel_tail = rel_tail.get(..t).unwrap_or(rel_tail);
+                    }
+                }
                 for _ in 0..up {
                     rel_tail = match rel_tail.iter().rposition(|&b| b == b'/') {
                         Some(i) => &rel_tail[..i],
@@ -1740,13 +1944,22 @@ unsafe fn project(
                         append_bytes(&mut rk, c, leaf)
                     }
                 };
+                // Read whole: the related object is often a controller's
+                // (a Job, with its users' template), and past the stack it
+                // is read onto the heap where this build has one
+                // (store_scan) — never read as absent, which a decision
+                // takes for "gone".
                 let mut rv = [0u8; MAX_VALUE];
-                let rvl = if rl <= MAX_KEY {
-                    get_value(sys, &rk[..rl], &mut rv, &s.waited).unwrap_or(0)
+                let rgot = if rl <= MAX_KEY {
+                    read_value(sys, &rk[..rl], &mut rv, &s.waited)
                 } else {
-                    0
+                    Val::Missing
                 };
-                let rval = &rv[..rvl];
+                let _rheld = HeapDoc::of(sys, &rgot);
+                if matches!(rgot, Val::TooBig) {
+                    too_big(sys, &s.waited, &rk[..rl.min(MAX_KEY)]);
+                }
+                let rval = val_bytes(&rgot, &rv);
                 let base = 70u8 + blk * 10;
                 let mut ps = 0usize;
                 let mut fno = 0u8;
@@ -1772,6 +1985,16 @@ unsafe fn project(
                             rval
                         } else if rel_flat {
                             flat_field(rval, path).unwrap_or(&[])
+                        } else if path.len() > 2 && path.ends_with(b".*") {
+                            // `path.*`: the related object's MEMBERS, braces
+                            // stripped, as `paths` reads them — a template's
+                            // labels spliced into the labels a writer adds.
+                            let mut segs: [&[u8]; 6] = [&[]; 6];
+                            let ns = split_dots(&path[..path.len() - 2], &mut segs);
+                            match j_sub(rval, &segs[..ns]) {
+                                Some(sub) => object_members(sub),
+                                None => &[],
+                            }
                         } else {
                             let mut segs: [&[u8]; 6] = [&[]; 6];
                             let ns = split_dots(path, &mut segs);
@@ -1784,14 +2007,9 @@ unsafe fn project(
                         let mut modbuf = [0u8; 256];
                         let got = match modifier {
                             Some(m) => {
-                                let n = if m == b"wall" {
-                                    let n = mo_wall(&*s.syscalls, got, &mut modbuf);
-                                    if n == 0 && got.first() == Some(&b'm') {
-                                        s.unresolved.set(1);
-                                    }
-                                    n
-                                } else {
-                                    apply_mod(m, got, &mut modbuf)
+                                let n = match moment_mod(s, m, got, &mut modbuf) {
+                                    Some(n) => n,
+                                    None => apply_mod(m, got, &mut modbuf),
                                 };
                                 &modbuf[..n]
                             }
@@ -1858,6 +2076,7 @@ unsafe fn project(
                     let mut ibufs = [[0u8; 20]; 5];
                     let mut segs: [&[u8]; 6] = [&[]; 6];
                     let ns = split_dots(one, &mut segs);
+                    subst_member(&mut segs, ns, member_key(s, value, expand_idx));
                     subst_index(
                         &mut segs,
                         ns,
@@ -1945,7 +2164,9 @@ unsafe fn project(
         n += 1;
         let mut dec = [0u8; 12];
         let dl = write_dec(&mut dec, i as u64);
-        let Some(q) = put_field(out, p, 21, TY_BYTES, &dec[..dl]) else {
+        // A `{}` expansion's 21 is the member's KEY.
+        let at21 = member_key(s, value, expand_idx).unwrap_or(&dec[..dl]);
+        let Some(q) = put_field(out, p, 21, TY_BYTES, at21) else {
             return 0;
         };
         p = q;
@@ -2404,9 +2625,16 @@ unsafe fn joined_fields(
     // superset of this object's `<b>` for `join_match = "a:b"`.
     if s.join_paths_len > 0 || s.join_match_len > 0 || s.join_each_len > 0 || s.join_terms_len > 0 {
         let sys = &*s.syscalls;
+        // Whole, as the emit walk reads its own objects: a joined Pod with
+        // a real template is past the stack, and read as absent it would
+        // match no selector (a Service without its endpoints).
         let mut jv = [0u8; MAX_VALUE];
-        let jl = get_value(sys, jkey, &mut jv, &s.waited).unwrap_or(0);
-        let jval = &jv[..jl];
+        let jgot = read_value(sys, jkey, &mut jv, &s.waited);
+        let _jheld = HeapDoc::of(sys, &jgot);
+        if matches!(jgot, Val::TooBig) {
+            too_big(sys, &s.waited, jkey);
+        }
+        let jval = val_bytes(&jgot, &jv);
         let spec = &s.join_paths[..s.join_paths_len as usize];
         let mut start = 0usize;
         let mut fno = 60u8;
@@ -2952,12 +3180,15 @@ unsafe fn join_fits(s: &State, sys: &SyscallTable, val: &[u8], name: &[u8]) -> b
     let kl = append_bytes(&mut key, 0, prefix);
     let kl = append_bytes(&mut key, kl, name);
     let mut v = [0u8; MAX_VALUE];
-    let Some(vl) = get_value(sys, &key[..kl], &mut v, &s.waited) else {
+    let got = read_value(sys, &key[..kl], &mut v, &s.waited);
+    let _held = HeapDoc::of(sys, &got);
+    if matches!(got, Val::Missing | Val::TooBig) {
         return false;
-    };
+    }
+    let doc = val_bytes(&got, &v);
     let mut jsegs: [&[u8]; 6] = [&[]; 6];
     let jn = split_dots(jpath, &mut jsegs);
-    match j_sub(&v[..vl], &jsegs[..jn]) {
+    match j_sub(doc, &jsegs[..jn]) {
         Some(labels) => j_obj_subset(sel, labels),
         None => false,
     }
@@ -3022,11 +3253,13 @@ unsafe fn join_argmin(
                 append_bytes(&mut full, a, &k[..kl])
             };
             let mut v = [0u8; MAX_VALUE];
-            match get_value(sys, &full[..fl], &mut v, &s.waited) {
-                Some(vl) => j_path(&v[..vl], &segs[..ns])
+            let got = read_value(sys, &full[..fl], &mut v, &s.waited);
+            let _held = HeapDoc::of(sys, &got);
+            match got {
+                Val::Missing | Val::TooBig => i64::MAX,
+                _ => j_path(val_bytes(&got, &v), &segs[..ns])
                     .map(parse_dec_bytes)
                     .unwrap_or(0) as i64,
-                None => i64::MAX,
             }
         };
         if best.map(|b| measure < b).unwrap_or(true) {
@@ -3062,11 +3295,13 @@ unsafe fn count_where(
         let mut rp = 0usize;
         while let Some((name, q)) = raw_entry(&page[..pn], rp) {
             rp = q;
+            // Whole (onto the heap past the stack, where there is one): a
+            // Pod with a real template is still a Pod to count.
             let mut v = [0u8; MAX_VALUE];
-            if let Some(vl) = get_value(sys, name, &mut v, w) {
-                if j_path(&v[..vl], &segs[..ns]) == Some(want) {
-                    total += 1;
-                }
+            let got = read_value(sys, name, &mut v, w);
+            let _held = HeapDoc::of(sys, &got);
+            if j_path(val_bytes(&got, &v), &segs[..ns]) == Some(want) {
+                total += 1;
             }
         }
         if nlen == 0 {
@@ -3184,13 +3419,37 @@ unsafe fn count_page(s: &mut State) -> bool {
             // in a set the emit walk does not emit.
             let mut v = [0u8; MAX_VALUE];
             let tg = dev_micros(sys);
-            let got = get_value(sys, name, &mut v, &s.waited);
+            // Read as the emit walk reads it (onto the heap past the stack,
+            // where there is one): an object it emits is one it counts.
+            let got = read_value(sys, name, &mut v, &s.waited);
             st_get(s, sys, tg);
-            let Some(vl) = got else {
-                continue;
+            let _held = HeapDoc::of(sys, &got);
+            let doc: &[u8] = match got {
+                Val::Stack(n) => v.get(..n).unwrap_or(&[]),
+                Val::Heap(p, n) => core::slice::from_raw_parts(p, n),
+                Val::Missing | Val::TooBig => continue,
             };
-            if !where_ok(s, &v[..vl]) {
+            if !where_ok(s, doc) {
                 continue;
+            }
+            if s.sched_len > 0 && s.sched_noexec == 0 && s.join_len > 0 {
+                // The scheduler's order: the highest priority among the
+                // Pods that can be placed, and among those that cannot.
+                let pl = s.prefix_len as usize;
+                let tail = name.get(pl..).unwrap_or(&[]);
+                let pod = doc;
+                let prio = sk_priority(pod);
+                let mut node = [0u8; SCH_NAME];
+                let mut o = SchOut::new();
+                let fit = sched_pick(s, sys, tail, pod, &mut node, &mut o, false).is_some();
+                if s.waited.get() {
+                    continue;
+                }
+                if fit {
+                    s.sch_fit_max = s.sch_fit_max.max(prio);
+                } else if sk_at(pod, b"spec.preemptionPolicy").map(sk_unq) != Some(&b"Never"[..]) {
+                    s.sch_unfit_max = s.sch_unfit_max.max(prio);
+                }
             }
         }
         s.total += 1;
@@ -3333,15 +3592,26 @@ unsafe fn emit_page(s: &mut State) -> u32 {
 
         let mut val = [0u8; MAX_VALUE];
         let tg = dev_micros(sys);
-        let got = get_value(sys, &key[..klen], &mut val, &s.waited);
+        // An object past the stack buffer (a Deployment with a real pod
+        // template) is read whole onto the heap when this build has one
+        // (store_scan), and freed when this object's turn ends.
+        let got = read_value(sys, &key[..klen], &mut val, &s.waited);
         st_get(s, sys, tg);
+        let _held = HeapDoc::of(sys, &got);
         if s.waited.get() {
             return hold_at(s, &key[..klen], s.exp_off, wrote);
         }
-        let Some(vlen) = got else {
-            continue;
+        let doc: &[u8] = match got {
+            Val::Stack(n) => val.get(..n).unwrap_or(&[]),
+            Val::Heap(p, n) => core::slice::from_raw_parts(p, n),
+            Val::Missing => continue,
+            Val::TooBig => {
+                // Named, so the node that cannot hold it can be found.
+                too_big(sys, &s.waited, &key[..klen]);
+                continue;
+            }
         };
-        if !where_ok(s, &val[..vlen]) {
+        if !where_ok(s, doc) {
             continue;
         }
         if s.unless_len > 0 {
@@ -3359,6 +3629,23 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             }
         }
         s.scan_hits = s.scan_hits.wrapping_add(1);
+        if s.sched_len > 0 && s.sched_noexec != 0 {
+            let ne = sched_noexec(s, sys, doc);
+            if s.waited.get() {
+                return hold_at(s, &key[..klen], s.exp_off, wrote);
+            }
+            s.sch_ne = ne.unwrap_or(0);
+        }
+        if s.cron_len > 0 {
+            // The next scheduled minute, on this boot's monotonic clock.
+            let (_, next, now) = cron_of(s, doc);
+            if next > 0 && now > 0 {
+                let d = s.scan_now.saturating_add(next - now).max(s.scan_now + 1);
+                if d < s.next_due {
+                    s.next_due = d;
+                }
+            }
+        }
         if s.due_len > 0 {
             // A comma list: an object may be waiting on several clocks (a kill
             // grace AND a restart backoff), and the timer must be armed for
@@ -3373,7 +3660,10 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     .unwrap_or(spec.len());
                 let one = &spec[ds..de];
                 // `<field>+<ms>`: a deadline that far past a recorded time.
-                let (one, after) = match one.iter().position(|&b| b == b'+') {
+                // Only a `+` before the modifier: `<path>!due+<path>` is the
+                // modifier's own offset, not this one.
+                let bang = one.iter().position(|&b| b == b'!').unwrap_or(one.len());
+                let (one, after) = match one[..bang].iter().position(|&b| b == b'+') {
                     Some(i) => (&one[..i], parse_dec_u64(&one[i + 1..]) as i64),
                     None => (one, 0),
                 };
@@ -3381,13 +3671,13 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     // `<path>!due:<ttl path>`: a deadline moment ([`due_moment`]).
                     let (one, modifier) = split_mod(one);
                     let raw = if s.flat != 0 {
-                        flat_field(&val[..vlen], one).unwrap_or(&[])
+                        flat_field(doc, one).unwrap_or(&[])
                     } else {
                         let mut segs: [&[u8]; 6] = [&[]; 6];
                         let ns = split_dots(one, &mut segs);
-                        j_path(&val[..vlen], &segs[..ns]).unwrap_or(&[])
+                        j_path(doc, &segs[..ns]).unwrap_or(&[])
                     };
-                    let t = match modifier.and_then(|m| due_moment(s, &val[..vlen], raw, m)) {
+                    let t = match modifier.and_then(|m| due_moment(s, doc, raw, m)) {
                         Some(d) => d,
                         None => parse_dec_u64(raw) as i64,
                     };
@@ -3436,7 +3726,14 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             } else {
                 0
             };
-            let (c, tail_n) = if spec.ends_with(b"[]") {
+            let (c, tail_n) = if spec.ends_with(b"{}") {
+                // `a{}`: one record per MEMBER of the object at `a` — `#` in a
+                // path is that member's key, and field 21 carries it.
+                let mut segs: [&[u8]; 6] = [&[]; 6];
+                let ns = split_dots(&spec[..spec.len() - 2], &mut segs);
+                let n = j_sub(doc, &segs[..ns]).map_or(0, |o| jp_members(o).count());
+                (n as i64, 0)
+            } else if spec.ends_with(b"[]") {
                 // `a[]*b[]*…`: up to four lists, crossed.
                 let mut parts: [&[u8]; 4] = [&[]; 4];
                 let mut np = 0usize;
@@ -3454,7 +3751,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     };
                     if s.flat != 0 {
                         // A flat record's list is `<field>=a,b,c`.
-                        return match flat_field(&val[..vlen], p) {
+                        return match flat_field(doc, p) {
                             Some(l) if !l.is_empty() => {
                                 l.iter().filter(|&&c| c == b',').count() as i64 + 1
                             }
@@ -3463,7 +3760,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     }
                     let mut segs: [&[u8]; 6] = [&[]; 6];
                     let ns = split_dots(p, &mut segs);
-                    j_arr_len(&val[..vlen], &segs[..ns]) as i64
+                    j_arr_len(doc, &segs[..ns]) as i64
                 };
                 if np < 2 {
                     (arr_len(parts[0]), plus)
@@ -3477,12 +3774,10 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     (total, 0)
                 }
             } else {
-                let mut segs: [&[u8]; 6] = [&[]; 6];
-                let ns = split_dots(spec, &mut segs);
+                // A count, read as the object's shape is: a flat record's
+                // field, or a JSON path.
                 (
-                    j_path(&val[..vlen], &segs[..ns])
-                        .map(parse_dec_bytes)
-                        .unwrap_or(0) as i64,
+                    i64::from(parse_dec_bytes(path_value(s, doc, spec))),
                     s.expand_tail as i64,
                 )
             };
@@ -3497,18 +3792,40 @@ unsafe fn emit_page(s: &mut State) -> u32 {
         } else {
             None
         };
-        let joined = if s.join_len > 0 && span.is_none() {
+        let mut sch_node = [0u8; SCH_NAME];
+        let mut sch_nl = 0usize;
+        let joined = if s.join_len > 0 && span.is_none() && s.sched_len > 0 && s.sched_noexec == 0 {
+            // The scheduler's pick (sched.rs): ONE record, placed or not —
+            // or, for the Pod that preempts, one per victim.
+            let pod = doc;
+            let prio = sk_priority(pod);
+            let preempt = s.sched_preempt != 0 && s.sch_pre == 0 && prio == s.sch_unfit_max;
+            let mut o = SchOut::new();
+            let picked = sched_pick(s, sys, tail, pod, &mut sch_node, &mut o, preempt);
+            if s.waited.get() {
+                return hold_at(s, &key[..klen], s.exp_off, wrote);
+            }
+            s.sch_fit = u8::from(picked.is_some());
+            sch_nl = picked.unwrap_or(0);
+            s.sch_prio = prio;
+            let victims = if o.vl > 0 {
+                s.sch_pre = 1;
+                o.victims.iter().take(o.vl).filter(|&&b| b == b',').count() as i64 + 1
+            } else {
+                1
+            };
+            s.sch_out = o;
+            Some(victims)
+        } else if s.join_len > 0 && span.is_none() {
             if s.join_pick_len > 0 && s.join_fit_len > 0 {
                 // A pick among the entries the object fits: none fits, no
                 // record.
                 let mut probe = [0u8; MAX_KEY];
-                Some(
-                    if join_argmin(s, sys, tail, &val[..vlen], &mut probe).is_some() {
-                        1
-                    } else {
-                        0
-                    },
-                )
+                Some(if join_argmin(s, sys, tail, doc, &mut probe).is_some() {
+                    1
+                } else {
+                    0
+                })
             } else if s.join_pick_len > 0 {
                 // A pick reduces the join to one record — or none, when the
                 // joined set is empty: there is nothing to choose.
@@ -3539,15 +3856,31 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             // record, where it replaces the join ordinal: "the first unbound
             // pod" is a position among pods, and with a pick the join ordinal
             // is always 0 anyway.
-            let list_pos = if s.count != 0 && span.is_none() {
+            let list_pos = if s.sched_len > 0 && s.sched_noexec == 0 && joined.is_some() {
+                // Position 0: the first placeable Pod of the highest
+                // priority; -1: one nothing fits.
+                let at = if s.sch_fit == 0 {
+                    -1
+                } else if s.sch_prio == s.sch_fit_max && s.sch_zero == 0 {
+                    s.sch_zero = 1;
+                    0
+                } else {
+                    s.list_idx + 1
+                };
+                Some((at, s.total))
+            } else if s.count != 0 && span.is_none() {
                 Some((s.list_idx, s.total))
             } else {
                 None
             };
+            s.sch_out.vi = ord.max(0) as usize;
             let mut segbuf = [0u8; MAX_KEY];
             let join = match joined {
+                Some(j) if s.sched_len > 0 && s.sched_noexec == 0 => {
+                    Some((ord, j, sch_node.get(..sch_nl).unwrap_or(&[])))
+                }
                 Some(j) => match if s.join_pick_len > 0 {
-                    join_argmin(s, sys, tail, &val[..vlen], &mut segbuf)
+                    join_argmin(s, sys, tail, doc, &mut segbuf)
                 } else {
                     join_nth(s, sys, tail, ord, &mut segbuf)
                 } {
@@ -3575,15 +3908,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                 },
                 None => None,
             };
-            let flen = project(
-                s,
-                tail,
-                &val[..vlen],
-                expand_idx,
-                list_pos,
-                join,
-                &mut frame,
-            );
+            let flen = project(s, tail, doc, expand_idx, list_pos, join, &mut frame);
             if s.waited.get() {
                 // This record's reads were not answered: it is not sent,
                 // and the scan resumes at it.
@@ -3749,7 +4074,20 @@ pub unsafe extern "C" fn module_new(
         s.differs_len = 0;
         s.join_pick_len = 0;
         s.join_fit_len = 0;
+        s.sched_len = 0;
+        s.sched_preempt = 0;
+        s.sched_noexec = 0;
+        s.sch_fit_max = i64::MIN;
+        s.sch_unfit_max = i64::MIN;
+        s.sch_zero = 0;
+        s.sch_pre = 0;
+        s.sch_prio = 0;
+        s.sch_fit = 0;
+        s.sch_ne = 0;
+        s.sch_out = SchOut::new();
         s.facts_len = 0;
+        s.capacity_len = 0;
+        s.cron_len = 0;
         s.address_len = 0;
         s.recheck = 0;
         s.unresolved = core::cell::Cell::new(0);
@@ -3993,6 +4331,10 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 s.list_idx = 0;
                 s.total = 0;
                 s.scan_hits = 0;
+                s.sch_fit_max = i64::MIN;
+                s.sch_unfit_max = i64::MIN;
+                s.sch_zero = 0;
+                s.sch_pre = 0;
                 s.counting = if s.count != 0 { 1 } else { 0 };
                 s.scan_now = dev_millis(sys) as i64;
                 s.next_due = i64::MAX;
@@ -4870,6 +5212,34 @@ enum Val {
     TooBig,
 }
 
+/// A heap-read object, freed when its scope ends — on every `continue` and
+/// `return` of a scan that reads one object at a time.
+struct HeapDoc {
+    sys: *const SyscallTable,
+    p: *mut u8,
+}
+
+impl HeapDoc {
+    fn of(sys: &SyscallTable, v: &Val) -> HeapDoc {
+        HeapDoc {
+            sys,
+            p: match *v {
+                Val::Heap(p, _) => p,
+                _ => core::ptr::null_mut(),
+            },
+        }
+    }
+}
+
+impl Drop for HeapDoc {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            // SAFETY: allocated through this table by `read_value`, freed once.
+            unsafe { heap_free(&*self.sys, self.p) };
+        }
+    }
+}
+
 /// Read `key` whole: into `raw` when it fits, else onto the heap. `Missing`
 /// with `w` set when the store has not answered yet (`EAGAIN`).
 unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8], w: &Wait) -> Val {
@@ -4916,6 +5286,40 @@ unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8], w: &Wait) -
         return Val::Missing;
     }
     out
+}
+
+/// The bytes [`read_value`] read: `raw`'s prefix, or its heap copy (alive
+/// while the [`HeapDoc`] made of `got` is); empty when nothing was read.
+unsafe fn val_bytes<'a>(got: &Val, raw: &'a [u8]) -> &'a [u8] {
+    match *got {
+        Val::Stack(n) => raw.get(..n).unwrap_or(&[]),
+        Val::Heap(p, n) => core::slice::from_raw_parts(p, n),
+        Val::Missing | Val::TooBig => &[],
+    }
+}
+
+/// Name an object this build could not hold whole (no heap, or past it), so
+/// the node that skipped it can be found — at most once per
+/// [`REFUSAL_SAY_MS`] per module, as a value past a buffer is.
+unsafe fn too_big(sys: &SyscallTable, w: &Wait, key: &[u8]) {
+    let nag = &w.nag;
+    let now = dev_millis(sys);
+    if nag.past.get() && now.wrapping_sub(nag.past_ms.get()) < REFUSAL_SAY_MS {
+        nag.past_quiet.set(nag.past_quiet.get().saturating_add(1));
+        return;
+    }
+    nag.past.set(true);
+    nag.past_ms.set(now);
+    nag.past_quiet.set(0);
+    let mut m = [0u8; MAX_KEY + 96];
+    let a = append_bytes(&mut m, 0, b"[store_source] ");
+    let a = append_bytes(&mut m, a, key);
+    let a = append_bytes(
+        &mut m,
+        a,
+        b": past the buffer and no heap holds it - REFUSED, not read cut (a store_scan reads it whole)",
+    );
+    dev_log(sys, 1, m.as_ptr(), a);
 }
 
 /// `RANGE_GET` at `off` into `dst`: bytes copied, or the provider's error.
@@ -5173,10 +5577,9 @@ unsafe fn list_step(s: &mut State, wi: usize) -> bool {
                 Some(l) => &sc[..l],
                 None => doc,
             },
-            SchView::Text(prefix, path) => {
+            SchView::Text(parts) => {
                 let tv = TextView {
-                    prefix,
-                    path,
+                    parts,
                     tail: w.tail,
                     lbytes: w.lbytes,
                 };
@@ -5486,15 +5889,17 @@ fn stamp_rv(raw: &[u8], rev: u64, out: &mut [u8], rvp: &[u8]) -> usize {
 /// What a `text:` view reads: the key `<prefix><doc's value at path>`, cut
 /// to its last `tail` lines and at most `lbytes` bytes (0: no cut).
 struct TextView<'v> {
-    prefix: &'v [u8],
-    path: &'v [u8],
+    /// `<lit>|<path>|<lit>|<path>…`: the key's parts in turn.
+    parts: &'v [u8],
     tail: u32,
     lbytes: u32,
 }
 
-/// A `text:` view: the text stored at `<prefix><doc's value at path>` (for
-/// a Pod's log, the sandbox's output tail under its uid), its last `tail`
-/// lines and at most `lbytes` bytes when asked. Nothing stored: empty.
+/// A `text:` view: the text stored at the key its literals and the doc's
+/// values at its paths make in turn (for a Pod's log, the sandbox's output
+/// tail its node keeps under its uid: `/~node/<nodeName>/sandbox-logs/<uid>`),
+/// its last `tail` lines and at most `lbytes` bytes when asked. A path the
+/// doc has no value at (a Pod not yet on a node), or nothing stored: empty.
 unsafe fn related_text<'a>(
     sys: &SyscallTable,
     doc: &[u8],
@@ -5503,23 +5908,33 @@ unsafe fn related_text<'a>(
     w: &Wait,
 ) -> &'a [u8] {
     let TextView {
-        prefix,
-        path,
+        parts,
         tail,
         lbytes,
     } = *view;
-    let id = sch_at(doc, path).unwrap_or(&[]);
-    let id = id
-        .strip_prefix(b"\"")
-        .and_then(|v| v.strip_suffix(b"\""))
-        .unwrap_or(id);
     let mut key = [0u8; MAX_KEY];
-    if id.is_empty() || prefix.len() + id.len() > key.len() {
-        return &[];
+    let mut kl = 0usize;
+    for (i, part) in parts.split(|&b| b == b'|').enumerate() {
+        let piece = if i % 2 == 0 {
+            part
+        } else {
+            let v = sch_at(doc, part).unwrap_or(&[]);
+            let v = v
+                .strip_prefix(b"\"")
+                .and_then(|x| x.strip_suffix(b"\""))
+                .unwrap_or(v);
+            if v.is_empty() {
+                return &[];
+            }
+            v
+        };
+        let Some(dst) = key.get_mut(kl..kl + piece.len()) else {
+            return &[];
+        };
+        dst.copy_from_slice(piece);
+        kl += piece.len();
     }
-    key[..prefix.len()].copy_from_slice(prefix);
-    key[prefix.len()..prefix.len() + id.len()].copy_from_slice(id);
-    let n = match read_value(sys, &key[..prefix.len() + id.len()], out, w) {
+    let n = match read_value(sys, &key[..kl], out, w) {
         Val::Stack(n) => n,
         Val::Heap(p, _) => {
             heap_free(sys, p);
@@ -6021,11 +6436,14 @@ unsafe fn ev_arm(s: &mut State, sys: &SyscallTable) {
 }
 
 /// store_watch — this source built with `big` — takes a heap arena: a whole
-/// object, its stamped copy and wire line, and a change-feed batch. store_source
+/// object, its stamped copy and wire line, and a change-feed batch.
+/// store_scan — built with `doc_heap` — takes one for the object a scan reads
+/// whole when it is past the stack buffer: one at a time, up to `DOC_MAX` (a
+/// whole read grows in place on a heap that holds nothing else). store_source
 /// takes none.
 #[allow(
     unexpected_cfgs,
-    reason = "`big` is store_watch's feature; this file is also store_source, whose build does not declare it"
+    reason = "`big` and `doc_heap` are store_watch's and store_scan's features; this file is also store_source, whose build declares neither"
 )]
 mod arena {
     #[cfg(feature = "big")]
@@ -6033,6 +6451,12 @@ mod arena {
     #[link_section = ".text.module_arena_size"]
     pub extern "C" fn module_arena_size() -> u32 {
         32 << 20
+    }
+    #[cfg(feature = "doc_heap")]
+    #[no_mangle]
+    #[link_section = ".text.module_arena_size"]
+    pub extern "C" fn module_arena_size() -> u32 {
+        4 << 20
     }
 }
 
@@ -6044,6 +6468,34 @@ const TIMER_CANCEL: u32 = 0x0606;
 /// Arm the kernel timer for the earliest deadline ahead (or cancel it when
 /// none is), at the end of a scan. The kernel wakes this module when it
 /// fires; `module_step` sees POLL_IN and re-arms the scan.
+/// The two modifiers that read a recorded MOMENT (`_shared/moment.rs`),
+/// which need the node's clock and so are the source's, not `pathmod.rs`'s:
+///   `!wall`  the moment as Unix ms, empty until it can be said truthfully
+///   `!wjts`  the same as a JSON time (`"2026-10-18T09:30:00Z"`), `null`
+///            until then — a status field a moment stamped
+/// A moment of this boot not yet sayable marks the scan unresolved, so
+/// `recheck` scans again. `None` for any other modifier.
+unsafe fn moment_mod(s: &State, m: &[u8], got: &[u8], out: &mut [u8]) -> Option<usize> {
+    let wall_jts = m == b"wjts";
+    if m != b"wall" && !wall_jts {
+        return None;
+    }
+    let mut t = [0u8; 24];
+    let n = mo_wall(&*s.syscalls, got, &mut t);
+    if n == 0 && got.first() == Some(&b'm') {
+        s.unresolved.set(1);
+    }
+    let said = t.get(..n).unwrap_or(&[]);
+    if wall_jts {
+        return Some(pm_json_time(said, out));
+    }
+    let k = said.len().min(out.len());
+    for (o, &c) in out.iter_mut().zip(said.iter()) {
+        *o = c;
+    }
+    Some(k)
+}
+
 /// `<path>!due:<ttl path>` — the deadline at `<path>` is a MOMENT
 /// (`_shared/moment.rs`; a tomb's, `_shared/tomb.rs`): read as THIS boot's
 /// monotonic ms, the clock `now` (58) and the `due` timer run on. A moment
@@ -6051,18 +6503,32 @@ const TIMER_CANCEL: u32 = 0x0606;
 /// the clock is untrusted) is re-based to `<ttl path>` ms past this boot's
 /// origin — it ends within its ttl of a restart, never lives for ever — and
 /// said. `None` when `m` is not `due`.
+///
+/// `<path>!due+<offset path>` is the moment at `<path>` PLUS the ms at
+/// `<offset path>` ([`mo_due_after`]): a deadline measured from a moment
+/// the record kept — a start plus a deadline's length — re-based to the
+/// offset. Both paths read the object as the source does (`flat`).
 unsafe fn due_moment(s: &State, value: &[u8], raw: &[u8], m: &[u8]) -> Option<i64> {
-    let ttl_path = m.strip_prefix(b"due")?;
-    let ttl_path = ttl_path.strip_prefix(b":").unwrap_or(ttl_path);
-    let ttl = if ttl_path.is_empty() {
+    let rest = m.strip_prefix(b"due")?;
+    let (after, path) = match rest.strip_prefix(b"+") {
+        Some(p) => (true, p),
+        None => (false, rest.strip_prefix(b":").unwrap_or(rest)),
+    };
+    let ms = if path.is_empty() {
         0
+    } else if s.flat != 0 {
+        parse_dec_u64(flat_field(value, path).unwrap_or(&[]))
     } else {
         let mut segs: [&[u8]; 6] = [&[]; 6];
-        let ns = split_dots(ttl_path, &mut segs);
+        let ns = split_dots(path, &mut segs);
         parse_dec_u64(j_path(value, &segs[..ns]).unwrap_or(&[]))
     };
     let sys = &*s.syscalls;
-    let (d, rebased) = mo_due(sys, raw, ttl);
+    let (d, rebased) = if after {
+        mo_due_after(sys, raw, ms)
+    } else {
+        mo_due(sys, raw, ms)
+    };
     if rebased {
         let n = s.rebased.get().wrapping_add(1);
         s.rebased.set(n);
@@ -6081,7 +6547,7 @@ unsafe fn arm_due(s: &mut State, sys: &SyscallTable) {
             s.next_due = d;
         }
     }
-    if s.due_len == 0 && (s.recheck == 0 || s.next_due == i64::MAX) {
+    if s.due_len == 0 && s.cron_len == 0 && (s.recheck == 0 || s.next_due == i64::MAX) {
         return;
     }
     if s.timer_fd < 0 {
@@ -6122,3 +6588,6 @@ fn append_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> usize {
 }
 
 include!("../_shared/table.rs");
+include!("../_shared/labelsel.rs");
+include!("../_shared/cron.rs");
+include!("../_shared/sched.rs");

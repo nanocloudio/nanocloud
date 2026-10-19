@@ -1,0 +1,191 @@
+// A CronJob's status, its Jobs' history, and the end of its records
+// (cronjob.uproc runs the schedule).
+//
+//   status   /cronjobs.batch/ + its active records (list_children) + its
+//            /cron-last/ -> PATCH status: active (ObjectReferences),
+//            lastScheduleTime, lastSuccessfulTime (null until there is one)
+//   history  a finished Job of a CronJob -> GET its CronJob's limits ->
+//            COUNT that CronJob's Jobs of the same outcome scheduled after
+//            it -> as many as successfulJobsHistoryLimit (default 3) or
+//            failedJobsHistoryLimit (default 1): DELETE it
+//   prune    an active record whose Job is gone -> DELETE it
+//   lastgc   a /cron-last/ record whose CronJob is gone -> DELETE it
+module nanocloud.cronjobstatus {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum DELETE = 4;
+  enum PATCH = 5;
+  enum COUNT = 12;
+
+  // ---- status ----
+  message cs.Cj {
+    seq: int = 1;
+    key: string = 3;
+    uid: string = 4;
+    active: string = 56;  // the active records' values, `,`-joined
+    lst: string = 70;     // /cron-last/ t, as a JSON time (or null)
+    lok: string = 71;     // /cron-last/ s
+  }
+  message cs.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9; v7: string = 10;
+  }
+  // No active Job: no `active` (upstream omits an empty list).
+  decision st(c: cs.Cj) -> cs.Set {
+    when c.uid == "" ->
+      cs.Set { cid: c.seq, op: NOOP, key: "", path: "" };
+    when c.active == "" ->
+      cs.Set { cid: c.seq, op: PATCH, key: c.key, path: "status",
+               v1: "{\"lastScheduleTime\":", v4: c.lst,
+               v5: ",\"lastSuccessfulTime\":", v6: c.lok, v7: "}" };
+    default ->
+      cs.Set { cid: c.seq, op: PATCH, key: c.key, path: "status",
+               v1: "{\"active\":[", v2: c.active, v3: "],\"lastScheduleTime\":", v4: c.lst,
+               v5: ",\"lastSuccessfulTime\":", v6: c.lok, v7: "}" };
+  }
+
+  // ---- history ----
+  // carried by: cs.Ask, cs.Got, cs.Count, cs.Counted
+  message HCtx {
+    job: string = 1;      // "<ns>/<job>"
+    ns: string = 2;
+    ouid: string = 3;
+    ok: string = 4;       // "1" succeeded, "0" failed
+    sched: int = 5;
+    limit: int = 6;
+  }
+  message cs.Job {
+    seq: int = 1;
+    key: string = 3;
+    owner: string = 4;    // ownerReferences.0.name (a CronJob's: `where`)
+    ouid: string = 5;     // ownerReferences.0.uid
+    complete: string = 6;
+    failed: string = 7;
+    ns: string = 28;
+    sched: int = 50;      // its scheduled time (annotation, `!unix`)
+  }
+  message cs.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: HCtx = 254;
+  }
+  decision h0(j: cs.Job) -> cs.Ask {
+    when j.owner != "" && j.complete == "True" ->
+      cs.Ask { cid: j.seq, op: GET, key: "cronjobs.batch/" + j.ns + "/" + j.owner,
+               ctx: HCtx { job: j.key, ns: j.ns, ouid: j.ouid, ok: "1", sched: j.sched, limit: 0 } };
+    when j.owner != "" && j.failed == "True" ->
+      cs.Ask { cid: j.seq, op: GET, key: "cronjobs.batch/" + j.ns + "/" + j.owner,
+               ctx: HCtx { job: j.key, ns: j.ns, ouid: j.ouid, ok: "0", sched: j.sched, limit: 0 } };
+    default ->
+      cs.Ask { cid: j.seq, op: NOOP, key: "", ctx: HCtx { job: "", ns: "", ouid: "", ok: "", sched: 0, limit: 0 } };
+  }
+  message cs.Got {
+    cid: int = 1;
+    status: int = 2;
+    okS: string = 40;     // spec.successfulJobsHistoryLimit
+    failS: string = 41;   // spec.failedJobsHistoryLimit
+    ctx: HCtx = 254;
+  }
+  decision h1(g: cs.Got) -> cs.Ask {
+    when g.ctx.job != "" && g.status == 200 && g.ctx.ok == "1" ->
+      cs.Ask { cid: g.cid, op: COUNT, key: "jobs.batch/" + g.ctx.ns + "/",
+               ctx: HCtx { job: g.ctx.job, ns: g.ctx.ns, ouid: g.ctx.ouid, ok: "1", sched: g.ctx.sched,
+                           limit: int("0" + g.okS) + 3 * (1 - math.least(1, size(g.okS))) } };
+    when g.ctx.job != "" && g.status == 200 ->
+      cs.Ask { cid: g.cid, op: COUNT, key: "jobs.batch/" + g.ctx.ns + "/",
+               ctx: HCtx { job: g.ctx.job, ns: g.ctx.ns, ouid: g.ctx.ouid, ok: "0", sched: g.ctx.sched,
+                           limit: int("0" + g.failS) + (1 - math.least(1, size(g.failS))) } };
+    default ->
+      cs.Ask { cid: g.cid, op: NOOP, key: "", ctx: HCtx { job: "", ns: "", ouid: "", ok: "", sched: 0, limit: 0 } };
+  }
+  // A Job of the same CronJob and outcome, scheduled after this one.
+  message cs.Other {
+    ouid: string = 40;
+    complete: string = 41;
+    failed: string = 42;
+    sched: int = 50;
+    ctx: HCtx = 254;
+  }
+  message cs.Keep {
+    k: int = 1;
+  }
+  decision newer(o: cs.Other) -> cs.Keep {
+    when o.ouid == o.ctx.ouid && o.ctx.ouid != "" && o.sched > o.ctx.sched && o.ctx.ok == "1" && o.complete == "True" -> cs.Keep { k: 1 };
+    when o.ouid == o.ctx.ouid && o.ctx.ouid != "" && o.sched > o.ctx.sched && o.ctx.ok == "0" && o.failed == "True" -> cs.Keep { k: 1 };
+    default -> cs.Keep { };
+  }
+  message cs.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: HCtx = 254;
+  }
+  message cs.Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  decision h2(c: cs.Counted) -> cs.Del {
+    when c.ctx.job != "" && c.status == 200 && has(c.n) && c.n >= c.ctx.limit ->
+      cs.Del { cid: c.cid, op: DELETE, key: "jobs.batch/" + c.ctx.job };
+    default ->
+      cs.Del { cid: c.cid, op: NOOP, key: "" };
+  }
+
+  // ---- prune ----
+  // carried by: cs.PAsk, cs.PGot
+  message PCtx {
+    rec: string = 1;      // "<ns>/<cj>/<job>"
+  }
+  message cs.Rec {
+    seq: int = 1;
+    key: string = 3;
+    ns: string = 28;
+    job: string = 29;
+  }
+  message cs.PAsk {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: PCtx = 254;
+  }
+  decision p0(r: cs.Rec) -> cs.PAsk {
+    when r.key != "" -> cs.PAsk { cid: r.seq, op: GET, key: "jobs.batch/" + r.ns + "/" + r.job, ctx: PCtx { rec: r.key } };
+    default -> cs.PAsk { cid: r.seq, op: NOOP, key: "", ctx: PCtx { rec: "" } };
+  }
+  message cs.PGot {
+    cid: int = 1;
+    status: int = 2;
+    ctx: PCtx = 254;
+  }
+  decision p1(g: cs.PGot) -> cs.Del {
+    when g.status == 404 && g.ctx.rec != "" -> cs.Del { cid: g.cid, op: DELETE, key: "cron-active/" + g.ctx.rec };
+    default -> cs.Del { cid: g.cid, op: NOOP, key: "" };
+  }
+
+  // ---- lastgc ----
+  message cs.Last {
+    seq: int = 1;
+    key: string = 3;
+    cuid: string = 70;    // its CronJob's uid (`related`)
+  }
+  decision lg(l: cs.Last) -> cs.Del {
+    when l.cuid == "" -> cs.Del { cid: l.seq, op: DELETE, key: l.key };
+    default -> cs.Del { cid: l.seq, op: NOOP, key: "" };
+  }
+
+  pipeline st_p(c: cs.Cj) -> cs.Set { call x = st(c); return x; }
+  pipeline h0_p(j: cs.Job) -> cs.Ask { call x = h0(j); return x; }
+  pipeline h1_p(g: cs.Got) -> cs.Ask { call x = h1(g); return x; }
+  pipeline newer_p(o: cs.Other) -> cs.Keep { call x = newer(o); return x; }
+  pipeline h2_p(c: cs.Counted) -> cs.Del { call x = h2(c); return x; }
+  pipeline p0_p(r: cs.Rec) -> cs.PAsk { call x = p0(r); return x; }
+  pipeline p1_p(g: cs.PGot) -> cs.Del { call x = p1(g); return x; }
+  pipeline lg_p(l: cs.Last) -> cs.Del { call x = lg(l); return x; }
+  provenance revision "cronjob-status" toolchain "chronicle-authoring";
+}

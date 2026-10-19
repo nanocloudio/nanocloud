@@ -1,0 +1,168 @@
+// PriorityClass as params: a Pod's priority, resolved from its class as
+// upstream's Priority admission resolves it, and the classes every cluster
+// has.
+//
+//   system   /priorityclasses/ without system-node-critical -> CREATE it
+//            (2000001000) and system-cluster-critical (2000000000)
+//   default  /priorityclasses/ -> /priority-default/<name> while the class
+//            is globalDefault (dropped when it is not, or is gone)
+//   resolve  a Pod with no spec.priority -> its priorityClassName, else the
+//            global default's -> PATCH spec.priority (the class's value),
+//            spec.priorityClassName and spec.preemptionPolicy (the class's,
+//            PreemptLowerPriority unless it says Never); no class and no
+//            default: priority 0. A class that does not exist leaves the Pod
+//            unscheduled with PodScheduled=False, "no PriorityClass with name
+//            <n> was found" — where upstream refuses the create.
+//
+// The scheduler (_shared/sched.rs) places no Pod whose class is not yet
+// resolved; it orders the pending by priority and preempts by it.
+module nanocloud.priority {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum LIST = 7;
+  enum CREATE = 8;
+  enum PATCH_MERGE = 13;
+
+  // ---- system classes ----
+  message pc.Sys {
+    seq: int = 1;
+    total: int = 22;      // 0: system-node-critical absent (`empty`)
+  }
+  message pc.Create {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision sys1(s: pc.Sys) -> pc.Create {
+    when s.total == 0 ->
+      pc.Create { cid: s.seq, op: CREATE, key: "system-node-critical",
+                  v1: "{\"apiVersion\":\"scheduling.k8s.io/v1\",\"kind\":\"PriorityClass\",\"metadata\":{\"name\":\"system-node-critical\"},\"value\":2000001000,\"globalDefault\":false,\"description\":\"Used for system critical pods that must not be moved from their current node.\",\"preemptionPolicy\":\"PreemptLowerPriority\"}" };
+    default ->
+      pc.Create { cid: s.seq, op: NOOP, key: "" };
+  }
+  message pc.Made {
+    cid: int = 1;
+    status: int = 2;
+  }
+  decision sys2(m: pc.Made) -> pc.Create {
+    when m.status == 200 || m.status == 204 || m.status == 409 ->
+      pc.Create { cid: m.cid, op: CREATE, key: "system-cluster-critical",
+                  v1: "{\"apiVersion\":\"scheduling.k8s.io/v1\",\"kind\":\"PriorityClass\",\"metadata\":{\"name\":\"system-cluster-critical\"},\"value\":2000000000,\"globalDefault\":false,\"description\":\"Used for system critical pods that must run in the cluster, but can be moved to another node if necessary.\",\"preemptionPolicy\":\"PreemptLowerPriority\"}" };
+    default ->
+      pc.Create { cid: m.cid, op: NOOP, key: "" };
+  }
+
+  // ---- the global default ----
+  message pc.Class {
+    seq: int = 1;
+    key: string = 3;      // the class's name
+    gd: string = 4;       // globalDefault
+  }
+  message pc.Mark {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision def(c: pc.Class) -> pc.Mark {
+    when c.gd == "true" -> pc.Mark { cid: c.seq, op: PUT, key: c.key, v1: "1" };
+    default -> pc.Mark { cid: c.seq, op: DELETE, key: c.key, v1: "" };
+  }
+  message pc.Def {
+    seq: int = 1;
+    key: string = 3;
+    name: string = 70;    // the class (`related`): gone when empty
+  }
+  decision defgc(d: pc.Def) -> pc.Mark {
+    when d.name == "" -> pc.Mark { cid: d.seq, op: DELETE, key: d.key, v1: "" };
+    default -> pc.Mark { cid: d.seq, op: NOOP, key: "", v1: "" };
+  }
+
+  // ---- resolve ----
+  // carried by: pc.Ask, pc.Listed, pc.Get, pc.Got
+  message PCtx {
+    pod: string = 1;      // "<ns>/<pod>"
+    name: string = 2;     // the Pod's priorityClassName
+    cls: string = 3;      // the class asked after
+  }
+  message pc.Pod {
+    seq: int = 1;
+    key: string = 3;
+    name: string = 4;     // spec.priorityClassName
+  }
+  message pc.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: PCtx = 254;
+  }
+  decision r0(p: pc.Pod) -> pc.Ask {
+    when p.key != "" ->
+      pc.Ask { cid: p.seq, op: LIST, key: "priority-default/", ctx: PCtx { pod: p.key, name: p.name, cls: "" } };
+    default ->
+      pc.Ask { cid: p.seq, op: NOOP, key: "", ctx: PCtx { pod: "", name: "", cls: "" } };
+  }
+  message pc.Listed {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;    // the default classes' names
+    ctx: PCtx = 254;
+  }
+  decision r1(l: pc.Listed) -> pc.Ask {
+    when l.ctx.pod == "" ->
+      pc.Ask { cid: l.cid, op: NOOP, key: "", ctx: l.ctx };
+    when l.ctx.name != "" ->
+      pc.Ask { cid: l.cid, op: GET, key: "priorityclasses/" + l.ctx.name,
+               ctx: PCtx { pod: l.ctx.pod, name: l.ctx.name, cls: l.ctx.name } };
+    when l.status == 200 && l.value.contains(",") ->
+      pc.Ask { cid: l.cid, op: GET, key: "priorityclasses/" + l.value.substring(0, l.value.indexOf(",")),
+               ctx: PCtx { pod: l.ctx.pod, name: "", cls: l.value.substring(0, l.value.indexOf(",")) } };
+    when l.status == 200 && l.value != "" ->
+      pc.Ask { cid: l.cid, op: GET, key: "priorityclasses/" + l.value,
+               ctx: PCtx { pod: l.ctx.pod, name: "", cls: l.value } };
+    default ->
+      pc.Ask { cid: l.cid, op: NOOP, key: "", ctx: PCtx { pod: l.ctx.pod, name: "", cls: "" } };
+  }
+  message pc.Got {
+    cid: int = 1;
+    status: int = 2;
+    policy: string = 40;  // the class's preemptionPolicy
+    value: int = 50;      // the class's value
+    ctx: PCtx = 254;
+  }
+  message pc.Patch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: string = 9; v7: string = 10;
+  }
+  decision r2(g: pc.Got) -> pc.Patch {
+    when g.ctx.pod == "" ->
+      pc.Patch { cid: g.cid, op: NOOP, key: "" };
+    when g.ctx.cls != "" && g.status == 200 ->
+      pc.Patch { cid: g.cid, op: PATCH_MERGE, key: g.ctx.pod,
+                 v1: "{\"spec\":{\"priorityClassName\":\"", v2: g.ctx.cls, v3: "\",\"priority\":", v4: g.value,
+                 v5: ",\"preemptionPolicy\":\"",
+                 v6: "PreemptLowerPriorityNever".substring(20 * math.least(1, size(g.policy) - size(g.policy.replace("Never", ""))), 20 + 5 * math.least(1, size(g.policy) - size(g.policy.replace("Never", "")))),
+                 v7: "\"}}" };
+    when g.ctx.name != "" ->
+      pc.Patch { cid: g.cid, op: PATCH_MERGE, key: g.ctx.pod,
+                 v1: "{\"status\":{\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"False\",\"reason\":\"Unschedulable\",\"message\":\"no PriorityClass with name ",
+                 v2: g.ctx.name, v3: " was found\",\"lastProbeTime\":null,\"lastTransitionTime\":null}]}}" };
+    default ->
+      pc.Patch { cid: g.cid, op: PATCH_MERGE, key: g.ctx.pod, v1: "{\"spec\":{\"priority\":0}}" };
+  }
+
+  pipeline sys1_p(s: pc.Sys) -> pc.Create { call x = sys1(s); return x; }
+  pipeline sys2_p(m: pc.Made) -> pc.Create { call x = sys2(m); return x; }
+  pipeline def_p(c: pc.Class) -> pc.Mark { call x = def(c); return x; }
+  pipeline defgc_p(d: pc.Def) -> pc.Mark { call x = defgc(d); return x; }
+  pipeline r0_p(p: pc.Pod) -> pc.Ask { call x = r0(p); return x; }
+  pipeline r1_p(l: pc.Listed) -> pc.Ask { call x = r1(l); return x; }
+  pipeline r2_p(g: pc.Got) -> pc.Patch { call x = r2(g); return x; }
+  provenance revision "priority" toolchain "chronicle-authoring";
+}

@@ -1,13 +1,25 @@
 // A scheduled Pod as the node's ask: /pods/ with spec.nodeName -> the flat
 // /pod-specs/<uid> record the node's pod-lifecycle chain runs.
 //
-//   spec    /pods/<ns>/<name> bound to a node -> /pod-specs/<uid>
-//           node image pull restart grace desired cmd args env workdir cpu
-//           mem eph pod; desired=deleted once the Pod carries a
-//           deletionTimestamp
+//   spec    /pods/<ns>/<name> bound to a node, graph-backed
+//           (runtimeClassName: fluxor) -> /pod-specs/<uid>
+//           node graph image restart grace desired cpu mem eph pod paused;
+//           desired=deleted once the Pod carries a deletionTimestamp. A
+//           CONTAINER Pod's records — one per container — are pod_resolve's
+//           (_shared/podres.rs): its environment, command, user and volumes
+//           are functions of other objects, which no decision can compute
 //   gone    /~tomb-at/pods/<ns>/<name> (a Pod deleted outright: its tomb's
 //           index entry, its identity at the tomb's paths)
-//           -> /pod-specs/<uid> desired=deleted
+//           -> /pod-specs/<uid> desired=deleted, either kind, and the same
+//           for every container record of it, <uid>~c<n> and <uid>~i<n>
+//           (store_effect PUT_FAMILY: one listing of the uid's prefix), so
+//           no sidecar or init container of a deleted Pod keeps running.
+//           Its grace is the delete's (the tomb's
+//           deletionGracePeriodSeconds: the request's DeleteOptions, 0 for
+//           `--force --grace-period=0`), else the Pod's own
+//           terminationGracePeriodSeconds, else 30 — what a controller's or
+//           the garbage collector's delete gives it. The node signals
+//           SIGTERM, waits out the grace, then SIGKILL (pod_lifecycle).
 //
 // Each record is written into its node's scope, /~node/<node>/pod-specs/
 // <uid> (the effect's key_prefix is /~node/): a worker's store keeps
@@ -18,6 +30,7 @@ module nanocloud.podspecs {
 
   enum NOOP = 0;
   enum PUT = 3;
+  enum PUT_FAMILY = 19;
 
   message ps.Pod {
     seq: int = 1;
@@ -25,24 +38,14 @@ module nanocloud.podspecs {
     key: string = 3;       // "<ns>/<name>"
     uid: string = 4;       // metadata.uid
     node: string = 5;      // spec.nodeName ("" until scheduled)
-    cmd: string = 6;       // spec.containers.0.command, as argv
-    args: string = 7;      // spec.containers.0.args, as argv
-    image: string = 8;     // spec.containers.0.image
-    restart: string = 9;   // spec.restartPolicy, lowercased
-    grace: string = 10;    // spec.terminationGracePeriodSeconds
-    deleting: string = 11; // metadata.deletionTimestamp
-    rtc: string = 12;      // spec.runtimeClassName: "fluxor" names a graph-backed Pod
-    pull: string = 13;     // spec.containers.0.imagePullPolicy
-    env: string = 14;      // spec.containers.0.env!jenv: NAME=VALUE,… escaped
-    workdir: string = 15;  // spec.containers.0.workingDir!esc
-    cpu: string = 16;      // spec.containers.0.resources.limits.cpu!milli
-    mem: string = 17;      // …limits.memory!bytes
-    eph: string = 18;      // …limits.ephemeral-storage!bytes
-    // Whether the container declares an exec readinessProbe — its command
-    // (`related`: the Pod itself, past the source's fifteen `paths`): the
-    // gate the node's status reads Ready by. The probe itself, both kinds,
-    // goes as its own record (pod_probes.uproc).
-    rcmd: string = 70;     // readinessProbe.exec.command!jargv
+    image: string = 6;     // spec.containers.0.image
+    restart: string = 7;   // spec.restartPolicy, lowercased
+    deleting: string = 8;  // metadata.deletionTimestamp
+    rtc: string = 9;       // spec.runtimeClassName: "fluxor" names a graph-backed Pod
+    cpu: string = 10;      // spec.containers.0.resources.limits.cpu!milli
+    mem: string = 11;      // …limits.memory!bytes
+    eph: string = 12;      // …limits.ephemeral-storage!bytes
+    paused: string = 13;   // metadata.annotations!pick=nanocloud.io/paused
   }
   // Value parts are joined into the record (store_effect: 4..16, then
   // 80..99); the node reads it as flat `k=v;` fields, in any order.
@@ -55,107 +58,47 @@ module nanocloud.podspecs {
     p9: string = 12;  p10: string = 13; p11: string = 14; p12: string = 15;
     p13: string = 16;
     p14: string = 80; p15: string = 81; p16: string = 82; p17: string = 83;
-    p18: string = 84; p19: string = 85; p20: string = 86; p21: string = 87;
-    p22: string = 88; p23: string = 89; p24: string = 90; p25: string = 91;
-    p26: string = 92; p27: string = 93; p28: string = 94; p29: string = 95;
-    p30: string = 96; p31: string = 97; p32: string = 98; p33: string = 99;
+    p18: string = 84;
   }
   // The defaults upstream's API server applies to a Pod it admits, applied
-  // where the spec is read: an unstated grace period is 30 seconds (0 would
-  // kill a deleted Pod's process without its SIGTERM window), an unstated
-  // restartPolicy is Always. A controller's Pod carries its template's: a
-  // Deployment's, ReplicaSet's, DaemonSet's or StatefulSet's Always unless it
-  // says otherwise, a Job's the OnFailure or Never its template must state.
-  //
-  // A container Pod carries command and args APART (`cmd=`, `args=`): which
-  // of them replaces the image's Entrypoint and which its Cmd is the node's
-  // to compose (pod_image.uproc), and only it has the image config. Its env
-  // (`env=`), workingDir (`workdir=`) and resource limits (`cpu=` in
-  // millicores, `mem=` and `eph=` — ephemeral-storage — in bytes) ride along;
-  // an empty one is unstated. So is its readiness probe's command
-  // (`rp_cmd`); a graph-backed Pod has no exec seam to run one through, and
-  // carries none.
+  // where the spec is read: an unstated restartPolicy is Always. A
+  // graph-backed Pod has no SIGTERM window to grant (grace 0), and its image
+  // — a Graph's name, or a pulled workload image's reference — is its graph.
   decision spec(p: ps.Pod) -> ps.Spec {
-    when p.node == "" || p.uid == "" ->
+    when p.node == "" || p.uid == "" || p.rtc != "fluxor" ->
       ps.Spec { cid: p.seq, op: NOOP, key: "" };
-    when p.deleting != "" && p.rtc == "fluxor" && (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) ->
+    when p.deleting != "" && (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";image=", p6: p.image,
                  p7: ";grace=0;desired=deleted;cmd=;cpu=", p8: p.cpu, p9: ";mem=", p10: p.mem,
                  p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key };
-    when p.deleting != "" && p.rtc == "fluxor" ->
+    when p.deleting != "" ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image,
                  p5: ";grace=0;desired=deleted;cmd=;cpu=", p6: p.cpu, p7: ";mem=", p8: p.mem,
                  p9: ";eph=", p10: p.eph, p11: ";pod=", p12: p.key };
-    when p.deleting != "" && p.grace == "" ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";grace=", p8: "30", p9: ";desired=deleted;cmd=", p10: p.cmd,
-                 p11: ";args=", p12: p.args, p13: ";env=", p14: p.env, p15: ";workdir=",
-                 p16: p.workdir, p17: ";cpu=", p18: p.cpu, p19: ";mem=", p20: p.mem,
-                 p21: ";eph=", p22: p.eph, p23: ";pod=", p24: p.key };
-    when p.deleting != "" ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";grace=", p8: p.grace, p9: ";desired=deleted;cmd=", p10: p.cmd,
-                 p11: ";args=", p12: p.args, p13: ";env=", p14: p.env, p15: ";workdir=",
-                 p16: p.workdir, p17: ";cpu=", p18: p.cpu, p19: ";mem=", p20: p.mem,
-                 p21: ";eph=", p22: p.eph, p23: ";pod=", p24: p.key };
-    when p.rtc == "fluxor" && (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) && p.restart == "" ->
+    when (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) && p.restart == "" ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";image=", p6: p.image,
                  p7: ";restart=", p8: "always", p9: ";grace=0;desired=running;cmd=;cpu=",
                  p10: p.cpu, p11: ";mem=", p12: p.mem, p13: ";eph=", p14: p.eph, p15: ";pod=",
-                 p16: p.key };
-    when p.rtc == "fluxor" && (p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0) ->
+                 p16: p.key, p17: ";paused=", p18: p.paused };
+    when p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0 ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";image=", p6: p.image,
                  p7: ";restart=", p8: p.restart, p9: ";grace=0;desired=running;cmd=;cpu=",
                  p10: p.cpu, p11: ";mem=", p12: p.mem, p13: ";eph=", p14: p.eph, p15: ";pod=",
-                 p16: p.key };
-    when p.rtc == "fluxor" && p.restart == "" ->
+                 p16: p.key, p17: ";paused=", p18: p.paused };
+    when p.restart == "" ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";restart=", p6: "always",
                  p7: ";grace=0;desired=running;cmd=;cpu=", p8: p.cpu, p9: ";mem=", p10: p.mem,
-                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key };
-    when p.rtc == "fluxor" ->
+                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused };
+    default ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";restart=", p6: p.restart,
                  p7: ";grace=0;desired=running;cmd=;cpu=", p8: p.cpu, p9: ";mem=", p10: p.mem,
-                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key };
-    when p.grace == "" && p.restart == "" ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";restart=", p8: "always", p9: ";grace=", p10: "30",
-                 p11: ";desired=running;cmd=", p12: p.cmd, p13: ";args=", p14: p.args,
-                 p15: ";env=", p16: p.env, p17: ";workdir=", p18: p.workdir, p19: ";cpu=",
-                 p20: p.cpu, p21: ";mem=", p22: p.mem, p23: ";eph=", p24: p.eph, p25: ";pod=",
-                 p26: p.key, p27: ";rp_cmd=", p28: p.rcmd };
-    when p.grace == "" ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";restart=", p8: p.restart, p9: ";grace=", p10: "30",
-                 p11: ";desired=running;cmd=", p12: p.cmd, p13: ";args=", p14: p.args,
-                 p15: ";env=", p16: p.env, p17: ";workdir=", p18: p.workdir, p19: ";cpu=",
-                 p20: p.cpu, p21: ";mem=", p22: p.mem, p23: ";eph=", p24: p.eph, p25: ";pod=",
-                 p26: p.key, p27: ";rp_cmd=", p28: p.rcmd };
-    when p.restart == "" ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";restart=", p8: "always", p9: ";grace=", p10: p.grace,
-                 p11: ";desired=running;cmd=", p12: p.cmd, p13: ";args=", p14: p.args,
-                 p15: ";env=", p16: p.env, p17: ";workdir=", p18: p.workdir, p19: ";cpu=",
-                 p20: p.cpu, p21: ";mem=", p22: p.mem, p23: ";eph=", p24: p.eph, p25: ";pod=",
-                 p26: p.key, p27: ";rp_cmd=", p28: p.rcmd };
-    default ->
-      ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
-                 p2: p.node, p3: ";image=", p4: p.image, p5: ";pull=", p6: p.pull,
-                 p7: ";restart=", p8: p.restart, p9: ";grace=", p10: p.grace,
-                 p11: ";desired=running;cmd=", p12: p.cmd, p13: ";args=", p14: p.args,
-                 p15: ";env=", p16: p.env, p17: ";workdir=", p18: p.workdir, p19: ";cpu=",
-                 p20: p.cpu, p21: ";mem=", p22: p.mem, p23: ";eph=", p24: p.eph, p25: ";pod=",
-                 p26: p.key, p27: ";rp_cmd=", p28: p.rcmd };
+                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused };
   }
 
   message ps.Tomb {
@@ -166,20 +109,31 @@ module nanocloud.podspecs {
     node: string = 5;     // obj.spec.nodeName
     rtc: string = 6;      // obj.spec.runtimeClassName
     image: string = 7;    // obj.spec.containers.0.image
+    dgrace: string = 8;   // obj.metadata.deletionGracePeriodSeconds (the delete's)
+    tgrace: string = 9;   // obj.spec.terminationGracePeriodSeconds (the Pod's)
   }
   // A graph-backed Pod's tombstone keeps naming its graph: the node's
   // lifecycle chain tears a metal sandbox down only for a spec that says
-  // which graph it was (its delete arms carry `graph` to the metal effect).
+  // which graph it was (its delete arms carry `graph` to the metal effect);
+  // it has no SIGTERM window to grant (grace 0).
   decision gone(t: ps.Tomb) -> ps.Spec {
     when t.uid == "" || t.node == "" ->
       ps.Spec { cid: t.seq, op: NOOP, key: "" };
     when t.rtc == "fluxor" ->
-      ps.Spec { cid: t.seq, op: PUT, key: t.node + "/pod-specs/" + t.uid,
+      ps.Spec { cid: t.seq, op: PUT_FAMILY, key: t.node + "/pod-specs/" + t.uid,
                 p1: "node=", p2: t.node, p3: ";graph=", p4: t.image,
                 p5: ";grace=0;desired=deleted;cmd=" };
+    when t.dgrace != "" ->
+      ps.Spec { cid: t.seq, op: PUT_FAMILY, key: t.node + "/pod-specs/" + t.uid,
+                p1: "node=", p2: t.node, p3: ";grace=", p4: t.dgrace,
+                p5: ";desired=deleted;cmd=" };
+    when t.tgrace != "" ->
+      ps.Spec { cid: t.seq, op: PUT_FAMILY, key: t.node + "/pod-specs/" + t.uid,
+                p1: "node=", p2: t.node, p3: ";grace=", p4: t.tgrace,
+                p5: ";desired=deleted;cmd=" };
     default ->
-      ps.Spec { cid: t.seq, op: PUT, key: t.node + "/pod-specs/" + t.uid,
-                p1: "node=", p2: t.node, p3: ";grace=0;desired=deleted;cmd=" };
+      ps.Spec { cid: t.seq, op: PUT_FAMILY, key: t.node + "/pod-specs/" + t.uid,
+                p1: "node=", p2: t.node, p3: ";grace=30;desired=deleted;cmd=" };
   }
 
   pipeline spec_p(p: ps.Pod) -> ps.Spec {

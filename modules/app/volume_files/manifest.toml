@@ -1,0 +1,84 @@
+name = "volume_files"
+version = "0.1.0"
+description = "A Pod's own volumes on its node — emptyDir, ConfigMap and Secret directories made, projected and removed"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The volumes a Pod brings itself rather than claims (volume.uproc, from
+# pod_resolve's list): each is a directory of the Pod's own on this node,
+# `<root>/<pod uid>/volumes/<volume>`, bound into every container of the Pod
+# that mounts it — one directory per Pod, whichever container asks first,
+# kept across its containers' restarts and removed once the Pod is gone, as
+# upstream's kubelet keeps them under its pods directory.
+#
+#   emptyDir    made empty, mode 0777 (any user the container runs as can
+#               write it)
+#   a file      `@d/<vol>/<text, %XX-escaped>`: the text as
+#               `<vol>/resolv.conf`, mode 0644 — a Pod's /etc/resolv.conf
+#               by its dnsPolicy (pod_resolve, _shared/poddns.rs); the file,
+#               not its directory, is what is bound
+#   configMap   each key of the ConfigMap's `data` (and `binaryData`), or
+#   secret      the Secret's `data` decoded (and `stringData`), as a file of
+#               that name — or only `items`, each at its `path` — mode
+#               `defaultMode` (the item's `mode`), 0644 unless stated.
+#               A ConfigMap or Secret that is missing and not `optional`
+#               (or an item's key missing) prepares nothing: the container
+#               waits, as upstream's does on a failed mount
+#
+# It sits in the volume chain in front of the store connector: a request
+# whose op is PREPARE (40) is this module's — field 3 the volume's spec
+# (`@e/<vol>`, `@c/<vol>/<ns>/<name>/<mode>/<optional>[/<key>=<path>[=<mode>]|…]`,
+# `@s/…` for a Secret), field 17 the sandbox id (`<pod uid>[~<container>]`)
+# — and leaves as a NOOP carrying the directory at field 39 (none when it
+# could not be prepared), which the store connector echoes to the chain's
+# next decision; any other request passes through untouched. A directory
+# whose contents are what it last wrote is not written again.
+#
+# Files are written through `fs`; their modes, and a gone Pod's directory,
+# through the process executor: the node's grant must allow `chmod` and
+# `rm` (`SECTOR_PROC_ALLOW`). A volume whose mode could not be set is not
+# offered (its container waits): a 0600 file a non-root container cannot
+# read is not the volume it asked for. Every `gc_ms` the root is swept for
+# Pods whose record (`/pod-specs/<uid>`) is gone.
+#
+# Parameters:
+# | Tag | Name  | Type | Default                    | Description |
+# |-----|-------|------|----------------------------|-------------|
+# | 1   | root  | str  | /var/lib/nanocloud.io/pods | Where the Pods' directories live |
+# | 2   | gc_ms | u32  | 30000                      | How often gone Pods' directories are removed |
+timer_class = "wall_clock"
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+# A ConfigMap's or Secret's data; a Pod's record (is it gone?).
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[[resources]]
+requires_contract = "proc"
+access = "write"
+
+[observability]
+exempt = "control-plane connector — one directory prepared per request, its result carried on the record"

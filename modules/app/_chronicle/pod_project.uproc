@@ -46,6 +46,16 @@ module nanocloud.podproject {
     res_env: string = 72;     //   the image's Env
     res_wd: string = 73;      //   its WorkingDir
     res_user: string = 74;    //   its User
+    res_uid: string = 75;     //   its User's uid (!uidnum: "" for a name)
+    // The container's securityContext and config (/pod-specs/ itself,
+    // pod_resolve's fields), its init order, and its sandbox's state.
+    ruid: string = 80;        // runAsUser
+    rgid: string = 81;        // runAsGroup
+    nonroot: string = 82;     // runAsNonRoot: "1"
+    cfgerr: string = 83;      // why Kubernetes would not create it
+    gate: int = 84;           // the init containers that must have completed
+    done: int = 90;           // /pod-init/<pod uid> done: those that have
+    st: string = 100;         // /sandbox-status/ state
   }
   message pp.Art {
     cid: int = 1;
@@ -57,7 +67,8 @@ module nanocloud.podproject {
     p13: string = 16;
     p14: string = 80; p15: string = 81; p16: string = 82; p17: string = 83;
     p18: string = 84; p19: string = 85; p20: string = 86; p21: string = 87;
-    p22: string = 88; p23: string = 89; p24: string = 90;
+    p22: string = 88; p23: string = 89; p24: string = 90; p25: string = 91;
+    p26: string = 92; p27: string = 93; p28: string = 94;
     ctx: Ctx = 254;
   }
   message pp.Made {
@@ -109,37 +120,79 @@ module nanocloud.podproject {
   // entry overriding an earlier of its name (`env=`, joined; workload_effect
   // composes it); `host=` the Pod's name (HOSTNAME); `wd=` the container's
   // workingDir and `iwd=` the image's, the first that is set winning; `user=`
-  // the image's User; `cpu=`/`mem=`/`eph=` the container's limits.
+  // `<the image's User>/<runAsUser>/<runAsGroup>` (workload_effect composes
+  // them: the securityContext's over the image's, a runAsGroup alone keeping
+  // the image's uid); `cpu=`/`mem=`/`eph=` the container's limits, `tasks=`
+  // its pids envelope (pod_resolve's: what gives it a cgroup).
   // A Pod with no image (a host process, or an explicit rootfs): its command
-  // and args as one argv, its own env, no user.
+  // and args as one argv, its own env, its runAsUser/runAsGroup (none: the
+  // node's own identity).
+  //
+  // Not created, as upstream's kubelet would not create it — the sandbox's
+  // status says `refused` with why (CreateContainerConfigError), which a live
+  // sandbox is never overwritten with: a config error pod_resolve found (a
+  // missing ConfigMap, a setting the node cannot give), and runAsNonRoot
+  // with a user that is root or a name no number says is not. A container
+  // after init containers waits until they have completed (/pod-init/).
   decision artifact(s: pp.Spec) -> pp.Art {
     when s.graph != "" ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when has(s.cfgerr) && s.cfgerr != "" && (!has(s.st) || s.st == "" || s.st == "refused") ->
+      pp.Art { cid: s.seq, op: PUT, key: "sandbox-status/" + s.key,
+               p1: "state=refused;code=", p2: s.cfgerr, ctx: Ctx { key: s.key } };
+    when has(s.cfgerr) && s.cfgerr != "" ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when has(s.gate) && s.gate > 0 && (!has(s.done) || s.done < s.gate) ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when s.image != "" && s.rootfs == "" && has(s.res_cmd) && s.res_cmd != "" && has(s.res_rootfs)
+         && s.res_rootfs != "" && !s.res_rootfs.startsWith("pack:") && has(s.nonroot) && s.nonroot == "1"
+         && (!has(s.ruid) || s.ruid == "") && (!has(s.res_uid) || s.res_uid == "") && (!has(s.st) || s.st == "" || s.st == "refused") ->
+      pp.Art { cid: s.seq, op: PUT, key: "sandbox-status/" + s.key,
+               p1: "state=refused;code=container has runAsNonRoot and image has non-numeric user (", p2: s.res_user,
+               p3: "), cannot verify user is non-root", ctx: Ctx { key: s.key } };
+    when s.image != "" && s.rootfs == "" && has(s.res_cmd) && s.res_cmd != "" && has(s.res_rootfs)
+         && s.res_rootfs != "" && !s.res_rootfs.startsWith("pack:") && has(s.nonroot) && s.nonroot == "1"
+         && (!has(s.ruid) || s.ruid == "") && has(s.res_uid) && s.res_uid == "0" && (!has(s.st) || s.st == "" || s.st == "refused") ->
+      pp.Art { cid: s.seq, op: PUT, key: "sandbox-status/" + s.key,
+               p1: "state=refused;code=container has runAsNonRoot and image will run as root", ctx: Ctx { key: s.key } };
+    when s.image != "" && s.rootfs == "" && has(s.res_cmd) && s.res_cmd != "" && has(s.res_rootfs)
+         && s.res_rootfs != "" && !s.res_rootfs.startsWith("pack:") && has(s.nonroot) && s.nonroot == "1"
+         && (!has(s.ruid) || s.ruid == "") && (!has(s.res_uid) || s.res_uid == "" || s.res_uid == "0") ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     when s.image != "" && s.rootfs == "" && has(s.res_cmd) && s.res_cmd != "" && has(s.res_rootfs)
          && s.res_rootfs != "" && !s.res_rootfs.startsWith("pack:") ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+      pp.Art { cid: s.seq, op: MERGE, key: "sandboxes/" + s.key,
                p1: "cmd=", p2: s.res_cmd, p3: ";rootfs=", p4: s.res_rootfs,
                p5: ";iso=1;env=", p6: s.res_env, p7: ",", p8: s.env,
                p9: ";host=", p10: s.pod.substring(s.pod.indexOf("/") + 1),
                p11: ";wd=", p12: s.workdir, p13: ";iwd=", p14: s.res_wd,
-               p15: ";user=", p16: s.res_user, p17: ";cpu=", p18: s.cpu,
-               p19: ";mem=", p20: s.mem, p21: ";eph=", p22: s.eph, ctx: Ctx { key: s.key } };
+               p15: ";user=", p16: s.res_user, p17: "/", p18: s.ruid, p19: "/", p20: s.rgid,
+               p21: ";cpu=", p22: s.cpu, p23: ";mem=", p24: s.mem, p25: ";eph=", p26: s.eph,
+               p27: ";tasks=", p28: s.tasks, ctx: Ctx { key: s.key } };
     when s.image != "" && s.rootfs == "" ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
+    when s.cmd != "" && has(s.nonroot) && s.nonroot == "1" && (!has(s.ruid) || s.ruid == "" || s.ruid == "0")
+         && (!has(s.st) || s.st == "" || s.st == "refused") ->
+      pp.Art { cid: s.seq, op: PUT, key: "sandbox-status/" + s.key,
+               p1: "state=refused;code=container has runAsNonRoot and image will run as root", ctx: Ctx { key: s.key } };
+    when s.cmd != "" && has(s.nonroot) && s.nonroot == "1" && (!has(s.ruid) || s.ruid == "" || s.ruid == "0") ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     when s.cmd != "" && s.args != "" ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+      pp.Art { cid: s.seq, op: MERGE, key: "sandboxes/" + s.key,
                p1: "cmd=", p2: s.cmd, p3: " ", p4: s.args, p5: ";rootfs=", p6: s.rootfs,
                p7: ";iso=", p8: s.iso, p9: ";env=", p10: s.env,
                p11: ";host=", p12: s.pod.substring(s.pod.indexOf("/") + 1),
-               p13: ";wd=", p14: s.workdir, p15: ";iwd=;user=;cpu=", p16: s.cpu,
-               p17: ";mem=", p18: s.mem, p19: ";eph=", p20: s.eph, ctx: Ctx { key: s.key } };
+               p13: ";wd=", p14: s.workdir, p15: ";iwd=;user=/", p16: s.ruid, p17: "/", p18: s.rgid,
+               p19: ";cpu=", p20: s.cpu, p21: ";mem=", p22: s.mem, p23: ";eph=", p24: s.eph,
+               p25: ";tasks=", p26: s.tasks, ctx: Ctx { key: s.key } };
     when s.cmd != "" ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+      pp.Art { cid: s.seq, op: MERGE, key: "sandboxes/" + s.key,
                p1: "cmd=", p2: s.cmd, p3: ";rootfs=", p4: s.rootfs,
                p5: ";iso=", p6: s.iso, p7: ";env=", p8: s.env,
                p9: ";host=", p10: s.pod.substring(s.pod.indexOf("/") + 1),
-               p11: ";wd=", p12: s.workdir, p13: ";iwd=;user=;cpu=", p14: s.cpu,
-               p15: ";mem=", p16: s.mem, p17: ";eph=", p18: s.eph, ctx: Ctx { key: s.key } };
+               p11: ";wd=", p12: s.workdir, p13: ";iwd=;user=/", p14: s.ruid, p15: "/", p16: s.rgid,
+               p17: ";cpu=", p18: s.cpu, p19: ";mem=", p20: s.mem, p21: ";eph=", p22: s.eph,
+               p23: ";tasks=", p24: s.tasks, ctx: Ctx { key: s.key } };
     default ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }
@@ -189,7 +242,7 @@ module nanocloud.podproject {
       pp.Act { cid: k.cid, op: MERGE, key: "sandboxes/", k2: k.ctx.key, v1: "phase=delete" };
     when k.status == 404 ->
       pp.Act { cid: k.cid, op: DROP_EACH, key: k.ctx.key, k2: "",
-               v1: "pod-runtime,sandboxes,metal-sandboxes,sandbox-status,sandbox-boot-of,sandbox-logs,sandbox-kill,sandbox-pause,pod-lifecycle-status,probe-status,probe-rt-l,probe-rt-r,pod-resolved,pod-cond,pod-wait,pod-probes,image-requests,image-digests,image-index,image-pull-failed" };
+               v1: "pod-runtime,pod-init,sandboxes,metal-sandboxes,sandbox-status,sandbox-boot-of,sandbox-logs,sandbox-log-n,sandbox-kill,sandbox-pause,pod-lifecycle-status,probe-status,probe-rt-l,probe-rt-r,pod-resolved,pod-cond,pod-wait,pod-probes,image-requests,image-digests,image-index,image-pull-failed,image-pull-auth" };
     default ->
       pp.Act { cid: k.cid, op: NOOP, key: "", k2: "", v1: "" };
   }
@@ -199,7 +252,9 @@ module nanocloud.podproject {
               iso: s.iso, net: s.net, tasks: s.tasks, graph: s.graph, image: s.image,
               args: s.args, env: s.env, workdir: s.workdir, cpu: s.cpu, mem: s.mem,
               eph: s.eph, pod: s.pod, res_rootfs: s.res_rootfs, res_cmd: s.res_cmd,
-              res_env: s.res_env, res_wd: s.res_wd, res_user: s.res_user }
+              res_env: s.res_env, res_wd: s.res_wd, res_user: s.res_user, res_uid: s.res_uid,
+              ruid: s.ruid, rgid: s.rgid, nonroot: s.nonroot, cfgerr: s.cfgerr, gate: s.gate,
+              done: s.done, st: s.st }
   }
   transformation pass_made(m: pp.Made) -> pp.Made {
     pp.Made { cid: m.cid, status: m.status, value: m.value, ctx: m.ctx }

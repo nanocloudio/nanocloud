@@ -14,12 +14,22 @@
 #              → live flips 1→0 past the failure threshold → pod_lifecycle
 #                kills + relaunches under backoff (restarts=n persisted);
 #                the verdict resets to live=1 for the fresh run
-#   pod-tcp    lp_tcp=8080                 → a tcp probe is not an exec probe and
-#                no dial connector exists yet: it gets NO probe state and no
-#                status — never faked as pass OR fail, no restart may fire
+#   pod-tcp    lp_cmd=@tcp <listening>      → probe_dial connects: live stays 1,
+#                                             no restart
+#   pod-tcpdown lp_cmd=@tcp <closed port>   → refused: live 0, restarted
+#   pod-http   rp_cmd=@http … /ok (200)      → ready 0→1
+#   pod-http5  rp_cmd=@http … /bad (500)     → ready stays 0
+#   pod-start  sp_cmd=/bin/true, rp_cmd=/bin/true
+#                                           → not ready until the startup
+#                                             probe passed (verdict 2→1)
+#   pod-startfail sp_cmd=/bin/false, lp_cmd=/bin/true
+#                                           → startup fails for good (0):
+#                                             live 0, restarted; liveness
+#                                             never ran meanwhile
 #
-# Probe fields on /pod-probes/<uid> (flat, per kind l|r; pod_probes.uproc
-# writes them from a Pod's probes):
+# Probe fields on /pod-probes/<uid> (flat, per kind l|r|s; pod_resolve
+# writes them from a Pod's probes — an httpGet / tcpSocket as `@http …` /
+# `@tcp …`, dialled by probe_dial):
 #   <k>p_cmd <k>p_period <k>p_timeout <k>p_fail <k>p_succ <k>p_delay
 # (unstated: upstream's defaults, 10 s / 1 s / 3 / 1 / 0)
 set -euo pipefail
@@ -39,7 +49,8 @@ for f in "$FLUXOR_RUNTIME" "$MODULES_DIR/workload_effect.fmod" "$MODULES_DIR/sto
 done
 
 D="$(mktemp -d /tmp/nc-probe-e2e-XXXXXX)"
-trap 'rm -rf "$D"' EXIT
+SRV_PID=""
+trap '[ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; rm -rf "$D"' EXIT
 fail() { echo "FAIL: $1"; tail -20 "$D/run.log" 2>/dev/null || true; exit 1; }
 
 # Append one put record to the store's durable log (same wire the store writes:
@@ -111,9 +122,38 @@ store_put "/pod-probes/pod-ready" "rp_cmd=/bin/true;rp_period=1;rp_timeout=2;rp_
 # Liveness: /bin/false every 1s, 2 consecutive fails flip live→0.
 store_put "/pod-specs/pod-live" "cmd=/bin/sleep 60;desired=running;restart=always"
 store_put "/pod-probes/pod-live" "lp_cmd=/bin/false;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
-# tcp: parsed, NOT IMPLEMENTED — must be ignored (no fake verdict, no restart).
-store_put "/pod-specs/pod-tcp" "cmd=/bin/sleep 60;desired=running"
-store_put "/pod-probes/pod-tcp" "lp_tcp=8080;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
+# The Pods' own server: 200 on /ok, 500 on anything else, a TCP listener
+# besides; and a port nothing listens on.
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+HP="$(free_port)"; DEAD="$(free_port)"
+python3 - "$HP" >"$D/srv.log" 2>&1 <<'PY' &
+import http.server, socketserver, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.path == "/ok" and self.headers.get("User-Agent", "").startswith("kube-probe/")
+        sys.stderr.write(f"{self.path} {self.headers.get('User-Agent')}\n"); sys.stderr.flush()
+        self.send_response(200 if ok else 500)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a): pass
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+SRV_PID=$!
+store_put "/pod-specs/pod-tcp" "cmd=/bin/sleep 60;desired=running;restart=always"
+store_put "/pod-probes/pod-tcp" "lp_cmd=@tcp 127.0.0.1 $HP;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
+store_put "/pod-specs/pod-tcpdown" "cmd=/bin/sleep 60;desired=running;restart=always"
+store_put "/pod-probes/pod-tcpdown" "lp_cmd=@tcp 127.0.0.1 $DEAD;lp_period=1;lp_timeout=2;lp_fail=2;lp_succ=1"
+store_put "/pod-specs/pod-http" "cmd=/bin/sleep 60;desired=running"
+store_put "/pod-probes/pod-http" "rp_cmd=@http 127.0.0.1 $HP /ok;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
+store_put "/pod-specs/pod-http5" "cmd=/bin/sleep 60;desired=running"
+store_put "/pod-probes/pod-http5" "rp_cmd=@http 127.0.0.1 $HP /bad;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
+# startup: readiness held back until it passed; one that fails for good is
+# the container's liveness failing.
+store_put "/pod-specs/pod-start" "cmd=/bin/sleep 60;desired=running"
+store_put "/pod-probes/pod-start" "sp_cmd=/bin/true;sp_period=1;sp_timeout=2;sp_fail=3;sp_succ=1;rp_cmd=/bin/true;rp_period=1;rp_timeout=2;rp_fail=1;rp_succ=1"
+store_put "/pod-specs/pod-startfail" "cmd=/bin/sleep 60;desired=running;restart=always"
+store_put "/pod-probes/pod-startfail" "sp_cmd=/bin/false;sp_period=1;sp_timeout=2;sp_fail=2;sp_succ=1;lp_cmd=/bin/true;lp_period=1;lp_timeout=2;lp_fail=1;lp_succ=1"
 
 echo "== 3. run the pipeline (probe cadence ~1s; liveness kill + backoff ~4s) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 14 "$FLUXOR_RUNTIME" \
@@ -147,16 +187,29 @@ case "$LAST_LIVE" in
   *) fail "pod-live probe status missing, got '$LAST_LIVE'";;
 esac
 
-echo "== 6. tcp probe honesty: ignored, never faked, no restart =="
-PT="$(store_last /probe-status/pod-tcp)"
-[ -z "$PT" ] || fail "pod-tcp (no exec probe) should have no probe status, got '$PT'"
-[ -z "$(store_last /probe-rt-l/pod-tcp)" ] || fail "pod-tcp should have no liveness probe state"
+echo "== 6. tcpSocket: a listening port is live; a refused one is a liveness failure =="
+[ "$(store_last /probe-status/pod-tcp)" = "live=1;ready=1" ] || fail "pod-tcp: '$(store_last /probe-status/pod-tcp)'"
+store_history /sandbox-exec-result/pod-tcp/probe-l | grep -qx 0 || fail "pod-tcp was never dialled: $(store_history /sandbox-exec-result/pod-tcp/probe-l | head -3)"
 if store_history /pod-lifecycle-status/pod-tcp | grep -Eq 'Restarting|restarts='; then
-  fail "an unimplemented tcp probe must never drive a restart"
+  fail "pod-tcp restarted though its port listens"
 fi
-case "$(store_last /pod-lifecycle-status/pod-tcp)" in
-  phase=Running*) ;;
-  *) fail "pod-tcp should be Running, got '$(store_last /pod-lifecycle-status/pod-tcp)'";;
-esac
+store_history /probe-status/pod-tcpdown | grep -q 'live=0' || fail "pod-tcpdown never went live=0: $(store_history /probe-status/pod-tcpdown | tail -3)"
+store_history /pod-lifecycle-status/pod-tcpdown | grep -Eq 'restarts=[0-9]+' || fail "pod-tcpdown was not restarted"
+echo "   pod-tcp: dialled, live; pod-tcpdown: refused, live=0, restarted"
 
-echo "== E2E green: probes as params over the /sandbox-exec/ seam — readiness flip, liveness kill+backoff, tcp ignored honestly =="
+echo "== 7. httpGet: 200..399 passes, 500 does not =="
+[ "$(store_last /probe-status/pod-http)" = "live=1;ready=1" ] || fail "pod-http: '$(store_last /probe-status/pod-http)'"
+[ "$(store_last /probe-status/pod-http5)" = "live=1;ready=0" ] || fail "pod-http5: '$(store_last /probe-status/pod-http5)'"
+grep -q "^/ok kube-probe/" "$D/srv.log" || fail "the server saw no probe GET /ok: $(head -3 "$D/srv.log")"
+echo "   pod-http: ready (GET /ok 200, User-Agent kube-probe/…); pod-http5: never ready (500)"
+
+echo "== 8. startupProbe: readiness held back until it passed; failing for good restarts =="
+store_history /probe-status/pod-start | head -1 | grep -q 'ready=0' || fail "pod-start was ready before its startup probe passed: $(store_history /probe-status/pod-start | head -2)"
+[ "$(store_last /probe-status/pod-start)" = "live=1;ready=1" ] || fail "pod-start: '$(store_last /probe-status/pod-start)'"
+store_history /probe-rt-s/pod-start | grep -q 'verdict=1' || fail "pod-start's startup verdict never 1: $(store_last /probe-rt-s/pod-start)"
+store_history /probe-status/pod-startfail | grep -q 'live=0' || fail "pod-startfail never live=0: $(store_history /probe-status/pod-startfail | tail -3)"
+store_history /pod-lifecycle-status/pod-startfail | grep -Eq 'restarts=[0-9]+' || fail "pod-startfail was not restarted"
+[ -z "$(store_history /sandbox-exec/pod-startfail/probe-l)" ] || fail "pod-startfail's liveness probe ran before its startup probe passed"
+echo "   pod-start: ready only after startup passed; pod-startfail: startup failed for good -> restarted, liveness never ran"
+
+echo "== E2E green: probes as params over the /sandbox-exec/ seam — exec, tcpSocket and httpGet (probe_dial), startup gating, liveness kill+backoff =="

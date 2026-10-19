@@ -58,6 +58,14 @@
 //           units, rounded up — a memory or storage limit in bytes
 //           Both render EMPTY for anything that is not a quantity, a
 //           negative one, or one past u64: no limit, rather than a guessed one
+//   !unix   an RFC 3339 time (`2026-10-19T14:44:00Z`, fractions and an
+//           offset allowed) as Unix seconds; EMPTY for anything else
+//   !reqcpu !reqmem !limcpu !limmem
+//           a POD (the whole object) as its quota and scheduler count it:
+//           its containers' requests (a container's limit when it states
+//           no request — the API's default) or limits, summed, and the
+//           largest init container's when that is larger — cpu in
+//           millicores, memory in bytes
 //   !ts     Unix milliseconds (decimal) as an RFC 3339 UTC time to the
 //           second, `2026-10-18T09:30:00Z` — a moment a node recorded with
 //           its wall clock, in the spelling every Kubernetes time field has
@@ -66,6 +74,14 @@
 //   !jts    the same as a JSON value: `"2026-10-18T09:30:00Z"`, quotes and
 //           all, or `null` for no time — a moment a node could not yet stamp
 //           truthfully (its clock untrusted) is absent, never 1970
+//   !uidnum the uid of an OCI user (`uid[:gid]`, or a name): its digits,
+//           `0` when it is empty (an image that names no User runs as
+//           root), EMPTY when it is a name — who that is only the image's
+//           own /etc/passwd says, so runAsNonRoot cannot verify it
+//   !pick=<name>  the scalar member <name> of an object, by its WHOLE name —
+//           an annotation or a label, whose key holds the `.` and `/` a
+//           dotted path would split on (`metadata.annotations!pick=
+//           nanocloud.io/paused`). EMPTY when there is no such member
 //
 // An unknown modifier yields the raw bytes rather than an error: a projection
 // that silently changed meaning would be worse than one that did nothing.
@@ -88,6 +104,9 @@ fn split_mod(spec: &[u8]) -> (&[u8], Option<&[u8]>) {
 /// caller uses the slice, so a modifier that is a pure SUBSTRING could return
 /// a borrow — it writes instead so every modifier has one shape.
 fn apply_mod(m: &[u8], src: &[u8], out: &mut [u8]) -> usize {
+    if let Some(name) = m.strip_prefix(b"pick=") {
+        return pm_pick(src, name, out);
+    }
     match m {
         b"size" => match pm_member_size(src) {
             Some(n) => pm_dec(n, out),
@@ -231,9 +250,27 @@ fn apply_mod(m: &[u8], src: &[u8], out: &mut [u8]) -> usize {
         b"jargv" => pm_json_argv(src, out).unwrap_or(0),
         b"jenv" => pm_json_env(src, out).unwrap_or(0),
         b"milli" => pm_quantity(src, 3).map_or(0, |v| pm_dec(v, out)),
+        b"unix" => pm_unix(src).map_or(0, |v| pm_dec(v, out)),
+        b"reqcpu" => pm_dec(pm_pod_res(src, b"requests", b"cpu", 3), out),
+        b"reqmem" => pm_dec(pm_pod_res(src, b"requests", b"memory", 0), out),
+        b"limcpu" => pm_dec(pm_pod_res(src, b"limits", b"cpu", 3), out),
+        b"limmem" => pm_dec(pm_pod_res(src, b"limits", b"memory", 0), out),
         b"bytes" => pm_quantity(src, 0).map_or(0, |v| pm_dec(v, out)),
         b"ts" => pm_rfc3339(src, out).unwrap_or(0),
         b"jts" => pm_json_time(src, out),
+        b"uidnum" => {
+            let uid = match src.iter().position(|&c| c == b':') {
+                Some(i) => src.get(..i).unwrap_or(&[]),
+                None => src,
+            };
+            if src.is_empty() {
+                pm_put(out, 0, b"0").unwrap_or(0)
+            } else if !uid.is_empty() && uid.iter().all(|c| c.is_ascii_digit()) {
+                pm_put(out, 0, uid).unwrap_or(0)
+            } else {
+                0
+            }
+        }
         _ => {
             let n = src.len().min(out.len());
             out[..n].copy_from_slice(&src[..n]);
@@ -590,6 +627,65 @@ fn pm_member_size(src: &[u8]) -> Option<u64> {
     }
 }
 
+/// `!pick=<name>`: the scalar value of member `name` (compared as written,
+/// escapes and all) of the object `src`, into `out`. EMPTY when `src` is not
+/// an object, has no such member, or its value is not a scalar; OVERFLOW when
+/// the value does not fit.
+fn pm_pick(src: &[u8], name: &[u8], out: &mut [u8]) -> usize {
+    let ws = |b: &[u8], mut i: usize| {
+        while b
+            .get(i)
+            .is_some_and(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            i += 1;
+        }
+        i
+    };
+    let mut i = ws(src, 0);
+    if src.get(i) != Some(&b'{') {
+        return 0;
+    }
+    i = ws(src, i + 1);
+    while src.get(i) == Some(&b'"') {
+        let ks = i + 1;
+        let mut ke = ks;
+        while let Some(&c) = src.get(ke) {
+            if c == b'"' {
+                break;
+            }
+            ke += if c == b'\\' { 2 } else { 1 };
+        }
+        let key = src.get(ks..ke).unwrap_or(&[]);
+        i = ws(src, ke + 1);
+        if src.get(i) != Some(&b':') {
+            return 0;
+        }
+        i = ws(src, i + 1);
+        if key == name {
+            let v = j_scalar(src, i);
+            if src.get(i).is_some_and(|&c| c == b'{' || c == b'[') {
+                return 0;
+            }
+            if v.len() > out.len() {
+                return pm_overflow(out);
+            }
+            for (o, &c) in out.iter_mut().zip(v) {
+                *o = c;
+            }
+            return v.len();
+        }
+        let at = j_skip(src, i);
+        if at <= i {
+            return 0;
+        }
+        i = ws(src, at);
+        if src.get(i) == Some(&b',') {
+            i = ws(src, i + 1);
+        }
+    }
+    0
+}
+
 /// The decoded byte size of the JSON string opening at `src[i]`, and the index
 /// past its closing quote. `\uXXXX` counts as its UTF-8 length.
 fn pm_str_size(src: &[u8], i: usize) -> Option<(u64, usize)> {
@@ -628,6 +724,98 @@ fn pm_str_size(src: &[u8], i: usize) -> Option<(u64, usize)> {
         }
     }
     None
+}
+
+/// `!unix`: an RFC 3339 time as Unix seconds (before 1970: none).
+fn pm_unix(t: &[u8]) -> Option<u64> {
+    let num = |a: usize, b: usize| -> Option<i64> {
+        let mut v = 0i64;
+        for &c in t.get(a..b)? {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + i64::from(c - b'0');
+        }
+        Some(v)
+    };
+    if t.get(4) != Some(&b'-')
+        || t.get(7) != Some(&b'-')
+        || t.get(13) != Some(&b':')
+        || t.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    if !matches!(t.get(10), Some(&b'T') | Some(&b't') | Some(&b' ')) {
+        return None;
+    }
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Past the seconds: a fraction, then Z or an offset.
+    let mut i = 19usize;
+    if t.get(i) == Some(&b'.') {
+        i += 1;
+        while t.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+    }
+    let off = match t.get(i) {
+        Some(&b'Z') | Some(&b'z') if i + 1 == t.len() => 0,
+        Some(&s) if (s == b'+' || s == b'-') && t.len() == i + 6 && t.get(i + 3) == Some(&b':') => {
+            let o = num(i + 1, i + 3)? * 3600 + num(i + 4, i + 6)? * 60;
+            if s == b'+' {
+                o
+            } else {
+                -o
+            }
+        }
+        _ => return None,
+    };
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss - off;
+    u64::try_from(secs).ok()
+}
+
+/// `!reqcpu` and friends: a Pod's `kind` (`requests` or `limits`) of
+/// `res`, times 10^`scale10` — summed over spec.containers, the largest of
+/// spec.initContainers when larger. A request a container does not state
+/// is its limit (the API's default); a limit it does not state is none.
+fn pm_pod_res(pod: &[u8], kind: &[u8], res: &[u8], scale10: i32) -> u64 {
+    let one = |c: &[u8]| -> u64 {
+        let v = j_path(c, &[&b"resources"[..], kind, res])
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                if kind == b"requests" {
+                    j_path(c, &[&b"resources"[..], b"limits", res]).filter(|v| !v.is_empty())
+                } else {
+                    None
+                }
+            });
+        v.and_then(|v| pm_quantity(v, scale10)).unwrap_or(0)
+    };
+    let mut sum = 0u64;
+    if let Some(cs) = j_sub(pod, &[&b"spec"[..], b"containers"]) {
+        let mut i = 0usize;
+        while let Some(c) = j_idx(cs, i) {
+            sum = sum.saturating_add(one(c));
+            i += 1;
+        }
+    }
+    if let Some(cs) = j_sub(pod, &[&b"spec"[..], b"initContainers"]) {
+        let mut i = 0usize;
+        while let Some(c) = j_idx(cs, i) {
+            sum = sum.max(one(c));
+            i += 1;
+        }
+    }
+    sum
 }
 
 /// `!milli` / `!bytes`: a Kubernetes quantity — `[+]<digits>[.<digits>]`

@@ -4,10 +4,13 @@
 # command log (`state_store: 1`, `command_log: 1`), and the TTL clock: lattice's
 # configs/single-minimal-disk-log.yaml, derived by scripts/support/to-workload.py.
 #
-# Durable without a volume: a workload's storage is rooted at its owner
+# Its store lives in the workload's own storage, rooted at its owner
 # (fluxor 812bdbe9 — $FLUXOR_OWNER_ROOT/<identity>/), which a node restart
 # keeps and only the workload's DESTROY removes. A Pod's identity is its UID,
-# so its data lives as long as the Pod: a power cut keeps it, a delete ends it.
+# so that storage is ephemeral, as an emptyDir is upstream: a power cut keeps
+# it, a delete ends it, and a Pod made again (rescheduled, rolled, a new UID)
+# starts empty. Data that must outlive the Pod belongs in a
+# PersistentVolumeClaim.
 #
 #   fluxor build packaging/apps/lattice-kv.yaml --emit=workload -o <dir>
 #   fluxor publish workload <dir>     (registry.nanocloud.io/nanocloud/lattice-kv)

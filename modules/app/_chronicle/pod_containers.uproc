@@ -1,0 +1,98 @@
+// A Pod of several containers on its node. pod_resolve writes one
+// /pod-specs/ record per container — `<uid>` for the first app container (the
+// Pod's own: its tomb, its status, its prune), `<uid>~c<n>` for app container
+// n, `<uid>~i<n>` for init container n — and every node chain runs each as a
+// sandbox of its own: a container is its own process, pulled, created,
+// restarted and probed on its own, sharing the Pod's network (the node's,
+// unless the Pod has an address of its own) and its volumes (the Pod's
+// directories, by uid).
+//
+//   spec   /pod-specs/<id> with the Pod's own record beside it (`~`):
+//          a container follows the Pod's record — `desired=deleted` (a Pod
+//          deleted outright is said so only on the Pod's record, from its
+//          tomb) and, once the Pod's record is gone, the container's goes
+//          too, and with it every record the node keeps for it
+//          (pod_project.uproc `prune`); otherwise the nanocloud-specific
+//          pause (`nanocloud.io/paused: "true"` on the Pod, pod_resolve's
+//          `paused=true`): /sandbox-pause/<id> pause, and resume once it is no
+//          longer asked
+//   init   /pod-lifecycle-status/<uid>~i<n> -> /pod-init/<uid>: `done` the
+//          init containers that have completed, in order (init container n
+//          Succeeded: done = its `ord`, n + 1, never back), `failed=1` when one failed
+//          and its restartPolicy (Never) runs it no more. A container's
+//          record says how many must be done before it is created (`gate`,
+//          pod_project.uproc); a Pod whose init failed for good has Failed
+//          (pod_lifecycle.uproc)
+module nanocloud.podcontainers {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  message pc.Spec {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // <uid>[~<container>]
+    desired: string = 4;
+    grace: string = 5;
+    paused: string = 6;
+    pdesired: string = 70; // the Pod's own record (`/pod-specs/~`)
+    pgrace: string = 71;
+    pnode: string = 72;    // "" when the Pod's record is gone
+    pause: string = 80;    // /sandbox-pause/<id>, the last ask
+  }
+  message pc.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+  }
+  decision spec(s: pc.Spec) -> pc.Act {
+    when s.key.indexOf("~") > 0 && (!has(s.pnode) || s.pnode == "") ->
+      pc.Act { cid: s.seq, op: DELETE, key: "pod-specs/" + s.key };
+    when s.key.indexOf("~") > 0 && has(s.pdesired) && s.pdesired == "deleted" && s.desired != "deleted" ->
+      pc.Act { cid: s.seq, op: MERGE, key: "pod-specs/" + s.key, v1: "desired=deleted;grace=", v2: s.pgrace };
+    when s.desired != "deleted" && s.paused == "true" && (!has(s.pause) || s.pause != "pause") ->
+      pc.Act { cid: s.seq, op: PUT, key: "sandbox-pause/" + s.key, v1: "pause" };
+    when s.paused != "true" && has(s.pause) && s.pause == "pause" ->
+      pc.Act { cid: s.seq, op: PUT, key: "sandbox-pause/" + s.key, v1: "resume" };
+    default ->
+      pc.Act { cid: s.seq, op: NOOP, key: "" };
+  }
+
+  message pc.Run {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // <uid>~i<n>, or any other sandbox
+    phase: string = 4;
+    done: int = 70;        // /pod-init/<uid> (`~`)
+    failed: string = 71;
+    ord: int = 80;         // /pod-specs/<id> ord: an init container's n + 1
+  }
+  message pc.Init {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: int = 5;
+  }
+  decision init(r: pc.Run) -> pc.Init {
+    when has(r.ord) && r.ord > 0 && r.key.indexOf("~i") > 0 && r.phase == "Succeeded"
+         && (!has(r.done) || r.done < r.ord) ->
+      pc.Init { cid: r.seq, op: MERGE, key: r.key.substring(0, r.key.indexOf("~i")), v1: "done=",
+                v2: r.ord };
+    when has(r.ord) && r.ord > 0 && r.key.indexOf("~i") > 0 && r.phase == "Failed"
+         && (!has(r.failed) || r.failed != "1") ->
+      pc.Init { cid: r.seq, op: MERGE, key: r.key.substring(0, r.key.indexOf("~i")), v1: "failed=1" };
+    default ->
+      pc.Init { cid: r.seq, op: NOOP, key: "" };
+  }
+
+  pipeline pc_spec(s: pc.Spec) -> pc.Act { call x = spec(s); return x; }
+  pipeline pc_init(r: pc.Run) -> pc.Init { call x = init(r); return x; }
+  entry pc_spec = pc_spec;
+  entry pc_init = pc_init;
+  provenance revision "pod-containers" toolchain "chronicle-authoring";
+}

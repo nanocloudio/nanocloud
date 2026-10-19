@@ -1,0 +1,286 @@
+// Image garbage collection, the kubelet's (its ImageGCManager) as params: an
+// image no Pod uses is removed, the least recently used first, when the node
+// holds more than it should — and, when a maximum age is set, once it has
+// gone unused that long.
+//
+// An image is its manifest digest <m> and everything keyed by it:
+// /image-manifests/<m>, /image-config/<m>, /image-rootfs/<m> (and the rootfs
+// directory it names), /image-layer-ok/<m>-<i>, /image-pull-failed/<m>; the
+// requests that resolved to it (/image-requests/<rk>, /image-digests/<rk>,
+// /image-index/<rk>); and each layer's blob (/image-blobs/<hex> and its file
+// in the cache) — a blob shared with another image stays while that image
+// does.
+//
+// In use: a Pod on the node resolved to it (/pod-resolved/<uid> digest=<m>)
+// — running, or not yet removed after it ended, as a container the kubelet
+// still holds keeps its image. Being pulled or assembled: not ready, never a
+// candidate. Neither is ever removed.
+//
+// The limits are /config/image (`gc_high`, `gc_low`: images held, past
+// which GC runs and down to which it removes — 20 and 15 when unset;
+// `gc_min`: ms an image must have gone unused before it may go — 120000,
+// the kubelet's ImageMinimumGCAge; `gc_max`: ms after which an unused image
+// goes whatever the count — 0, off, the kubelet's ImageMaximumGCAge). The
+// node's disk is not what they count: the fs contract states no free space
+// (no STATFS), so the kubelet's HighThresholdPercent/LowThresholdPercent
+// are an image count here.
+//
+//   gu   (/image-rootfs/<m>, every record) the Pods resolved to it, counted
+//        -> unused and ready: /image-lru-of/<m> at=<wall ms> (once), then
+//        /image-lru/<at>/<m> — keyed by when it went unused, so a listing is
+//        oldest first; used again, or not ready: both removed
+//   gc   (/image-lru/, listed oldest first, counted — one empty record when
+//        it is empty, so the latch still turns off) the images held counted
+//        -> past `gc_high`: /image-gc-run on; at `gc_low`: off. While on,
+//        the oldest unused image (old enough) is marked: /image-rootfs/<m>
+//        state=gc (no Pod resolves to it from then on) and /image-gc/<m>
+//        phase=start. One image at a time, oldest first.
+//   gd   /image-gc/<m> phase by phase:
+//        start   a Pod resolved to it after all -> state=ready again, the mark
+//                dropped; else its layers and rootfs path copied
+//                (phase=refs), for the steps that remove their records
+//        refs    once no request names it (gj removes them) -> the manifest,
+//                then the config and any failure record; phase=files
+//        files   the rootfs directory removed (fs_effect, through the fs
+//                contract; a workload image's pack has none); phase=layers
+//        layers  once gl has dropped every /image-layer-ok/<m>-* -> the
+//                rootfs record, the LRU entry, the mark
+//   gj   (/image-digests/<rk> joined with /image-gc/) a request naming an
+//        image being removed -> /image-requests/<rk>, /image-digests/<rk>,
+//        /image-index/<rk> removed: a Pod that asks for the reference again
+//        pulls it again
+//   gl   (/image-gc/<m> phase=layers, one record per layer) no other image
+//        holds the layer (/image-layer-ok/*-* naming it, counted) -> its
+//        blob dropped through the pull's own queue (/image-fetch-q/d-<hex>:
+//        http_fetch unlinks the file, then its marker goes, image.uproc);
+//        then /image-layer-ok/<m>-<i> removed
+//
+// Every step is a store write a later scan can find done or not done, and
+// every one is asked again until it is: a GC cut off by a power cut goes on
+// from where it stands.
+//
+// Each chain carries a context of its own (field 254) and what its next
+// stage does as the flat carry `c_next` (39): a stage passes the context on
+// untouched, which keeps every decision small — they are config, and a
+// node's graph holds a bounded amount of it.
+module nanocloud.image_gc {
+
+  // gu's context, and gc's.
+  message Cu {
+    m: string = 30;        // the image
+    st: string = 31;       // its rootfs state
+    at: string = 32;       // when it went unused (wall ms, as digits)
+  }
+  message Cg {
+    m: string = 30;
+    at: string = 31;
+    hi: int = 32;          // the limits, defaulted: gc_high, gc_low, gc_min, gc_max
+    lo: int = 33;
+    mn: int = 34;
+    mx: int = 35;
+    pos: int = 36;         // its place in the index, oldest first
+    atn: int = 37;         // when it went unused, as a number
+    on: string = 38;       // /image-gc-run on
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum COUNT = 12;
+
+  // ── a COUNT walk's child: a Pod (or a request) resolved to the image ──
+  message Ref {
+    tail: string = 3;
+    digest: string = 40;   // /pod-resolved/<uid>, /image-digests/<rk>
+    c_m: string = 30;
+  }
+  message Keep {
+    k: int = 1;
+  }
+  decision cw_ref(c: Ref) -> Keep {
+    when c.digest == c.c_m -> Keep { k: 1 };
+    default -> Keep {};
+  }
+
+  // ── gu: the LRU index ──
+  message Img {
+    seq: int = 1;
+    key: string = 3;       // <m>
+    st: string = 4;        // state
+    at: string = 70;       // /image-lru-of/<m> at
+  }
+  message AskU {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_m: string = 30;
+    ctx: Cu = 254;
+  }
+  decision gu1(i: Img) -> AskU {
+    when i.st == "ready" || i.at != "" ->
+      AskU { cid: i.seq, op: COUNT, key: "/pod-resolved/", c_m: i.key, ctx: Cu { m: i.key, st: i.st, at: i.at } };
+    default ->
+      AskU { cid: i.seq, op: NOOP, key: "", c_m: "", ctx: Cu { m: "", st: "", at: "" } };
+  }
+  message GotU {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;           // the Pods resolved to it
+    wall: int = 60;        // the node's wall clock, ms
+    ctx: Cu = 254;
+  }
+  message WU {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    k3: string = 18;
+    k4: string = 25;
+    v1: string = 4; v2: int = 5;
+    c_next: string = 39;
+    ctx: Cu = 254;
+  }
+  decision gu2(g: GotU) -> WU {
+    // Unused, ready, not in the index yet: the moment it went unused —
+    // once the node's clock is the wall's (not 1970).
+    when g.status == 200 && g.ctx.st == "ready" && g.n == 0 && g.ctx.at == "" && g.wall > 1000000000000 ->
+      WU { cid: g.cid, op: PUT, key: "/image-lru-of/", k2: g.ctx.m, k3: "", k4: "", v1: "at=", v2: g.wall, c_next: "", ctx: g.ctx };
+    // Indexed under that moment (written, or found as it was).
+    when g.status == 200 && g.ctx.st == "ready" && g.n == 0 && g.ctx.at != "" ->
+      WU { cid: g.cid, op: PUT, key: "/image-lru/", k2: g.ctx.at, k3: "/", k4: g.ctx.m, v1: "at=", v2: int(g.ctx.at),
+           c_next: "", ctx: g.ctx };
+    // In use again, or not ready (healed, assembling): out of the index.
+    // One being removed (`gc`) is the removal's to finish.
+    when g.status == 200 && g.ctx.at != "" && g.ctx.st != "gc" ->
+      WU { cid: g.cid, op: DELETE, key: "/image-lru/", k2: g.ctx.at, k3: "/", k4: g.ctx.m, v1: "", v2: 0, c_next: "out", ctx: g.ctx };
+    default ->
+      WU { cid: g.cid, op: NOOP, key: "", k2: "", k3: "", k4: "", v1: "", v2: 0, c_next: "", ctx: g.ctx };
+  }
+  message DoneU {
+    cid: int = 1;
+    status: int = 2;
+    c_next: string = 39;
+    ctx: Cu = 254;
+  }
+  decision gu3(d: DoneU) -> AskU {
+    when d.c_next == "out" ->
+      AskU { cid: d.cid, op: DELETE, key: "/image-lru-of/" + d.ctx.m, c_m: "", ctx: d.ctx };
+    default ->
+      AskU { cid: d.cid, op: NOOP, key: "", c_m: "", ctx: d.ctx };
+  }
+
+  // ── gc: the decision ──
+  message Lru {
+    seq: int = 1;
+    key: string = 3;       // <at>/<m>
+    pos: int = 20;         // its place, oldest first
+    at: int = 50;
+    first: string = 28;    // <at>
+    m: string = 29;        // <m>
+    high: int = 70;        // /config/image gc_high, gc_low, gc_min, gc_max
+    low: int = 71;
+    min: int = 72;
+    max: int = 73;
+    on: string = 80;       // /image-gc-run on
+  }
+  message AskG {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_st: string = 38;     // its rootfs state, once read
+    ctx: Cg = 254;
+  }
+  // Its rootfs's state (only a ready image is removed), and the limits,
+  // defaulted: 20 held, down to 15, unused 2 min, no maximum age.
+  decision gc1(l: Lru) -> AskG {
+    default ->
+      AskG { cid: l.seq, op: GET, key: "/image-rootfs/" + l.m, c_st: "",
+             ctx: Cg { m: l.m, at: l.first,
+                       hi: l.high + 20 * (1 - math.least(1, math.greatest(0, l.high))),
+                       lo: l.low + 15 * (1 - math.least(1, math.greatest(0, l.low))),
+                       mn: l.min + 120000 * (1 - math.least(1, math.greatest(0, l.min))),
+                       mx: l.max, pos: l.pos, atn: l.at, on: l.on } };
+  }
+  message GotG {
+    cid: int = 1;
+    status: int = 2;
+    st: string = 40;       // the GET's `state`
+    ctx: Cg = 254;
+  }
+  // The images held, counted.
+  decision gc2(g: GotG) -> AskG {
+    default -> AskG { cid: g.cid, op: COUNT, key: "/image-rootfs/", c_st: g.st, ctx: g.ctx };
+  }
+  message Lim {
+    cid: int = 1;
+    status: int = 2;
+    t: int = 45;           // images held
+    wall: int = 60;
+    c_st: string = 38;
+    ctx: Cg = 254;
+  }
+  message WG {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4;
+    c_next: string = 39;
+    ctx: Cg = 254;
+  }
+  decision gc3(g: Lim) -> WG {
+    // Not ready (being pulled, assembled, healed — or gone): out of the
+    // index. Being removed: left to the removal.
+    when g.ctx.m != "" && g.c_st != "ready" && g.c_st != "gc" ->
+      WG { cid: g.cid, op: DELETE, key: "/image-lru/" + g.ctx.at + "/", k2: g.ctx.m, v1: "", c_next: "stale", ctx: g.ctx };
+    when g.status != 200 ->
+      WG { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", c_next: "", ctx: g.ctx };
+    // The latch: on past the high mark, off at the low one.
+    when g.ctx.on == "1" && g.t <= g.ctx.lo ->
+      WG { cid: g.cid, op: DELETE, key: "/image-gc-run", k2: "", v1: "", c_next: "", ctx: g.ctx };
+    when g.ctx.on != "1" && g.t > g.ctx.hi ->
+      WG { cid: g.cid, op: PUT, key: "/image-gc-run", k2: "", v1: "on=1", c_next: "", ctx: g.ctx };
+    // While on: the oldest unused image, unused long enough, is removed;
+    // past its maximum age, any.
+    when g.c_st == "ready" && g.wall - g.ctx.atn >= g.ctx.mn
+         && ((g.ctx.pos == 0 && g.ctx.on == "1" && g.t > g.ctx.lo) || (g.ctx.mx > 0 && g.wall - g.ctx.atn > g.ctx.mx)) ->
+      WG { cid: g.cid, op: MERGE, key: "/image-rootfs/", k2: g.ctx.m, v1: "state=gc", c_next: "mark", ctx: g.ctx };
+    default ->
+      WG { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", c_next: "", ctx: g.ctx };
+  }
+  message DoneG {
+    cid: int = 1;
+    status: int = 2;
+    c_next: string = 39;
+    ctx: Cg = 254;
+  }
+  decision gc4(d: DoneG) -> WG {
+    when d.c_next == "stale" ->
+      WG { cid: d.cid, op: DELETE, key: "/image-lru-of/", k2: d.ctx.m, v1: "", c_next: "", ctx: d.ctx };
+    // Marked: the removal's record.
+    when d.c_next == "mark" && (d.status == 200 || d.status == 204) ->
+      WG { cid: d.cid, op: CREATE, key: "/image-gc/", k2: d.ctx.m, v1: "phase=start", c_next: "", ctx: d.ctx };
+    default ->
+      WG { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", c_next: "", ctx: d.ctx };
+  }
+
+  pipeline gc_cw_ref(c: Ref) -> Keep { call y = cw_ref(c); return y; }
+  pipeline gc_u1(i: Img) -> AskU { call y = gu1(i); return y; }
+  pipeline gc_u2(g: GotU) -> WU { call y = gu2(g); return y; }
+  pipeline gc_u3(d: DoneU) -> AskU { call y = gu3(d); return y; }
+  pipeline gc_c1(l: Lru) -> AskG { call y = gc1(l); return y; }
+  pipeline gc_c2(g: GotG) -> AskG { call y = gc2(g); return y; }
+  pipeline gc_c3(g: Lim) -> WG { call y = gc3(g); return y; }
+  pipeline gc_c4(d: DoneG) -> WG { call y = gc4(d); return y; }
+  entry gc_cw_ref = gc_cw_ref;
+  entry gc_u1 = gc_u1;
+  entry gc_u2 = gc_u2;
+  entry gc_u3 = gc_u3;
+  entry gc_c1 = gc_c1;
+  entry gc_c2 = gc_c2;
+  entry gc_c3 = gc_c3;
+  entry gc_c4 = gc_c4;
+  provenance revision "image-gc" toolchain "chronicle-authoring";
+}

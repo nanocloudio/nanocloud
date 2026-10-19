@@ -1,11 +1,19 @@
 // Pod volumes as params: each volume a pod spec names becomes a bind the
 // workload connector mounts (the workload contract's `mount`/`bind` option).
 //
-//   /pod-specs/<uid>  volumes=<claim>:<mountPath>[:ro],…
-//   /volumes/<claim>  path=<host directory>               (a bound claim)
+//   /pod-specs/<id>   volumes=<source>:<mountPath>[:ro],…  (pod_resolve)
+//     <ns>/<claim>    a PersistentVolumeClaim: /volumes/<ns>/<claim>
+//                     path=<host directory> once bound (an encrypted volume
+//                     attached and mounted, or a PersistentVolume's own
+//                     directory)
+//     /<host path>    a hostPath: that directory
+//     @e/… @c/… @s/…  an emptyDir, ConfigMap or Secret: the Pod's own
+//                     directory on this node, made (and projected) by
+//                     volume_files, which answers it at field 39
 //
-//   get    each named volume (the flat list, expanded) -> GET its claim
-//   put    bound -> /volume-binds/<uid>/<i> = <host path>:<mountPath>[:ro];
+//   get    each named volume (the flat list, expanded) -> GET its claim, or
+//          PREPARE the Pod's own directory, or (hostPath) nothing to ask
+//   put    bound -> /volume-binds/<id>/<i> = <host path>:<mountPath>[:ro];
 //          unbound -> no row, so the sandbox waits (its start counts the rows
 //          against the volumes named)
 //   prune  a row whose pod spec is gone
@@ -27,6 +35,7 @@ module nanocloud.volume {
   enum GET = 1;
   enum PUT = 3;
   enum DELETE = 4;
+  enum PREPARE = 40;
 
   message Vol {
     seq: int = 1;
@@ -38,9 +47,17 @@ module nanocloud.volume {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
+    id: string = 17;       // PREPARE: the sandbox (`<pod uid>[~<container>]`)
+    dir: string = 39;      // hostPath: the directory, echoed back
     ctx: Ctx = 254;
   }
   decision get(v: Vol) -> Get {
+    when v.v.startsWith("@") && v.v.indexOf(":") > 0 ->
+      Get { cid: v.seq, op: PREPARE, key: v.v.substring(0, v.v.indexOf(":")), id: v.key,
+            ctx: Ctx { uid: v.key, at: v.at, rest: v.v.substring(v.v.indexOf(":") + 1) } };
+    when v.v.startsWith("/") && v.v.indexOf(":") > 0 ->
+      Get { cid: v.seq, op: NOOP, key: "", dir: v.v.substring(0, v.v.indexOf(":")),
+            ctx: Ctx { uid: v.key, at: v.at, rest: v.v.substring(v.v.indexOf(":") + 1) } };
     when v.v != "" && v.v.indexOf(":") > 0 ->
       Get { cid: v.seq, op: GET, key: v.v.substring(0, v.v.indexOf(":")), ctx: Ctx { uid: v.key, at: v.at, rest: v.v.substring(v.v.indexOf(":") + 1) } };
     default -> Get { cid: v.seq, op: NOOP, key: "", ctx: Ctx { uid: "", at: "", rest: "" } };
@@ -48,6 +65,7 @@ module nanocloud.volume {
   message Got {
     cid: int = 1;
     status: int = 2;
+    dir: string = 39;      // a directory volume_files made, or a hostPath
     path: string = 40;     // store_effect `paths: "path"` (flat)
     ctx: Ctx = 254;
   }
@@ -60,6 +78,8 @@ module nanocloud.volume {
     v1: string = 4; v2: string = 5; v3: string = 6;
   }
   decision put(g: Got) -> Row {
+    when has(g.dir) && g.dir != "" && g.ctx.uid != "" ->
+      Row { cid: g.cid, op: PUT, key: g.ctx.uid, k2: "/", k3: g.ctx.at, v1: g.dir, v2: ":", v3: g.ctx.rest };
     when g.status == 200 && g.path != "" ->
       Row { cid: g.cid, op: PUT, key: g.ctx.uid, k2: "/", k3: g.ctx.at, v1: g.path, v2: ":", v3: g.ctx.rest };
     when g.ctx.uid != "" ->
@@ -83,7 +103,7 @@ module nanocloud.volume {
     default -> Del { cid: b.seq, op: NOOP, key: "", rev: 0 };
   }
   transformation tv(v: Vol) -> Vol { Vol { seq: v.seq, key: v.key, v: v.v, at: v.at } }
-  transformation tg(g: Got) -> Got { Got { cid: g.cid, status: g.status, path: g.path, ctx: g.ctx } }
+  transformation tg(g: Got) -> Got { Got { cid: g.cid, status: g.status, dir: g.dir, path: g.path, ctx: g.ctx } }
   transformation tb(b: Bind) -> Bind { Bind { seq: b.seq, rev: b.rev, key: b.key, spec: b.spec } }
   pipeline vb_get(v: Vol) -> Get { call x = tv(v); call y = get(x); return y; }
   pipeline vb_put(g: Got) -> Row { call x = tg(g); call y = put(x); return y; }

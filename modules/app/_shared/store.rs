@@ -688,8 +688,7 @@ unsafe fn get_live(
         return Got::Pending;
     }
     if truncated {
-        let m = b"[store] GET value larger than the reader's buffer - REFUSED, not truncated";
-        dev_log(sys, 1, m.as_ptr(), m.len());
+        say_past_buffer(sys, nag, key);
         return Got::Absent;
     }
     Got::Found((n as usize, rev))

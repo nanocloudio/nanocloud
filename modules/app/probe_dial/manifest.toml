@@ -1,0 +1,79 @@
+name = "probe_dial"
+version = "0.1.0"
+description = "A container's httpGet and tcpSocket probes — dialled over the node's net, answered on the exec seam the probe chain reads"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The probe chain (probe.uproc, probe_collect.uproc) runs every probe through
+# the exec seam: it writes `/sandbox-exec/<id>/probe-<l|r|s>` and folds the
+# exit code that lands at `/sandbox-exec-result/<id>/probe-<…>`. An exec
+# probe is run in the sandbox (sandbox.uproc); an httpGet or tcpSocket probe
+# is an argv pod_resolve spelled for this module —
+#
+#   @tcp  <host> <port>                       passes when the connection is
+#                                             accepted
+#   @http <host> <port> <path> [<name>:<value>…]
+#                                             passes on a status 200..399,
+#                                             as upstream's prober does
+#
+# — dialled through the node's net provider (`net_out`/`net_in`, wired to
+# `linux_net` beside every other dialler on it) and answered at the same
+# result key: `0` when it passed, `1` when it did not (refused, closed, an
+# error status, or no answer within `timeout_ms`), so the chain folds it as
+# it folds an exit code. The request is upstream's: `GET <path> HTTP/1.1`,
+# `Host: <host>:<port>`, `User-Agent: kube-probe/1.30`, `Accept: */*`,
+# `Connection: close`, the probe's headers.
+#
+# In (`request_in`, a store_source record over /sandbox-exec/ with `rev = 1`
+# and `paths = "."`, `unless` its result): 2 the request's revision, 3
+# `<id>/probe-<w>`, 4 the argv. Anything not spelled `@tcp`/`@http` is the
+# sandbox's, and is left alone. One dial at a time; an attempt answered is not
+# dialled again for the same revision, however often the source offers it
+# before its result lands.
+# Out (`response_out`): store_effect PUTs, key_prefix `/sandbox-exec-result/`.
+#
+# The net channel is shared: every frame on it is read every step, its own
+# connection's or not, so this module never holds the others up.
+#
+# Parameters:
+# | Tag | Name       | Type | Default | Description |
+# |-----|------------|------|---------|-------------|
+# | 1   | timeout_ms | u32  | 10000   | An attempt with no answer this long has failed |
+timer_class = "wall_clock"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 8600
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 4096
+max_record = 2560
+required = true
+
+[[ports]]
+name = "request_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 8192
+
+[observability]
+exempt = "control-plane connector — one probe dial at a time, its outcome a store record"

@@ -1,176 +1,320 @@
-// Job as params: run-to-completion. Three chains.
-//   launch  /jobs.batch/ expanded by spec.completions -> EXISTS the pod ->
-//           create-if-absent; NEVER recreated (a Succeeded pod stays)
-//   done    /pods/ owned by a Job with status.phase Succeeded ->
-//           /job-done/<ns>/<pod> = "1" (else deleted): the per-pod fact
-//   status  /jobs.batch/ plain, with count_children over /job-done/ and
-//           desired = spec.completions -> /job-status/<ns>/<job> =
-//           "succeeded=<n>;complete=<0|1>" — the fold is the source's
+// Job as params, to Kubernetes' semantics: parallelism, completions
+// (NonIndexed and Indexed), backoffLimit with exponential backoff,
+// activeDeadlineSeconds, ttlSecondsAfterFinished, suspend, and the status a
+// client reads (`kubectl get jobs`, `kubectl wait --for=condition=complete`).
+//
+// The Job's own state lives beside it, flat, at /job-ctl/<ns>/<job>:
+//
+//   u     the Job's uid (a record of an earlier Job of the name is dropped)
+//   a s f r   its Pods: active, succeeded, failed, ready (counted, never
+//         accumulated: a Pod is the fact, the count its fold)
+//   n     how many Pods a NonIndexed Job should have had created: s+f+a, plus
+//         the new ones it may start now (`w`)
+//   w     Pods it may start now: min(parallelism, completions-s) - a, or 0
+//   c p md    completions, parallelism, completionMode, as the launch reads
+//   fin   ""; or the terminal state: Complete, BackoffLimitExceeded,
+//         DeadlineExceeded — latched, a finished Job never runs again
+//   t0 tf fat ts  MOMENTS (_shared/moment.rs): started, finished, the last
+//         failure, the last suspend/resume — never a 1970 stamp from a
+//         clock not yet trusted
+//   dms bms xms   the activeDeadline, the current backoff, the ttl, in ms:
+//         the deadlines are t0+dms, fat+bms, tf+xms, read back by the
+//         source as this boot's monotonic ms (`!due+`) and armed on the
+//         kernel timer — nothing polls
+//   fc    the failed count the last backoff was started for
+//   sp    "1" suspended, "0" resumed (the Suspended condition)
+//
+// Chains (prefix jb_ in the graphs):
+//   seed    /jobs.batch/ with no /job-ctl/ -> CREATE it `u=<uid>;n=0`
+//   ctl     /job-ctl/ (+ its Job by `related`, its Pods watched, its
+//           deadlines on the timer) -> ONE COUNT of its Pods, weighted so the
+//           sum carries all four (active, succeeded, failed, ready) -> W1:
+//           the counts, n/w, a terminal state, a new backoff, the TTL's
+//           delete of the Job -> W2: startTime, suspend/resume
+//   status  /job-ctl/ -> the Job's .status, put-if-changed (job_status.uproc)
+//   launch  (job_launch.uproc) NonIndexed: /job-ctl/ expanded by `n` -> CREATE <job>-<i>
+//           Indexed: /job-ctl/ expanded by `c` -> COUNT index i covered,
+//           its failures, the indexes below it covered -> /job-idx/<ns>/
+//           <job>/<i>; /job-idx/ -> CREATE <job>-<i>-<attempt> while fewer
+//           than `w` pending indexes lie below it
+//   kill    a Job's active Pod while the Job is suspended or finished -> DELETE
+//           (job_status.uproc)
+// The Pods are collected with their Job by the ownerRef sweep (gc.uproc).
 module nanocloud.job {
 
-  // The context each chain here carries across its effects: ONE nested
-  // message in the reserved carry field (254), echoed unchanged by every
-  // connector. Inner numbers are the old carry-through numbers, so every
-  // module that hands a context on agrees on it.
-  // carried by: jb.Probe, jb.Answer
-  message Ctx {
-    key: string = 30;
-    tmpl: string = 31;
-    ns: string = 34;
-    name: string = 35;
-    ouid: string = 36;    // the Job's metadata.uid: its Pods' controller reference
-    pod: string = 39;
-  }
+  enum NOOP = 0;
+  enum DELETE = 4;
+  enum PATCH = 5;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum GET = 1;
+  enum COUNT = 12;
 
-  message jb.Ord {
+  // ---------------------------------------------------------------- seed ----
+  message jb.Job {
     seq: int = 1;
-    rev: int = 2;
-    key: string = 3;
-    tmpl: string = 4;        // spec.template.spec
-    completions: string = 5; // spec.completions as text; empty = not a Job
-    uid: string = 6;         // metadata.uid, the Pods' controller reference
-    ord: int = 20;
-    want: int = 22;
-    selfkey: string = 24;
-    pod: string = 26;
-    ns: string = 28;
-    name: string = 29;
-  }
-  message jb.Probe {
-    cid: int = 1;
-    op: int = 2;
-    key: string = 3;
-    ctx: Ctx = 254;
-  }
-  message jb.Answer {
-    cid: int = 1;
-    status: int = 2;
-    value: string = 3;
-    ctx: Ctx = 254;
-  }
-  message jb.Create {
-    cid: int = 1;
-    op: int = 2;
-    key: string = 3;
-    p1: string = 4;   p2: string = 5;   p3: string = 6;
-    p4: string = 7;   p5: string = 8;   p6: string = 9;
-    p7: string = 10;  p8: string = 11;  p9: string = 12;
-  }
-
-  message jb.Pod {
-    seq: int = 1;
-    rev: int = 2;
-    key: string = 3;
-    kind: string = 4;   // metadata.ownerReferences.0.kind
-    phase: string = 5;  // status.phase
+    key: string = 3;      // "<ns>/<job>"
+    uid: string = 4;      // metadata.uid
   }
   message jb.Mark {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    v1: string = 4;
+    v1: string = 4; v2: string = 5; v3: string = 6;
+  }
+  decision seed(j: jb.Job) -> jb.Mark {
+    when j.uid != "" ->
+      jb.Mark { cid: j.seq, op: CREATE, key: j.key, v1: "u=", v2: j.uid, v3: ";n=0" };
+    default ->
+      jb.Mark { cid: j.seq, op: NOOP, key: "" };
   }
 
-  message jb.Job {
-    seq: int = 1;
-    rev: int = 2;
-    key: string = 3;
-    completions: string = 4;
-    want: int = 20;         // desired = spec.completions
-    donestr: string = 21;   // children under /job-done/, as digits
-    done: int = 22;         // and as a number
+  // ----------------------------------------------------------------- ctl ----
+  // The context the count stages carry (one nested message, field 254).
+  // carried by: jb.Count, jb.Tally, jb.Put, jb.Wrote
+  message Ctx {
+    key: string = 30;     // "<ns>/<job>"
+    ns: string = 31;
+    ouid: string = 32;    // the Job's uid: its Pods' owner
+    gone: string = 33;    // "1" the Job is gone (its record deleted), "x" a count failed
+    par: int = 34;        // parallelism (default 1)
+    comp: int = 35;       // completions; -1 when unset (a work queue)
+    mode: string = 36;    // completionMode
+    bol: int = 37;        // backoffLimit (default 6)
+    hads: int = 38;       // 1 when activeDeadlineSeconds is set
+    ads: int = 39;
+    httl: int = 40;       // 1 when ttlSecondsAfterFinished is set
+    ttl: int = 41;
+    sus: string = 42;     // spec.suspend
+    h0: int = 43;         // 1 when started (t0)
+    hfat: int = 44;       // 1 when a backoff is recorded
+    htf: int = 45;        // 1 when finished (tf)
+    fc: int = 46;
+    fin: string = 47;
+    sp: string = 48;
+    d0: int = 49;         // t0+dms, fat+bms, tf+xms: this boot's monotonic ms
+    dfat: int = 50;
+    dtf: int = 51;
+    now: int = 52;
   }
-  message jb.Status {
+
+  message jb.Ctl {
+    seq: int = 1;
+    key: string = 3;
+    u: string = 4;
+    fin: string = 5;
+    sp: string = 6;
+    fc: string = 7;
+    t0: string = 8;
+    fat: string = 9;
+    tf: string = 10;
+    ns: string = 28;
+    d0: int = 50;
+    dfat: int = 51;
+    dtf: int = 52;
+    now: int = 58;
+    juid: string = 70;    // the Job, by `related`
+    parS: string = 71;
+    par: int = 72;
+    compS: string = 73;
+    comp: int = 74;
+    mode: string = 75;
+    bolS: string = 76;
+    bol: int = 77;
+    adsS: string = 78;
+    ads: int = 79;
+    ttlS: string = 80;
+    ttl: int = 81;
+    sus: string = 82;
+  }
+  message jb.Count {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    v1: string = 4; v2: string = 5; v3: string = 6;
+    a: int = 30;          // 0: echoed, unused since the one weighted count
+    s: int = 31;
+    f: int = 32;
+    ctx: Ctx = 254;
+  }
+  // One Pod, as a COUNT's predicate reads it (the count nodes' `paths`).
+  message jb.Pod {
+    owner: string = 40;   // metadata.ownerReferences.0.uid
+    del: string = 41;     // metadata.deletionTimestamp
+    phase: string = 42;   // status.phase
+    ready: string = 43;   // status.conditions[type=Ready].status
+    ctx: Ctx = 254;
+  }
+  message jb.Keep {
+    k: int = 1;
   }
 
-  enum NOOP = 0;
-  enum EXISTS = 2;
-  enum PUT = 3;
-  enum DELETE = 4;
-
-  decision probe(o: jb.Ord) -> jb.Probe {
-    when o.completions == "" ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
-    when o.ord < o.want ->
-      jb.Probe { cid: o.seq, op: EXISTS, key: o.selfkey, ctx: Ctx { key: o.selfkey, tmpl: o.tmpl, ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
+  // The Job's spec as numbers, with upstream's defaults: parallelism 1;
+  // completions 1 when neither it nor parallelism is set, else unset (-1, a
+  // work queue) when only parallelism is; backoffLimit 6. A record whose Job
+  // is gone, or is another Job of the name, is deleted (the seed makes a
+  // fresh one for a new Job).
+  decision c0(r: jb.Ctl) -> jb.Count {
+    when r.juid == "" || r.juid != r.u ->
+      jb.Count { cid: r.seq, op: DELETE, key: "job-ctl/" + r.key, a: 0, s: 0, f: 0,
+                 ctx: Ctx { key: r.key, ns: r.ns, ouid: "", gone: "1", par: 0, comp: 0, mode: "", bol: 0,
+                            hads: 0, ads: 0, httl: 0, ttl: 0, sus: "", h0: 0, hfat: 0, htf: 0, fc: 0,
+                            fin: "", sp: "", d0: 0, dfat: 0, dtf: 0, now: 0 } };
     default ->
-      jb.Probe { cid: o.seq, op: NOOP, key: "", ctx: Ctx { key: "", tmpl: "", ns: o.ns, name: o.name, pod: o.pod, ouid: o.uid } };
+      jb.Count { cid: r.seq, op: COUNT, key: "pods/" + r.ns + "/", a: 0, s: 0, f: 0,
+                 ctx: Ctx { key: r.key, ns: r.ns, ouid: r.juid, gone: "",
+                            par: r.par + 1 - math.least(1, size(r.parS)),
+                            comp: math.least(1, size(r.compS)) * r.comp
+                                  + (1 - math.least(1, size(r.compS))) * (1 - 2 * math.least(1, size(r.parS))),
+                            mode: r.mode,
+                            bol: r.bol + 6 * (1 - math.least(1, size(r.bolS))),
+                            hads: math.least(1, size(r.adsS)), ads: r.ads,
+                            httl: math.least(1, size(r.ttlS)), ttl: r.ttl,
+                            sus: r.sus,
+                            h0: math.least(1, size(r.t0)), hfat: math.least(1, size(r.fat)),
+                            htf: math.least(1, size(r.tf)),
+                            fc: int("0" + r.fc), fin: r.fin, sp: r.sp,
+                            d0: r.d0, dfat: r.dfat, dtf: r.dtf, now: r.now } };
   }
-  decision launch(a: jb.Answer) -> jb.Create {
-    when a.status == 404 && a.ctx.key != "" ->
-      jb.Create { cid: a.cid, op: PUT, key: a.ctx.key,
-                  p1: "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"",
-                  p2: a.ctx.pod,
-                  p3: "\",\"namespace\":\"",
-                  p4: a.ctx.ns,
-                  p5: "\",\"ownerReferences\":[{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"name\":\"",
-                  p6: a.ctx.name,
-                  p7: "\",\"uid\":\"" + a.ctx.ouid + "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":",
-                  p8: a.ctx.tmpl,
-                  p9: "}" };
-    default ->
-      jb.Create { cid: a.cid, op: NOOP, key: "" };
-  }
-
-  decision done(p: jb.Pod) -> jb.Mark {
-    when p.kind == "Job" && p.phase == "Succeeded" ->
-      jb.Mark { cid: p.seq, op: PUT, key: p.key, v1: "1" };
-    when p.kind == "Job" ->
-      jb.Mark { cid: p.seq, op: DELETE, key: p.key, v1: "" };
-    default ->
-      jb.Mark { cid: p.seq, op: NOOP, key: "", v1: "" };
-  }
-
-  decision status(j: jb.Job) -> jb.Status {
-    when j.completions == "" ->
-      jb.Status { cid: j.seq, op: NOOP, key: "", v1: "", v2: "", v3: "" };
-    when j.want > 0 && j.done >= j.want ->
-      jb.Status { cid: j.seq, op: PUT, key: j.key, v1: "succeeded=", v2: j.donestr, v3: ";complete=1" };
-    default ->
-      jb.Status { cid: j.seq, op: PUT, key: j.key, v1: "succeeded=", v2: j.donestr, v3: ";complete=0" };
+  // The Job's Pods, counted in ONE walk: each Pod counts as the SUM of the
+  // weights of what it is — active 1, succeeded 2^16, failed 2^32, ready
+  // (an active Pod whose Ready condition is True) 2^48 — so the store's sum
+  // carries the four counts at once (each under 2^15) and W1 unpacks them.
+  // One walk of the namespace's Pods, not four: a Pod past a record is read
+  // whole on the counting node's heap, and that node is one, not four.
+  decision tally(p: jb.Pod) -> jb.Keep {
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.phase == "Succeeded" ->
+      jb.Keep { k: 65536 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.phase == "Failed" ->
+      jb.Keep { k: 4294967296 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" && p.ready == "True" ->
+      jb.Keep { k: 281474976710657 };
+    when p.owner == p.ctx.ouid && p.ctx.ouid != "" && p.del == "" ->
+      jb.Keep { k: 1 };
+    default -> jb.Keep { };
   }
 
-  transformation pass_ord(o: jb.Ord) -> jb.Ord {
-    jb.Ord { seq: o.seq, rev: o.rev, key: o.key, tmpl: o.tmpl, completions: o.completions,
-             ord: o.ord, want: o.want, selfkey: o.selfkey, pod: o.pod, ns: o.ns, name: o.name }
+  // W1 — the weighted count arrives, unpacked; every number is in hand. In upstream's
+  // order: a finished Job stays finished (and is deleted at its TTL); then
+  // too many failures, then the deadline, then completion; a suspended Job
+  // starts nothing; a NEW failure starts a backoff of 10 s doubling per
+  // failure to 6 min, during which nothing starts; else start up to
+  // parallelism, never past the completions still wanted.
+  // The COUNT's answer: the weighted sum (`tally`), unpacked where it is
+  // read — active n % 2^16, succeeded n / 2^16 % 2^16, failed n / 2^32 %
+  // 2^16, ready n / 2^48. (A decision is what a node runs: a pipeline's
+  // transformation does not reach it.)
+  message jb.Tally {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    moment: string = 62;  // `wall = 2`: the moment now, as a record keeps it
+    ctx: Ctx = 254;
   }
-  transformation pass_ans(a: jb.Answer) -> jb.Answer {
-    jb.Answer { cid: a.cid, status: a.status, value: a.value, ctx: a.ctx }
+  message jb.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;  v2: int = 5;   v3: string = 6;  v4: int = 7;
+    v5: string = 8;  v6: int = 9;   v7: string = 10; v8: int = 11;
+    v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16;
+    v14: string = 80; v15: int = 81; v16: string = 82; v17: string = 83;
+    v18: int = 84; v19: string = 85; v20: int = 86; v21: string = 87;
+    v22: string = 88; v23: string = 89; v24: string = 90; v25: int = 91;
+    ctx: Ctx = 254;
   }
-  transformation pass_pod(p: jb.Pod) -> jb.Pod {
-    jb.Pod { seq: p.seq, rev: p.rev, key: p.key, kind: p.kind, phase: p.phase }
+  decision w1(r: jb.Tally) -> jb.Put {
+    when r.ctx.gone != "" || r.status != 200 ->
+      jb.Put { cid: r.cid, op: NOOP, key: "", ctx: r.ctx };
+    when r.ctx.fin != "" && r.ctx.httl == 1 && r.ctx.htf == 1 && r.ctx.now >= r.ctx.dtf ->
+      jb.Put { cid: r.cid, op: DELETE, key: "jobs.batch/" + r.ctx.key, ctx: r.ctx };
+    when r.ctx.fin != "" ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";xms=", v12: r.ctx.ttl * 1000, ctx: r.ctx };
+    when (r.n / 4294967296 % 65536) > r.ctx.bol ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";xms=", v12: r.ctx.ttl * 1000,
+               v13: ";fin=BackoffLimitExceeded;tf=", v14: r.moment, ctx: r.ctx };
+    when r.ctx.hads == 1 && r.ctx.h0 == 1 && r.ctx.sus != "true" && r.ctx.now >= r.ctx.d0 ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";xms=", v12: r.ctx.ttl * 1000,
+               v13: ";fin=DeadlineExceeded;tf=", v14: r.moment, ctx: r.ctx };
+    when (r.ctx.comp >= 0 && (r.n / 65536 % 65536) >= r.ctx.comp) || (r.ctx.comp < 0 && (r.n / 65536 % 65536) >= 1 && (r.n % 65536) == 0) ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";xms=", v12: r.ctx.ttl * 1000,
+               v13: ";fin=Complete;tf=", v14: r.moment, ctx: r.ctx };
+    when r.ctx.sus == "true" ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536), v11: ";p=", v12: r.ctx.par,
+               v13: ";md=" + r.ctx.mode, ctx: r.ctx };
+    when (r.n / 4294967296 % 65536) > r.ctx.fc ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";fc=", v12: (r.n / 4294967296 % 65536),
+               v13: ";fat=", v14: r.moment, v16: ";bms=",
+               v18: math.least(360000, math.bitShiftLeft(10000, math.least((r.n / 4294967296 % 65536) - 1, 6))),
+               v19: ";dms=", v20: r.ctx.ads * 1000, v21: ";md=" + r.ctx.mode, ctx: r.ctx };
+    when r.ctx.hfat == 1 && r.ctx.now < r.ctx.dfat ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=0;n=", v10: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + (r.n % 65536), v11: ";dms=", v12: r.ctx.ads * 1000,
+               v13: ";md=" + r.ctx.mode, ctx: r.ctx };
+    when r.ctx.comp >= 0 ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=", v10: math.greatest(0, math.least(r.ctx.par, r.ctx.comp - (r.n / 65536 % 65536)) - (r.n % 65536)),
+               v11: ";n=", v12: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + math.greatest((r.n % 65536), math.least(r.ctx.par, r.ctx.comp - (r.n / 65536 % 65536))),
+               v13: ";c=", v15: r.ctx.comp, v16: ";p=", v18: r.ctx.par,
+               v19: ";dms=", v20: r.ctx.ads * 1000, v21: ";md=" + r.ctx.mode, ctx: r.ctx };
+    default ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),
+               v9: ";w=", v10: math.greatest(0, r.ctx.par * (1 - math.least(1, (r.n / 65536 % 65536))) - (r.n % 65536)),
+               v11: ";n=", v12: (r.n / 65536 % 65536) + (r.n / 4294967296 % 65536) + math.greatest((r.n % 65536), r.ctx.par * (1 - math.least(1, (r.n / 65536 % 65536)))),
+               v13: ";c=0;p=", v15: r.ctx.par,
+               v19: ";dms=", v20: r.ctx.ads * 1000, v21: ";md=" + r.ctx.mode, ctx: r.ctx };
   }
-  transformation pass_job(j: jb.Job) -> jb.Job {
-    jb.Job { seq: j.seq, rev: j.rev, key: j.key, completions: j.completions,
-             want: j.want, donestr: j.donestr, done: j.done }
+
+  // W2 — the moments: startTime when the Job first runs, and the suspend
+  // and resume transitions. A suspended Job's deadline does not run: its
+  // start is cleared, and stamped anew when it resumes (upstream resets
+  // startTime on resume).
+  message jb.Wrote {
+    cid: int = 1;
+    status: int = 2;
+    moment: string = 62;
+    ctx: Ctx = 254;
   }
-  pipeline prb(o: jb.Ord) -> jb.Probe {
-    call x = pass_ord(o);
-    call y = probe(x);
-    return y;
+  message jb.Stamp {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
   }
-  pipeline mk(a: jb.Answer) -> jb.Create {
-    call x = pass_ans(a);
-    call y = launch(x);
-    return y;
+  decision w2(w: jb.Wrote) -> jb.Stamp {
+    when w.ctx.gone != "" || w.ctx.fin != "" ->
+      jb.Stamp { cid: w.cid, op: NOOP, key: "" };
+    when w.ctx.sus == "true" && w.ctx.sp != "1" ->
+      jb.Stamp { cid: w.cid, op: MERGE, key: "job-ctl/" + w.ctx.key, v1: "sp=1;t0=;ts=", v2: w.moment };
+    when w.ctx.sus != "true" && w.ctx.sp == "1" ->
+      jb.Stamp { cid: w.cid, op: MERGE, key: "job-ctl/" + w.ctx.key, v1: "sp=0;ts=", v2: w.moment, v3: ";t0=", v4: w.moment };
+    when w.ctx.sus != "true" && w.ctx.h0 == 0 ->
+      jb.Stamp { cid: w.cid, op: MERGE, key: "job-ctl/" + w.ctx.key, v1: "t0=", v2: w.moment };
+    default ->
+      jb.Stamp { cid: w.cid, op: NOOP, key: "" };
   }
-  pipeline dn(p: jb.Pod) -> jb.Mark {
-    call x = pass_pod(p);
-    call y = done(x);
-    return y;
-  }
-  pipeline st(j: jb.Job) -> jb.Status {
-    call x = pass_job(j);
-    call y = status(x);
-    return y;
-  }
-  entry prb = prb;
-  entry mk = mk;
-  entry dn = dn;
-  entry st = st;
-  provenance revision "job-fold" toolchain "chronicle-authoring";
+
+  pipeline seed_p(j: jb.Job) -> jb.Mark { call x = seed(j); return x; }
+  pipeline c0_p(r: jb.Ctl) -> jb.Count { call x = c0(r); return x; }
+  pipeline tally_p(p: jb.Pod) -> jb.Keep { call x = tally(p); return x; }
+  pipeline w1_p(t: jb.Tally) -> jb.Put { call x = w1(t); return x; }
+  pipeline w2_p(w: jb.Wrote) -> jb.Stamp { call x = w2(w); return x; }
+  // No `entry` lines: a document holds eight, and a graph names its
+  // pipeline (`chronicle-source: <uproc> <pipeline>`), not an entry.
+  provenance revision "job-k8s" toolchain "chronicle-authoring";
 }

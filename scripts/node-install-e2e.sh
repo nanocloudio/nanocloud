@@ -127,6 +127,9 @@ keys |= {"/image-blobs/", "/image-fetch-q/", "/image-digests/", "/image-requests
          "/image-config/", "/image-index/", "/image-layer-ok/", "/image-rootfs/", "/sandboxes/"}
 # A Pod's events are the plane's to serve: written unscoped on purpose.
 keys.discard("/events/")
+# A Pod and its ServiceAccount are the cluster's: READ for its pull
+# credentials (image_auth.uproc), never written.
+keys -= {"/pods/", "/serviceaccounts/"}
 unscoped = [k for k in sorted(keys) if not any(k.startswith(p) for p in scoped)]
 assert not unscoped, f"image records the worker's store does not scope: {unscoped}"
 assert "BEGIN" not in g and "PRIVATE" not in g, "a certificate or key is IN the graph"

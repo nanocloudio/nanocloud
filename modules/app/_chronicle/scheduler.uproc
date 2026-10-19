@@ -1,46 +1,82 @@
-// The scheduler as params: least-loaded placement, one Pod per pass.
-//   bind    the FIRST unbound Pod (where spec.nodeName=, count index 0)
-//           JOIN /ready-nodes/ picked by the least number of Pods bound to
-//           it (mincount over /pods/ by spec.nodeName) -> PATCH spec.nodeName
-//   record  the Scheduled event, from the write's own reply
-// One Pod per pass, and the load is measured from the Pods themselves at
+// The scheduler as params. The PICK is the source's (`sc_unbound`, store_
+// source `sched`, _shared/sched.rs): every pending Pod is judged against the
+// ready nodes as upstream's default profile judges it — cordon, nodeSelector
+// and node affinity, taints and tolerations, requests against allocatable,
+// pod affinity and anti-affinity, topology spread — and scored; position 0
+// goes to the first placeable Pod of the highest priority, -1 to one nothing
+// fits (with upstream's FailedScheduling message), and the first
+// unplaceable Pod of the highest priority may preempt lower-priority Pods
+// (one record per victim). These decisions act on that verdict:
+//
+//   vict    a preemption's victim -> DELETE it (its tomb tells its node)
+//   bind    position 0 -> merge-patch spec.nodeName and PodScheduled True;
+//           a Pod nothing fits -> PodScheduled False, reason Unschedulable,
+//           upstream's message (and nominatedNodeName when it preempts)
+//   record  the Scheduled, FailedScheduling or Preempted event, from the
+//           write's own reply
+//
+// One bind per pass, and the load is measured from the Pods themselves at
 // pick time — not from a projection that could lag the bind that just
-// happened — so the spread is exact, and emergent, as k8s's is.
+// happened — so the placement is exact.
+//
+// The taint manager (te_*): a Pod bound to a node whose NoExecute taint it
+// does not tolerate is evicted at once; one it tolerates for
+// tolerationSeconds gets a moment recorded (/taint-evict/<ns>/<pod>) and is
+// evicted when that long has passed — on the kernel timer — unless the taint
+// went first.
 module nanocloud.scheduler {
 
-  // The context each chain here carries across its effects: ONE nested
-  // message in the reserved carry field (254), echoed unchanged by every
-  // connector. Inner numbers are the old carry-through numbers, so every
-  // module that hands a context on agrees on it.
-  // carried by: sc.Bind, sc.Bound
-  message Ctx {
-    key: string = 30;
-    ns: string = 34;
-    pod: string = 35;
-    node: string = 36;
-  }
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum CREATE = 8;
+  enum PATCH_MERGE = 13;
+
+  // The pick, as the source states it. The carry (30..39, echoed by every
+  // connector) holds what the later stages need: a 300-byte message does not
+  // fit a nested context's scratch.
   message sc.Unbound {
     seq: int = 1;
-    rev: int = 2;
     key: string = 3;      // "<ns>/<pod>"
-    idx: int = 20;        // position among unbound pods
-    node: string = 21;    // the least-loaded ready node (join_pick)
+    uid: string = 4;      // metadata.uid
+    idx: int = 20;        // position: 0 binds, -1 nothing fits
+    node: string = 21;    // the chosen node ("" when none)
     ns: string = 28;
     pod: string = 29;
+    msg: string = 66;     // why nothing fits
+    nom: string = 68;     // a preemption's node
+    victim: string = 69;  // a preemption's victim, "<ns>/<name>"
   }
-  message sc.Bind {
+  message sc.Act {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
-    path: string = 19;
-    v1: string = 4; v2: string = 5; v3: string = 6;   // a JSON string: quote, node, quote
-    ctx: Ctx = 254;
+    c_key: string = 30; c_ns: string = 31; c_pod: string = 32; c_node: string = 33;
+    c_msg: string = 34; c_nom: string = 35; c_victim: string = 36; c_uid: string = 37;
+    c_idx: int = 38;
   }
-  message sc.Bound {
+  message sc.Done {
     cid: int = 1;
     status: int = 2;
-    value: string = 3;
-    ctx: Ctx = 254;
+    c_key: string = 30; c_ns: string = 31; c_pod: string = 32; c_node: string = 33;
+    c_msg: string = 34; c_nom: string = 35; c_victim: string = 36; c_uid: string = 37;
+    c_idx: int = 38;
+  }
+  message sc.Patch {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    c_key: string = 30; c_ns: string = 31; c_pod: string = 32; c_node: string = 33;
+    c_msg: string = 34; c_nom: string = 35; c_victim: string = 36; c_uid: string = 37;
+    c_idx: int = 38; c_did: string = 39;
+  }
+  message sc.Patched {
+    cid: int = 1;
+    status: int = 2;
+    c_key: string = 30; c_ns: string = 31; c_pod: string = 32; c_node: string = 33;
+    c_msg: string = 34; c_nom: string = 35; c_victim: string = 36; c_uid: string = 37;
+    c_idx: int = 38; c_did: string = 39;
   }
   message sc.Evt {
     cid: int = 1;
@@ -50,45 +86,123 @@ module nanocloud.scheduler {
     v1: string = 4;   v2: string = 5;   v3: string = 6;
     v4: string = 7;   v5: string = 8;   v6: string = 9;
     v7: string = 10;  v8: string = 11;  v9: string = 12;
-    v10: string = 13; v11: string = 14;
+    v10: string = 13; v11: string = 14; v12: string = 15; v13: string = 16;
   }
-  enum NOOP = 0;
-  enum PUT = 3;
-  enum PATCH = 5;
 
-  decision bind(u: sc.Unbound) -> sc.Bind {
-    when u.idx == 0 && u.node != "" ->
-      sc.Bind { cid: u.seq, op: PATCH, key: u.key, path: "spec.nodeName",
-                v1: "\"", v2: u.node, v3: "\"", ctx: Ctx { key: u.key, ns: u.ns, pod: u.pod, node: u.node } };
+  decision vict(u: sc.Unbound) -> sc.Act {
+    when u.victim != "" ->
+      sc.Act { cid: u.seq, op: DELETE, key: "pods/" + u.victim,
+               c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node, c_msg: u.msg, c_nom: u.nom,
+               c_victim: u.victim, c_uid: u.uid, c_idx: u.idx };
     default ->
-      sc.Bind { cid: u.seq, op: NOOP, key: "", path: "", v1: "", v2: "", v3: "", ctx: Ctx { key: u.key, ns: u.ns, pod: u.pod, node: u.node } };
+      sc.Act { cid: u.seq, op: NOOP, key: "",
+               c_key: u.key, c_ns: u.ns, c_pod: u.pod, c_node: u.node, c_msg: u.msg, c_nom: u.nom,
+               c_victim: u.victim, c_uid: u.uid, c_idx: u.idx };
   }
-  decision record(b: sc.Bound) -> sc.Evt {
-    when b.status == 200 ->
-      sc.Evt { cid: b.cid, op: PUT, key: b.ctx.key, xk: ".Scheduled.0",
-               v1: "{\"metadata\":{\"name\":\"",
-               v2: b.ctx.pod,
-               v3: ".Scheduled.0\",\"namespace\":\"",
-               v4: b.ctx.ns,
-               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"",
-               v6: b.ctx.ns,
-               v7: "\",\"name\":\"",
-               v8: b.ctx.pod,
-               v9: "\"},\"reason\":\"Scheduled\",\"message\":\"Successfully assigned to ",
-               v10: b.ctx.node,
+  decision bind(d: sc.Done) -> sc.Patch {
+    when d.c_idx == 0 && d.c_node != "" ->
+      sc.Patch { cid: d.cid, op: PATCH_MERGE, key: d.c_key,
+                 v1: "{\"spec\":{\"nodeName\":\"", v2: d.c_node,
+                 v3: "\"},\"status\":{\"nominatedNodeName\":null,\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastProbeTime\":null,\"lastTransitionTime\":null}]}}",
+                 c_key: d.c_key, c_ns: d.c_ns, c_pod: d.c_pod, c_node: d.c_node, c_msg: d.c_msg, c_nom: d.c_nom,
+                 c_victim: d.c_victim, c_uid: d.c_uid, c_idx: d.c_idx, c_did: "bind" };
+    when d.c_node == "" && d.c_msg != "" && d.c_nom != "" ->
+      sc.Patch { cid: d.cid, op: PATCH_MERGE, key: d.c_key,
+                 v1: "{\"status\":{\"nominatedNodeName\":\"", v2: d.c_nom,
+                 v3: "\",\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"False\",\"reason\":\"Unschedulable\",\"message\":\"",
+                 v4: d.c_msg, v5: "\",\"lastProbeTime\":null,\"lastTransitionTime\":null}]}}",
+                 c_key: d.c_key, c_ns: d.c_ns, c_pod: d.c_pod, c_node: d.c_node, c_msg: d.c_msg, c_nom: d.c_nom,
+                 c_victim: d.c_victim, c_uid: d.c_uid, c_idx: d.c_idx, c_did: "preempt" };
+    when d.c_node == "" && d.c_msg != "" ->
+      sc.Patch { cid: d.cid, op: PATCH_MERGE, key: d.c_key,
+                 v1: "{\"status\":{\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"False\",\"reason\":\"Unschedulable\",\"message\":\"",
+                 v2: d.c_msg, v3: "\",\"lastProbeTime\":null,\"lastTransitionTime\":null}]}}",
+                 c_key: d.c_key, c_ns: d.c_ns, c_pod: d.c_pod, c_node: d.c_node, c_msg: d.c_msg, c_nom: d.c_nom,
+                 c_victim: d.c_victim, c_uid: d.c_uid, c_idx: d.c_idx, c_did: "unschedulable" };
+    default ->
+      sc.Patch { cid: d.cid, op: NOOP, key: "",
+                 c_key: d.c_key, c_ns: d.c_ns, c_pod: d.c_pod, c_node: d.c_node, c_msg: d.c_msg, c_nom: d.c_nom,
+                 c_victim: d.c_victim, c_uid: d.c_uid, c_idx: d.c_idx, c_did: "" };
+  }
+  // Events, keyed `<ns>/<obj>.<Reason>.0`: a recurring reason overwrites its
+  // own (put-if-changed: a settled one writes nothing).
+  decision record(b: sc.Patched) -> sc.Evt {
+    when b.c_did == "bind" && b.status == 200 ->
+      sc.Evt { cid: b.cid, op: PUT, key: b.c_key, xk: ".Scheduled.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: b.c_pod,
+               v3: ".Scheduled.0\",\"namespace\":\"", v4: b.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"", v6: b.c_ns,
+               v7: "\",\"name\":\"", v8: b.c_pod,
+               v9: "\"},\"reason\":\"Scheduled\",\"message\":\"Successfully assigned to ", v10: b.c_node,
                v11: "\",\"type\":\"Normal\",\"count\":1}" };
+    when b.c_did == "preempt" && b.c_victim != "" ->
+      sc.Evt { cid: b.cid, op: PUT, key: b.c_victim, xk: ".Preempted.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: b.c_victim.substring(b.c_victim.indexOf("/") + 1, size(b.c_victim)),
+               v3: ".Preempted.0\",\"namespace\":\"", v4: b.c_victim.substring(0, b.c_victim.indexOf("/")),
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"", v6: b.c_victim.substring(0, b.c_victim.indexOf("/")),
+               v7: "\",\"name\":\"", v8: b.c_victim.substring(b.c_victim.indexOf("/") + 1, size(b.c_victim)),
+               v9: "\"},\"reason\":\"Preempted\",\"message\":\"Preempted by pod ", v10: b.c_uid,
+               v11: " on node ", v12: b.c_nom, v13: "\",\"type\":\"Normal\",\"count\":1}" };
+    when b.c_did == "unschedulable" || b.c_did == "preempt" ->
+      sc.Evt { cid: b.cid, op: PUT, key: b.c_key, xk: ".FailedScheduling.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: b.c_pod,
+               v3: ".FailedScheduling.0\",\"namespace\":\"", v4: b.c_ns,
+               v5: "\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"", v6: b.c_ns,
+               v7: "\",\"name\":\"", v8: b.c_pod,
+               v9: "\"},\"reason\":\"FailedScheduling\",\"message\":\"", v10: b.c_msg,
+               v11: "\",\"type\":\"Warning\",\"count\":1}" };
     default ->
       sc.Evt { cid: b.cid, op: NOOP, key: "", xk: "" };
   }
-  transformation pass_unbound(u: sc.Unbound) -> sc.Unbound {
-    sc.Unbound { seq: u.seq, rev: u.rev, key: u.key, idx: u.idx, node: u.node, ns: u.ns, pod: u.pod }
+
+  // ---- the taint manager ----
+  message te.Pod {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<pod>"
+    uid: string = 4;
+    ne: int = 66;         // the NoExecute verdict: 0 none, -1 now, else seconds
+    rec: string = 70;     // /taint-evict/<ns>/<pod> t (the moment recorded)
+    moment: string = 62;  // `wall = 2`: the moment now
   }
-  transformation pass_bound(b: sc.Bound) -> sc.Bound {
-    sc.Bound { cid: b.cid, status: b.status, value: b.value, ctx: b.ctx }
+  message te.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: string = 9;
   }
-  pipeline bd(u: sc.Unbound) -> sc.Bind { call x = pass_unbound(u); call y = bind(x); return y; }
-  pipeline rc(b: sc.Bound) -> sc.Evt { call x = pass_bound(b); call y = record(x); return y; }
-  entry bd = bd;
-  entry rc = rc;
-  provenance revision "scheduler-mincount" toolchain "chronicle-authoring";
+  decision taint(p: te.Pod) -> te.Act {
+    when p.ne == -1 ->
+      te.Act { cid: p.seq, op: DELETE, key: "pods/" + p.key };
+    when p.ne > 0 && p.rec == "" ->
+      te.Act { cid: p.seq, op: CREATE, key: "taint-evict/" + p.key,
+               v1: "t=", v2: p.moment, v3: ";ms=", v4: p.ne * 1000, v5: ";u=", v6: p.uid };
+    when p.ne == 0 && p.rec != "" ->
+      te.Act { cid: p.seq, op: DELETE, key: "taint-evict/" + p.key };
+    default ->
+      te.Act { cid: p.seq, op: NOOP, key: "" };
+  }
+  message te.Due {
+    seq: int = 1;
+    key: string = 3;
+    u: string = 4;
+    due: int = 50;        // t + ms, this boot's monotonic ms
+    now: int = 58;
+    puid: string = 70;    // the Pod's uid now
+  }
+  decision evict(d: te.Due) -> te.Act {
+    when d.puid == "" || d.puid != d.u ->
+      te.Act { cid: d.seq, op: DELETE, key: "taint-evict/" + d.key };
+    when d.due > 0 && d.now >= d.due ->
+      te.Act { cid: d.seq, op: DELETE, key: "pods/" + d.key };
+    default ->
+      te.Act { cid: d.seq, op: NOOP, key: "" };
+  }
+
+  pipeline vict_p(u: sc.Unbound) -> sc.Act { call x = vict(u); return x; }
+  pipeline bind_p(d: sc.Done) -> sc.Patch { call x = bind(d); return x; }
+  pipeline record_p(b: sc.Patched) -> sc.Evt { call x = record(b); return x; }
+  pipeline taint_p(p: te.Pod) -> te.Act { call x = taint(p); return x; }
+  pipeline evict_p(d: te.Due) -> te.Act { call x = evict(d); return x; }
+  // No `entry` lines: a graph names its pipeline.
+  provenance revision "scheduler-k8s" toolchain "chronicle-authoring";
 }

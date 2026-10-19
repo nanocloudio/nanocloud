@@ -1,0 +1,133 @@
+// PodDisruptionBudget as params: its status as upstream's disruption
+// controller keeps it, and the Eviction subresource's verdict.
+//
+//   status  /poddisruptionbudgets/<ns>/<pdb> (and any Pod changing) ->
+//           COUNT the Pods its selector selects (not terminal) — expectedPods
+//           -> COUNT those Ready and not being deleted — currentHealthy ->
+//           PATCH status: desiredHealthy from minAvailable (an int, or a
+//           percentage of expectedPods rounded up) or expectedPods less
+//           maxUnavailable (likewise), disruptionsAllowed = max(0, healthy -
+//           desired), observedGeneration, and the DisruptionAllowed condition
+//           (SufficientPods / InsufficientPods)
+//
+//   evict   POST …/pods/<name>/eviction, in the API's request chain after
+//           admission: GET the Pod -> COUNT the budgets in its namespace that
+//           select it with no disruption left -> none: the request becomes the
+//           Pod's DELETE (its tomb tells its node); any: 429 TooManyRequests,
+//           "Cannot evict pod as it would violate the pod's disruption
+//           budget." — as upstream answers, so `kubectl drain` waits and
+//           retries.
+//
+// The selector is judged by the COUNT connector (`count_sel`): a label
+// selector is a walk over a set, which a decision cannot make.
+module nanocloud.pdb {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PATCH = 5;
+  enum COUNT = 12;
+  enum M_DELETE = 7;
+
+  // ---- status ----
+  message pd.Pdb {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<pdb>"
+    minS: string = 4;     // spec.minAvailable (an int, or "<n>%")
+    maxS: string = 5;     // spec.maxUnavailable
+    sel: string = 6;      // spec.selector, as written
+    gen: int = 50;        // metadata.generation
+    ns: string = 28;
+  }
+  message pd.Count {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_key: string = 30; c_ns: string = 31; c_min: string = 32; c_max: string = 33;
+    c_gen: int = 34; c_sel: string = 36; c_exp: int = 37;
+  }
+  message pd.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    c_key: string = 30; c_ns: string = 31; c_min: string = 32; c_max: string = 33;
+    c_gen: int = 34; c_sel: string = 36; c_exp: int = 37;
+  }
+  // One Pod, as the COUNT's predicate reads it.
+  message pd.Pod {
+    selected: string = 48; // `count_sel`: the budget's selector selects it
+    del: string = 40;      // metadata.deletionTimestamp
+    phase: string = 41;    // status.phase
+    ready: string = 42;    // status.conditions[type=Ready].status
+  }
+  message pd.Keep {
+    k: int = 1;
+  }
+  decision p0(d: pd.Pdb) -> pd.Count {
+    when d.ns != "" ->
+      pd.Count { cid: d.seq, op: COUNT, key: "pods/" + d.ns + "/",
+                 c_key: d.key, c_ns: d.ns, c_min: d.minS, c_max: d.maxS, c_gen: d.gen, c_sel: d.sel, c_exp: 0 };
+    default ->
+      pd.Count { cid: d.seq, op: NOOP, key: "",
+                 c_key: d.key, c_ns: d.ns, c_min: d.minS, c_max: d.maxS, c_gen: d.gen, c_sel: d.sel, c_exp: 0 };
+  }
+  decision expected(p: pd.Pod) -> pd.Keep {
+    when p.selected == "1" && p.phase != "Succeeded" && p.phase != "Failed" -> pd.Keep { k: 1 };
+    default -> pd.Keep { };
+  }
+  decision healthy(p: pd.Pod) -> pd.Keep {
+    when p.selected == "1" && p.del == "" && p.phase != "Succeeded" && p.phase != "Failed" && p.ready == "True" -> pd.Keep { k: 1 };
+    default -> pd.Keep { };
+  }
+  decision p1(c: pd.Counted) -> pd.Count {
+    when c.status == 200 && c.c_ns != "" ->
+      pd.Count { cid: c.cid, op: COUNT, key: "pods/" + c.c_ns + "/",
+                 c_key: c.c_key, c_ns: c.c_ns, c_min: c.c_min, c_max: c.c_max, c_gen: c.c_gen, c_sel: c.c_sel, c_exp: c.n };
+    default ->
+      pd.Count { cid: c.cid, op: NOOP, key: "",
+                 c_key: c.c_key, c_ns: "", c_min: c.c_min, c_max: c.c_max, c_gen: c.c_gen, c_sel: c.c_sel, c_exp: 0 };
+  }
+  message pd.Set {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    path: string = 19;
+    v1: string = 4;  v2: int = 5;   v3: string = 6;  v4: int = 7;
+    v5: string = 8;  v6: int = 9;   v7: string = 10; v8: int = 11;
+    v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16;
+  }
+  // desired: expected less maxUnavailable (n, or p% of expected rounded
+  // up), else minAvailable (n, or p% rounded up), else none required.
+  // Branch-free (a decision's arms are its only branches): a percentage is
+  // its text with the `%` dropped, and which of the two is stated is the
+  // size of its text.
+  decision p2(c: pd.Counted) -> pd.Set {
+    when c.status != 200 || c.c_ns == "" ->
+      pd.Set { cid: c.cid, op: NOOP, key: "" };
+    when c.n - (math.least(1, size(c.c_max)) * math.greatest(0, c.c_exp - (math.least(1, size(c.c_max) - size(c.c_max.replace("%", ""))) * ((int("0" + c.c_max.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_max) - size(c.c_max.replace("%", "")))) * int("0" + c.c_max.replace("%", "")))) + (1 - math.least(1, size(c.c_max))) * math.least(1, size(c.c_min)) * (math.least(1, size(c.c_min) - size(c.c_min.replace("%", ""))) * ((int("0" + c.c_min.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_min) - size(c.c_min.replace("%", "")))) * int("0" + c.c_min.replace("%", "")))) > 0 ->
+      pd.Set { cid: c.cid, op: PATCH, key: c.c_key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.c_gen,
+               v3: ",\"disruptionsAllowed\":", v4: c.n - (math.least(1, size(c.c_max)) * math.greatest(0, c.c_exp - (math.least(1, size(c.c_max) - size(c.c_max.replace("%", ""))) * ((int("0" + c.c_max.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_max) - size(c.c_max.replace("%", "")))) * int("0" + c.c_max.replace("%", "")))) + (1 - math.least(1, size(c.c_max))) * math.least(1, size(c.c_min)) * (math.least(1, size(c.c_min) - size(c.c_min.replace("%", ""))) * ((int("0" + c.c_min.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_min) - size(c.c_min.replace("%", "")))) * int("0" + c.c_min.replace("%", "")))),
+               v5: ",\"currentHealthy\":", v6: c.n,
+               v7: ",\"desiredHealthy\":", v8: (math.least(1, size(c.c_max)) * math.greatest(0, c.c_exp - (math.least(1, size(c.c_max) - size(c.c_max.replace("%", ""))) * ((int("0" + c.c_max.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_max) - size(c.c_max.replace("%", "")))) * int("0" + c.c_max.replace("%", "")))) + (1 - math.least(1, size(c.c_max))) * math.least(1, size(c.c_min)) * (math.least(1, size(c.c_min) - size(c.c_min.replace("%", ""))) * ((int("0" + c.c_min.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_min) - size(c.c_min.replace("%", "")))) * int("0" + c.c_min.replace("%", "")))),
+               v9: ",\"expectedPods\":", v10: c.c_exp,
+               v11: ",\"conditions\":[{\"type\":\"DisruptionAllowed\",\"observedGeneration\":", v12: c.c_gen,
+               v13: ",\"status\":\"True\",\"reason\":\"SufficientPods\",\"message\":\"\",\"lastTransitionTime\":null}]}" };
+    default ->
+      pd.Set { cid: c.cid, op: PATCH, key: c.c_key, path: "status",
+               v1: "{\"observedGeneration\":", v2: c.c_gen,
+               v3: ",\"disruptionsAllowed\":", v4: 0,
+               v5: ",\"currentHealthy\":", v6: c.n,
+               v7: ",\"desiredHealthy\":", v8: (math.least(1, size(c.c_max)) * math.greatest(0, c.c_exp - (math.least(1, size(c.c_max) - size(c.c_max.replace("%", ""))) * ((int("0" + c.c_max.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_max) - size(c.c_max.replace("%", "")))) * int("0" + c.c_max.replace("%", "")))) + (1 - math.least(1, size(c.c_max))) * math.least(1, size(c.c_min)) * (math.least(1, size(c.c_min) - size(c.c_min.replace("%", ""))) * ((int("0" + c.c_min.replace("%", "")) * c.c_exp + 99) / 100) + (1 - math.least(1, size(c.c_min) - size(c.c_min.replace("%", "")))) * int("0" + c.c_min.replace("%", "")))),
+               v9: ",\"expectedPods\":", v10: c.c_exp,
+               v11: ",\"conditions\":[{\"type\":\"DisruptionAllowed\",\"observedGeneration\":", v12: c.c_gen,
+               v13: ",\"status\":\"False\",\"reason\":\"InsufficientPods\",\"message\":\"\",\"lastTransitionTime\":null}]}" };
+  }
+
+  pipeline p0_p(d: pd.Pdb) -> pd.Count { call x = p0(d); return x; }
+  pipeline expected_p(p: pd.Pod) -> pd.Keep { call x = expected(p); return x; }
+  pipeline healthy_p(p: pd.Pod) -> pd.Keep { call x = healthy(p); return x; }
+  pipeline p1_p(c: pd.Counted) -> pd.Count { call x = p1(c); return x; }
+  pipeline p2_p(c: pd.Counted) -> pd.Set { call x = p2(c); return x; }
+  provenance revision "pdb" toolchain "chronicle-authoring";
+}

@@ -1,0 +1,235 @@
+// CronJob as params, to Kubernetes' semantics: schedule (standard cron, and
+// spec.timeZone), concurrencyPolicy, startingDeadlineSeconds, suspend, the
+// history limits, and status.active / lastScheduleTime /
+// lastSuccessfulTime.
+//
+// The schedule is judged by the source (store_source `cron`,
+// _shared/cron.rs) against the TRUSTED wall clock only: a board before
+// SNTP schedules nothing, never a 1970 run (the moment design,
+// _shared/moment.rs). Its state beside it, flat, at /cron-last/<ns>/<cj>:
+//   t0  the floor: its creation (a new CronJob runs only what falls after)
+//   t   the last scheduled time it ran (or skipped: a missed deadline)
+//   rp  a Replace pending: the active Jobs scheduled before it go
+//   s   the last successful Job's completion
+// (Unix ms each). Its active Jobs: /cron-active/<ns>/<cj>/<job>, each the
+// ObjectReference status.active lists.
+//
+//   run     the CronJob (cron: the latest scheduled minute; its active Jobs
+//           counted) -> CREATE the Job <cj>-<minutes since 1970> from
+//           jobTemplate (owned, the scheduled time its annotation) — unless
+//           suspended, already run, past startingDeadlineSeconds (then
+//           skipped), Forbid with one active, or Replace with one active
+//           (then `rp`) -> record t
+//   active  a CronJob's Job -> GET its /cron-last/ -> one older than a
+//           pending Replace: DELETE it; finished: its active record goes
+//           (and a success newer than `s` is `s`); else its active record
+//   prune   an active record whose Job is gone goes
+//   history a finished Job -> its CronJob's limits -> COUNT newer Jobs of
+//           the same outcome -> past successfulJobsHistoryLimit (3) or
+//           failedJobsHistoryLimit (1): DELETE it (its Pods follow, gc.uproc)
+//   status  /cronjobs.batch/ + its active records + /cron-last/ -> status
+module nanocloud.cronjob {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum PATCH = 5;
+  enum MERGE = 6;
+  enum CREATE = 8;
+  enum COUNT = 12;
+
+  // ---- run ----
+  message cj.Cron {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<cj>"
+    policy: string = 4;   // spec.concurrencyPolicy
+    suspend: string = 5;
+    sdS: string = 6;      // spec.startingDeadlineSeconds
+    uid: string = 7;
+    active: int = 22;     // its active Jobs (count_children)
+    ns: string = 28;
+    name: string = 29;
+    created: int = 50;    // metadata.creationTimestamp, Unix s
+    sd: int = 51;         // spec.startingDeadlineSeconds
+    t: int = 70;          // /cron-last/ (related)
+    t0: int = 71;
+    rp: int = 72;
+    prev: int = 160;      // the latest scheduled minute (`cron`), Unix ms
+    now: int = 162;
+    prevts: string = 163; // the same, RFC 3339
+  }
+  // carried by: cj.Act, cj.Acted
+  message CCtx {
+    key: string = 1;
+    prev: int = 2;
+    did: string = 3;      // "run" | ""
+  }
+  message cj.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: int = 17;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;   p4: int = 7;
+    p5: string = 8;   p6: string = 9;   p7: string = 10;  p8: string = 11;
+    p9: string = 12;  p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    p14: string = 80; p15: string = 81; p16: string = 82;
+    src: string = 70;     // splice source: the CronJob's key tail
+    splice: string = 71;  // what is spliced from it, and where
+    ctx: CCtx = 254;
+  }
+  decision run(c: cj.Cron) -> cj.Act {
+    when c.suspend == "true" || c.prev <= 0 || c.uid == "" ->
+      cj.Act { cid: c.seq, op: NOOP, key: "", ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    when c.t == 0 && c.t0 == 0 ->
+      cj.Act { cid: c.seq, op: MERGE, key: "cron-last/" + c.key, p1: "t0=", p4: c.created * 1000,
+               ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    when c.prev <= math.greatest(c.t, c.t0) ->
+      cj.Act { cid: c.seq, op: NOOP, key: "", ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    when c.sdS != "" && c.now - c.prev > c.sd * 1000 ->
+      cj.Act { cid: c.seq, op: MERGE, key: "cron-last/" + c.key, p1: "t=", p4: c.prev,
+               ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    when c.policy == "Forbid" && c.active > 0 ->
+      cj.Act { cid: c.seq, op: NOOP, key: "", ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    when c.policy == "Replace" && c.active > 0 ->
+      cj.Act { cid: c.seq, op: MERGE, key: "cron-last/" + c.key, p1: "rp=", p4: c.prev,
+               ctx: CCtx { key: c.key, prev: 0, did: "" } };
+    // The Job as upstream's CronJob controller makes it from jobTemplate:
+    // its labels, its annotations beside the scheduled time, its spec —
+    // SPLICED from the stored CronJob by the writer, so a template of any
+    // size arrives whole; only names and times cross this decision.
+    default ->
+      cj.Act { cid: c.seq, op: CREATE, key: "jobs.batch/" + c.key + "-", k2: c.prev / 60000,
+               p1: "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"name\":\"", p2: c.name,
+               p3: "-", p4: c.prev / 60000, p5: "\",\"namespace\":\"", p6: c.ns,
+               p7: "\",\"labels\":{",
+               p8: "},\"annotations\":{\"batch.kubernetes.io/cronjob-scheduled-timestamp\":\"", p9: c.prevts,
+               p10: "\"",
+               p11: "},\"ownerReferences\":[{\"apiVersion\":\"batch/v1\",\"kind\":\"CronJob\",\"name\":\"", p12: c.name,
+               p13: "\",\"uid\":\"", p14: c.uid,
+               p15: "\",\"controller\":true,\"blockOwnerDeletion\":true}]},\"spec\":", p16: "}",
+               src: c.key,
+               splice: "/cronjobs.batch/|11=spec.jobTemplate.metadata.labels.*;14=,spec.jobTemplate.metadata.annotations.*;82=spec.jobTemplate.spec",
+               ctx: CCtx { key: c.key, prev: c.prev, did: "run" } };
+  }
+  message cj.Acted {
+    cid: int = 1;
+    status: int = 2;
+    ctx: CCtx = 254;
+  }
+  message cj.Rec {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5;
+  }
+  // The run is recorded once its Job exists (created now, or before).
+  decision rec(a: cj.Acted) -> cj.Rec {
+    when a.ctx.did == "run" && (a.status == 200 || a.status == 409) ->
+      cj.Rec { cid: a.cid, op: MERGE, key: "cron-last/" + a.ctx.key, v1: "t=", v2: a.ctx.prev };
+    default ->
+      cj.Rec { cid: a.cid, op: NOOP, key: "" };
+  }
+
+  // ---- active ----
+  message cj.Job {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<job>"
+    owner: string = 4;    // metadata.ownerReferences.0.name (a CronJob's: `where`)
+    uid: string = 5;
+    complete: string = 6; // status.conditions[type=Complete].status
+    failed: string = 7;   // status.conditions[type=Failed].status
+    del: string = 8;      // metadata.deletionTimestamp
+    ns: string = 28;
+    name: string = 29;
+    sched: int = 50;      // its scheduled time, Unix s (annotation, `!unix`)
+    done: int = 51;       // status.completionTime, Unix s
+  }
+  // carried by: cj.Ask, cj.Last
+  message ACtx {
+    job: string = 1;      // "<ns>/<job>"
+    rec: string = 2;      // "<ns>/<cj>/<job>"
+    uid: string = 3;      // the Job's, for its ObjectReference
+    state: string = 4;    // "done" | "ok" (succeeded) | "run"
+    sched: int = 5;
+    done: int = 6;
+    cj: string = 7;       // "<ns>/<cj>"
+    ns: string = 8;
+    name: string = 9;
+  }
+  message cj.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: ACtx = 254;
+  }
+  decision a0(j: cj.Job) -> cj.Ask {
+    when j.owner == "" ->
+      cj.Ask { cid: j.seq, op: NOOP, key: "", ctx: ACtx { job: "", rec: "", uid: "", state: "", sched: 0, done: 0, cj: "", ns: "", name: "" } };
+    when j.complete == "True" ->
+      cj.Ask { cid: j.seq, op: GET, key: "cron-last/" + j.ns + "/" + j.owner,
+               ctx: ACtx { job: j.key, rec: j.ns + "/" + j.owner + "/" + j.name, uid: "", state: "ok", sched: j.sched, done: j.done, cj: j.ns + "/" + j.owner, ns: j.ns, name: j.name } };
+    when j.failed == "True" || j.del != "" ->
+      cj.Ask { cid: j.seq, op: GET, key: "cron-last/" + j.ns + "/" + j.owner,
+               ctx: ACtx { job: j.key, rec: j.ns + "/" + j.owner + "/" + j.name, uid: "", state: "done", sched: j.sched, done: 0, cj: j.ns + "/" + j.owner, ns: j.ns, name: j.name } };
+    default ->
+      cj.Ask { cid: j.seq, op: GET, key: "cron-last/" + j.ns + "/" + j.owner,
+               ctx: ACtx { job: j.key, rec: j.ns + "/" + j.owner + "/" + j.name, uid: j.uid,
+                           state: "run", sched: j.sched, done: 0, cj: j.ns + "/" + j.owner, ns: j.ns, name: j.name } };
+  }
+  message cj.Last {
+    cid: int = 1;
+    status: int = 2;
+    rp: int = 50;         // /cron-last/ (`ints`, flat)
+    s: int = 51;
+    ctx: ACtx = 254;
+  }
+  message cj.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9; v7: string = 10;
+    ctx: ACtx = 254;
+  }
+  decision a1(l: cj.Last) -> cj.Put {
+    when l.ctx.job == "" ->
+      cj.Put { cid: l.cid, op: NOOP, key: "", ctx: l.ctx };
+    when l.ctx.state == "run" && l.rp > 0 && l.ctx.sched * 1000 < l.rp ->
+      cj.Put { cid: l.cid, op: DELETE, key: "jobs.batch/" + l.ctx.job, ctx: l.ctx };
+    when l.ctx.state == "run" ->
+      cj.Put { cid: l.cid, op: PUT, key: "cron-active/" + l.ctx.rec,
+               v1: "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"name\":\"", v2: l.ctx.name,
+               v3: "\",\"namespace\":\"", v4: l.ctx.ns, v5: "\",\"uid\":\"", v6: l.ctx.uid, v7: "\"}", ctx: l.ctx };
+    default ->
+      cj.Put { cid: l.cid, op: DELETE, key: "cron-active/" + l.ctx.rec,
+               ctx: ACtx { job: l.ctx.job, rec: l.ctx.rec, uid: "", state: l.ctx.state, sched: l.ctx.sched,
+                           done: l.ctx.done * math.least(1, math.greatest(0, l.ctx.done * 1000 - l.s)), cj: l.ctx.cj, ns: "", name: "" } };
+  }
+  message cj.Put_ {
+    cid: int = 1;
+    status: int = 2;
+    ctx: ACtx = 254;
+  }
+  message cj.Merge {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5;
+  }
+  // A success newer than the last recorded is the last.
+  decision a2(p: cj.Put_) -> cj.Merge {
+    when p.ctx.state == "ok" && p.ctx.done > 0 ->
+      cj.Merge { cid: p.cid, op: MERGE, key: "cron-last/" + p.ctx.cj, v1: "s=", v2: p.ctx.done * 1000 };
+    default ->
+      cj.Merge { cid: p.cid, op: NOOP, key: "" };
+  }
+
+  pipeline run_p(c: cj.Cron) -> cj.Act { call x = run(c); return x; }
+  pipeline rec_p(a: cj.Acted) -> cj.Rec { call x = rec(a); return x; }
+  pipeline a0_p(j: cj.Job) -> cj.Ask { call x = a0(j); return x; }
+  pipeline a1_p(l: cj.Last) -> cj.Put { call x = a1(l); return x; }
+  pipeline a2_p(p: cj.Put_) -> cj.Merge { call x = a2(p); return x; }
+  // No `entry` lines: a graph names its pipeline.
+  provenance revision "cronjob" toolchain "chronicle-authoring";
+}

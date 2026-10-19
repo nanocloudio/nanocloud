@@ -1,0 +1,182 @@
+// A Pod's image pull credentials, as the node's image plane offers them: its
+// imagePullSecrets — or, when it states none, its ServiceAccount's (what
+// upstream's ServiceAccount admission copies into a Pod it admits) — named
+// for the pull its image resolves through.
+//
+//   pa1  /pod-specs/<uid> with an image to pull -> GET /pods/<ns>/<name>
+//        (spec.imagePullSecrets[].name, spec.serviceAccountName); one being
+//        deleted -> its record DELETEd
+//   pa2  none stated -> GET /serviceaccounts/<ns>/<sa> (imagePullSecrets)
+//        (`default` when the Pod names no ServiceAccount)
+//   pa3  -> /image-pull-auth/<uid> `rk=<pull>;s=<ns>/<name>,…`, or DELETEd
+//        when there are none. <pull> is the request the Pod's image resolves
+//        through (/image-requests/<rk>, pod_image.uproc): the reference's
+//        store-key spelling, or the Pod's uid when its imagePullPolicy is
+//        Always (stated, or upstream's default for `:latest` and no tag)
+//   pa4  a record that CHANGED -> the pull's manifest row read (its
+//        revision), and
+//   pa5  -> its backoff cleared (`fails=;due=` merged, conditional on that
+//        revision): a Pod that brings credentials to a pull another Pod's
+//        refusal is backing off is not made to wait out that Pod's delay
+//
+// http_fetch (its `pull_auth` prefix) answers a registry's challenge with
+// each Secret the records for a request name, in turn — each one's `auths`
+// entry for the registry (_shared/regcred.rs) — then the node's own
+// credentials, then none.
+//
+// What a Pod without credentials may run, per upstream's default (the
+// kubelet's alpha `ensureImagePullCredentials` off): an image is pulled with
+// the credentials of the Pods that ask for it, and once it is on the node an
+// IfNotPresent Pod runs it whatever credentials it brings — as a kubelet
+// runs any image already present. A Pod that must be refused what it cannot
+// pull itself states imagePullPolicy Always (or uses `:latest`): its pull is
+// its own (`rk` = its uid), asked of the registry with its own credentials
+// alone, and a 401 is its ErrImagePull.
+module nanocloud.image_auth {
+
+  // carried by: Ask, Got, Rec, Put
+  message Ctx {
+    uid: string = 30;
+    rk: string = 31;       // the pull
+    ns: string = 32;
+    list: string = 33;     // the Pod's imagePullSecrets, by name
+    del: string = 34;      // "1": the Pod is being deleted
+    put: string = 35;      // "1": the record is written (not removed)
+  }
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  message Spec {
+    seq: int = 1;
+    key: string = 3;       // uid
+    image: string = 4;
+    ikey: string = 5;      // image!ikey
+    tag: string = 6;       // image!tag
+    pin: string = 7;       // image!pin
+    pull: string = 8;      // imagePullPolicy
+    pod: string = 9;       // <ns>/<name>
+    desired: string = 10;
+    rootfs: string = 11;   // an explicit rootfs: not an image to pull
+  }
+  message Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    ctx: Ctx = 254;
+  }
+  decision pa1(s: Spec) -> Ask {
+    when s.desired == "deleted" ->
+      Ask { cid: s.seq, op: DELETE, key: "/image-pull-auth/", k2: s.key,
+            ctx: Ctx { uid: s.key, rk: "", ns: "", list: "", del: "1", put: "" } };
+    when s.image == "" || s.rootfs != "" || s.ikey == "" || s.pull == "Never" || s.pod.indexOf("/") <= 0 ->
+      Ask { cid: s.seq, op: NOOP, key: "", k2: "",
+            ctx: Ctx { uid: "", rk: "", ns: "", list: "", del: "", put: "" } };
+    when s.pull == "Always" || (s.pull != "IfNotPresent" && s.pin == "" && s.tag == "latest") ->
+      Ask { cid: s.seq, op: GET, key: "/pods/", k2: s.pod,
+            ctx: Ctx { uid: s.key, rk: s.key, ns: s.pod.substring(0, s.pod.indexOf("/")), list: "", del: "", put: "" } };
+    default ->
+      Ask { cid: s.seq, op: GET, key: "/pods/", k2: s.pod,
+            ctx: Ctx { uid: s.key, rk: s.ikey, ns: s.pod.substring(0, s.pod.indexOf("/")), list: "", del: "", put: "" } };
+  }
+
+  message Got {
+    cid: int = 1;
+    status: int = 2;
+    p0: string = 40;       // the Pod's imagePullSecrets (pa1), or its
+                           // ServiceAccount's (pa2), names comma-joined
+    p1: string = 41;       // spec.serviceAccountName (pa1)
+    rev: int = 59;         // the key's revision (pa4)
+    ctx: Ctx = 254;
+  }
+  decision pa2(g: Got) -> Ask {
+    when g.ctx.uid == "" || g.ctx.del == "1" || g.status != 200 ->
+      Ask { cid: g.cid, op: NOOP, key: "", k2: "",
+            ctx: Ctx { uid: "", rk: "", ns: "", list: "", del: "", put: "" } };
+    when g.p0 != "" ->
+      Ask { cid: g.cid, op: NOOP, key: "", k2: "",
+            ctx: Ctx { uid: g.ctx.uid, rk: g.ctx.rk, ns: g.ctx.ns, list: g.p0, del: "", put: "" } };
+    when g.p1 != "" ->
+      Ask { cid: g.cid, op: GET, key: "/serviceaccounts/", k2: g.ctx.ns + "/" + g.p1, ctx: g.ctx };
+    default ->
+      Ask { cid: g.cid, op: GET, key: "/serviceaccounts/", k2: g.ctx.ns + "/default", ctx: g.ctx };
+  }
+
+  message Rec {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8; v6: string = 9;
+    ctx: Ctx = 254;
+  }
+  decision pa3(g: Got) -> Rec {
+    when g.ctx.uid == "" ->
+      Rec { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", ctx: g.ctx };
+    when g.ctx.list != "" ->
+      Rec { cid: g.cid, op: PUT, key: "/image-pull-auth/", k2: g.ctx.uid,
+            v1: "rk=", v2: g.ctx.rk, v3: ";s=", v4: g.ctx.ns, v5: "/", v6: g.ctx.list,
+            ctx: Ctx { uid: g.ctx.uid, rk: g.ctx.rk, ns: g.ctx.ns, list: g.ctx.list, del: "", put: "1" } };
+    when g.status == 200 && has(g.p0) && g.p0 != "" ->
+      Rec { cid: g.cid, op: PUT, key: "/image-pull-auth/", k2: g.ctx.uid,
+            v1: "rk=", v2: g.ctx.rk, v3: ";s=", v4: g.ctx.ns, v5: "/", v6: g.p0,
+            ctx: Ctx { uid: g.ctx.uid, rk: g.ctx.rk, ns: g.ctx.ns, list: g.p0, del: "", put: "1" } };
+    // None, here or on its ServiceAccount (or no ServiceAccount at all):
+    // the Pod offers nothing — any record it had is gone.
+    default ->
+      Rec { cid: g.cid, op: DELETE, key: "/image-pull-auth/", k2: g.ctx.uid,
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", ctx: g.ctx };
+  }
+
+  // A record that changed (200; 204 is a PUT that found it as it was):
+  // the pull's manifest row, read for its revision.
+  message Done {
+    cid: int = 1;
+    status: int = 2;
+    ctx: Ctx = 254;
+  }
+  decision pa4(d: Done) -> Ask {
+    when d.status == 200 && d.ctx.put == "1" && d.ctx.rk != "" ->
+      Ask { cid: d.cid, op: EXISTS, key: "/image-fetch-q/m-", k2: d.ctx.rk, ctx: d.ctx };
+    default ->
+      Ask { cid: d.cid, op: NOOP, key: "", k2: "", ctx: d.ctx };
+  }
+  message Clear {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: string = 17;
+    v1: string = 4;
+    rev: int = 28;         // conditional: never recreates a row now gone
+  }
+  decision pa5(g: Got) -> Clear {
+    when g.status == 200 && g.ctx.put == "1" && g.ctx.rk != "" && has(g.rev) && g.rev > 0 ->
+      Clear { cid: g.cid, op: MERGE, key: "/image-fetch-q/m-", k2: g.ctx.rk, v1: "fails=;due=", rev: g.rev };
+    default ->
+      Clear { cid: g.cid, op: NOOP, key: "", k2: "", v1: "", rev: 0 };
+  }
+
+  transformation t_spec(s: Spec) -> Spec {
+    Spec { seq: s.seq, key: s.key, image: s.image, ikey: s.ikey, tag: s.tag, pin: s.pin, pull: s.pull,
+           pod: s.pod, desired: s.desired, rootfs: s.rootfs }
+  }
+  transformation t_got(g: Got) -> Got {
+    Got { cid: g.cid, status: g.status, p0: g.p0, p1: g.p1, rev: g.rev, ctx: g.ctx }
+  }
+  transformation t_done(d: Done) -> Done { Done { cid: d.cid, status: d.status, ctx: d.ctx } }
+  pipeline ia_1(s: Spec) -> Ask { call x = t_spec(s); call y = pa1(x); return y; }
+  pipeline ia_2(g: Got) -> Ask { call x = t_got(g); call y = pa2(x); return y; }
+  pipeline ia_3(g: Got) -> Rec { call x = t_got(g); call y = pa3(x); return y; }
+  pipeline ia_4(d: Done) -> Ask { call x = t_done(d); call y = pa4(x); return y; }
+  pipeline ia_5(g: Got) -> Clear { call x = t_got(g); call y = pa5(x); return y; }
+  entry ia_1 = ia_1;
+  entry ia_2 = ia_2;
+  entry ia_3 = ia_3;
+  entry ia_4 = ia_4;
+  entry ia_5 = ia_5;
+  provenance revision "image-auth" toolchain "chronicle-authoring";
+}

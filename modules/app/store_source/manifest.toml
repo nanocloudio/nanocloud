@@ -85,6 +85,8 @@ hardware_targets = ["bcm2712", "linux"]
 # keyed `<ns>/<svc>/<pod>` can ask after its Service; `^<n>+<leaf>` is that
 # parent's `<leaf>` child (a session's `status` beside its `ctl`), and a large
 # `n` strips the whole tail — the prefix itself, a fixed record like a config.
+# `<prefix>~` looks up the tail up to its first `~`: a Pod's container keyed
+# `<uid>~<container>` asks after the Pod's own records at `<uid>`.
 # A `paths` entry `a[].b` collects member `b` of every element of the array
 # `a`, comma-joined, one entry per element (`-` where it has none) — the ports
 # of a rule, the peers of a policy. `expand = a[]+` is one record per element
@@ -138,6 +140,27 @@ hardware_targets = ["bcm2712", "linux"]
 # `expand`: the two meanings of field 20 are different and never both emitted.
 # `now`/`due` read the monotonic clock. Correct under any cadence — the value
 # is real elapsed time, never a tick count — which is what wall_clock means.
+# `expand = <path>{}` is one record per MEMBER of the object at <path> (a
+# ResourceQuota's spec.hard): `#` in a path is the member's key, and 21 is the
+# key. A dotted path segment in double quotes is one key, dots and all
+# (`metadata.annotations."batch.kubernetes.io/x"`). `related` paths take `.*`
+# (an object's members) as `paths` do.
+# Moments (_shared/moment.rs): `<path>!wjts` renders a recorded moment as a
+# JSON time, or null while it cannot be said; `<path>!due+<path>` (in `ints`
+# and `due`) is a moment plus the ms at the second path, as this boot's
+# monotonic ms (a start plus a deadline's length) — re-based to that length
+# when the moment is another boot's.
+# `capacity = <text>` stamps 46 (a node's capacity, JSON members).
+# `sched = "<nodes>:<pods>[:<pdbs>]"` with a `join` over the ready nodes and
+# `count = 1` is the scheduler's pick (_shared/sched.rs): 21 the node, 66 why
+# nothing fits, position 0 the first placeable Pod of the highest priority
+# (-1 one nothing fits); `sched_preempt = 1` one record per preemption victim
+# (68 the node, 69 the victim). `sched_noexec = 1`: 66 (i64) what a bound
+# Pod's node's NoExecute taints do (0 nothing, -1 evict, else seconds).
+# `cron = "<schedule path>|<zone path>"` (_shared/cron.rs): 160 the latest
+# scheduled minute at or before now, 161 the next, 162 now (Unix ms), 163 the
+# first as RFC 3339 — against the TRUSTED clock only (all 0 until it is); the
+# next minute arms the timer.
 timer_class = "wall_clock"
 
 # The store pushes namespace.change events onto this input. The graph allocates

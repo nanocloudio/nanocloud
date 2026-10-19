@@ -1,0 +1,65 @@
+name = "svc_alloc"
+version = "0.1.0"
+description = "NodePort and LoadBalancer allocation: a Service's node ports and its load-balancer address, each claimed once in the store"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# What the API server's allocators and a minimal in-cluster load balancer
+# (MetalLB's layer-2 mode, less the announcement) do for a Service:
+#
+#   type NodePort or LoadBalancer
+#       every port without a `nodePort` is given one from `node_ports`
+#       (default 30000-32767), written into `spec.ports[i].nodePort`
+#   type LoadBalancer, with `lb_pool` set
+#       one address of the pool, written as `status.loadBalancer.ingress`
+#       (`[{"ip":…}]`); without a pool the Service stays pending, as it
+#       does upstream with no load-balancer controller
+#
+# Uniqueness is the store's: a port is held by the key
+# `/ipam/nodeport/<port>`, an address by `/ipam/lb/<address as u32>`, each
+# CREATED under the ABSENT precondition with the owner (`<ns>/<name>`) as its
+# value. One action per step, in this order, so nothing is handed out twice:
+#
+#   claim     a port or address a Service already holds (its own, or one an
+#             operator wrote) and nobody has claimed is claimed for it
+#   release   a claim whose owner is gone, or no longer holds it (another
+#             type, another port, another address), is deleted
+#   allocate  the first Service still owed a port or an address gets the
+#             lowest free one at or after the module's cursor, its object
+#             written back conditional on the revision read — and is claimed
+#             by the next pass's `claim`, before anything else is allocated
+#
+# A port two Services both name (written so by hand) is claimed by the first
+# and said once for the other; its traffic is the proxy's to merge.
+# A write the store answers EINPROGRESS is asked again, byte-identical, before
+# anything else; a read answered EAGAIN drops the pass and runs it again.
+#
+# Parameters:
+# | Tag | Name       | Type | Default     | Description |
+# |-----|------------|------|-------------|-------------|
+# | 1   | node_ports | str  | 30000-32767 | the NodePort range, `<lo>-<hi>` |
+# | 2   | lb_pool    | str  | (none)      | the load-balancer pool, `<a.b.c.d>/<n>` (its network and broadcast addresses excepted) |
+timer_class = "agnostic"
+
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane allocator — one store action per change, not a data path"
