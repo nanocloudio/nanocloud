@@ -1,33 +1,59 @@
-// A deleted object's tombstone, at its end. store_doc leaves the object's
-// last state at /~tomb/<collection>/<ns>/<name> with a deadline, for a
-// watch's DELETED event; at the deadline the tomb goes:
+// A deleted object's tombstone, at its end. A writer (store_doc,
+// store_effect `tomb`) leaves the object's last state at
+// /~tomb/<collection>/<ns>/<name> = {"deadline":…,"obj":…}, for a watch's
+// DELETED event, and indexes its end at /~tomb-at/<same> =
+// {"deadline":<moment>,"ttl":<ms>,"obj":<identity>} (_shared/tomb.rs). The
+// source scans the INDEX, never the tomb: an index entry is small whatever
+// the object's size, and carries what this chain reads (the uid, the node)
+// at the tomb's own paths — so a 1 MiB tomb, or a Pod's past a record, ends
+// at its deadline and drops its node spec like any other. The deadline is a
+// moment the source reads as this boot's monotonic ms (`!due:ttl`): wall
+// time survives a restart; another boot's monotonic time is re-based to its
+// ttl past this boot. At the deadline:
 //
-//   ex     the tomb, due -> DELETE it, carrying what it was (its uid, its
-//          node) to the step after
-//   spec   a Pod's tomb gone -> DELETE /~node/<node>/pod-specs/<uid>
+//   ex      the index entry, due -> DROP_EACH tomb,tomb-at: the tomb and its
+//           entry go together, carrying what the tomb was (its uid, its
+//           node) to the step after
+//   ex_any  the same, for a graph that carries nothing on (the API plane)
+//   spec    a Pod's tomb gone -> DELETE /~node/<node>/pod-specs/<uid>
 //
 // A Pod's node spec (pod_specs.uproc) says `desired=deleted` while its tomb
-// lives — rewritten from the tomb, so a node catching up still reads the
-// delete. When the tomb is gone the spec goes too, and with it every record
-// the node keeps for that Pod (pod_project.uproc `prune`): nothing else ever
-// removes them, and a node's records would grow by every Pod it ran.
+// lives — rewritten from the tomb's index, so a node catching up still reads
+// the delete. When the tomb is gone the spec goes too, and with it every
+// record the node keeps for that Pod (pod_project.uproc `prune`): nothing
+// else ever removes them, and a node's records would grow by every Pod it
+// ran.
 module nanocloud.tomb {
   message tb.Rec {
     seq: int = 1;
     rev: int = 2;
     key: string = 3;      // "<collection>/<ns>/<name>"
-    uid: string = 4;      // obj.metadata.uid
+    deadline: int = 50;   // ints = deadline!due:ttl (this boot's monotonic ms)
+    now: int = 58;
+    uid: string = 4;      // obj.metadata.uid (the index's identity)
     node: string = 5;     // obj.spec.nodeName
-    deadline: int = 50;   // ints = deadline (ms, monotonic)
+  }
+  message tb.At {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    deadline: int = 50;
     now: int = 58;
   }
   message tb.Act {
     cid: int = 1;
     op: int = 2;
     key: string = 3;
+    names: string = 4;
     c_key: string = 30;
     c_uid: string = 31;
     c_node: string = 32;
+  }
+  message tb.Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    names: string = 4;
   }
   message tb.Gone {
     cid: int = 1;
@@ -43,12 +69,20 @@ module nanocloud.tomb {
   }
   enum NOOP = 0;
   enum DELETE = 4;
+  enum DROP_EACH = 18;
 
   decision expire(r: tb.Rec) -> tb.Act {
     when r.deadline > 0 && r.now >= r.deadline ->
-      tb.Act { cid: r.seq, op: DELETE, key: r.key, c_key: r.key, c_uid: r.uid, c_node: r.node };
+      tb.Act { cid: r.seq, op: DROP_EACH, key: r.key, names: "tomb,tomb-at",
+               c_key: r.key, c_uid: r.uid, c_node: r.node };
     default ->
-      tb.Act { cid: r.seq, op: NOOP, key: "", c_key: "", c_uid: "", c_node: "" };
+      tb.Act { cid: r.seq, op: NOOP, key: "", names: "", c_key: "", c_uid: "", c_node: "" };
+  }
+  decision expire_any(r: tb.At) -> tb.Drop {
+    when r.deadline > 0 && r.now >= r.deadline ->
+      tb.Drop { cid: r.seq, op: DROP_EACH, key: r.key, names: "tomb,tomb-at" };
+    default ->
+      tb.Drop { cid: r.seq, op: NOOP, key: "", names: "" };
   }
   // A Pod's tomb, gone: its node spec goes with it. `has` guards the carry:
   // another collection's tomb names no uid or node, and a `when` that read
@@ -65,12 +99,17 @@ module nanocloud.tomb {
     tb.Rec { seq: r.seq, rev: r.rev, key: r.key, uid: r.uid, node: r.node,
              deadline: r.deadline, now: r.now }
   }
+  transformation pass_at(r: tb.At) -> tb.At {
+    tb.At { seq: r.seq, rev: r.rev, key: r.key, deadline: r.deadline, now: r.now }
+  }
   transformation pass_gone(g: tb.Gone) -> tb.Gone {
     tb.Gone { cid: g.cid, status: g.status, c_key: g.c_key, c_uid: g.c_uid, c_node: g.c_node }
   }
   pipeline ex(r: tb.Rec) -> tb.Act { call x = pass(r); call y = expire(x); return y; }
+  pipeline ex_any(r: tb.At) -> tb.Drop { call x = pass_at(r); call y = expire_any(x); return y; }
   pipeline spec_p(g: tb.Gone) -> tb.Del { call x = pass_gone(g); call y = spec(x); return y; }
   entry ex = ex;
+  entry ex_any = ex_any;
   entry spec_p = spec_p;
-  provenance revision "tomb" toolchain "chronicle-authoring";
+  provenance revision "tomb-at-moment" toolchain "chronicle-authoring";
 }

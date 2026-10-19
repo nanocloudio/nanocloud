@@ -324,6 +324,9 @@ struct State {
     scan_now: i64,
     /// Earliest deadline ahead of `scan_now` seen this scan; i64::MAX = none.
     next_due: i64,
+    /// Deadlines `!due` re-based to this boot (another boot's, or a wall
+    /// time with the clock untrusted): counted, said at the 1st, 2nd, 4th…
+    rebased: core::cell::Cell<u32>,
     /// `recheck = <ms>`: while a `!wall` projection read a moment it could
     /// not yet say as wall-clock time (the node's clock untrusted), the
     /// source scans again that long after — the clock's becoming trusted is
@@ -1865,14 +1868,18 @@ unsafe fn project(
                     j_path(value, &segs[..ns]).unwrap_or(&[])
                 };
                 let mut modbuf = [0u8; 64];
+                let due = match modifier {
+                    Some(m) => due_moment(s, value, raw, m),
+                    None => None,
+                };
                 let raw = match modifier {
-                    Some(m) => {
+                    Some(m) if due.is_none() => {
                         let n = apply_mod(m, raw, &mut modbuf);
                         &modbuf[..n]
                     }
-                    None => raw,
+                    _ => raw,
                 };
-                let v = parse_dec_u64(raw) as i64;
+                let v = due.unwrap_or_else(|| parse_dec_u64(raw) as i64);
                 let Some(q) = put_field(out, p, fno, TY_I64, &v.to_le_bytes()) else {
                     return 0;
                 };
@@ -3371,6 +3378,8 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                     None => (one, 0),
                 };
                 if !one.is_empty() {
+                    // `<path>!due:<ttl path>`: a deadline moment ([`due_moment`]).
+                    let (one, modifier) = split_mod(one);
                     let raw = if s.flat != 0 {
                         flat_field(&val[..vlen], one).unwrap_or(&[])
                     } else {
@@ -3378,7 +3387,10 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                         let ns = split_dots(one, &mut segs);
                         j_path(&val[..vlen], &segs[..ns]).unwrap_or(&[])
                     };
-                    let t = parse_dec_u64(raw) as i64;
+                    let t = match modifier.and_then(|m| due_moment(s, &val[..vlen], raw, m)) {
+                        Some(d) => d,
+                        None => parse_dec_u64(raw) as i64,
+                    };
                     if t != 0 {
                         let d = t.saturating_add(after);
                         if d > s.scan_now && d < s.next_due {
@@ -3748,6 +3760,7 @@ pub unsafe extern "C" fn module_new(
         s.timer_fd = -1;
         s.scan_now = 0;
         s.next_due = i64::MAX;
+        s.rebased = core::cell::Cell::new(0);
         s.child_sep = b'-';
         s.expand_over_len = 0;
         s.count_children_len = 0;
@@ -4078,6 +4091,9 @@ const WIRE_CHUNK: usize = 2048;
 /// The largest object the watch connector reads whole (a request body may be
 /// 3 MiB; Kubernetes stores up to ~1.5 MiB).
 const DOC_MAX: usize = 3 << 20;
+/// A tomb's wrapping past the object it holds (`{"deadline":<ms>,"obj":…}`):
+/// a tomb of an object at [`DOC_MAX`] is still read whole.
+const TOMB_SLACK: usize = 4096;
 /// A change-feed batch grown on the heap stops here: past it, 410.
 const EVH_MAX: usize = 16 << 20;
 /// `ENOMEM`: the provider's answer when a CHANGES batch outgrows the buffer.
@@ -4577,10 +4593,22 @@ unsafe fn event_emit(
     wire_emit_body(s, wi, t, k, rev, o, body, &pre[..a], &post[..b], true)
 }
 
-/// The object a DELETED event carries: the tombstone store_effect left
-/// (`tomb` + the key, its `obj`), else what the key itself says — name and namespace
-/// under the registration's kind — so a client can still drop it by key.
-unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> usize {
+/// The object a DELETED event carries: the tombstone a writer left (`tomb`
+/// followed by the key, its `obj`) — whole: a tomb past a record is read onto the
+/// heap (the `big` variant, up to [`DOC_MAX`] + [`TOMB_SLACK`]) and the
+/// object answered from there (`Del::Heap`, which the caller frees) — else
+/// what the key itself says, name and namespace under the registration's
+/// kind, so a client can still drop it by key. That fallback is the
+/// registered limit: a tomb this build cannot hold (store_source, which has
+/// no heap, or one past the bound) carries the identity, and says so.
+enum Del {
+    /// `out[..n]`.
+    Stack(usize),
+    /// The tomb on the heap at `p`; its object at `off..off + n`.
+    Heap(*mut u8, usize, usize),
+}
+
+unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> Del {
     let sys = &*s.syscalls;
     if s.tomb_len > 0 {
         let mut tk = [0u8; MAX_KEY + 16];
@@ -4588,13 +4616,28 @@ unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> u
         let kl = append_bytes(&mut tk, a, key);
         let mut tv = [0u8; MAX_VALUE];
         if kl <= MAX_KEY {
-            if let Some(n) = get_value(sys, &tk[..kl], &mut tv, &s.waited) {
-                if let Some(obj) = j_sub1(&tv[..n], b"obj") {
-                    if let Some(dst) = out.get_mut(..obj.len()) {
-                        dst.copy_from_slice(obj);
-                        return obj.len();
+            match read_value(sys, &tk[..kl], &mut tv, &s.waited) {
+                Val::Stack(n) => {
+                    if let Some(obj) = tv.get(..n).and_then(|t| j_sub1(t, b"obj")) {
+                        if let Some(dst) = out.get_mut(..obj.len()) {
+                            dst.copy_from_slice(obj);
+                            return Del::Stack(obj.len());
+                        }
                     }
                 }
+                Val::Heap(p, n) => {
+                    let t = core::slice::from_raw_parts(p, n);
+                    if let Some(obj) = j_sub1(t, b"obj") {
+                        let off = obj.as_ptr() as usize - p as usize;
+                        return Del::Heap(p, off, obj.len());
+                    }
+                    heap_free(sys, p);
+                }
+                Val::TooBig => {
+                    let m = b"[store_source] a tomb past this build's bound - the DELETED event carries the object's identity only";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                }
+                Val::Missing => {}
             }
         }
     }
@@ -4626,9 +4669,9 @@ unsafe fn deleted_object(s: &State, key: &[u8], reg: &[u8], out: &mut [u8]) -> u
             && put(out, &mut l, b"\"");
     }
     if ok && put(out, &mut l, b"}}") {
-        l
+        Del::Stack(l)
     } else {
-        0
+        Del::Stack(0)
     }
 }
 
@@ -4905,11 +4948,11 @@ unsafe fn read_heap(sys: &SyscallTable, h: i32, key: &[u8], w: &Wait) -> Val {
         if len < cap {
             return Val::Heap(p, len);
         }
-        if cap >= DOC_MAX {
+        if cap >= DOC_MAX + TOMB_SLACK {
             heap_free(sys, p);
             return Val::TooBig;
         }
-        cap = (cap * 2).min(DOC_MAX);
+        cap = (cap * 2).min(DOC_MAX + TOMB_SLACK);
         p = heap_realloc(sys, p, cap as u32);
     }
 }
@@ -5828,11 +5871,18 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
     let mut key = [0u8; MAX_KEY];
     key[..kl].copy_from_slice(&b[ks..ks + kl]);
     let mut raw = [0u8; MAX_VALUE];
+    // A tomb read whole onto the heap: freed once the event is emitted.
+    let mut tomb_heap: *mut u8 = core::ptr::null_mut();
     let doc: &[u8] = if kind == 2 {
         let mut reg = [0u8; MAX_VALUE];
         let rl = get_value(sys, reg_key, &mut reg, &s.waited).unwrap_or(0);
-        let n = deleted_object(s, &key[..kl], &reg[..rl], &mut raw);
-        &raw[..n]
+        match deleted_object(s, &key[..kl], &reg[..rl], &mut raw) {
+            Del::Stack(n) => raw.get(..n).unwrap_or(&[]),
+            Del::Heap(p, off, n) => {
+                tomb_heap = p;
+                core::slice::from_raw_parts(p.add(off), n)
+            }
+        }
     } else {
         &b[ks + kl..ks + kl + vl]
     };
@@ -5908,6 +5958,9 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
     }
     if !tp.is_null() {
         heap_free(sys, tp);
+    }
+    if !tomb_heap.is_null() {
+        heap_free(sys, tomb_heap);
     }
     if sent == Emit::Sent {
         return true;
@@ -5991,6 +6044,36 @@ const TIMER_CANCEL: u32 = 0x0606;
 /// Arm the kernel timer for the earliest deadline ahead (or cancel it when
 /// none is), at the end of a scan. The kernel wakes this module when it
 /// fires; `module_step` sees POLL_IN and re-arms the scan.
+/// `<path>!due:<ttl path>` — the deadline at `<path>` is a MOMENT
+/// (`_shared/moment.rs`; a tomb's, `_shared/tomb.rs`): read as THIS boot's
+/// monotonic ms, the clock `now` (58) and the `due` timer run on. A moment
+/// this boot cannot say (another boot's monotonic time, a wall time while
+/// the clock is untrusted) is re-based to `<ttl path>` ms past this boot's
+/// origin — it ends within its ttl of a restart, never lives for ever — and
+/// said. `None` when `m` is not `due`.
+unsafe fn due_moment(s: &State, value: &[u8], raw: &[u8], m: &[u8]) -> Option<i64> {
+    let ttl_path = m.strip_prefix(b"due")?;
+    let ttl_path = ttl_path.strip_prefix(b":").unwrap_or(ttl_path);
+    let ttl = if ttl_path.is_empty() {
+        0
+    } else {
+        let mut segs: [&[u8]; 6] = [&[]; 6];
+        let ns = split_dots(ttl_path, &mut segs);
+        parse_dec_u64(j_path(value, &segs[..ns]).unwrap_or(&[]))
+    };
+    let sys = &*s.syscalls;
+    let (d, rebased) = mo_due(sys, raw, ttl);
+    if rebased {
+        let n = s.rebased.get().wrapping_add(1);
+        s.rebased.set(n);
+        if n.is_power_of_two() {
+            let m = b"[store_source] a deadline from another boot (or a wall time, the clock untrusted) re-based to its ttl past this boot";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+        }
+    }
+    Some(d)
+}
+
 unsafe fn arm_due(s: &mut State, sys: &SyscallTable) {
     if s.recheck > 0 && s.unresolved.get() != 0 {
         let d = s.scan_now.saturating_add(i64::from(s.recheck));

@@ -69,6 +69,20 @@ const HC_CT_MAX: usize = 128;
 const HC_HDR_MAX: usize = 512;
 /// Refusals owed to exchanges that never got a slot.
 const HC_REFUSALS: usize = 16;
+/// How long an exchange may wait for the chain's first reply envelope,
+/// from its head, before this desk answers it 503 itself (with
+/// `Retry-After`). Wave's `http` server gives an application 30 s from its
+/// last progress (`APP_TIMEOUT_MS`; the credit this desk grants as the head
+/// arrives) and then answers 504 for it: an internal stall — a store too
+/// busy to decide a 1 MiB replace in time — must reach the client as the
+/// retryable 503 it is, before that. The chain's late reply answers no one.
+const HC_ANSWER_MS: u64 = 28_000;
+/// The late answer: upstream's Status for a request the server could not
+/// decide in time, which a client retries after `Retry-After`. The write
+/// may still land (as a write whose etcd request timed out may).
+const HC_LATE_CT: &[u8] = b"application/json";
+const HC_LATE_HDRS: &[u8] = b"Retry-After: 1\r\n";
+const HC_LATE_BODY: &[u8] = b"{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the request could not be decided in time; it may still be applied - retry\",\"reason\":\"ServiceUnavailable\",\"details\":{\"retryAfterSeconds\":1},\"code\":503}";
 
 const HC_FREE: u8 = 0;
 /// The request body is still arriving.
@@ -214,6 +228,10 @@ struct HcSlot {
     grant: u32,
     /// The status a refusal answers with.
     refuse: u16,
+    /// When the exchange's head arrived (the desk's clock, [`HcDesk::tick`]).
+    opened_ms: u64,
+    /// The refusal is the late answer ([`HC_ANSWER_MS`]).
+    late: bool,
     abort: u8,
 
     // The response.
@@ -246,6 +264,8 @@ impl HcSlot {
         staged: false,
         grant: 0,
         refuse: 0,
+        opened_ms: 0,
+        late: false,
         abort: 0,
         credit: 0,
         head_set: false,
@@ -361,6 +381,8 @@ struct HcDesk<const SLOTS: usize> {
     turn: usize,
     queued: [(hx::ExchangeId, u16); HC_REFUSALS],
     queued_len: usize,
+    /// The module's clock as of its last [`HcDesk::tick`]; 0 before one.
+    now_ms: u64,
     /// Counters.
     taken: u32,
     refused: u32,
@@ -379,10 +401,40 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         self.next_seq = 0;
         self.turn = 0;
         self.queued_len = 0;
+        self.now_ms = 0;
         self.taken = 0;
         self.refused = 0;
         self.stray = 0;
         self.aborted = 0;
+    }
+
+    /// The step's clock: every exchange the chain has not begun to answer
+    /// within [`HC_ANSWER_MS`] of its head is answered 503 now. The number
+    /// so answered.
+    fn tick<H: HcHeap>(&mut self, heap: &mut H, now: u64) -> u32 {
+        self.now_ms = now;
+        let mut late = 0u32;
+        for at in 0..SLOTS {
+            let Some(s) = self.slots.get_mut(at) else {
+                break;
+            };
+            if s.st == HC_FREE {
+                continue;
+            }
+            if s.opened_ms == 0 {
+                s.opened_ms = now;
+            }
+            let waiting = matches!(s.st, HC_STAGE | HC_READY | HC_CHAIN) && !s.head_set;
+            if waiting && now.saturating_sub(s.opened_ms) >= HC_ANSWER_MS {
+                s.stash.release(heap);
+                self.refuse(heap, at, hx::status::BUSY);
+                if let Some(s) = self.slots.get_mut(at) {
+                    s.late = true;
+                }
+                late += 1;
+            }
+        }
+        late
     }
 
     /// Whether a request record can be taken now: a refusal to an exchange
@@ -514,6 +566,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         s.hdr_len = h.headers.len() as u16;
         s.peer_len = h.peer.len() as u16;
         s.credit = h.resp_credit;
+        s.opened_ms = self.now_ms;
         let ok = s.req.push(heap, h.target, limit)
             && s.req.push(heap, h.headers, limit)
             && s.req.push(heap, h.peer, limit)
@@ -775,6 +828,17 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             s.ct_len = ct.len() as u8;
             s.hdrs[..hdrs.len()].copy_from_slice(hdrs);
             s.hdrs_len = hdrs.len() as u16;
+            // Every 503 this front sends says when to ask again: the chain's
+            // (a write the store did not decide) as much as its own.
+            let n = hdrs.len();
+            if status == hx::status::BUSY && hx::header(hdrs, b"retry-after").is_none() {
+                if let Some(d) = s.hdrs.get_mut(n..n + HC_LATE_HDRS.len()) {
+                    for (o, &b) in d.iter_mut().zip(HC_LATE_HDRS) {
+                        *o = b;
+                    }
+                    s.hdrs_len = (n + HC_LATE_HDRS.len()) as u16;
+                }
+            }
         }
         if !s.stash.push(heap, body, stash_max) {
             // The server is not taking this exchange's response as fast as
@@ -816,6 +880,35 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             HC_COLLECT if s.grant > 0 => {
                 let n = hx::write_credit(&s.id, s.grant, out)?;
                 Some((HcOut::Grant(at), n))
+            }
+            HC_REFUSE if s.late => {
+                let n = hx::write_response_head(
+                    &hx::ResponseHead {
+                        id: s.id,
+                        flags: 0,
+                        status: s.refuse,
+                        content_type: HC_LATE_CT,
+                        headers: HC_LATE_HDRS,
+                        body: HC_LATE_BODY,
+                    },
+                    out,
+                )?;
+                Some((HcOut::Refusal(at), n))
+            }
+            HC_REFUSE if s.refuse == hx::status::BUSY => {
+                // As many exchanges as this desk holds: asked again, later.
+                let n = hx::write_response_head(
+                    &hx::ResponseHead {
+                        id: s.id,
+                        flags: 0,
+                        status: s.refuse,
+                        content_type: &[],
+                        headers: HC_LATE_HDRS,
+                        body: &[],
+                    },
+                    out,
+                )?;
+                Some((HcOut::Refusal(at), n))
             }
             HC_REFUSE => {
                 let n = hx::write_response(&s.id, s.refuse, &[], &[], out)?;

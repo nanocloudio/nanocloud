@@ -37,6 +37,32 @@
 // caller drops the pass and runs it again on a later step. The `*_live`
 // readers answer a [`Got`], whose `Pending` a caller has to handle.
 //
+// A VALUE PAST THE JOURNAL. The journal holds 16 KiB; an object the API
+// keeps may be 3 MiB. Its bytes are never recorded — only what tells the
+// replay it saw the same object:
+//   * A whole read ([`read_whole`]) records the value's length, the
+//     revision its read handle observed and a 64-bit digest of its bytes.
+//     The replay reads it live again and checks all three; any difference
+//     is DIVERGENCE (the journal breaks, its writes are refused unasked) —
+//     never a different object silently handed to a serve replaying the
+//     first.
+//   * A serve's own write can move the key it read before the replay
+//     reads it again (taken, applied, decided only when asked again), so
+//     before a write is first asked, any key this serve read whole and is
+//     about to write is read once more and KEPT on the heap, checked
+//     against its record: the replay hands out the kept bytes, not the
+//     store's. A pre-image that cannot be kept (no heap) is not kept, and
+//     the replay detects the moved key as divergence.
+//   * A write whose value does not fit the journal records its length and
+//     digest instead of its bytes; the replay must build the same value
+//     (checked) and asks again with it. The provider identifies a write by
+//     its bytes, not their address (`storage.object`'s "ask again with
+//     byte-identical arguments"), so it is the same write: never made
+//     twice. A different value is divergence, refused unasked. A serve
+//     building a large value reads its clock ([`mono_millis`],
+//     [`now_millis`], [`drawn_bytes`]) and its randomness ([`rand_fill`])
+//     through the journal, so its replay builds the same bytes.
+//
 // ALL of them, even the ones that module never calls: the reference here is
 // lexical, so a const that looks dead to `dead_code` is still what makes this
 // file compile. Deleting one because the compiler called it unused is a build
@@ -73,6 +99,20 @@ const J_LIST: u8 = 5;
 const J_WRITE: u8 = 6;
 const J_TIME: u8 = 7;
 const J_GETREV: u8 = 8;
+const J_MONO: u8 = 9;
+const J_RAND: u8 = 10;
+const J_DRAWN: u8 = 11;
+
+/// A whole read's record: `[revision:u64][digest:u64]`, its length the
+/// call's answer.
+const J_WHOLE_REC: usize = 16;
+/// A recorded pending write: `[flags][pre][rev:u64][key_len:u16][key]`,
+/// then its value, or (`W_DIGEST`) `[len:u64][digest:u64]` of it.
+const W_PUT: u8 = 1;
+const W_DIGEST: u8 = 2;
+/// Pre-images one serve keeps on the heap (a whole read of a key the
+/// serve then writes).
+const JOURNAL_KEPT: usize = 4;
 
 /// A write's recorded answer while it is undecided.
 const J_PENDING: i64 = i64::MIN;
@@ -117,11 +157,27 @@ struct Journal {
     /// The serving module's refused reads, said rate-limited. Not reset with
     /// the record: the limit is the module's, across records.
     nag: ReadNag,
+    /// The table the kept pre-images are freed through (set by
+    /// [`Store::serving`]).
+    sys: *const SyscallTable,
+    /// Pre-images kept for the replay: `(call, bytes, length)`, the call a
+    /// whole read recorded; null when free.
+    kept: [(u16, *mut u8, u32); JOURNAL_KEPT],
 }
 
 impl Journal {
+    /// A journal in module state, before its first record: nothing kept.
+    /// A module calls it once, in `module_new` (its state is not assumed
+    /// zeroed).
+    fn init(&mut self) {
+        self.sys = core::ptr::null();
+        self.kept = [(0, core::ptr::null_mut(), 0); JOURNAL_KEPT];
+        self.reset();
+    }
+
     /// A journal for a record just taken.
     fn reset(&mut self) {
+        self.settle();
         self.n = 0;
         self.at = 0;
         self.used = 0;
@@ -184,7 +240,43 @@ impl Journal {
     }
 
     fn data(&self, c: &JCall) -> &[u8] {
-        &self.bytes[c.off as usize..(c.off + c.len) as usize]
+        self.bytes
+            .get(c.off as usize..(c.off + c.len) as usize)
+            .unwrap_or(&[])
+    }
+
+    /// The record's pre-images freed: its serve is answered (or a new
+    /// record taken). A module calls it once a serve is not held.
+    fn settle(&mut self) {
+        for k in self.kept.iter_mut() {
+            if !k.1.is_null() {
+                // SAFETY: allocated through this table when kept.
+                if let Some(sys) = unsafe { self.sys.as_ref() } {
+                    unsafe { heap_free(sys, k.1) };
+                }
+            }
+            *k = (0, core::ptr::null_mut(), 0);
+        }
+    }
+
+    /// The pre-image kept for call `at`.
+    fn kept_at(&self, at: u16) -> Option<(*mut u8, usize)> {
+        self.kept
+            .iter()
+            .find(|k| !k.1.is_null() && k.0 == at)
+            .map(|k| (k.1, k.2 as usize))
+    }
+
+    /// Keep `p` (`n` bytes on the heap, now the journal's) as call `at`'s
+    /// pre-image; false (the caller frees it) when every slot is taken.
+    fn keep(&mut self, at: u16, p: *mut u8, n: usize) -> bool {
+        match self.kept.iter_mut().find(|k| k.1.is_null()) {
+            Some(k) => {
+                *k = (at, p, n as u32);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a call must answer without reaching the store.
@@ -232,6 +324,7 @@ impl Store {
     /// The store as the record `j` journals sees it.
     fn serving(sys: &SyscallTable, j: &mut Journal) -> Store {
         let nag: *const ReadNag = &j.nag;
+        j.sys = sys;
         Store {
             sys,
             j,
@@ -298,6 +391,81 @@ unsafe fn now_millis(sys: &Store) -> u64 {
         return t;
     }
     dev_unix_millis(sys.table())
+}
+
+/// The monotonic clock (ms), as the serve first saw it: a value built from
+/// it (a tomb's deadline) is built the same on the replay.
+unsafe fn mono_millis(sys: &Store) -> u64 {
+    if let Some(j) = sys.j.as_mut() {
+        if j.silent() {
+            return 0;
+        }
+        if let Ok(Some(c)) = j.replay(J_MONO, 0) {
+            return c.rc as u64;
+        }
+        let t = dev_millis(sys.table());
+        j.record(J_MONO, 0, t as i64, &[]);
+        return t;
+    }
+    dev_millis(sys.table())
+}
+
+/// Random bytes into `buf` (the platform's CSPRNG), as the serve first drew
+/// them: a value built from them (a uid, a generated name) is built the
+/// same on the replay. Zeros while the serve is silent.
+unsafe fn rand_fill(sys: &Store, buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    if let Some(j) = sys.j.as_mut() {
+        if j.silent() {
+            return;
+        }
+        if let Ok(Some(c)) = j.replay(J_RAND, buf.len() as u32) {
+            for (d, s) in buf.iter_mut().zip(j.data(&c)) {
+                *d = *s;
+            }
+            return;
+        }
+        dev_csprng_fill(sys.table(), buf.as_mut_ptr(), buf.len());
+        j.record(J_RAND, buf.len() as u32, 0, &[buf]);
+        return;
+    }
+    dev_csprng_fill(sys.table(), buf.as_mut_ptr(), buf.len());
+}
+
+/// Bytes the serve draws from outside the store (a moment, a clock reading
+/// rendered), as the serve first drew them: `fill` writes them into `out`
+/// and answers their length; the replay answers the recorded bytes and does
+/// not call it. Empty while the serve is silent.
+unsafe fn drawn_bytes(sys: &Store, out: &mut [u8], fill: impl FnOnce(&mut [u8]) -> usize) -> usize {
+    if let Some(j) = sys.j.as_mut() {
+        if j.silent() {
+            return 0;
+        }
+        if let Ok(Some(c)) = j.replay(J_DRAWN, 0) {
+            let d = j.data(&c);
+            let n = d.len().min(out.len());
+            for (o, s) in out.iter_mut().zip(d.iter()) {
+                *o = *s;
+            }
+            return n;
+        }
+        let n = fill(out).min(out.len());
+        j.record(J_DRAWN, 0, 0, &[out.get(..n).unwrap_or(&[])]);
+        return n;
+    }
+    fill(out).min(out.len())
+}
+
+/// 64-bit FNV-1a over `v`: what a whole read or a large write records in
+/// place of its bytes.
+fn value_digest(v: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in v {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// True iff `key` currently exists (open+close a GET handle).
@@ -532,6 +700,11 @@ unsafe fn get_live(
 /// absent, past `max`, or the module has no heap (or it is exhausted) — or
 /// when the pass is [`waiting`](Store::waiting). The caller frees it with
 /// `heap_free`.
+///
+/// In a serve the journal records its length, revision and digest, never
+/// its bytes: the replay hands out the pre-image kept for it (a key the
+/// serve wrote, [`keep_pre_images`]) or reads it live again, and a read
+/// that is not the one recorded breaks the journal (divergence).
 unsafe fn read_whole(sys: &Store, key: &[u8], max: usize) -> Option<(*mut u8, usize)> {
     let kh = key_hash(key);
     if sys.silent() {
@@ -543,20 +716,41 @@ unsafe fn read_whole(sys: &Store, key: &[u8], max: usize) -> Option<(*mut u8, us
                 if c.rc < 0 {
                     return None;
                 }
-                // The caller frees what it is handed: a copy of the record.
-                let d = j.data(&c);
-                let p = heap_alloc(sys.table(), d.len().max(1) as u32);
-                if p.is_null() {
-                    return None;
+                let at = j.at - 1;
+                if let Some((kp, kn)) = j.kept_at(at) {
+                    // The caller frees what it is handed: a copy.
+                    let p = heap_alloc(sys.table(), kn.max(1) as u32);
+                    if p.is_null() {
+                        j.broken = true;
+                        return None;
+                    }
+                    core::ptr::copy_nonoverlapping(kp, p, kn);
+                    return Some((p, kn));
                 }
-                core::ptr::copy_nonoverlapping(d.as_ptr(), p, d.len());
-                return Some((p, d.len()));
+                let d = j.data(&c);
+                let rec = whole_rec(d);
+                return match read_whole_rev_live(sys.table(), sys.nag(), key, max) {
+                    Got::Pending => {
+                        sys.wait();
+                        None
+                    }
+                    Got::Found((p, n, rev)) if whole_same(rec, c.rc, p, n, rev) => Some((p, n)),
+                    got => {
+                        if let Got::Found((p, _, _)) = got {
+                            heap_free(sys.table(), p);
+                        }
+                        j.broken = true;
+                        let m = b"[store] a whole read replayed as another object - the serve DIVERGED, its writes refused";
+                        dev_log(sys.table(), 1, m.as_ptr(), m.len());
+                        None
+                    }
+                };
             }
             Ok(None) => {}
             Err(()) => return None,
         }
     }
-    let got = match read_whole_live(sys.table(), sys.nag(), key, max) {
+    let got = match read_whole_rev_live(sys.table(), sys.nag(), key, max) {
         Got::Pending => {
             sys.wait();
             return None;
@@ -566,11 +760,69 @@ unsafe fn read_whole(sys: &Store, key: &[u8], max: usize) -> Option<(*mut u8, us
     };
     if let Some(j) = sys.j.as_mut() {
         match got {
-            Some((p, n)) => j.record(J_WHOLE, kh, n as i64, &[core::slice::from_raw_parts(p, n)]),
+            Some((p, n, rev)) => {
+                let mut rec = [0u8; J_WHOLE_REC];
+                rec[..8].copy_from_slice(&rev.to_le_bytes());
+                rec[8..].copy_from_slice(
+                    &value_digest(core::slice::from_raw_parts(p, n)).to_le_bytes(),
+                );
+                j.record(J_WHOLE, kh, n as i64, &[&rec])
+            }
             None => j.record(J_WHOLE, kh, -1, &[]),
         };
     }
-    got
+    got.map(|(p, n, _)| (p, n))
+}
+
+/// A whole read's record: `(revision, digest)`.
+fn whole_rec(d: &[u8]) -> (u64, u64) {
+    let mut r = [0u8; 8];
+    let mut g = [0u8; 8];
+    for (x, y) in r.iter_mut().zip(d.iter()) {
+        *x = *y;
+    }
+    for (x, y) in g.iter_mut().zip(d.iter().skip(8)) {
+        *x = *y;
+    }
+    (u64::from_le_bytes(r), u64::from_le_bytes(g))
+}
+
+/// Whether `n` bytes at `p` read at `rev` are the object a whole read
+/// recorded (`rec`, length `rc`). A revision of 0 (a provider without read
+/// fences) is not compared; length and digest always are.
+unsafe fn whole_same(rec: (u64, u64), rc: i64, p: *const u8, n: usize, rev: u64) -> bool {
+    n as i64 == rc
+        && (rec.0 == 0 || rev == 0 || rec.0 == rev)
+        && value_digest(core::slice::from_raw_parts(p, n)) == rec.1
+}
+
+/// Before this serve first asks a write of `key`: every whole read it made
+/// of the same key is read again (still the pre-image: the write is not
+/// asked yet) and kept on the heap, checked against its record. A replay
+/// then hands out what the serve first read, though its own write has moved
+/// the key. `false` when a read waits (the write is not asked: the record
+/// is held); a pre-image that is not the one recorded, or finds no room,
+/// is not kept, and a replay that needs it diverges.
+unsafe fn keep_pre_images(sys: &Store, j: &mut Journal, key: &[u8], kh: u32) -> bool {
+    let mut i = 0usize;
+    while i < j.n as usize {
+        let c = j.calls[i];
+        i += 1;
+        if c.kind != J_WHOLE || c.key != kh || c.rc < 0 || j.kept_at((i - 1) as u16).is_some() {
+            continue;
+        }
+        let rec = whole_rec(j.data(&c));
+        match read_whole_rev_live(sys.table(), sys.nag(), key, c.rc as usize + 1) {
+            Got::Pending => return false,
+            Got::Found((p, n, rev)) => {
+                if !(whole_same(rec, c.rc, p, n, rev) && j.keep((i - 1) as u16, p, n)) {
+                    heap_free(sys.table(), p);
+                }
+            }
+            Got::Absent => {}
+        }
+    }
+    true
 }
 
 unsafe fn read_whole_live(
@@ -579,6 +831,21 @@ unsafe fn read_whole_live(
     key: &[u8],
     max: usize,
 ) -> Got<(*mut u8, usize)> {
+    match read_whole_rev_live(sys, nag, key, max) {
+        Got::Found((p, n, _)) => Got::Found((p, n)),
+        Got::Absent => Got::Absent,
+        Got::Pending => Got::Pending,
+    }
+}
+
+/// [`read_whole_live`] with the revision its read handle observed
+/// ([`handle_rev`]; 0 when the provider gives none).
+unsafe fn read_whole_rev_live(
+    sys: &SyscallTable,
+    nag: &ReadNag,
+    key: &[u8],
+    max: usize,
+) -> Got<(*mut u8, usize, u64)> {
     let mut garg = [0u8; MAX_KEY];
     if key.len() > garg.len() {
         return Got::Absent;
@@ -588,7 +855,8 @@ unsafe fn read_whole_live(
     if h < 0 {
         return refusal(sys, nag, b"GET", key, h);
     }
-    let mut cap = 64 * 1024usize;
+    let rev = handle_rev(sys, h);
+    let mut cap = (64 * 1024usize).min(max.max(1));
     let mut p = heap_alloc(sys, cap as u32);
     let mut len = 0usize;
     let out = loop {
@@ -611,7 +879,7 @@ unsafe fn read_whole_live(
         }
         len += n as usize;
         if len < cap {
-            break Got::Found((p, len));
+            break Got::Found((p, len, rev));
         }
         if cap >= max {
             heap_free(sys, p);
@@ -1080,6 +1348,13 @@ unsafe fn delete_cond(sys: &Store, key: &[u8], pre: u8, rev: u64) -> WriteAnswer
 /// A PUT (`value` given) or DELETE of `key`, through the serve's journal:
 /// a write it decided answers as decided, the write it holds is asked
 /// again as first asked, and a new one is asked only with room to hold it.
+///
+/// A value that fits the journal is recorded and asked again from the
+/// record. One that does not (an object past a record: a tomb, a staged
+/// body, a replaced 1 MiB object) is recorded by its length and digest: the
+/// replay must build the same value, which is checked, and is asked again
+/// with it — the provider identifies the write by its bytes, so it is the
+/// same write. Any other value is divergence, refused unasked.
 unsafe fn write(sys: &Store, key: &[u8], value: Option<&[u8]>, pre: u8, rev: u64) -> WriteAnswer {
     let Some(j) = sys.j.as_mut() else {
         if sys.waited.get() {
@@ -1102,43 +1377,98 @@ unsafe fn write(sys: &Store, key: &[u8], value: Option<&[u8]>, pre: u8, rev: u64
         Ok(Some(c)) if c.rc != J_PENDING => return WriteAnswer::Decided(c.rc as i32),
         Ok(Some(c)) => {
             // The write this record is held for, asked again as it was
-            // first asked: `[put][pre][rev:u64][key_len:u16][key][value]`.
+            // first asked: `[flags][pre][rev:u64][key_len:u16][key]`, then
+            // the value, or its `[len:u64][digest:u64]` (`W_DIGEST`).
             let at = (j.at - 1) as usize;
             let d = j.data(&c);
-            let put = d[0] != 0;
-            let (p, r) = (
-                d[1],
-                u64::from_le_bytes(d[2..10].try_into().unwrap_or([0; 8])),
+            let (Some(&flags), Some(&p)) = (d.first(), d.get(1)) else {
+                j.broken = true;
+                return WriteAnswer::Decided(ERR_DIVERGED);
+            };
+            let put = flags & W_PUT != 0;
+            let r = u64::from_le_bytes(
+                d.get(2..10)
+                    .and_then(|b| b.try_into().ok())
+                    .unwrap_or([0; 8]),
             );
-            let kl = u16::from_le_bytes([d[10], d[11]]) as usize;
-            let (k, v) = (&d[12..12 + kl], &d[12 + kl..]);
+            let kl = d
+                .get(10..12)
+                .and_then(|b| b.try_into().ok())
+                .map_or(0, |b| u16::from_le_bytes(b) as usize);
+            let (Some(k), Some(tail)) = (d.get(12..12 + kl), d.get(12 + kl..)) else {
+                j.broken = true;
+                return WriteAnswer::Decided(ERR_DIVERGED);
+            };
+            let v: &[u8] = if flags & W_DIGEST == 0 {
+                tail
+            } else {
+                let (len, dig) = whole_rec(tail);
+                match value {
+                    Some(v) if put && v.len() as u64 == len && value_digest(v) == dig => v,
+                    _ => {
+                        // Not the value first asked: asking it would be a
+                        // second write. The first stays the provider's.
+                        j.broken = true;
+                        let m = b"[store] a held write replayed with another value - the serve DIVERGED, not asked";
+                        dev_log(sys.table(), 1, m.as_ptr(), m.len());
+                        return WriteAnswer::Decided(ERR_DIVERGED);
+                    }
+                }
+            };
             let a = write_live(sys.table(), k, put.then_some(v), p, r);
             match a {
                 WriteAnswer::Pending => j.stalled = true,
-                WriteAnswer::Decided(rc) => j.calls[at].rc = i64::from(rc),
+                WriteAnswer::Decided(rc) => {
+                    if let Some(c) = j.calls.get_mut(at) {
+                        c.rc = i64::from(rc);
+                    }
+                }
             }
             return a;
         }
         Ok(None) => {}
     }
     // Room to hold it must be there before it is asked: a write the
-    // provider has taken is never left untracked.
-    let need = 12 + key.len() + value.map_or(0, <[u8]>::len);
+    // provider has taken is never left untracked. A value the journal
+    // cannot hold is held by its digest.
+    let vlen = value.map_or(0, <[u8]>::len);
+    let inline = 12 + key.len() + vlen;
+    let by_digest = j.used as usize + inline > JOURNAL_BYTES;
+    let need = if by_digest {
+        12 + key.len() + J_WHOLE_REC
+    } else {
+        inline
+    };
     if j.n as usize >= JOURNAL_CALLS || j.used as usize + need > JOURNAL_BYTES {
         j.broken = true;
         let m = b"[store] a serve outgrew its journal - its write REFUSED, not asked";
         dev_log(sys.table(), 1, m.as_ptr(), m.len());
         return WriteAnswer::Decided(ERR_NO_ROOM);
     }
+    // What this serve read whole of the key it now writes is kept: its
+    // replay must see what it first read, not its own write.
+    if !keep_pre_images(sys, j, key, kh) {
+        sys.wait();
+        return WriteAnswer::Pending;
+    }
     let a = write_live(sys.table(), key, value, pre, rev);
     match a {
         WriteAnswer::Pending => {
             let mut head = [0u8; 12];
-            head[0] = u8::from(value.is_some());
+            head[0] =
+                if value.is_some() { W_PUT } else { 0 } | if by_digest { W_DIGEST } else { 0 };
             head[1] = pre;
             head[2..10].copy_from_slice(&rev.to_le_bytes());
             head[10..12].copy_from_slice(&(key.len() as u16).to_le_bytes());
-            j.record(J_WRITE, kh, J_PENDING, &[&head, key, value.unwrap_or(&[])]);
+            if by_digest {
+                let v = value.unwrap_or(&[]);
+                let mut dg = [0u8; J_WHOLE_REC];
+                dg[..8].copy_from_slice(&(v.len() as u64).to_le_bytes());
+                dg[8..].copy_from_slice(&value_digest(v).to_le_bytes());
+                j.record(J_WRITE, kh, J_PENDING, &[&head, key, &dg]);
+            } else {
+                j.record(J_WRITE, kh, J_PENDING, &[&head, key, value.unwrap_or(&[])]);
+            }
             j.stalled = true;
         }
         WriteAnswer::Decided(rc) => {

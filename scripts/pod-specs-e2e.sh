@@ -2,7 +2,7 @@
 # A scheduled Pod as its node's ask, as params: the control plane projects
 # /pods/<ns>/<name> bound to a node into the flat /pod-specs/<uid> record the
 # node's pod-lifecycle chain runs, and a Pod deleted outright (its tomb under
-# /~tomb/pods/) into desired=deleted. Each lands in its node's scope,
+# index entry under /~tomb-at/pods/) into desired=deleted. Each lands in its node's scope,
 # /~node/<node>/pod-specs/<uid> (a worker's store names it /pod-specs/<uid>).
 # Chains from modules/app/_chronicle/pod_specs.uproc.
 #
@@ -12,7 +12,9 @@
 #          server defaults them, command and args apart, env/workingDir and
 #          the resource limits (Kubernetes quantities) in the record's own
 #          grammar
-#   gone   /~tomb/pods/        -> /pod-specs/<uid> desired=deleted
+#   gone   /~tomb-at/pods/     -> /pod-specs/<uid> desired=deleted
+#          (the tomb's index entry: small whatever the Pod's size, its
+#          identity at the tomb's paths — _shared/tomb.rs)
 #
 # Every record is asserted WHOLE: a field that moved, vanished or gained a
 # byte fails, as it would for the node that reads it.
@@ -141,7 +143,7 @@ modules:
     key_prefix: "/~node/"
   - name: ps_tombs
     type: store_source
-    prefix: "/~tomb/pods/"
+    prefix: "/~tomb-at/pods/"
     paths: "obj.metadata.uid,obj.spec.nodeName,obj.spec.runtimeClassName,obj.spec.containers.0.image"
   - name: ps_gone
     type: store_effect
@@ -185,7 +187,15 @@ echo "== 1. Pods: scheduled, unscheduled, being deleted, deleted outright; defau
 store_put "/pods/default/web" '{"metadata":{"name":"web","namespace":"default","uid":"uid-web"},"spec":{"nodeName":"node-a","restartPolicy":"OnFailure","terminationGracePeriodSeconds":5,"containers":[{"name":"web","image":"busybox:1.36","imagePullPolicy":"IfNotPresent","command":["sh","-c"],"args":["echo hi; sleep 9"],"workingDir":"/srv/w;x","env":[{"name":"A","value":"1"},{"name":"B","value":"x, y; 100%"},{"name":"S","valueFrom":{"secretKeyRef":{"name":"s","key":"k"}}},{"name":"E"}],"resources":{"limits":{"cpu":"500m","memory":"128Mi","ephemeral-storage":"1Gi"},"requests":{"cpu":"9"}}}]}}'
 store_put "/pods/default/wait" '{"metadata":{"name":"wait","namespace":"default","uid":"uid-wait"},"spec":{"containers":[{"name":"wait","image":"busybox:1.36"}]}}'
 store_put "/pods/default/bye" '{"metadata":{"name":"bye","namespace":"default","uid":"uid-bye","deletionTimestamp":"2026-10-03T00:00:00Z"},"spec":{"nodeName":"node-b","containers":[{"name":"bye","image":"busybox:1.36","command":["sleep","60"]}]}}'
-store_put "/~tomb/pods/default/gone" '{"deadline":1,"obj":{"metadata":{"name":"gone","namespace":"default","uid":"uid-gone"},"spec":{"nodeName":"node-a"}}}'
+store_put "/~tomb/pods/default/gone" '{"deadline":"1","obj":{"metadata":{"name":"gone","namespace":"default","uid":"uid-gone"},"spec":{"nodeName":"node-a"}}}'
+store_put "/~tomb-at/pods/default/gone" '{"deadline":"1","ttl":300000,"obj":{"metadata":{"name":"gone","namespace":"default","uid":"uid-gone"},"spec":{"nodeName":"node-a"}}}'
+# A Pod past a record (its spec 6 KiB): its tomb no source can read whole,
+# its index entry every source can — the writer prunes it to the identity.
+HUGE_ENV="$(python3 -c 'import json;print(json.dumps([{"name":"E%03d"%i,"value":"v"*40} for i in range(120)]))')"
+HUGE='{"metadata":{"name":"huge","namespace":"default","uid":"uid-huge"},"spec":{"nodeName":"node-b","containers":[{"name":"c","image":"busybox:1.36","env":'"$HUGE_ENV"'}]}}'
+[ "${#HUGE}" -gt 4096 ] || fail "the huge Pod is not past a record (${#HUGE} bytes)"
+store_put "/~tomb/pods/default/huge" '{"deadline":"1","obj":'"$HUGE"'}'
+store_put "/~tomb-at/pods/default/huge" '{"deadline":"1","ttl":300000,"obj":{"metadata":{"name":"huge","namespace":"default","uid":"uid-huge"},"spec":{"nodeName":"node-b","containers":[{"image":"busybox:1.36"}]}}}'
 # No restartPolicy, no grace, args only, quantities in every spelling.
 store_put "/pods/default/dflt" '{"metadata":{"name":"dflt","namespace":"default","uid":"uid-dflt","ownerReferences":[{"kind":"ReplicaSet","name":"web-1"}]},"spec":{"nodeName":"node-a","containers":[{"name":"c","image":"nanocloud/app:1","args":["--port","80"],"resources":{"limits":{"cpu":"2","memory":"1e9","ephemeral-storage":"1.5Gi"}}}]}}'
 # A Job's Pod keeps the policy its template must state.
@@ -213,6 +223,8 @@ is /~node/node-b/pod-specs/uid-bye "node=node-b;image=busybox:1.36;pull=;grace=3
 echo "   bye:  being deleted -> desired=deleted, the default 30 s grace"
 is /~node/node-a/pod-specs/uid-gone "node=node-a;grace=0;desired=deleted;cmd="
 echo "   gone: deleted outright (its tomb) -> desired=deleted, now"
+is /~node/node-b/pod-specs/uid-huge "node=node-b;grace=0;desired=deleted;cmd="
+echo "   huge: a Pod past a record (6 KiB), deleted outright -> desired=deleted, from its tomb's index"
 is /~node/node-a/pod-specs/uid-dflt "node=node-a;image=nanocloud/app:1;pull=;restart=always;grace=30;desired=running;cmd=;args=--port 80;env=;workdir=;cpu=2000;mem=1000000000;eph=1610612736;pod=default/dflt;rp_cmd="
 echo "   dflt: no restartPolicy -> always (a ReplicaSet's Pod), no grace -> 30; args with no command"
 is /~node/node-a/pod-specs/uid-job "node=node-a;image=busybox:1.36;pull=;restart=never;grace=30;desired=running;cmd=true;args=;env=;workdir=;cpu=;mem=;eph=;pod=default/job-0;rp_cmd="

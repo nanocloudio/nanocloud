@@ -141,3 +141,84 @@ unsafe fn mo_wall(sys: &SyscallTable, src: &[u8], out: &mut [u8]) -> usize {
     let ago = dev_millis(sys).saturating_sub(mono);
     mo_dec(now_wall.saturating_sub(ago), out, 0)
 }
+
+/// The moment `ms` from now, in the header's form; its length in `out`. A
+/// deadline stamped so is a WALL time when the clock is trusted — it means
+/// the same after a restart — and this boot's monotonic time otherwise.
+unsafe fn mo_after(sys: &SyscallTable, ms: u64, out: &mut [u8; 64]) -> usize {
+    match mo_trusted_ms(sys) {
+        Some(now) => mo_dec(now.saturating_add(ms), out, 0),
+        None => {
+            out[0] = b'm';
+            let p = mo_dec(dev_millis(sys).saturating_add(ms), out, 1);
+            let p = match out.get_mut(p) {
+                Some(slot) => {
+                    *slot = b'@';
+                    p + 1
+                }
+                None => p,
+            };
+            mo_boot(sys, out, p)
+        }
+    }
+}
+
+/// A recorded deadline moment as THIS boot's monotonic ms (the clock a
+/// source's `now` and its timer run on), and whether it had to be re-based.
+///
+///   <unix ms>          the clock trusted now: now, plus how far ahead it is
+///                      (a deadline passed is due now)
+///   m<mono>@<boot>     this boot's: as it is
+///
+/// A deadline that cannot be said on this boot — another boot's monotonic
+/// time, or a wall time while the clock is not trusted — is RE-BASED to
+/// `ttl` past this boot's origin: it ends within `ttl` of the restart,
+/// never kept for ever and never ended early by a clock that means nothing
+/// here. The re-base is the same on every read of this boot (it moves with
+/// nothing), so the deadline is deterministic. An empty or malformed
+/// deadline is 0 (none).
+unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
+    if src.is_empty() {
+        return (0, false);
+    }
+    if src.iter().all(|c| c.is_ascii_digit()) {
+        let mut wall = 0u64;
+        for &c in src.iter().take(19) {
+            wall = wall.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+        }
+        return match mo_trusted_ms(sys) {
+            Some(now_wall) => {
+                let now = dev_millis(sys);
+                let d = if wall <= now_wall {
+                    now
+                } else {
+                    now.saturating_add(wall - now_wall)
+                };
+                (d.max(1).min(i64::MAX as u64) as i64, false)
+            }
+            None => (ttl.max(1).min(i64::MAX as u64) as i64, true),
+        };
+    }
+    let Some(rest) = src.strip_prefix(b"m") else {
+        return (0, false);
+    };
+    let Some(at) = rest.iter().position(|&c| c == b'@') else {
+        return (0, false);
+    };
+    let (Some(mono_s), Some(boot_s)) = (rest.get(..at), rest.get(at + 1..)) else {
+        return (0, false);
+    };
+    if mono_s.is_empty() || mono_s.len() > 19 || !mono_s.iter().all(|c| c.is_ascii_digit()) {
+        return (0, false);
+    }
+    let mut mono = 0u64;
+    for &c in mono_s {
+        mono = mono.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+    }
+    let mut boot = [0u8; 40];
+    let bl = mo_boot(sys, &mut boot, 0);
+    if boot.get(..bl) == Some(boot_s) && boot_s != b"-" {
+        return (mono.max(1).min(i64::MAX as u64) as i64, false);
+    }
+    (ttl.max(1).min(i64::MAX as u64) as i64, true)
+}

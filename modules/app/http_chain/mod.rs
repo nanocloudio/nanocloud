@@ -49,6 +49,13 @@ const PER_STEP: usize = 32;
 const MAX_PREFIX: usize = 48;
 /// How long a staged body stays before it is collected (its expiry key).
 const STAGED_TTL_MS: u64 = 300_000;
+/// A staging slower than this is said, with its asks. Each ask of a pending
+/// write costs the store a digest of the WHOLE value (it knows a re-asked
+/// write by its bytes) and moves its chunk upload on as far as the store
+/// has room; a loaded host's store takes a 1 MiB body in 1-11 s, hundreds
+/// of asks. Asked less often, it is taken later (measured), so it is asked
+/// every step.
+const SLOW_STAGE_MS: u64 = 2_000;
 
 // storage.object, for staging (`_shared/store.rs` takes its opcodes from
 // whoever mounts it).
@@ -87,7 +94,14 @@ struct State {
     stage_hex: [u8; 64],
     /// The staged body's expiry, fixed when its staging starts.
     stage_deadline: u64,
+    /// When the staging began, and the writes it has asked: a staging past
+    /// [`SLOW_STAGE_MS`] is said.
+    stage_began_ms: u64,
+    stage_asks: u32,
     staged: u32,
+    /// Exchanges answered 503 because the chain had not answered in time
+    /// ([`HC_ANSWER_MS`]).
+    late: u32,
 
     desk: HcDesk<SLOTS>,
     buf: [u8; HC_ENV_MAX],
@@ -195,7 +209,10 @@ pub unsafe extern "C" fn module_new(
     s.stage_at = -1;
     s.stage_step = 0;
     s.stage_deadline = 0;
+    s.stage_began_ms = 0;
+    s.stage_asks = 0;
     s.staged = 0;
+    s.late = 0;
     params_def::set_defaults(s);
     params_def::parse_tlv(s, params, params_len);
     let sys = &*s.syscalls;
@@ -237,6 +254,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if s.request_in < 0 || s.response_out < 0 || s.record_out < 0 {
             return 0;
+        }
+        let late = s.desk.tick(&mut Arena(sys), dev_millis(sys));
+        if late > 0 {
+            s.late = s.late.wrapping_add(late);
+            let m = b"[http_chain] the chain did not answer in time - 503 ServiceUnavailable, Retry-After";
+            dev_log(sys, 2, m.as_ptr(), m.len());
         }
         to_server(s, sys);
         from_server(s, sys);
@@ -305,7 +328,10 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
         // waited 60 s for idle slots to be reclaimed (2026-10-10: every
         // staged POST hung, and with them the RBAC index).
         s.stage_deadline = dev_millis(sys).saturating_add(STAGED_TTL_MS);
+        s.stage_began_ms = dev_millis(sys);
+        s.stage_asks = 0;
     }
+    let now = dev_millis(sys);
     let (at, cid) = (s.stage_at as usize, s.stage_cid);
     let mut key = [0u8; MAX_PREFIX + 7 + 64];
     let prefix = &s.prefix[..s.prefix_len as usize];
@@ -322,7 +348,8 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
     let store = Store::plain(sys, &s.nag);
     let answer = if s.stage_step == 0 {
         let Some(body) = s.desk.stage_body(at, cid) else {
-            // Aborted while it waited for the store: nothing is owed.
+            // Aborted (or answered late) while it waited for the store:
+            // nothing is owed.
             s.stage_at = -1;
             return;
         };
@@ -338,6 +365,7 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
         }
         put_value(&store, &key[..kl], &v[..vl])
     };
+    s.stage_asks = s.stage_asks.wrapping_add(1);
     match answer {
         WriteAnswer::Pending => {}
         WriteAnswer::Decided(0) if s.stage_step == 0 => s.stage_step = 1,
@@ -346,6 +374,27 @@ unsafe fn stage(s: &mut State, sys: &SyscallTable) {
             s.desk.staged(&mut Arena(sys), at, cid, Some(&hex));
             s.staged = s.staged.wrapping_add(1);
             s.stage_at = -1;
+            let took = now.saturating_sub(s.stage_began_ms);
+            if took > SLOW_STAGE_MS {
+                let mut m = [0u8; 96];
+                let mut d = [0u8; 20];
+                let mut l = 0usize;
+                let mut put = |part: &[u8], l: &mut usize| {
+                    for &c in part {
+                        if let Some(slot) = m.get_mut(*l) {
+                            *slot = c;
+                            *l += 1;
+                        }
+                    }
+                };
+                put(b"[http_chain] slow staging ms=", &mut l);
+                let n = dec_u64(took, &mut d);
+                put(d.get(..n).unwrap_or(&[]), &mut l);
+                put(b" asks=", &mut l);
+                let n = dec_u64(u64::from(s.stage_asks), &mut d);
+                put(d.get(..n).unwrap_or(&[]), &mut l);
+                dev_log(sys, 2, m.as_ptr(), l);
+            }
         }
         WriteAnswer::Decided(_) => {
             s.desk.staged(&mut Arena(sys), at, cid, None);

@@ -5,7 +5,8 @@
 //           node image pull restart grace desired cmd args env workdir cpu
 //           mem eph pod; desired=deleted once the Pod carries a
 //           deletionTimestamp
-//   gone    /~tomb/pods/<ns>/<name> (a Pod deleted outright: its last state)
+//   gone    /~tomb-at/pods/<ns>/<name> (a Pod deleted outright: its tomb's
+//           index entry, its identity at the tomb's paths)
 //           -> /pod-specs/<uid> desired=deleted
 //
 // Each record is written into its node's scope, /~node/<node>/pod-specs/

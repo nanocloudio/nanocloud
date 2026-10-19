@@ -24,6 +24,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/store.rs");
 include!("../_shared/views.rs");
+include!("../_shared/json.rs");
+include!("../_shared/moment.rs");
+include!("../_shared/tomb.rs");
 
 // lattice's JSON document wire, from its published source — the channel
 // contract its dialect reads, not restated here.
@@ -113,8 +116,13 @@ const MSG_CAP: usize = DOC_MAX + 65536;
 /// The heap: the two message buffers, a staged body read beside them
 /// (read_whole grows to DOC_MAX), and the allocator's rounding.
 const ARENA: usize = 2 * MSG_CAP + DOC_MAX + (1 << 20);
-/// A lost answer is a 503, never a writer stalled for good.
-const ANSWER_MS: u64 = 30_000;
+/// A lost answer is a 503, never a writer stalled for good: how long the
+/// dialect may take (`answer_ms`, default). A write it has not answered by
+/// then may still land; the 503 says so, and the client retries.
+const ANSWER_MS: u32 = 30_000;
+/// An answer slower than this is said (with its outcome), as is every one
+/// that is not the client's to act on (5xx).
+const SLOW_ANSWER_MS: u64 = 2_000;
 /// How long a deleted object's last state stays for a watch to carry.
 /// How long a deleted object's tomb stays (`tomb_ms`): a watch's DELETED
 /// event reads it, and a Pod's node spec lives as long (tomb.uproc).
@@ -137,6 +145,8 @@ struct State {
     tomb: [u8; 48],
     tomb_len: u8,
     tomb_ms: u32,
+    /// How long the dialect may take to answer ([`ANSWER_MS`]).
+    answer_ms: u32,
     /// `blob = <prefix>`: a body `sha256:<hex>` is the staged body there.
     blob: [u8; 48],
     blob_len: u8,
@@ -183,6 +193,8 @@ struct State {
     served: u32,
     refused: u32,
     timeouts: u32,
+    /// Envelopes of answers no request awaited, drained and dropped.
+    stale: u32,
 }
 
 fn frame_field(frame: &[u8], number: u8) -> Option<(u8, &[u8])> {
@@ -793,13 +805,28 @@ impl State {
         }
         // SAFETY: the clock through the loader's table.
         let now = unsafe { dev_millis(sys) };
-        if now.saturating_sub(self.sent_ms) > ANSWER_MS {
+        if now.saturating_sub(self.sent_ms) > u64::from(self.answer_ms) {
             self.timeouts = self.timeouts.wrapping_add(1);
             let m = b"[store_doc] the dialect did not answer in time - 503";
             // SAFETY: logging through the loader's table.
             unsafe { dev_log(self.sys(), 1, m.as_ptr(), m.len()) };
             self.reply(503, &[]);
         }
+    }
+
+    /// Read and drop what the dialect sends while no request awaits it.
+    fn drain_stale(&mut self) {
+        let sys = self.syscalls;
+        // SAFETY: the loader's table, set in module_new.
+        let sys = unsafe { &*sys };
+        for _ in 0..64 {
+            // SAFETY: reads into this module's own buffer.
+            if unsafe { read_envelope(sys, self.doc_in, &mut self.env) }.is_none() {
+                break;
+            }
+            self.stale = self.stale.wrapping_add(1);
+        }
+        self.reasm.reset();
     }
 
     /// The answer in `ans[..total]`: replied when it is this request's.
@@ -820,6 +847,26 @@ impl State {
         }
         let status = status_of(a.outcome, a.flags, self.op);
         let text = a.field(JR_TEXT).unwrap_or(&[]);
+        // SAFETY: the clock through the loader's table.
+        let took = unsafe { dev_millis(self.sys()) }.saturating_sub(self.sent_ms);
+        if status >= 500 || took > SLOW_ANSWER_MS {
+            let mut m = [0u8; 120];
+            let mut d = [0u8; 24];
+            let mut l = append(&mut m, 0, b"[store_doc] answer op=");
+            let k = dec(self.op, &mut d);
+            l = append(&mut m, l, &d[..k]);
+            l = append(&mut m, l, b" outcome=");
+            let k = dec(i64::from(a.outcome), &mut d);
+            l = append(&mut m, l, &d[..k]);
+            l = append(&mut m, l, b" status=");
+            let k = dec(status, &mut d);
+            l = append(&mut m, l, &d[..k]);
+            l = append(&mut m, l, b" ms=");
+            let k = dec(took as i64, &mut d);
+            l = append(&mut m, l, &d[..k]);
+            // SAFETY: logging through the loader's table.
+            unsafe { dev_log(self.sys(), 2, m.as_ptr(), l.min(m.len())) };
+        }
         // A refusal the client cannot act on (too large, unavailable,
         // anything internal) is said here with the engine's reason; the
         // rest (absent, conflicts, invalid) are the client's answers.
@@ -847,16 +894,19 @@ impl State {
         let mut tk = [0u8; MAX_KEY];
         tk[..tl].copy_from_slice(&self.tomb[..tl]);
         tk[tl..tl + kl].copy_from_slice(&self.key[..kl]);
-        let mut digits = [0u8; 24];
+        // The deadline as a moment (`_shared/tomb.rs`): wall time when the
+        // clock is trusted, else this boot's; drawn through the journal, so
+        // a held delete builds the tomb (and its index) it first asked.
+        let mut moment = [0u8; 64];
         // SAFETY: the clock through the loader's table.
-        let deadline = unsafe { dev_millis(self.sys()) }.saturating_add(self.tomb_ms as u64);
-        let dl = dec(deadline as i64, &mut digits);
+        let ml = unsafe { tomb_deadline(&self.store(), self.tomb_ms as u64, &mut moment) };
+        let deadline = &moment[..ml.min(moment.len())];
         // The request message is spent: the tomb is assembled there.
         let v = self.msg_buf();
         let mut l = 0usize;
-        l = append(v, l, b"{\"deadline\":");
-        l = append(v, l, &digits[..dl]);
-        l = append(v, l, b",\"obj\":");
+        l = append(v, l, b"{\"deadline\":\"");
+        l = append(v, l, deadline);
+        l = append(v, l, b"\",\"obj\":");
         l = append(v, l, obj);
         l = append(v, l, b"}");
         if l >= v.len() {
@@ -865,8 +915,19 @@ impl State {
         let (msg, store) = (self.msg, self.store());
         // SAFETY: `l` bytes of the heap message just written. A tomb the
         // store has not decided holds the request: served again, its
-        // journal asks the same write again.
+        // journal asks the same write again. Its expiry index first
+        // ([`put_tomb_at`]): no tomb without the entry that ends it.
         unsafe {
+            if !put_tomb_at(
+                &store,
+                &self.tomb[..tl],
+                &self.key[..kl],
+                deadline,
+                self.tomb_ms as u64,
+                obj,
+            ) {
+                return;
+            }
             let v = core::slice::from_raw_parts(msg, l);
             let _ = put_value(&store, &tk[..tl + kl], v);
         }
@@ -940,6 +1001,11 @@ mod params_def {
         4, tomb_ms, u32, 300000
             => |s, d, len| { s.tomb_ms = super::p_u32(d, len, 0, super::TOMB_MS); };
 
+        // How long the dialect may take to answer a write, ms (default
+        // ANSWER_MS): past it the write is answered 503, never left hanging.
+        5, answer_ms, u32, 30000
+            => |s, d, len| { s.answer_ms = super::p_u32(d, len, 0, super::ANSWER_MS).max(1); };
+
         3, blob, str, 0
             => |s, d, len| {
                 let n = if len > 48 { 48 } else { len };
@@ -999,6 +1065,7 @@ pub unsafe extern "C" fn module_new(
         s.request_in = in_chan;
         s.response_out = out_chan;
         s.doc_in = dev_channel_port(sys, PORT_INPUT, 1);
+        s.journal.init();
         s.doc_out = dev_channel_port(sys, PORT_OUTPUT, 1);
         s.out_at = 0;
         s.out_len = 0;
@@ -1059,6 +1126,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         PHASE_SEND => {
             if s.send() {
                 s.phase = PHASE_WAIT;
+            } else {
+                // The dialect is not reading: it may be writing an answer
+                // to a request already answered (503 past `answer_ms`),
+                // which it finishes only once that answer is read — so
+                // answers are read here too (a stale one is dropped by its
+                // corr), and past `answer_ms` this request is 503 as well,
+                // never a writer stalled for good.
+                s.receive();
+                if s.out_len > 0 {
+                    s.flush_reply();
+                }
             }
             return 0;
         }
@@ -1071,6 +1149,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         _ => {}
     }
+    // No request awaits an answer: one arriving now is to a request already
+    // answered 503 (past `answer_ms`). Drained and dropped — left in the
+    // channel, a large one blocks the dialect part-way through writing it,
+    // and it never reads the next request (2026-10-18: one late 1 MiB
+    // answer wedged every write behind it).
+    s.drain_stale();
     if s.held == 0 {
         let Some(n) = s.read_request() else {
             return 0;
@@ -1105,6 +1189,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         return 0;
     }
     s.held = 0;
+    // Answered: the pre-images kept for a replay are not needed.
+    s.journal.settle();
     if s.phase == PHASE_SEND && s.send() {
         s.phase = PHASE_WAIT;
     }

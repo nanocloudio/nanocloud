@@ -30,6 +30,7 @@ include!("../_shared/json.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonq.rs");
 include!("../_shared/moment.rs");
+include!("../_shared/tomb.rs");
 include!("../_shared/jsonpatch.rs");
 include!("../_shared/views.rs");
 include!("../_shared/fieldset.rs");
@@ -1350,7 +1351,8 @@ unsafe fn create_stamped(
         let nl = if generate {
             let alphabet = b"bcdfghjklmnpqrstvwxz2456789";
             let mut r = [0u8; 5];
-            dev_csprng_fill(sys, r.as_mut_ptr(), r.len());
+            // Through the journal: a held create builds the same name.
+            rand_fill(sys, &mut r);
             name[..gen.len()].copy_from_slice(gen);
             for (i, &x) in r.iter().enumerate() {
                 name[gen.len() + i] = alphabet[x as usize % alphabet.len()];
@@ -1374,7 +1376,9 @@ unsafe fn create_stamped(
         // The stamps, as a merge patch over what the client sent: the
         // schema's `create` fields, and a `named` one for a key it names.
         let mut u = [0u8; 16];
-        dev_csprng_fill(sys, u.as_mut_ptr(), u.len());
+        // Through the journal: a held create builds the same uid, so the
+        // value it asks again is the one first asked.
+        rand_fill(sys, &mut u);
         u[6] = (u[6] & 0x0f) | 0x40;
         u[8] = (u[8] & 0x3f) | 0x80;
         let mut uh = [0u8; 32];
@@ -1680,9 +1684,11 @@ mod arena {
 /// How long a deleted object's last state stays for a watch to carry.
 const TOMB_MS: u64 = 300_000;
 
-/// Leave `value` as `key`'s tombstone (see `tomb`). A tombstone that would
-/// not fit the store's value ceiling is not written: the DELETED event then
-/// carries the object's identity only, which is what a client needs to drop it.
+/// Leave `value` as `key`'s tombstone (see `tomb`). A tomb past a record
+/// is built on the heap (store_big); without one it is not written: the
+/// DELETED event then carries the object's identity only, which is what a
+/// client needs to drop it. The deadline is read through the journal
+/// as a moment ([`tomb_deadline`]), so a held delete asks again the tomb it first asked.
 unsafe fn leave_tomb(s: &State, sys: &Store, key: &[u8], value: &[u8]) {
     let mut tk = [0u8; MAX_KEY];
     let tl = s.tomb_len as usize;
@@ -1691,22 +1697,43 @@ unsafe fn leave_tomb(s: &State, sys: &Store, key: &[u8], value: &[u8]) {
     }
     tk[..tl].copy_from_slice(&s.tomb[..tl]);
     tk[tl..tl + key.len()].copy_from_slice(key);
-    let mut digits = [0u8; 20];
-    let dl = dec(dev_millis(sys).saturating_add(TOMB_MS), &mut digits);
+    // The deadline as a moment (`_shared/tomb.rs`), drawn through the
+    // journal: a held delete asks again the tomb it first asked.
+    let mut moment = [0u8; 64];
+    let ml = tomb_deadline(sys, TOMB_MS, &mut moment);
+    let deadline = moment.get(..ml).unwrap_or(&[]);
     // Sequential appends, never an array of byte-string literals: such an
     // array's pointers are not relocated in a PIC module.
-    let mut v = [0u8; MAX_VALUE];
+    let need = value.len() + ml + 24;
+    let mut stack = [0u8; MAX_VALUE];
+    let heap = if need <= stack.len() {
+        core::ptr::null_mut()
+    } else {
+        let p = heap_alloc(sys, need as u32);
+        if p.is_null() {
+            return;
+        }
+        p
+    };
+    let v: &mut [u8] = if heap.is_null() {
+        &mut stack
+    } else {
+        core::slice::from_raw_parts_mut(heap, need)
+    };
     let mut l = 0usize;
-    let fits = value.len() + dl + 20 <= v.len();
-    if !fits {
-        return;
+    l = append(v, l, b"{\"deadline\":\"");
+    l = append(v, l, deadline);
+    l = append(v, l, b"\",\"obj\":");
+    l = append(v, l, value);
+    l = append(v, l, b"}");
+    // Its expiry index first ([`put_tomb_at`]): no tomb without the entry
+    // that ends it.
+    if put_tomb_at(sys, &s.tomb[..tl], key, deadline, TOMB_MS, value) {
+        let _ = put_value(sys, &tk[..tl + key.len()], v.get(..l).unwrap_or(&[]));
     }
-    l = append(&mut v, l, b"{\"deadline\":");
-    l = append(&mut v, l, &digits[..dl]);
-    l = append(&mut v, l, b",\"obj\":");
-    l = append(&mut v, l, value);
-    l = append(&mut v, l, b"}");
-    let _ = put_value(sys, &tk[..tl + key.len()], &v[..l]);
+    if !heap.is_null() {
+        heap_free(sys, heap);
+    }
 }
 
 /// Append field 59 (the store revision, i64) to a finished reply frame.
@@ -1933,6 +1960,7 @@ pub unsafe extern "C" fn module_new(
         s.request_in = in_chan;
         s.response_out = out_chan;
         s.served = 0;
+        s.journal.init();
         s.out_at = 0;
         s.out_len = 0;
         s.malformed = 0;
@@ -2502,25 +2530,51 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         _ => 0,
                     };
                     let mut probe = [0u8; MAX_VALUE];
-                    let found = get_value(sys, key, &mut probe);
+                    let small = get_value(sys, key, &mut probe);
+                    // An object past a record is there too: read whole where
+                    // this build has a heap (store_big), for its guard and its
+                    // tomb; without one it is deleted with no tomb (the
+                    // DELETED event then carries its identity only).
+                    let mut whole: *mut u8 = core::ptr::null_mut();
+                    let mut whole_n = 0usize;
+                    let past = small.is_none() && !sys.waiting() && exists(sys, key);
+                    if past {
+                        if let Some((p, n)) = read_whole(sys, key, DOC_MAX) {
+                            whole = p;
+                            whole_n = n;
+                        }
+                    }
+                    let obj: &[u8] = match small {
+                        Some(vl) => &probe[..vl],
+                        None if !whole.is_null() => core::slice::from_raw_parts(whole, whole_n),
+                        None => &[],
+                    };
+                    let found = if small.is_some() || past {
+                        Some(obj.len())
+                    } else {
+                        None
+                    };
                     // An object with finalizers is not deleted: it is marked
                     // (deletionTimestamp) and stays until the last finalizer
                     // is removed — which a later write completes.
-                    let held =
-                        s.stamp != 0 && found.is_some_and(|vl| is_guarded(&probe[..vl], sch));
-                    if dry {
+                    let held = s.stamp != 0 && found.is_some() && is_guarded(obj, sch);
+                    let status = if dry {
                         // A dry run deletes nothing: whether it would is answered.
                         let status = if found.is_some() { 200 } else { 404 };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
+                    } else if past && whole.is_null() && s.stamp != 0 {
+                        // Its guard (finalizers) cannot be read here: refused,
+                        // never deleted past one.
+                        reply_projected(&mut out, cid, 500, &[], carry, &proj)
                     } else if held {
-                        let status = mark_deleting(sys, key, &probe[..found.unwrap_or(0)], sch);
+                        let status = mark_deleting(sys, key, obj, sch);
                         if s.revision != 0 {
                             rev = head(sys, key).unwrap_or(0);
                         }
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else {
-                        if let (Some(vl), true) = (found, s.tomb_len > 0) {
-                            leave_tomb(s, sys, key, &probe[..vl]);
+                        if found.is_some() && !obj.is_empty() && s.tomb_len > 0 {
+                            leave_tomb(s, sys, key, obj);
                         }
                         let status = if found.is_none() && s.stamp != 0 {
                             404 // the API's delete of nothing: NotFound
@@ -2538,7 +2592,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             500
                         };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
+                    };
+                    if !whole.is_null() {
+                        heap_free(sys, whole);
                     }
+                    status
                 }
                 OP_CREATE if s.stamp != 0 => {
                     let mut fk = [0u8; MAX_KEY];
@@ -2951,8 +3009,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             }
                         }
                         let one = k.get(..kl).unwrap_or(&[]);
-                        let mut probe = [0u8; MAX_VALUE];
-                        if get_value(sys, one, &mut probe).is_some() {
+                        // Whether it is there, whatever its size: a value
+                        // past a record (a 1 MiB tomb) is there too.
+                        if exists(sys, one) {
                             let _ = done(delete_value(sys, one));
                         }
                     }
@@ -3063,6 +3122,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // the record is served again next step.
             return 0;
         }
+        // Answered: the pre-images kept for a replay are not needed.
+        s.journal.settle();
         // Field 59 on EVERY reply when asked for, miss or hit: a decision
         // indexes by number, and a field that exists only on some outcomes
         // silently kills the decision on the others.

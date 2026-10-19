@@ -1471,6 +1471,7 @@ pub extern "C" fn module_new(
         s.args_chan = in_chan; // input port 0 ← cli_in.args_out
         s.out_chan = out_chan; // output port 0 → cli_out.bytes_in
         s.exit_chan = -1; // output port 1 → cli_out.exit_in (resolved lazily)
+        s.journal.init();
         s.waited = 0;
         s.store_ready = 0;
         s.store_wait_from = 0;

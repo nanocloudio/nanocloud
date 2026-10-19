@@ -187,6 +187,14 @@ module nanocloud.apiplane_reply {
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"RequestEntityTooLarge\",\"code\":413}",
               v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
               flags: 0 };
+    // A write the store did not decide (store_doc's 503: the dialect busy,
+    // unavailable or timed out, or its answer lost) is "not yet", which the
+    // client retries — never an internal error.
+    when a.c_answer == "@stored" && a.c_wstatus == 503 ->
+      Reply { cid: a.c_cid, status: 503,
+              value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the store could not decide the write in time; it may still be applied - retry\"}",
+              v2: "", v3: "", v4: "", v5: "", v6: "", v7: "",
+              flags: 0 };
     when a.c_answer == "@stored" ->
       Reply { cid: a.c_cid, status: 500,
               value: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"InternalError\",\"code\":500}",
