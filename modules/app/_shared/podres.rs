@@ -26,15 +26,22 @@
 //             container's environment (not the image's), as an argv
 //   user      securityContext `runAsUser` / `runAsGroup` / `runAsNonRoot`, the
 //             container's over the Pod's (`ruid`, `rgid`, `nonroot`: the node
-//             composes them with the image's User and refuses root);
-//             `readOnlyRootFilesystem`, `supplementalGroups` and `privileged`
-//             the node cannot give, so a container asking for them is refused
-//             rather than run without them
+//             composes them with the image's User and refuses root); the
+//             Pod's `fsGroup` and `supplementalGroups` (in that order) under
+//             its `supplementalGroupsPolicy`, and the container's
+//             `readOnlyRootFilesystem`, as `rgid`'s tail
+//             `/<gid>,…/<s strict><r read-only root>` when any is stated
+//             (workload_effect gives them to the process); `privileged` the
+//             node cannot give, so a container asking for it is refused
+//             rather than run without it
 //   volumes   each volumeMount against the Pod's volumes, as the node's list
-//             (`volume.uproc`): a PersistentVolumeClaim `<ns>/<claim>`, a
-//             hostPath `<path>`, an emptyDir `@e/<vol>`, a ConfigMap
-//             `@c/<vol>/<ns>/<name>/<mode>/<optional>[/<key>=<path>|…]`, a
-//             Secret `@s/…` the same way — each `:<mountPath>[:ro]`
+//             (`volume.uproc`): a PersistentVolumeClaim `<ns>/<claim>` —
+//             `@g/<vol>/<ns>/<claim>/<fsGroup>/<a|r>` when the Pod's fsGroup
+//             owns it (not read-only; fsGroupChangePolicy Always or
+//             OnRootMismatch) — a hostPath `<path>`, an emptyDir
+//             `@e/<vol>[/<fsGroup>/<a|r>]`, a ConfigMap
+//             `@c/<vol>/<ns>/<name>/<mode>/<optional>/<fsGroup>[/<key>=<path>|…]`,
+//             a Secret `@s/…` the same way — each `:<mountPath>[:ro]`
 //   restart   the Pod's policy (`always` unless stated); an init container's
 //             is `onfailure` unless the Pod's is `never`
 //
@@ -156,6 +163,19 @@ struct PrScratch {
     /// a line.
     claims: [u8; PR_CLAIMS],
     claims_len: usize,
+    /// The Pod's fsGroup (`fsg_set` when it states one) and its
+    /// fsGroupChangePolicy (`a` Always, `r` OnRootMismatch), for the volumes
+    /// that take it.
+    fsg: u32,
+    fsg_set: bool,
+    fsg_policy: u8,
+    /// The node's allocatable and capacity (a downward-API volume's
+    /// resourceFieldRef of a limit not set).
+    node_obj: [u8; 512],
+    node_obj_len: usize,
+    /// [`PrRes::NeedLease`]: the node's Pod CIDR the address is asked from.
+    net_cidr: [u8; 32],
+    net_cidr_len: usize,
 }
 
 const PR_CLAIMS: usize = 4096;
@@ -393,6 +413,19 @@ const PR_ARGV_MAX: usize = 512;
 
 fn pr_ms<'a>(b: &'a [u8], k: &[u8]) -> &'a [u8] {
     pr_s(pr_m(b, k))
+}
+
+/// Field `k` of a flat `k=v;k=v` record (empty when absent).
+fn pr_flat<'a>(rec: &'a [u8], k: &[u8]) -> &'a [u8] {
+    for part in rec.split(|&c| c == b';') {
+        if part.len() > k.len()
+            && part.get(k.len()) == Some(&b'=')
+            && part.get(..k.len()) == Some(k)
+        {
+            return part.get(k.len() + 1..).unwrap_or(&[]);
+        }
+    }
+    &[]
 }
 
 fn pr_true(b: &[u8], k: &[u8]) -> bool {
@@ -738,6 +771,7 @@ fn pr_field<'a>(
     pod: &'a [u8],
     path: &[u8],
     host_ip: &'a [u8],
+    pod_ip: &'a [u8],
     out: &'a mut [u8],
 ) -> Option<&'a [u8]> {
     let meta = pr_m(pod, b"metadata").unwrap_or(b"{}");
@@ -748,9 +782,10 @@ fn pr_field<'a>(
         b"metadata.uid" => pr_ms(meta, b"uid"),
         b"spec.nodeName" => pr_ms(spec, b"nodeName"),
         b"spec.serviceAccountName" => pr_ms(spec, b"serviceAccountName"),
+        b"status.hostIP" | b"status.hostIPs" => host_ip,
         // A Pod shares its node's network unless it has an address of its
-        // own: its IP is its node's (pod_status.uproc).
-        b"status.hostIP" | b"status.hostIPs" | b"status.podIP" | b"status.podIPs" => host_ip,
+        // own: then its lease, else its node's (pod_status.uproc).
+        b"status.podIP" | b"status.podIPs" => pod_ip,
         _ => {
             let (coll, rest): (&[u8], &[u8]) =
                 if let Some(r) = path.strip_prefix(b"metadata.labels['") {
@@ -967,6 +1002,362 @@ fn pr_named_meta<'a>(list: Option<&'a [u8]>, name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
+/// The most supplementary groups a container is given (fsGroup and
+/// supplementalGroups): what one node record field carries.
+const PR_MAX_GROUPS: usize = 32;
+const PR_GROUPS_TEXT: usize = PR_MAX_GROUPS * 11;
+
+/// A group ID as upstream validates one: decimal, 0..=2147483647.
+fn pr_gid_ok(g: &[u8]) -> bool {
+    if g.is_empty() || g.len() > 10 || !g.iter().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut v: u64 = 0;
+    for &c in g {
+        v = v * 10 + u64::from(c - b'0');
+    }
+    v <= 0x7FFF_FFFF
+}
+
+/// A group ID [`pr_gid_ok`] accepted, as a number.
+fn pr_gid(g: &[u8]) -> u32 {
+    g.iter().fold(0u32, |v, &c| {
+        v.wrapping_mul(10).wrapping_add(u32::from(c - b'0'))
+    })
+}
+
+/// `/<gid>/<policy>` of an emptyDir or a claim the fsGroup owns.
+fn pr_fsg_tail(x: &PrScratch, out: &mut PrOut) {
+    out.byte(b'/');
+    out.dec(u64::from(x.fsg));
+    out.byte(b'/');
+    out.byte(x.fsg_policy);
+}
+
+/// The longest volume list entry a node record carries: one element of the
+/// node's `volumes[]` expansion, which the volume chain's decision splits
+/// in its 512-byte scratch (volume.uproc).
+const PR_VOL_MAX: usize = 400;
+
+/// A projected file's text for a node record: every byte but the plainest
+/// `%XX`-escaped (volume_files decodes it), so no separator of the list
+/// (`,` `;` `:` `|` `=` `~`), quote or line break is ever raw.
+fn pr_text(v: &[u8], out: &mut PrOut) {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    for &c in v {
+        if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b' ' | b'/') {
+            out.byte(c);
+        } else {
+            out.byte(b'%');
+            out.byte(HEX.get(usize::from(c >> 4)).copied().unwrap_or(b'0'));
+            out.byte(HEX.get(usize::from(c & 15)).copied().unwrap_or(b'0'));
+        }
+    }
+}
+
+/// A downward-API map (`metadata.labels`, `metadata.annotations`) as
+/// upstream's volume writes it: `key="value"` lines, sorted by key, the
+/// value quoted with `"` and `\` escaped.
+fn pr_map_text(map: &[u8], val: &mut [u8], out: &mut PrOut) {
+    let mut last: &[u8] = &[];
+    loop {
+        // The least key greater than the last written.
+        let mut best: Option<(&[u8], &[u8])> = None;
+        let mut i = j_ws(map, 1);
+        while map.get(i) == Some(&b'"') {
+            let ks = i + 1;
+            let mut ke = ks;
+            while let Some(&c) = map.get(ke) {
+                if c == b'"' {
+                    break;
+                }
+                ke += if c == b'\\' { 2 } else { 1 };
+            }
+            let k = map.get(ks..ke).unwrap_or(&[]);
+            i = j_ws(map, ke + 1);
+            if map.get(i) != Some(&b':') {
+                return;
+            }
+            let vs = j_ws(map, i + 1);
+            let ve = j_skip(map, vs);
+            if k > last && best.is_none_or(|(b, _)| k < b) {
+                best = Some((k, j_scalar(map, vs)));
+            }
+            i = j_ws(map, ve);
+            if map.get(i) == Some(&b',') {
+                i = j_ws(map, i + 1);
+            }
+        }
+        let Some((k, v)) = best else {
+            return;
+        };
+        pr_text(k, out);
+        pr_text(b"=\"", out);
+        let n = pr_unescape(v, val).unwrap_or(0);
+        for &c in val.get(..n).unwrap_or(&[]) {
+            match c {
+                b'"' => pr_text(b"\\\"", out),
+                b'\\' => pr_text(b"\\\\", out),
+                b'\n' => pr_text(b"\\n", out),
+                _ => pr_text(&[c], out),
+            }
+        }
+        pr_text(b"\"\n", out);
+        last = k;
+    }
+}
+
+/// A downward-API item's file (`fieldRef`, `resourceFieldRef`) as a
+/// projection item's text source `t~<text>`; false (said) when the node
+/// cannot render it.
+fn pr_downward_item(
+    x: &mut PrScratch,
+    pod: &[u8],
+    vname: &[u8],
+    it: &[u8],
+    err: &mut PrErr,
+    out: &mut PrOut,
+) -> bool {
+    out.lit(b"t~");
+    if let Some(fr) = pr_m(it, b"fieldRef") {
+        let path = pr_ms(fr, b"fieldPath");
+        let meta = pr_m(pod, b"metadata").unwrap_or(b"{}");
+        if path == b"metadata.labels" || path == b"metadata.annotations" {
+            let coll: &[u8] = if path == b"metadata.labels" {
+                b"labels"
+            } else {
+                b"annotations"
+            };
+            pr_map_text(pr_m(meta, coll).unwrap_or(b"{}"), &mut x.val, out);
+            return true;
+        }
+        let allowed = matches!(
+            path,
+            b"metadata.name" | b"metadata.namespace" | b"metadata.uid"
+        ) || path.starts_with(b"metadata.labels['")
+            || path.starts_with(b"metadata.annotations['");
+        let mut fv = [0u8; 512];
+        match pr_field(pod, path, &[], &[], &mut fv) {
+            Some(v) if allowed => {
+                pr_text(v, out);
+                return true;
+            }
+            _ => {}
+        }
+        err.set(&[
+            b"volume \"",
+            vname,
+            b"\": fieldRef \"",
+            path,
+            b"\" is not supported",
+        ]);
+        return false;
+    }
+    if let Some(rf) = pr_m(it, b"resourceFieldRef") {
+        let cname = pr_ms(rf, b"containerName");
+        let spec = pr_m(pod, b"spec").unwrap_or(b"{}");
+        let ctr = pr_named(pr_m(spec, b"containers"), cname)
+            .or_else(|| pr_named(pr_m(spec, b"initContainers"), cname));
+        let mut vb = [0u8; 32];
+        let mut o = PrOut {
+            b: &mut vb,
+            n: 0,
+            over: false,
+        };
+        let node = x.node_obj.get(..x.node_obj_len).unwrap_or(&[]);
+        if let Some(ctr) = ctr.filter(|_| !cname.is_empty()) {
+            if pr_resource(pod, ctr, rf, node, &mut o) && !o.over {
+                let n = o.n;
+                pr_text(vb.get(..n).unwrap_or(&[]), out);
+                return true;
+            }
+        }
+        err.set(&[
+            b"volume \"",
+            vname,
+            b"\": resourceFieldRef \"",
+            pr_ms(rf, b"resource"),
+            b"\" of container \"",
+            cname,
+            b"\" is not supported",
+        ]);
+        return false;
+    }
+    err.set(&[b"volume \"", vname, b"\": an item with no source"]);
+    false
+}
+
+/// A downwardAPI or projected volume as one projection the node writes
+/// (volume_files `@w`, `@p`: on a memory filesystem):
+/// `@p/<vol>/<ns>/<defaultMode>/<fsGroup>/` then its
+/// files, `|`-separated, each `<path>=<mode>=<source>`: `t~<text>` (a
+/// downward-API value, rendered here), `c~<name>~<key>~<optional>` or
+/// `s~…` (a ConfigMap's or Secret's key, read on the node; an empty key and
+/// path: every key, at its own name). A source the node cannot project
+/// (serviceAccountToken, clusterTrustBundle, podCertificate) is refused.
+fn pr_projected(
+    x: &mut PrScratch,
+    pod: &[u8],
+    ns: &[u8],
+    vname: &[u8],
+    vol: &[u8],
+    err: &mut PrErr,
+    out: &mut PrOut,
+) {
+    let (top, sources): (&[u8], Option<&[u8]>) = match pr_m(vol, b"projected") {
+        Some(pj) => (pj, pr_m(pj, b"sources")),
+        None => (pr_m(vol, b"downwardAPI").unwrap_or(b"{}"), None),
+    };
+    // A projected volume is on a memory filesystem (it may hold a Secret),
+    // a downwardAPI volume is not, as upstream backs them.
+    out.lit(if sources.is_some() { b"@p/" } else { b"@w/" });
+    out.lit(vname);
+    out.byte(b'/');
+    out.lit(ns);
+    out.byte(b'/');
+    if !pr_mode(pr_ms(top, b"defaultMode"), out) {
+        err.set(&[b"volume \"", vname, b"\": defaultMode is not a file mode"]);
+        return;
+    }
+    out.byte(b'/');
+    if x.fsg_set {
+        out.dec(u64::from(x.fsg));
+    }
+    out.byte(b'/');
+    let mut first = true;
+    // One item: `<path>=<mode>=`, its source written by the caller.
+    let mut item = |it: &[u8], path: &[u8], out: &mut PrOut, err: &mut PrErr| -> bool {
+        let plain = path.iter().all(|&c| c != b'~');
+        if !plain || (!path.is_empty() && !pr_path_ok(path, false)) {
+            err.set(&[
+                b"volume \"",
+                vname,
+                b"\": item \"",
+                path,
+                b"\" cannot be projected by this node",
+            ]);
+            return false;
+        }
+        if !first {
+            out.byte(b'|');
+        }
+        first = false;
+        out.lit(path);
+        out.byte(b'=');
+        let m = pr_ms(it, b"mode");
+        if !m.is_empty() && !pr_mode(m, out) {
+            err.set(&[b"volume \"", vname, b"\": item mode is not a file mode"]);
+            return false;
+        }
+        out.byte(b'=');
+        true
+    };
+    let Some(sources) = sources else {
+        // downwardAPI: its items, each rendered.
+        let items = pr_m(top, b"items").unwrap_or(b"[]");
+        let mut k = 0usize;
+        while let Some(it) = pr_at(items, k) {
+            k += 1;
+            let path = pr_ms(it, b"path");
+            if path.is_empty() {
+                err.set(&[b"volume \"", vname, b"\": an item has no path"]);
+                return;
+            }
+            if !item(it, path, out, err) || !pr_downward_item(x, pod, vname, it, err, out) {
+                return;
+            }
+        }
+        return;
+    };
+    let mut k = 0usize;
+    while let Some(src) = pr_at(sources, k) {
+        k += 1;
+        if let Some(da) = pr_m(src, b"downwardAPI") {
+            let items = pr_m(da, b"items").unwrap_or(b"[]");
+            let mut j = 0usize;
+            while let Some(it) = pr_at(items, j) {
+                j += 1;
+                let path = pr_ms(it, b"path");
+                if path.is_empty() {
+                    err.set(&[b"volume \"", vname, b"\": an item has no path"]);
+                    return;
+                }
+                if !item(it, path, out, err) || !pr_downward_item(x, pod, vname, it, err, out) {
+                    return;
+                }
+            }
+            continue;
+        }
+        let (tag, obj, name): (&[u8], &[u8], &[u8]) = if let Some(c) = pr_m(src, b"configMap") {
+            (b"c~", c, pr_ms(c, b"name"))
+        } else if let Some(s) = pr_m(src, b"secret") {
+            (b"s~", s, pr_ms(s, b"name"))
+        } else {
+            err.set(&[
+                b"volume \"",
+                vname,
+                b"\": a projected source this node does not support",
+            ]);
+            return;
+        };
+        if !pr_name_ok(name) {
+            err.set(&[
+                b"volume \"",
+                vname,
+                b"\": \"",
+                name,
+                b"\" is not an object name",
+            ]);
+            return;
+        }
+        let opt: &[u8] = if pr_true(obj, b"optional") {
+            b"~1"
+        } else {
+            b"~0"
+        };
+        let key_ok = |key: &[u8]| {
+            !key.is_empty()
+                && key
+                    .iter()
+                    .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        };
+        match pr_m(obj, b"items") {
+            Some(items) => {
+                let mut j = 0usize;
+                while let Some(it) = pr_at(items, j) {
+                    j += 1;
+                    let key = pr_ms(it, b"key");
+                    let path = pr_ms(it, b"path");
+                    if !key_ok(key) || path.is_empty() || !item(it, path, out, err) {
+                        err.set(&[
+                            b"volume \"",
+                            vname,
+                            b"\": item \"",
+                            key,
+                            b"\" cannot be projected by this node",
+                        ]);
+                        return;
+                    }
+                    out.lit(tag);
+                    out.lit(name);
+                    out.byte(b'~');
+                    out.lit(key);
+                    out.lit(opt);
+                }
+            }
+            None => {
+                if !item(b"{}", b"", out, err) {
+                    return;
+                }
+                out.lit(tag);
+                out.lit(name);
+                out.lit(b"~");
+                out.lit(opt);
+            }
+        }
+    }
+}
+
 /// The volume list entry for one volumeMount (see the header).
 fn pr_volume<W: PrWorld>(
     w: &mut W,
@@ -1009,11 +1400,20 @@ fn pr_volume<W: PrWorld>(
             Some(_) => i += 1,
             None => {
                 if pr_sts_claim(w, x, pod, key, vname)? && pr_name_ok(vname) {
+                    let owned = x.fsg_set;
+                    if owned {
+                        out.lit(b"@g/");
+                        out.lit(vname);
+                        out.byte(b'/');
+                    }
                     out.lit(ns);
                     out.byte(b'/');
                     out.lit(vname);
                     out.byte(b'-');
                     out.lit(key.get(slash + 1..).unwrap_or(&[]));
+                    if owned {
+                        pr_fsg_tail(x, out);
+                    }
                     out.byte(b':');
                     out.lit(mp);
                     if ro {
@@ -1042,10 +1442,22 @@ fn pr_volume<W: PrWorld>(
             ]);
             return Some(());
         }
+        // The fsGroup owns a claim the Pod may write (upstream's ownership
+        // management skips a read-only volume): volume_files gives it the
+        // group before it is bound.
+        let owned = x.fsg_set && !pr_true(pvc, b"readOnly");
         ro |= pr_true(pvc, b"readOnly");
+        if owned {
+            out.lit(b"@g/");
+            out.lit(vname);
+            out.byte(b'/');
+        }
         out.lit(ns);
         out.byte(b'/');
         out.lit(claim);
+        if owned {
+            pr_fsg_tail(x, out);
+        }
     } else if let Some(hp) = pr_m(vol, b"hostPath") {
         let path = pr_ms(hp, b"path");
         if !pr_path_ok(path, true) {
@@ -1078,6 +1490,13 @@ fn pr_volume<W: PrWorld>(
     } else if pr_m(vol, b"emptyDir").is_some() {
         out.lit(b"@e/");
         out.lit(vname);
+        if x.fsg_set {
+            pr_fsg_tail(x, out);
+        }
+    } else if pr_m(vol, b"downwardAPI").is_some() || pr_m(vol, b"projected").is_some() {
+        pr_projected(x, pod, ns, vname, vol, err, out);
+        // Projected and downward-API volumes are always mounted read-only.
+        ro = true;
     } else {
         let (kind, src, name): (&[u8], &[u8], &[u8]) = if let Some(c) = pr_m(vol, b"configMap") {
             (b"@c/", c, pr_ms(c, b"name"))
@@ -1117,6 +1536,11 @@ fn pr_volume<W: PrWorld>(
         } else {
             b"/0"
         });
+        // The group the projection is given: the fsGroup, else none.
+        out.byte(b'/');
+        if x.fsg_set {
+            out.dec(u64::from(x.fsg));
+        }
         if let Some(items) = pr_m(src, b"items") {
             let mut k = 0usize;
             while let Some(it) = pr_at(items, k) {
@@ -1172,6 +1596,10 @@ enum PrRes {
     NoContainer,
     /// A read is not answered yet: ask again later.
     Pending,
+    /// The Pod gets an address of its own from its node's Pod CIDR
+    /// (`x.net_cidr`), and has none yet: its request is the caller's to make
+    /// (`/ipam-request/<uid>`), and the Pod resolved again once it is leased.
+    NeedLease,
 }
 
 /// Which container of which Pod a record is asked for: init container
@@ -1261,6 +1689,80 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     };
     let host_ip = host_ip.get(..hl).unwrap_or(&[]);
     let node_obj = node_alloc.get(..nal).unwrap_or(&[]);
+    for (d, &c) in x.node_obj.iter_mut().zip(node_obj) {
+        *d = c;
+    }
+    x.node_obj_len = nal.min(x.node_obj.len());
+
+    // The Pod's own network: an address of its own from its node's Pod CIDR
+    // (`net=own`), once the node says its segment is in place (/node-net/,
+    // node_net's `seg=1`) — the Pod's IP then, what its probes dial and the
+    // downward API's podIP. A hostNetwork Pod shares its node's, as does one
+    // on a node that has no segment (none written: a node without node_net;
+    // or not in effect: its runtime cannot attach workloads), and a Pod of
+    // more than one container: each container is a workload of its own,
+    // and the runtime gives no two workloads one network.
+    let mut pod_ip = [0u8; 64];
+    let mut pil = 0usize;
+    let mut own = false;
+    x.net_cidr_len = 0;
+    let uid = pr_ms(pr_m(pod, b"metadata").unwrap_or(b"{}"), b"uid");
+    let single = pr_m(spec, b"containers")
+        .and_then(|l| pr_at(l, 1))
+        .is_none()
+        && pr_m(spec, b"initContainers")
+            .and_then(|l| pr_at(l, 0))
+            .is_none();
+    if pr_ms(spec, b"hostNetwork") != b"true" && single && !uid.is_empty() && !node.is_empty() {
+        let mut nk = [0u8; 160];
+        let mut kn = PrOut {
+            b: &mut nk,
+            n: 0,
+            over: false,
+        };
+        kn.lit(b"/node-net/");
+        kn.lit(node);
+        let kl = if kn.over { 0 } else { kn.n };
+        let mut nv = [0u8; 512];
+        let found = match w.raw(nk.get(..kl).unwrap_or(&[]), &mut nv) {
+            PrLook::Pending => return PrRes::Pending,
+            PrLook::Found(n) => n,
+            PrLook::Absent => 0,
+        };
+        let nv = nv.get(..found).unwrap_or(&[]);
+        let cidr = pr_flat(nv, b"cidr");
+        if pr_flat(nv, b"seg") == b"1" && !cidr.is_empty() && cidr.len() <= x.net_cidr.len() {
+            let mut lk = [0u8; 160];
+            let mut kl2 = PrOut {
+                b: &mut lk,
+                n: 0,
+                over: false,
+            };
+            kl2.lit(b"/ipam-lease/");
+            kl2.lit(uid);
+            let ll = if kl2.over { 0 } else { kl2.n };
+            match w.raw(lk.get(..ll).unwrap_or(&[]), &mut pod_ip) {
+                PrLook::Pending => return PrRes::Pending,
+                PrLook::Found(n) if n > 0 => {
+                    pil = n;
+                    own = true;
+                }
+                _ if deleting => {}
+                _ => {
+                    for (d, &c) in x.net_cidr.iter_mut().zip(cidr) {
+                        *d = c;
+                    }
+                    x.net_cidr_len = cidr.len();
+                    return PrRes::NeedLease;
+                }
+            }
+        }
+    }
+    let pod_ip: &[u8] = if own {
+        pod_ip.get(..pil).unwrap_or(&[])
+    } else {
+        host_ip
+    };
 
     // Service links: the namespace's (unless enableServiceLinks: false), and
     // the default namespace's `kubernetes` always.
@@ -1381,7 +1883,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
                 if let Some(fr) = pr_m(from, b"fieldRef") {
                     let path = pr_ms(fr, b"fieldPath");
                     let mut fv = [0u8; 512];
-                    match pr_field(pod, path, host_ip, &mut fv) {
+                    match pr_field(pod, path, host_ip, pod_ip, &mut fv) {
                         Some(v) => {
                             let n = v.len();
                             let mut tmp = [0u8; 512];
@@ -1638,23 +2140,29 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     o.lit(b";tasks=4194304");
     o.lit(b";pod=");
     o.lit(key);
+    // Its own network: the sandbox is created in a network domain of its
+    // own, holding its lease (sandbox.uproc).
+    if own {
+        o.lit(b";net=own");
+    }
     if !deleting {
         // The readiness gate the node's status reads (`rp_cmd`: whether the
         // probe chain's `ready` says it): the readiness probe, else the
         // startup probe — a container with one is not ready until it passed.
+        // A probe dials the Pod's IP: its own address, else its node's.
         o.lit(b";rp_cmd=");
         let at = o.n;
         pr_probe_cmd(
             ctr,
             pr_m(ctr, b"readinessProbe").unwrap_or(b"{}"),
-            host_ip,
+            pod_ip,
             &mut o,
         );
         if o.n == at {
             pr_probe_cmd(
                 ctr,
                 pr_m(ctr, b"startupProbe").unwrap_or(b"{}"),
-                host_ip,
+                pod_ip,
                 &mut o,
             );
         }
@@ -1668,7 +2176,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             n: 0,
             over: false,
         };
-        pr_probes(ctr, host_ip, &mut po);
+        pr_probes(ctr, pod_ip, &mut po);
         if po.over {
             0
         } else {
@@ -1708,13 +2216,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             b")",
         ]);
     }
-    if pr_true(csc, b"readOnlyRootFilesystem") {
-        err.set(&[
-            b"container \"",
-            cname,
-            b"\": readOnlyRootFilesystem is not supported by this node's runtime",
-        ]);
-    }
+    let ro_root = pr_true(csc, b"readOnlyRootFilesystem");
     if pr_true(csc, b"privileged") {
         err.set(&[
             b"container \"",
@@ -1722,19 +2224,88 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             b"\": privileged containers are not supported by this node's runtime",
         ]);
     }
-    if pr_at(pr_m(psc, b"supplementalGroups").unwrap_or(b"[]"), 0).is_some() {
-        err.set1(b"supplementalGroups are not supported by this node's runtime");
+    // The Pod's groups (PodSecurityContext only): fsGroup, then
+    // supplementalGroups, as upstream's runtime lists them; their policy.
+    let fsg = pr_ms(psc, b"fsGroup");
+    let mut groups = [0u8; PR_GROUPS_TEXT];
+    let mut go = PrOut {
+        b: &mut groups,
+        n: 0,
+        over: false,
+    };
+    let mut ng = 0usize;
+    let mut bad_gid = !fsg.is_empty() && !pr_gid_ok(fsg);
+    if !fsg.is_empty() {
+        go.lit(fsg);
+        ng += 1;
     }
+    let sgs = pr_m(psc, b"supplementalGroups").unwrap_or(b"[]");
+    let mut k = 0usize;
+    while let Some(g) = pr_at(sgs, k) {
+        k += 1;
+        let g = pr_s(Some(g));
+        bad_gid |= !pr_gid_ok(g);
+        if ng > 0 {
+            go.byte(b',');
+        }
+        go.lit(g);
+        ng += 1;
+    }
+    let (gn, gover) = (go.n, go.over);
+    if bad_gid {
+        err.set1(b"fsGroup/supplementalGroups must be group IDs between 0 and 2147483647");
+    }
+    if ng > PR_MAX_GROUPS || gover {
+        err.set1(b"the Pod has more supplementalGroups than this node carries");
+    }
+    let policy = pr_ms(psc, b"supplementalGroupsPolicy");
+    let strict = policy == b"Strict";
+    if !matches!(policy, b"" | b"Merge" | b"Strict") {
+        err.set(&[
+            b"supplementalGroupsPolicy \"",
+            policy,
+            b"\" is not Merge or Strict",
+        ]);
+    }
+    let gtext = groups.get(..gn).unwrap_or(&[]);
     o.lit(b";ruid=");
     o.lit(ruid);
     o.lit(b";rgid=");
     o.lit(rgid);
+    // The identity's tail the node composes with the user (workload_effect):
+    // `/<groups>/<flags>`, only when there is one.
+    if ng > 0 || strict || ro_root {
+        o.byte(b'/');
+        o.lit(gtext);
+        o.byte(b'/');
+        if strict {
+            o.byte(b's');
+        }
+        if ro_root {
+            o.byte(b'r');
+        }
+    }
     o.lit(b";nonroot=");
     if nonroot {
         o.byte(b'1');
     }
 
-    // volumes.
+    // volumes, with the Pod's fsGroup and its change policy.
+    let change = pr_ms(psc, b"fsGroupChangePolicy");
+    if !matches!(change, b"" | b"Always" | b"OnRootMismatch") {
+        err.set(&[
+            b"fsGroupChangePolicy \"",
+            change,
+            b"\" is not Always or OnRootMismatch",
+        ]);
+    }
+    x.fsg_set = pr_gid_ok(fsg);
+    x.fsg = if x.fsg_set { pr_gid(fsg) } else { 0 };
+    x.fsg_policy = if change == b"OnRootMismatch" {
+        b'r'
+    } else {
+        b'a'
+    };
     o.lit(b";volumes=");
     let mounts = pr_m(ctr, b"volumeMounts").unwrap_or(b"[]");
     let mut k = 0usize;
@@ -1743,8 +2314,16 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             o.byte(b',');
         }
         k += 1;
+        let start = o.n;
         if pr_volume(w, x, pod, key, m, &mut err, &mut o).is_none() {
             return PrRes::Pending;
+        }
+        if o.n.saturating_sub(start) > PR_VOL_MAX {
+            err.set(&[
+                b"volume \"",
+                pr_ms(m, b"name"),
+                b"\": larger than this node carries",
+            ]);
         }
     }
 
@@ -1755,6 +2334,12 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     // a container of an image only (a host command has no root of its own
     // to bind into).
     let mut has_resolv = false;
+    // The same context as the runtime's resolver context for the workload
+    // (`dns=<server> <search>…`, workload_effect's `net`/`resolver` option):
+    // where a runtime resolves for its workloads (bare metal), the same
+    // server and search list the file names.
+    let mut resolver = [0u8; 512];
+    let mut rvl = 0usize;
     let mut k2 = 0usize;
     while let Some(m) = pr_at(mounts, k2) {
         has_resolv |= pr_ms(m, b"mountPath") == b"/etc/resolv.conf";
@@ -1792,6 +2377,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
                 o.lit(b"/etc/resolv.conf:/etc/resolv.conf:ro");
             }
             PodDns::File(n) => {
+                rvl = pod_resolver(rc.get(..n).unwrap_or(&[]), &mut resolver);
                 if sep {
                     o.byte(b',');
                 }
@@ -1815,6 +2401,11 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
                 b"\" is not a policy this node writes",
             ]),
         }
+    }
+
+    if rvl > 0 {
+        o.lit(b";dns=");
+        o.esc(resolver.get(..rvl).unwrap_or(&[]));
     }
 
     // Ordering: an init container waits for the ones before it, an app

@@ -55,13 +55,16 @@ hardware_targets = ["bcm2712", "linux"]
 #               is left to the graph's other effectors
 #   answer_in   the graph's effectors' outcomes: those to served requests
 #               are written back, the rest pass by
-#   changes     the store's push sink (wired from `status`)
+# A change under the served prefix rings the relay's own kernel event (the
+# `event` resource): the store writes no channel of the relay's.
 # Out:
 #   response_out  the outcomes of relayed effects, as the effector would
 #                 have answered (cid and carry the chain's)
 #   effect_out    served requests, to the graph's effectors (cid the
 #                 relay's own, restored on the answer)
-#   status        the self-edge that gives `changes` its channel
+#   status        unwired (it carried the store's push channel, gone now
+#                 that the store rings the relay's event); kept so no index
+#                 moves
 timer_class = "wall_clock"
 
 [[ports]]
@@ -79,12 +82,6 @@ direction = "input"
 content_type = "OctetStream"
 buffer_size = 16384
 max_record = 4096
-
-[[ports]]
-name = "changes"
-index = 2
-direction = "input"
-content_type = "OctetStream"
 
 [[ports]]
 name = "response_out"
@@ -114,5 +111,17 @@ access = "write"
 requires_contract = "storage.namespace"
 access = "read"
 
+# Every subscription rings the module's one kernel event: the store writes
+# no channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
 [observability]
 exempt = "connector — every request and answer it carries is a store record"
+
+# Store subscriptions an instance opens: one (its side's asks or node
+# ops), on its one kernel event.
+[capacities]
+store_subscriptions = 1
+store_subscribers = 1

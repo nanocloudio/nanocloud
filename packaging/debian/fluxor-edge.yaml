@@ -17,7 +17,7 @@ target: linux
 tick_us: 100
 
 scheduler:
-  accept_cycles: true      # linux_net ⇄ tls ⇄ http feedback pairs + routes self-edge
+  accept_cycles: true      # linux_net ⇄ tls ⇄ http feedback pairs
 
 # Injects the `linux_net` built-in (host TCP via libc sockets) — the transport
 # tls terminates. External clients reach 443; tls forwards http's CMD_BIND(443)
@@ -48,14 +48,15 @@ modules:
     port: 443
     host_tcp: 1
     # Consume the compiled edge routes. Empty = feature off (default); set
-    # here, the module SUBSCRIBEs the prefix and maintains its DynRoute arena,
+    # here, the module SUBSCRIBEs the prefix (the store rings the module's own
+    # kernel event; no edge carries it) and maintains its DynRoute arena,
     # which the relay dials on a match.
     routes_prefix: "/dataplane/edge/"
     # Dynamic listeners are DEFERRED on this tls-fronted graph: http binds
     # through `tls`, so any mid-life-bound port is TLS-terminated regardless —
     # a `tls=1` listener, and only the cleartext (`tls=0`) mid-life bind is
-    # built, where http drives linux_net directly. The self-edge below is pre-wired but
-    # `listeners_prefix` stays unset here, leaving the subsystem inert. A
+    # built, where http drives linux_net directly. `listeners_prefix` stays
+    # unset here, leaving the subsystem inert. A
     # CLEARTEXT edge sets `listeners_prefix: "/dataplane/edge-listeners/"`
     # and mid-life-binds pooled ports directly (see the dynamic-listener e2e).
     # listeners_prefix: "/dataplane/edge-listeners/"
@@ -81,16 +82,3 @@ wiring:
   - from: http_edge.net_out
     to: tls.clear_in
     buffer_bytes: 32768
-  # Dynamic-route change-sink self-edge: the http
-  # module's own output feeds its `routes_changes` input, allocating a
-  # module-owned channel the store's namespace.change SUBSCRIBE pushes onto.
-  # The module never writes this output; it drains pushed events from the
-  # input. Inert unless `routes_prefix` is configured.
-  - from: http_edge.routes_sink
-    to: http_edge.routes_changes
-  # Dynamic-listener change-sink self-edge: a
-  # SECOND 1-node cycle allocating the module-owned channel the store's
-  # namespace.change SUBSCRIBE for /dataplane/edge-listeners/ pushes onto.
-  # Inert unless `listeners_prefix` is configured.
-  - from: http_edge.listeners_sink
-    to: http_edge.listeners_changes

@@ -24,17 +24,21 @@
 #            runs Pods too (NANOCLOUD_PODS=1), with this node's lease
 #            (worker.yaml's), so a cluster of one is its own node — and the
 #            node's dataplane enforcement: the `net_apply` nodes of the proxy
-#            (and, with NANOCLOUD_NETPOLICY=1, the NetworkPolicy) graph
-#            (below), which realize the cluster's rows as this node's packet
-#            policy (nftables DNAT and filters)
+#            and the NetworkPolicy graphs (below), which realize the
+#            cluster's rows as this node's packet policy (nftables DNAT and
+#            filters) — on every node that runs Pods, a worker as much as the
+#            control plane; each knows its own name, so a `Local` traffic
+#            policy keeps to the backends on it, and its host ports are its
+#            own
 #   SERVICES the cluster's Service plane, on the control plane (a template
 #            naming `__SERVICES_MODULES__`): the endpoints controller
 #            (fluxor-endpoints.yaml, installed as endpoints.yaml), the cluster
 #            DNS (fluxor-dns.yaml, as dns.yaml), and the proxy's chain
-#            (fluxor-proxy.yaml, as proxy.yaml) — and with NANOCLOUD_NETPOLICY=1
-#            the NetworkPolicy chain (fluxor-netpolicy.yaml, as
-#            netpolicy.yaml) — every node of those but their `net_apply`,
-#            which each node runs for itself (KUBELET)
+#            (fluxor-proxy.yaml, as proxy.yaml) and the NetworkPolicy chain
+#            (fluxor-netpolicy.yaml, as netpolicy.yaml) — every node of those
+#            but their `net_apply`, which each node runs for itself (KUBELET).
+#            The chains write the cluster's rows once; what is per node is
+#            decided where they are enforced
 #
 # Values come from /etc/nanocloud.io/cluster.env (NANOCLOUD_CLUSTER_ENV
 # overrides the path), each overridable from the environment:
@@ -80,18 +84,28 @@
 #                         see below)
 #   NANOCLOUD_PODS        on the control plane: 1 runs Pods here too
 #                         (default: 0; a fresh install's cluster.env says 1)
-#   NANOCLOUD_NETPOLICY   1: NetworkPolicy is computed (the control plane)
-#                         and enforced (each node). Default 0: a single node
-#                         that also pulls images cannot hold its chain — the
-#                         runtime's config arena (fluxor's CONFIG_ARENA_SIZE,
-#                         256 KiB) overflows and the node does not start
+#   NANOCLOUD_NETPOLICY   1 (the default): NetworkPolicy is computed (the
+#                         control plane) and enforced (each node); 0 leaves
+#                         it out, and a NetworkPolicy then constrains nothing
 #   NANOCLOUD_NODE_PORTS  the NodePort range (default: 30000-32767)
 #   NANOCLOUD_LB_POOL     the addresses LoadBalancer Services are given,
 #                         <a.b.c.d>/<n> (default: none — such a Service stays
-#                         pending). Each node DNATs them; nothing announces
-#                         them (no ARP): the network routes them to a node
+#                         pending). Each node DNATs them; ONE node answers
+#                         for each on the link that covers it (node_net:
+#                         the holder of its claim, taken over when that node
+#                         goes; for `Local`, only a node with an endpoint)
+#   NANOCLOUD_CLUSTER_CIDR  the cluster's Pod CIDR (default: 10.244.0.0/16):
+#                         each node is given a /24 of it at registration
+#                         (svc_alloc, Node.spec.podCIDR), its Pods their
+#                         addresses from that (ipam_pod), and every node
+#                         routes each other node's /24 to it (node_net)
 #   NANOCLOUD_DNS_PORT    the cluster DNS's port on the control plane
 #                         (default: 53)
+#   NANOCLOUD_DNS_SERVICE_IP  the ClusterIP of the Service fronting it,
+#                         kube-system/kube-dns, inside the Service range
+#                         (10.96.0.0/16) — what a Pod's resolv.conf names
+#                         (default: 10.96.0.10; empty: no Service, Pods name
+#                         the control plane's address)
 #   NANOCLOUD_DNS_UPSTREAM  where it forwards every name outside
 #                         cluster.local, an IPv4 address (default: the first
 #                         nameserver of /etc/resolv.conf that is neither
@@ -190,7 +204,11 @@ PEER_TRUST="${NANOCLOUD_PEER_TRUST:-pins}"
 TRUST_DOMAIN="${NANOCLOUD_TRUST_DOMAIN:-nanocloud.local}"
 SCOPED="${NANOCLOUD_SCOPED:-/pod-,/sandboxes/,/metal-sandboxes/,/sandbox-,/tty/,/probe-,/volume-binds/,/image-,/volume-ops/,/np-status/}"
 PODS="${NANOCLOUD_PODS:-0}"
-NETPOLICY="${NANOCLOUD_NETPOLICY:-0}"
+CLUSTER_CIDR="${NANOCLOUD_CLUSTER_CIDR:-10.244.0.0/16}"
+case "$CLUSTER_CIDR" in
+    *[!0-9./]*|"") fail "NANOCLOUD_CLUSTER_CIDR is '$CLUSTER_CIDR', not <a.b.c.d>/<n>" ;;
+esac
+NETPOLICY="${NANOCLOUD_NETPOLICY:-1}"
 case "$NETPOLICY" in 0|1) ;; *) fail "NANOCLOUD_NETPOLICY is '$NETPOLICY', not 0 or 1" ;; esac
 # The dataplane graphs a node enforces (their net_apply) and the control
 # plane computes (the rest).
@@ -313,9 +331,10 @@ $IMAGE_WIRING"
     fi
     # The node's dataplane enforcement: the proxy's (and NetworkPolicy's)
     # rows, realized as this node's packet policy.
-    # Its node ports are DNATed at its own address.
-    NODE_ADDR_LINE=""
-    [ -z "$NODE_ADDRESS" ] || NODE_ADDR_LINE="\\n    node_address: \"$NODE_ADDRESS\""
+    # Its node and host ports are DNATed at its own address, and its name
+    # says which backends are its own.
+    NODE_ADDR_LINE="\\n    node_name: \"$NODE_NAME\""
+    [ -z "$NODE_ADDRESS" ] || NODE_ADDR_LINE="$NODE_ADDR_LINE\\n    node_address: \"$NODE_ADDRESS\""
     for pair in $DATAPLANE; do
         F="$(fragment "" "${pair%%:*}" "${pair#*:}")" || fail "no ${pair%%:*} beside $TEMPLATE"
         KUBELET_MODULES="$KUBELET_MODULES
@@ -323,6 +342,16 @@ $(split_modules "$F" in | sed "s#^    table: \"proxy\"\$#    table: \"proxy\"$NO
         KUBELET_WIRING="$KUBELET_WIRING
 $(split_wiring "$F" in)"
     done
+    # The node's net_route writer: its segment from its Pod CIDR, its peer
+    # routes to every other node's, and the load-balancer addresses it
+    # answers for (node_net). Before any Pod of it is given an address of
+    # its own: pod_resolve gives one only once the node says its segment is
+    # in place.
+    KUBELET_MODULES="$KUBELET_MODULES
+  - name: node_net
+    type: node_net
+    node_name: \"$NODE_NAME\"
+    cluster_cidr: \"$CLUSTER_CIDR\""
     # The control plane's own lease, as a worker keeps its (worker.yaml).
     if [ "${NANOCLOUD_ROLE:-plane}" != node ]; then
         F="$(fragment "" worker.yaml fluxor-worker.yaml)" || fail "no worker graph beside $TEMPLATE"
@@ -331,8 +360,6 @@ $(split_wiring "$F" in)"
         KUBELET_MODULES="$KUBELET_MODULES
 $LEASE"
         KUBELET_WIRING="$KUBELET_WIRING
-  - from: nl_self.status
-    to: nl_self.changes
   - from: nl_self.record_out
     to: nl_renew.request_in"
     fi
@@ -366,10 +393,16 @@ $(split_wiring "$F" out)"
     done
     UP_LINE=""
     [ -z "$DNS_UPSTREAM" ] || UP_LINE="\\n    upstream: \"$DNS_UPSTREAM\""
-    # Where Pods reach it: this node's address (/cluster-dns).
+    # Where Pods reach it: this node's address, behind the ClusterIP of the
+    # Service fronting it (/cluster-dns).
+    DNS_SERVICE_IP="${NANOCLOUD_DNS_SERVICE_IP-10.96.0.10}"
+    case "$DNS_SERVICE_IP" in *[!0-9.]*) fail "NANOCLOUD_DNS_SERVICE_IP is '$DNS_SERVICE_IP', not an address" ;; esac
     [ -z "$NODE_ADDRESS" ] || UP_LINE="$UP_LINE\\n    address: \"$NODE_ADDRESS\""
+    [ -z "$NODE_ADDRESS" ] || [ -z "$DNS_SERVICE_IP" ] || UP_LINE="$UP_LINE\\n    service_ip: \"$DNS_SERVICE_IP\""
     LB_LINE=""
     [ -z "$LB_POOL" ] || LB_LINE="\\n    lb_pool: \"$LB_POOL\""
+    # Every node's Pod CIDR, carved from the cluster's.
+    LB_LINE="$LB_LINE\\n    cluster_cidr: \"$CLUSTER_CIDR\""
     SERVICES_MODULES="$(printf '%s\n' "$SERVICES_MODULES" \
         | sed -e "/^  - name: cluster_dns\$/,/^  - name: /s#^    port: 53\$#    port: $DNS_PORT$UP_LINE#" \
               -e "s#^    node_ports: \"30000-32767\"\$#    node_ports: \"$NODE_PORTS\"$LB_LINE#")"

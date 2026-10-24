@@ -111,6 +111,11 @@ module nanocloud.apiplane_watch {
     when e.type == "ERROR" ->
       WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
              c_cid: e.cid, c_status: 200, c_answer: e.line, c_stream: 0, c_wstatus: 0 };
+    // A list, get or watch whose read the store refused for good: its
+    // Status, 500, and the end.
+    when e.type == "FAILED" ->
+      WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,
+             c_cid: e.cid, c_status: 500, c_answer: e.line, c_stream: 0, c_wstatus: 0 };
     // A GET of an object that is not there.
     when e.type == "NOTFOUND" ->
       WAct { cid: e.seq, op: DELETE, key: "", kcid: e.cid,

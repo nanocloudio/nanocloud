@@ -76,8 +76,6 @@ modules:
   - name: debug
     mode: 1
 wiring:
-  - from: store_source.status
-    to: store_source.changes
   - from: store_source.record_out
     to: debug.data
     # buffer_group is REQUIRED on a record edge: a non-zero group puts the
@@ -266,10 +264,6 @@ modules:
   - name: debug
     mode: 1
 wiring:
-  - from: store_source.status
-    to: store_source.changes
-  - from: fold.status
-    to: fold.changes
   - from: store_source.record_out
     to: debug.data
     buffer_group: 1
@@ -363,12 +357,6 @@ modules:
     type: debug
     mode: 1
 wiring:
-  - from: waiting.status
-    to: waiting.changes
-  - from: nothing.status
-    to: nothing.changes
-  - from: leases.status
-    to: leases.changes
   - from: waiting.record_out
     to: dbg_w.data
     buffer_group: 1

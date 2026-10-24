@@ -55,8 +55,6 @@ modules:
     key_prefix: "/admit-resp/"
 
 wiring:
-  - from: adm_src.status
-    to: adm_src.changes
   - from: adm_src.record_out
     to: adm_in.record_in
   - from: adm_in.result_out

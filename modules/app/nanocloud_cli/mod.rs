@@ -50,8 +50,6 @@ const OBJ_GET: u32 = 0x1421;
 const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const PORT_OUTPUT: u8 = 1;
 const STEP_DONE: i32 = 1;
 
@@ -235,11 +233,34 @@ struct State {
 /// Keys a finishing command removes.
 const FINISH_KEYS: usize = 3;
 
+/// The command FAILS: the store refused one of its reads for good (`rc`), so
+/// what it would answer was built on reads that answered nothing. Said, exit
+/// 1, finished — never a command left asking again for an answer that will
+/// not come.
+unsafe fn refused_exit(s: &mut State, sys: &SyscallTable, rc: i32) -> i32 {
+    let mut m = [0u8; 96];
+    let mut p = append(&mut m, 0, b"error: the store refused a read (rc=-");
+    p = append_u32(&mut m, p, rc.unsigned_abs());
+    p = append(&mut m, p, b") - the command FAILED\n");
+    if s.out_chan >= 0 {
+        let _ = (sys.channel_write)(s.out_chan, m.as_ptr(), p);
+    }
+    if s.exit_chan >= 0 {
+        let c = 1i32.to_le_bytes();
+        let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
+    }
+    s.stream_mode = 0;
+    s.done = 1;
+    STEP_DONE
+}
+
 // ---- store ----
 
 /// Keys under `prefix`, counted over every page. A page the store has not
 /// answered yet (`EAGAIN`) leaves the count short, and the pass waiting
-/// ([`Store::waiting`]): the command is served again and answers then.
+/// ([`Store::waiting`]): the command is served again and answers then. A
+/// page refused for good leaves it short too, and the pass refused
+/// ([`Store::refusal`]): the command fails ([`refused_exit`]).
 unsafe fn count_prefix(sys: &Store, prefix: &[u8]) -> u32 {
     let mut walk = ListWalk::new(prefix);
     let mut count = 0u32;
@@ -598,6 +619,9 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
     let mut h = 0x811c_9dc5u32;
     while let Some(key) = walk.next(&st) {
         h = (h ^ key_hash(key)).wrapping_mul(0x0100_0193);
+    }
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
     }
     if !st.waiting() && h != s.watch_hash {
         s.watch_hash = h;
@@ -1057,6 +1081,9 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
         }
         log_tally(&st, id)
     };
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
+    }
     if st.waiting() || t1 != t2 {
         // Not answered yet (`EAGAIN`), or written meanwhile: asked next step.
         return 0;
@@ -1081,6 +1108,9 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
             Some(sl) => status_is_terminal(&sval[..sl]),
             None => false,
         };
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
+    }
     if terminal || s.stream_steps >= STREAM_MAX {
         if s.exit_chan >= 0 {
             let c = 0i32.to_le_bytes();
@@ -1153,6 +1183,9 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let mut oval = [0u8; MAX_VALUE];
             if ol != 0 {
                 let got = get_value(&st, &okey[..ol], &mut oval);
+                if let Some(rc) = st.refusal() {
+                    return refused_exit(s, sys, rc);
+                }
                 if st.waiting() {
                     // The output not answered yet: the result is read
                     // again next step, and nothing is removed unsaid.
@@ -1179,6 +1212,9 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
             return finish_step(s, sys);
         }
     }
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
+    }
     if s.stream_steps >= EXEC_POLL_MAX {
         let msg = b"error: exec timed out (is the control-plane/node graph running?)\n";
         if s.out_chan >= 0 {
@@ -1198,18 +1234,22 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
 const STORE_READY_WAIT_MS: u64 = 30_000;
 
 /// Whether the store answers a read: a GET of the root found, or answered
-/// absent as the contract answers absence (`ENXIO`/`ENOENT`). Ask-again —
-/// or any other refusal, which is undecided too ([`refused`]) — is not an
-/// answer: the command waits for one, then says the store never came up.
-unsafe fn store_answers(sys: &SyscallTable, nag: &ReadNag) -> bool {
+/// absent as the contract answers absence (`ENXIO`/`ENOENT`) — `Found`.
+/// The contract's "not yet" is not an answer (`Pending`): the command waits
+/// for one, then says the store never came up. A refusal that is final
+/// (`Refused`) is the store's answer, and the command fails on it at once.
+unsafe fn store_answers(sys: &SyscallTable, nag: &ReadNag) -> Got<()> {
     let mut key = *b"/";
     let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), key.len());
     if h >= 0 {
         let mut carg = [0u8; 4];
         (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
-        return true;
+        return Got::Found(());
     }
-    matches!(refusal::<()>(sys, nag, b"GET", b"/", h), Got::Absent)
+    match refusal::<()>(sys, nag, b"GET", b"/", h) {
+        Got::Absent => Got::Found(()),
+        got => got,
+    }
 }
 
 /// Owe the removal of `key` before the command exits.
@@ -1327,6 +1367,9 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     } else {
         0
     };
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
+    }
     if st.waiting() {
         return 0; // asked next step; the output is not empty
     }
@@ -1349,6 +1392,9 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
     } else {
         (false, 0)
     };
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
+    }
     if terminal || s.stream_steps >= STREAM_MAX {
         if s.exit_chan >= 0 {
             let c = code.to_le_bytes();
@@ -1378,6 +1424,9 @@ unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
         owe_removal(s, TOKEN_REQ_KEY);
         owe_removal(s, TOKEN_RESP_KEY);
         return finish_step(s, sys);
+    }
+    if let Some(rc) = st.refusal() {
+        return refused_exit(s, sys, rc);
     }
     if s.stream_steps >= EXEC_POLL_MAX {
         let msg = b"error: token mint timed out (is the control-plane graph running?)\n";
@@ -1700,7 +1749,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // read answers ask-again, which a one-shot command would take for
         // absent. A command runs once it answers, or says it never did.
         if s.store_ready == 0 {
-            if !store_answers(sys, &s.nag) {
+            let answers = store_answers(sys, &s.nag);
+            if let Got::Refused(rc) = answers {
+                return refused_exit(s, sys, rc);
+            }
+            if answers != Got::Found(()) {
                 let now = dev_millis(sys);
                 if s.store_wait_from == 0 {
                     s.store_wait_from = now.max(1);
@@ -2104,6 +2157,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         s.waiting = 0;
+        if let Some(rc) = s.journal.refusal() {
+            return refused_exit(s, sys, rc);
+        }
 
         // `logs -f` armed streaming instead of a one-shot answer: don't finalize
         // (no exit latch / Done yet) — subsequent steps stream via stream_step.

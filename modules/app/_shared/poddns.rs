@@ -19,7 +19,9 @@
 // Not the kubelet's: the node's own search path is not appended under
 // ClusterFirst, and a Default Pod's dnsConfig is not merged into the node's
 // file (the node's file is not read where this runs; Default binds it as it
-// is). The cluster DNS address and zone are the caller's.
+// is). The cluster DNS address and zone are the caller's: the address is
+// `/cluster-dns`, the ClusterIP of kube-system/kube-dns (cluster_dns), which
+// every node's proxy translates to the resolver.
 
 /// What a Pod's resolv.conf is.
 #[derive(PartialEq, Eq, Debug)]
@@ -227,4 +229,44 @@ fn pod_dns(pod: &[u8], ns: &[u8], dns: &[u8], zone: &[u8], out: &mut [u8]) -> Po
         return PodDns::Refused;
     }
     PodDns::File(o.at)
+}
+
+/// A resolv.conf as the runtime's resolver context: its first nameserver,
+/// when it is an IPv4 address, then its search list, space-separated into
+/// `out` (`<server> <search>…`). 0 when it names no IPv4 nameserver.
+fn pod_resolver(file: &[u8], out: &mut [u8]) -> usize {
+    let mut o = PdOut {
+        buf: out,
+        at: 0,
+        full: false,
+    };
+    let mut server: &[u8] = &[];
+    let mut search: &[u8] = &[];
+    for line in file.split(|&c| c == b'\n') {
+        if server.is_empty() {
+            if let Some(v) = line.strip_prefix(b"nameserver ") {
+                server = v;
+            }
+        }
+        if let Some(v) = line.strip_prefix(b"search ") {
+            search = v;
+        }
+    }
+    let v4 = !server.is_empty()
+        && server.split(|&c| c == b'.').count() == 4
+        && server.iter().all(|&c| c == b'.' || c.is_ascii_digit());
+    if !v4 {
+        return 0;
+    }
+    o.put(server);
+    for d in search.split(|&c| c == b' ') {
+        if !d.is_empty() {
+            o.put(b" ");
+            o.put(d);
+        }
+    }
+    if o.full {
+        return 0;
+    }
+    o.at
 }

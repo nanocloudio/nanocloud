@@ -14,7 +14,9 @@
 #
 # Compact format:
 #   /sandboxes/<id>       = "cmd=<argv>;phase=<create|start|delete>[;rootfs=<path>][;iso=1]"
-#   /sandbox-status/<id>  = "state=<created|running|exited|killed|failed|destroyed>;code=<n>"
+#   /sandbox-status/<id>  = "state=<created|running|exited|killed|failed|destroyed>;code=<n>[;started=<moment>]"
+#                           (started: the moment START started the run's
+#                           process, on every status of a run — its exit too)
 #
 # Prereqs: `fluxor modules build --target bcm2712` in this repo, and a
 # fluxor-linux runtime with the oci provider (contract 0x18). FLUXOR_RUNTIME
@@ -98,8 +100,8 @@ FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
 
 echo "== 5. verify terminal status written back to the store =="
 ST="$(wal_last /sandbox-status/test1)"
-[ "$ST" = "state=exited;code=0" ] \
-  || fail "status wrong: got '$ST', want 'state=exited;code=0'"
+[[ "$ST" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] \
+  || fail "status wrong: got '$ST', want 'state=exited;code=0;started=<moment>'"
 
 echo "== E2E green (null sandbox): store -> workload lifecycle over the shared store =="
 echo "   /sandbox-status/test1: $ST"
@@ -203,8 +205,8 @@ FLUXOR_STORE_DIR="$D2" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
 
 echo "== 7. verify the isolated sandbox ran and the host UTS is intact =="
 IST="$(D="$D2" wal_last /sandbox-status/iso1)"
-[ "$IST" = "state=exited;code=0" ] \
-  || fail "isolated status wrong: got '$IST', want 'state=exited;code=0'"
+[[ "$IST" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] \
+  || fail "isolated status wrong: got '$IST', want 'state=exited;code=0;started=<moment>'"
 [ "$(hostname)" = "$HOST_HOSTNAME" ] \
   || fail "host hostname changed ('$HOST_HOSTNAME' -> '$(hostname)') — UTS did NOT isolate"
 
@@ -222,6 +224,10 @@ IPBIN="$(command -v ip || echo /usr/sbin/ip)"
 # null sandbox + own netns; cmd runs `ip addr` inside the sandbox
 D5="$(mktemp -d /tmp/nc-sb-net-XXXXXX)"; trap 'rm -rf "$D" "$D2" "$D5"' EXIT
 D="$D5" wal_put "/ipam-pool"           "cidr=10.244.9.0/24"
+# The node states its segment before any own-network sandbox is created
+# (node_net's /sandbox-net): none here (0), so the identity is the pool's
+# prefix in a domain of its own.
+D="$D5" wal_put "/sandbox-net"         "seg=0"
 D="$D5" wal_put "/ipam-lease/netbox1"  "10.244.9.7"
 D="$D5" wal_put "/sandboxes/netbox1"   "cmd=$IPBIN addr;phase=start;net=own"
 D="$D5" wal_put "/sandboxes/netbox2"   "cmd=$IPBIN addr;phase=start;net=own"   # no lease -> defer
@@ -229,8 +235,8 @@ FLUXOR_STORE_DIR="$D5" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-net.log" 2>&1 || true
 
 NST="$(D="$D5" wal_last /sandbox-status/netbox1)"
-[ "$NST" = "state=exited;code=0" ] \
-  || fail "net=own status wrong: got '$NST', want 'state=exited;code=0'"
+[[ "$NST" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] \
+  || fail "net=own status wrong: got '$NST', want 'state=exited;code=0;started=<moment>'"
 NLOG="$(D="$D5" wal_last /sandbox-logs/netbox1)"
 case "$NLOG" in
   *10.244.9.7/24*) : ;;

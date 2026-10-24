@@ -68,9 +68,7 @@ platform:
   net:
     write_buf_kib: 8192
 
-# Every store_source self-wires status -> changes (a 1-node cycle) to allocate
-# its store-change sink, and the request chain returns to `http`, so the graph
-# is cyclic by construction.
+# The request chain returns to `http`, so the graph is cyclic by construction.
 scheduler:
   accept_cycles: true
 
@@ -583,8 +581,9 @@ modules:
     # carries, what a GET of nothing answers, how a view reads — a Scale
     # rendered from the object, a Pod's log as its sandbox's output tail —
     # and the watch wire: an event's framing, the 410 a watch past its
-    # history ends with, a bookmark's object, and a List's tail.
-    schema: "rv=metadata.resourceVersion;missing={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404};view.scale=tpl:{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\",\"metadata\":{\"name\":{{metadata.name}},\"namespace\":{{metadata.namespace}},\"uid\":{{metadata.uid}},\"creationTimestamp\":{{metadata.creationTimestamp}}},\"spec\":{\"replicas\":{{spec.replicas|1}}},\"status\":{\"replicas\":{{status.replicas|0}},\"selector\":\"{{pairs:spec.selector.matchLabels}}\"}};view.log=text:/~node/|spec.nodeName|/sandbox-logs/|metadata.uid;event={\"type\":\"{{type}}\",\"object\":{{object}}};expired={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"too old resource version\",\"reason\":\"Expired\",\"code\":410};bookmark={\"kind\":\"{{kind}}\",\"apiVersion\":\"{{av}}\",\"metadata\":{\"resourceVersion\":\"{{rv}}\"}};list.tail=],\"metadata\":{\"resourceVersion\":\"{{rv}}\"{{?continue:,\"continue\":\"$\"}}}};table.head={\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"columnDefinitions\":[{{cols}}],\"rows\":[;table.col={\"name\":\"{{name}}\",\"type\":\"string\",\"format\":\"{{format}}\",\"description\":\"\",\"priority\":0};table.row={\"cells\":[{{cells}}],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{{metadata}}}};table.end=]}"
+    # history ends with, the 500 a watch, list or get the store refused ends
+    # with, a bookmark's object, and a List's tail.
+    schema: "rv=metadata.resourceVersion;missing={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404};view.scale=tpl:{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\",\"metadata\":{\"name\":{{metadata.name}},\"namespace\":{{metadata.namespace}},\"uid\":{{metadata.uid}},\"creationTimestamp\":{{metadata.creationTimestamp}}},\"spec\":{\"replicas\":{{spec.replicas|1}}},\"status\":{\"replicas\":{{status.replicas|0}},\"selector\":\"{{pairs:spec.selector.matchLabels}}\"}};view.log=text:/~node/|spec.nodeName|/sandbox-logs/|metadata.uid;event={\"type\":\"{{type}}\",\"object\":{{object}}};expired={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"too old resource version\",\"reason\":\"Expired\",\"code\":410};failed={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the store refused a read\",\"reason\":\"InternalError\",\"code\":500};bookmark={\"kind\":\"{{kind}}\",\"apiVersion\":\"{{av}}\",\"metadata\":{\"resourceVersion\":\"{{rv}}\"}};list.tail=],\"metadata\":{\"resourceVersion\":\"{{rv}}\"{{?continue:,\"continue\":\"$\"}}}};table.head={\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"columnDefinitions\":[{{cols}}],\"rows\":[;table.col={\"name\":\"{{name}}\",\"type\":\"string\",\"format\":\"{{format}}\",\"description\":\"\",\"priority\":0};table.row={\"cells\":[{{cells}}],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{{metadata}}}};table.end=]}"
     prefix: "/watch-reg/"
     watch: "/"
     events: 1
@@ -610,7 +609,7 @@ modules:
   - name: ws_emit
     type: store_effect
     # chronicle-source: modules/app/_chronicle/apiplane_watch.uproc w_emit
-    decision: {hex: "04050000000f0001000246000000120300454e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004105000000110001000246000000120500434c4f53452000160000006d000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f00000012000040200000001000000000000000004021000000100000000000000000402400000041050000001100010002460000001205004552524f5220001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001400010002460000001208004e4f54464f554e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e000000109401000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004117000000710001000201000000400100000010000000000000000040020000001200004003000000100000000000000000401200000001000249000000401e0000000100024a000000401f0000000100024800000040200000001005000000000000004021000000100000000000000000402400000041"}
+    decision: {hex: "05050000000f0001000246000000120300454e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004105000000110001000246000000120500434c4f53452000160000006d000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f00000012000040200000001000000000000000004021000000100000000000000000402400000041050000001100010002460000001205004552524f5220001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001200010002460000001206004641494c454420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010f401000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001400010002460000001208004e4f54464f554e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e000000109401000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004117000000710001000201000000400100000010000000000000000040020000001200004003000000100000000000000000401200000001000249000000401e0000000100024a000000401f0000000100024800000040200000001005000000000000004021000000100000000000000000402400000041"}
     key_prefix: "/watch-reg/"
   # A deleted object's last state (store_doc `tomb`), kept for a watch's
   # DELETED event and expired by its deadline (tomb.uproc `ex_any`).
@@ -755,8 +754,6 @@ wiring:
     to: se_ans.request_in
   - from: se_ans.response_out
     to: reply.record_in
-  - from: gc_src.status
-    to: gc_src.changes
   - from: gc_src.record_out
     to: gc_blob.request_in
   - from: gc_blob.response_out
@@ -766,12 +763,8 @@ wiring:
   # MergeModule inserted automatically for two edges into one input; it clears
   # `buffer_group`, which is why the merge lands on a Chronicle engine input
   # (they self-frame) rather than on `http_chain.reply_in`.
-  - from: ws_evt.status
-    to: ws_evt.changes
   - from: ws_evt.record_out
     to: ws_emit.request_in
-  - from: tomb_src.status
-    to: tomb_src.changes
   - from: tomb_src.record_out
     to: tomb_gc.request_in
   - from: ws_emit.response_out
@@ -781,98 +774,62 @@ wiring:
   - from: enc_http.result_out
     to: http_chain.reply_in
     buffer_group: 7
-  - from: rb_roles.status
-    to: rb_roles.changes
   - from: rb_roles.record_out
     to: rb_roles_e.request_in
-  - from: rb_croles.status
-    to: rb_croles.changes
   - from: rb_croles.record_out
     to: rb_croles_e.request_in
-  - from: rb_rules.status
-    to: rb_rules.changes
   - from: rb_rules.record_out
     to: rb_rules_e.request_in
-  - from: rb_rbs.status
-    to: rb_rbs.changes
   - from: rb_rbs.record_out
     to: rb_rbs_e.request_in
-  - from: rb_crbs.status
-    to: rb_crbs.changes
   - from: rb_crbs.record_out
     to: rb_crbs_e.request_in
-  - from: rb_perms.status
-    to: rb_perms.changes
   - from: rb_perms.record_out
     to: rb_src_e.request_in
   - from: rb_src_e.response_out
     to: rb_g_e.request_in
-  - from: rb_prule.status
-    to: rb_prule.changes
   - from: rb_prule.record_out
     to: rb_prule_get.request_in
   - from: rb_prule_get.response_out
     to: rb_prule_del.request_in
-  - from: rb_pbind.status
-    to: rb_pbind.changes
   - from: rb_pbind.record_out
     to: rb_pbind_get.request_in
   - from: rb_pbind_get.response_out
     to: rb_pbind_del.request_in
-  - from: rb_pperm.status
-    to: rb_pperm.changes
   - from: rb_pperm.record_out
     to: rb_pperm_chk.request_in
   - from: rb_pperm_chk.response_out
     to: rb_pperm_del.request_in
-  - from: rb_aggselsrc.status
-    to: rb_aggselsrc.changes
   - from: rb_aggselsrc.record_out
     to: rb_aggsel.request_in
-  - from: rb_mirrorsrc.status
-    to: rb_mirrorsrc.changes
   - from: rb_mirrorsrc.record_out
     to: rb_mirror.request_in
-  - from: rb_paggsel.status
-    to: rb_paggsel.changes
   - from: rb_paggsel.record_out
     to: rb_paggsel_get.request_in
   - from: rb_paggsel_get.response_out
     to: rb_paggsel_del.request_in
-  - from: rb_pagg.status
-    to: rb_pagg.changes
   - from: rb_pagg.record_out
     to: rb_pagg_get.request_in
   - from: rb_pagg_get.response_out
     to: rb_pagg_del.request_in
-  - from: rb_paggrole.status
-    to: rb_paggrole.changes
   - from: rb_paggrole.record_out
     to: rb_paggrole_chk.request_in
   - from: rb_paggrole_chk.response_out
     to: rb_paggrole_del.request_in
-  - from: rb_pmirror.status
-    to: rb_pmirror.changes
   - from: rb_pmirror.record_out
     to: rb_pmirror_chk.request_in
   - from: rb_pmirror_chk.response_out
     to: rb_pmirror_del.request_in
-  - from: rb_aggsrc.status
-    to: rb_aggsrc.changes
   - from: rb_aggsrc.record_out
     to: rb_aggmap.record_in
   - from: rb_aggmap.result_out
     to: rb_agg.request_in
-  - from: rb_psrc.status
-    to: rb_psrc.changes
   - from: rb_psrc.record_out
     to: rb_psrc_p.request_in
   - from: rb_psrc_p.response_out
     to: rb_psrc_bp.request_in
   - from: rb_psrc_bp.response_out
     to: rb_psrc_del.request_in
-  - from: rb_pg.status
-    to: rb_pg.changes
   - from: rb_pg.record_out
     to: rb_pg_del.request_in
   # ── The store's own loops ─────────────────────────────────────────

@@ -11,7 +11,6 @@
 target: linux
 tick_us: 1000
 
-# Self-edges (change-sink allocators) are deliberate 1-node cycles.
 scheduler:
   accept_cycles: true
 
@@ -36,8 +35,6 @@ modules:
     key_prefix: "/route-status/"
 
 wiring:
-  - from: store_source.status
-    to: store_source.changes
 
   # NO buffer_group: a Chronicle engine self-frames over a byte stream
   # (io_core::admit_frame peeks, reads the length, consumes exactly that), so a

@@ -6,7 +6,6 @@
 target: linux
 tick_us: 1000
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -46,8 +45,6 @@ modules:
   # (count_children) and a decision states. Params from modules/app/_chronicle/job.uproc.
 
 wiring:
-  - from: st_source.status
-    to: st_source.changes
   - from: st_source.record_out
     to: st_nbget.request_in
   - from: st_nbget.response_out

@@ -117,8 +117,6 @@ modules:
     decision: {hex: "${DEC_REC}"}
     key_prefix: "/events/"
 wiring:
-  - from: store_source.status
-    to: store_source.changes
   - from: store_source.record_out
     to: current.request_in
   - from: current.response_out

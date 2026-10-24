@@ -159,10 +159,13 @@ fn tomb_identity(obj: &[u8], grace: Option<u64>, out: &mut [u8]) -> usize {
 /// or never written, is the end reached). One listing of the base's
 /// prefix, whatever the Pod's container count. The caller reads
 /// `sys.waiting()` after: a page or a write not answered yet holds its
-/// serve, which replays these calls.
-unsafe fn drop_family(sys: &Store, base: &[u8]) {
+/// serve, which replays these calls. A listing that failed (a page refused
+/// for good: `sys.refusal()`, or one that could not be parsed) leaves
+/// `<base>` too — removing it with its family unknown would orphan that
+/// family — and answers `false`.
+unsafe fn drop_family(sys: &Store, base: &[u8]) -> bool {
     if base.is_empty() || base.len() + 1 > MAX_KEY {
-        return;
+        return true;
     }
     let mut pre = [0u8; MAX_KEY];
     let n = append(&mut pre, 0, base);
@@ -176,12 +179,16 @@ unsafe fn drop_family(sys: &Store, base: &[u8]) {
         }
         let _ = delete_value(sys, k.get(..kl).unwrap_or(&[]));
     }
+    if walk.failed || sys.refusal().is_some() {
+        return false;
+    }
     if walk.pending || sys.waiting() {
-        return;
+        return true;
     }
     if exists(sys, base) {
         let _ = delete_value(sys, base);
     }
+    sys.refusal().is_none()
 }
 
 /// A Pod's tomb about to REPLACE another incarnation's (the same name,
@@ -194,7 +201,8 @@ unsafe fn drop_family(sys: &Store, base: &[u8]) {
 /// overwritten, nothing else would ever remove the old one's records.
 /// `false` while a read is asked again or the delete is undecided: the
 /// serve is held, and served again it replays these calls and goes on to
-/// leave the tomb.
+/// leave the tomb. `false` too when the store refused a read for good: the
+/// serve has failed, and leaves no tomb.
 unsafe fn end_replaced_pod(sys: &Store, at_key: &[u8], key: &[u8], obj: &[u8]) -> bool {
     if !key.starts_with(b"/pods/") {
         return true;
@@ -202,7 +210,7 @@ unsafe fn end_replaced_pod(sys: &Store, at_key: &[u8], key: &[u8], obj: &[u8]) -
     let mut old = [0u8; TOMB_AT_MAX];
     let n = match get_value(sys, at_key, &mut old) {
         Some(n) => n,
-        None if sys.waiting() => return false,
+        None if sys.waiting() || sys.refusal().is_some() => return false,
         None => return true,
     };
     let old = old.get(..n).unwrap_or(&[]);
@@ -228,7 +236,7 @@ unsafe fn end_replaced_pod(sys: &Store, at_key: &[u8], key: &[u8], obj: &[u8]) -
     // never written: a Pod no node ran) is the end reached. A read asked
     // again holds the serve (the tomb's own writes after it wait with it).
     drop_family(sys, spec);
-    !sys.waiting()
+    !sys.waiting() && sys.refusal().is_none()
 }
 
 /// Write the tomb's index entry `<tomb>-at<key>`: `false` when it was

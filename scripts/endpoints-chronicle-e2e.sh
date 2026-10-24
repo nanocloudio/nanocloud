@@ -103,7 +103,7 @@ modules:
   - name: sl_source
     type: store_source
     prefix: "/endpointslices/"
-    related: "/services/^1:metadata.name"
+    related: "/services/^1:metadata.name,spec.selector"
     watch: "/pods/,/services/"
   - name: podexists
     type: store_effect
@@ -135,24 +135,16 @@ modules:
     decision: {hex: "${DEC_GN}"}
     key_prefix: "/endpoints/"
 wiring:
-  - from: pairs.status
-    to: pairs.changes
   - from: pairs.record_out
     to: probe.request_in
   - from: probe.response_out
     to: slices.request_in
-  - from: sl_source.status
-    to: sl_source.changes
   - from: sl_source.record_out
     to: podexists.request_in
   - from: podexists.response_out
     to: collect.request_in
-  - from: svcs.status
-    to: svcs.changes
   - from: svcs.record_out
     to: write.request_in
-  - from: docs.status
-    to: docs.changes
   - from: docs.record_out
     to: gone.request_in
 YAML
@@ -243,5 +235,18 @@ store_put "/pods/default/big-2" '{"metadata":{"name":"big-2","labels":{"app":"bi
 run 7
 [ "$(store_last /endpoints/default/big)" = "big-1=10.0.0.9,big-2=10.0.0.10" ] || fail "big: '$(store_last /endpoints/default/big)' (big-1 is $(printf '%s' "$BIGPOD" | wc -c) bytes)"
 echo "   big: big-1=10.0.0.9 ($(printf '%s' "$BIGPOD" | wc -c) bytes),big-2=10.0.0.10"
+
+echo "== 7. a Service WITHOUT a selector is left alone: its own slice stays, no Pod is joined to it =="
+# As kube-system/kube-dns is (cluster_dns writes its one endpoint itself).
+store_put "/services/default/manual" '{"metadata":{"name":"manual"},"spec":{"clusterIP":"10.96.0.10","ports":[{"port":53,"protocol":"UDP"}]}}'
+store_put "/endpointslices/default/manual/cluster-dns-10-0-0-50" "10.0.0.50"
+run 7
+[ "$(store_last /endpointslices/default/manual/cluster-dns-10-0-0-50)" = "10.0.0.50" ] \
+  || fail "a selectorless Service's own slice was pruned (it names no Pod)"
+for p in web-1 web-2 api-1 db-1 big-1 big-2; do
+  [ -z "$(store_last "/endpointslices/default/manual/$p")" ] || fail "$p was joined to a Service with no selector"
+done
+[ -z "$(store_last /endpoints/default/manual)" ] || fail "a selectorless Service got an Endpoints document"
+echo "   manual: its slice kept, no Pod joined, no Endpoints document"
 
 echo "== E2E green: endpoints as params — a scoped join with a selector predicate, the probe override, a materialised list =="

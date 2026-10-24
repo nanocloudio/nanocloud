@@ -40,8 +40,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_CLOSE: u32 = 0x1425;
 const OBJ_DELETE: u32 = 0x1424;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 256;
 
@@ -1181,6 +1179,9 @@ enum Cand {
     Spent,
     /// A store read was not answered yet (`EAGAIN`): asked again shortly.
     Pending,
+    /// The store refused a read for good, or a listing failed: the
+    /// candidates cannot be known, and the request is answered 500.
+    Failed,
 }
 
 /// Candidate `idx` (1-based) for the held request, in the order a kubelet
@@ -1212,6 +1213,9 @@ unsafe fn cand_cred(s: &mut State, idx: u8) -> Cand {
         while let Some(key) = walk.next(&store) {
             let mut rec = [0u8; 512];
             let Some(rn) = get_value(&store, key, &mut rec) else {
+                if store.refusal().is_some() {
+                    return Cand::Failed;
+                }
                 if store.waiting() {
                     return Cand::Pending;
                 }
@@ -1233,6 +1237,9 @@ unsafe fn cand_cred(s: &mut State, idx: u8) -> Cand {
                     continue;
                 }
                 let Some(sn) = get_value(&store, &sk[..kl], &mut (*st).sec) else {
+                    if store.refusal().is_some() {
+                        return Cand::Failed;
+                    }
                     if store.waiting() {
                         return Cand::Pending;
                     }
@@ -1247,6 +1254,9 @@ unsafe fn cand_cred(s: &mut State, idx: u8) -> Cand {
                     }
                 }
             }
+        }
+        if walk.failed || store.refusal().is_some() {
+            return Cand::Failed;
         }
         if walk.pending || store.waiting() {
             return Cand::Pending;
@@ -1270,6 +1280,7 @@ unsafe fn cand_cred(s: &mut State, idx: u8) -> Cand {
                 }
             }
             Got::Pending => return Cand::Pending,
+            Got::Refused(_) => return Cand::Failed,
             Got::Absent => {}
         }
     }
@@ -1304,6 +1315,18 @@ unsafe fn next_credential(s: &mut State, scheme: u8, advance: bool) {
                 s.backoff_ms = BACKOFF_INIT_MS;
                 s.state_start_ms = dev_millis(&*s.syscalls);
                 s.phase = Phase::Backoff;
+                return;
+            }
+            Cand::Failed => {
+                log(
+                    s,
+                    1,
+                    b"[http_fetch] the store refused the credentials' records - 500",
+                );
+                s.cand = 0;
+                s.token_len = 0;
+                s.basic_on = 0;
+                reply(s, 500);
                 return;
             }
             Cand::Spent => {
@@ -1741,6 +1764,12 @@ unsafe fn start(s: &mut State) {
                 // again next step — not fetched again over a blob it has.
                 s.inflight = 0;
                 s.probe_owed = 1;
+                return;
+            }
+            // Refused for good (said by the read): whether the blob is
+            // there cannot be known, and asking again answers the same.
+            Got::Refused(_) => {
+                reply(s, 500);
                 return;
             }
             Got::Absent => {}

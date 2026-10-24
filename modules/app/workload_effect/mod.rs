@@ -19,6 +19,7 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::platform::linux::host_process as hp;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
@@ -28,6 +29,8 @@ include!("../_shared/argv.rs");
 const MAX_KEY: usize = 256;
 include!("../_shared/head_rev.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+// The moment a run starts, as a record keeps one (`mo_now`).
+include!("../_shared/moment.rs");
 
 const WL_CREATE: u32 = 0x1A00;
 const WL_START: u32 = 0x1A01;
@@ -165,10 +168,20 @@ const BAD_MAX: usize = 32 + MAX_ID + MAX_LAYERS * 65 + MAX_LAYERS * 3;
 /// The kernel's refusal of a pack whose module is not its pinned digest.
 const WL_EACCES: i32 = -13;
 const MAX_ID: usize = 128;
-const MAX_SB: usize = 16;
+/// A moment's text at most (`mo_now`: `m<20 digits>@<32 hex>` fits).
+const MOMENT_MAX: usize = 64;
+/// Workloads held at once, a finished one until it is destroyed: a node keeps
+/// a sandbox for every container of every Pod it hosts, its exit and logs
+/// with it, running or not — so this is the runtime's own sandbox table
+/// (fluxor's Linux host-process backend, which matches its owner table), and
+/// a create past it is refused (`failed`, -12) by the runtime, not here.
+const MAX_SB: usize = 64;
 const MAX_TTY: usize = 4;
 const MAX_SRC: usize = 4096;
 const MAX_OPTS: usize = 1024;
+/// The `net`/`resolver` Tier-2 entry at most: its head and the context's
+/// bound.
+const RESOLVER_OPT: usize = 1 + 3 + 1 + 8 + 1 + 2 + abi::contracts::workload::resolver::MAX;
 const LOG_READ: usize = 512;
 const EXEC_CAP: usize = 2048;
 const TTY_CAP: usize = 4096;
@@ -191,6 +204,11 @@ struct Sandbox {
     /// re-reports rather than creates twice.
     last: u8,
     id: [u8; MAX_ID],
+    /// The moment START started its process (`_shared/moment.rs`), carried by
+    /// every status of the run: a run's start is the runtime's to say, not
+    /// something a reader infers from having seen it running.
+    run_len: u8,
+    run_at: [u8; MOMENT_MAX],
 }
 
 const SB_EMPTY: Sandbox = Sandbox {
@@ -204,6 +222,8 @@ const SB_EMPTY: Sandbox = Sandbox {
     handle: -1,
     last: 0,
     id: [0; MAX_ID],
+    run_len: 0,
+    run_at: [0; MOMENT_MAX],
 };
 
 #[repr(C)]
@@ -247,6 +267,9 @@ struct Asm {
     at: [u32; MAX_LAYERS],
     buf: *mut u8,
     arg_len: u32,
+    /// The options' bytes at the end of the CREATE arg (its resolver
+    /// context).
+    opts_len: u16,
     pack_at: u32,
     pack_len: u32,
     cur: u8,
@@ -285,6 +308,10 @@ struct State {
     /// floods the kernel's provider log (pi5-a: 150 lines/s) and drowns
     /// every other telemetry line.
     hp_absent: bool,
+    /// What the host realizes of the host-process source
+    /// (`host_process::CAPS`, asked once: 0 where the class is absent):
+    /// a read-only root, numeric groups, the strict group policy.
+    hp_caps: u32,
     syscalls: *const SyscallTable,
     inputs: [i32; INPUTS],
     event_out: i32,
@@ -332,8 +359,8 @@ struct State {
     /// A failed pack's cached layers, as the record its status event carries
     /// (`pack=<name>;layers=<hex>,…;at=<index>,…`).
     bad: [u8; BAD_MAX],
-    /// An op whose store read was not answered yet (`EAGAIN`, not absence):
-    /// taken again, before any new op, on a later step.
+    /// An op whose store read was not answered yet (the store's "not yet",
+    /// not absence): taken again, before any new op, on a later step.
     held_op: [u8; REQ_BUF],
     held_op_len: u16,
     /// The spec of a graph or host workload's CREATE, held while staged.
@@ -505,6 +532,18 @@ unsafe fn emit(
     carry_from: Option<&[u8]>,
 ) {
     let sys = &*s.syscalls;
+    // A status of a started workload carries its run's start.
+    let mut run = [0u8; MOMENT_MAX];
+    let mut rl = 0usize;
+    if kind == EV_STATUS {
+        if let Some(i) = find_slot(s, id) {
+            let sb = &s.sandboxes[i];
+            if sb.started {
+                rl = (sb.run_len as usize).min(MOMENT_MAX);
+                run[..rl].copy_from_slice(&sb.run_at[..rl]);
+            }
+        }
+    }
     let ev = &mut s.ev;
     let mut p = 1usize;
     let mut n = 0u8;
@@ -556,6 +595,9 @@ unsafe fn emit(
         n
     };
     field!(put_field(ev, p, 8, TY_BYTES, &digits[..dn]));
+    // Always present (empty when there is no run to name), as every field
+    // before it: a decision reads a field the record carries.
+    field!(put_field(ev, p, 9, TY_BYTES, &run[..rl]));
     if let Some(req) = carry_from {
         for f in (CARRY_LO..=CARRY_HI).chain(core::iter::once(CARRY_FIELD)) {
             if let Some((ty, v)) = frame_field(req, f) {
@@ -597,12 +639,14 @@ fn find_tty(s: &State, tail: &[u8]) -> Option<usize> {
 }
 
 /// The host-process source (`SOURCE_HOST_PROCESS`, the linux backend's
-/// format): `[isolate:u8]` then, each `[len:u16 LE][bytes]`, the rootfs, the
-/// argv (NUL-separated), the environment (NUL-separated `NAME=VALUE`), the
-/// cwd and the user. From the op: 4 the argv — whitespace-separated tokens,
-/// each with `%XX` for a byte it cannot carry raw (a space inside
-/// `sh -c "a; b"`), decoded here — 5 rootfs, 6 iso, 14 env, 15 host, 16 wd,
-/// 17 iwd, 18 user (the last four `%XX`-escaped, decoded here).
+/// format, `host_process::SOURCE_HOST_PROCESS`): `[flags:u8]` (isolated,
+/// root read-only) then, each `[len:u16 LE][bytes]`, the rootfs, the argv
+/// (NUL-separated), the environment (NUL-separated `NAME=VALUE`), the cwd,
+/// the user and the groups (`[flags:u8][gid:u32 LE]×n`, `01 00 00` for
+/// none). From the op: 4 the argv — whitespace-separated tokens, each with
+/// `%XX` for a byte it cannot carry raw (a space inside `sh -c "a; b"`),
+/// decoded here — 5 rootfs, 6 iso, 14 env, 15 host, 16 wd, 17 iwd, 18 user
+/// (the last four `%XX`-escaped, decoded here).
 ///
 /// The environment is the WHOLE of what the process gets — the backend adds
 /// nothing of the runtime's: `HOSTNAME` (the Pod's name), then the
@@ -612,9 +656,59 @@ fn find_tty(s: &State, tail: &[u8]) -> Option<usize> {
 /// composes a Kubernetes container's environment. An entry with no `=` or no
 /// name is not one, and is left out. The cwd is the container's workingDir,
 /// else the image's (the backend's `/` when neither is set).
-fn spawn_src(buf: &mut [u8], req: &[u8]) -> Option<usize> {
+///
+/// The identity (field 18, [`split_ident`]): the user [`compose_user`]
+/// makes, the supplementary groups and their policy, and whether the root
+/// is read-only. What the host cannot realize (`caps`, the host's CAPS) is
+/// refused `EOPNOTSUPP` rather than run without it, as a read-only root
+/// without isolation is `EINVAL`: a container is never run with less than
+/// its securityContext asks.
+fn spawn_src(buf: &mut [u8], req: &[u8], caps: u32) -> Result<usize, i64> {
+    let mut ub = [0u8; MAX_IDENT];
+    let ul = decode_text(frame_bytes(req, 18), &mut ub).ok_or(-22i64)?;
+    let (user, groups, flags) = split_ident(ub.get(..ul).ok_or(-22i64)?).ok_or(-22i64)?;
+    // `s` before `r`, each at most once (split_ident).
+    let strict = flags.first() == Some(&b's');
+    let ro_root = flags.last() == Some(&b'r');
+    let iso = frame_bytes(req, 6) == b"1";
+    if ro_root && !iso {
+        return Err(-22);
+    }
+    let need = if ro_root { hp::caps::ROOT_READ_ONLY } else { 0 }
+        | if groups.is_empty() {
+            0
+        } else {
+            hp::caps::GROUPS
+        }
+        | if strict { hp::caps::GROUPS_STRICT } else { 0 };
+    if caps & need != need {
+        return Err(-95);
+    }
+    let mut b0 = 0u8;
+    if iso {
+        b0 |= hp::SRC_ISOLATED;
+    }
+    if ro_root {
+        b0 |= hp::SRC_ROOT_READ_ONLY;
+    }
+    spawn_parts(buf, req, b0, user, groups, strict).ok_or(-22)
+}
+
+/// The decoded identity of field 18 can carry this much: a user and up to
+/// [`MAX_GROUPS`] groups.
+const MAX_IDENT: usize = 512;
+const MAX_GROUPS: usize = 32;
+
+fn spawn_parts(
+    buf: &mut [u8],
+    req: &[u8],
+    flags: u8,
+    user: &[u8],
+    groups: &[u8],
+    strict: bool,
+) -> Option<usize> {
     let rootfs = frame_bytes(req, 5);
-    *buf.get_mut(0)? = (frame_bytes(req, 6) == b"1") as u8;
+    *buf.get_mut(0)? = flags;
     let mut p = put_part(buf, 1, rootfs)?;
     // argv
     let at = p;
@@ -647,11 +741,63 @@ fn spawn_src(buf: &mut [u8], req: &[u8]) -> Option<usize> {
     p = at + 2 + decode_text(wd, buf.get_mut(at + 2..)?)?;
     p = end_part(buf, at, p)?;
     // user
-    let mut ub = [0u8; 160];
-    let ul = decode_text(frame_bytes(req, 18), &mut ub)?;
     let at = p;
-    p = at + 2 + compose_user(ub.get(..ul)?, buf.get_mut(at + 2..)?)?;
+    p = at + 2 + compose_user(user, buf.get_mut(at + 2..)?)?;
+    p = end_part(buf, at, p)?;
+    // groups: the policy, then each gid
+    let at = p;
+    p += 2;
+    *buf.get_mut(p)? = if strict { hp::GROUPS_STRICT } else { 0 };
+    p += 1;
+    let mut n = 0usize;
+    for g in groups.split(|&c| c == b',').filter(|g| !g.is_empty()) {
+        n += 1;
+        if n > MAX_GROUPS {
+            return None;
+        }
+        p = copy_into(buf, p, &parse_gid(g)?.to_le_bytes())?;
+    }
     end_part(buf, at, p)
+}
+
+/// A numeric group id, as Kubernetes allows one (0..=2147483647).
+fn parse_gid(g: &[u8]) -> Option<u32> {
+    if g.is_empty() || g.len() > 10 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in g {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u64::from(c - b'0');
+    }
+    (v <= 0x7FFF_FFFF).then_some(v as u32)
+}
+
+/// Field 18 decoded, split: the user ([`compose_user`]'s
+/// `<image's User>/<runAsUser>/<runAsGroup>`, or a user alone), then — when
+/// pod_resolve states any — `/<gid>,<gid>…/<flags>`: the supplementary groups
+/// (fsGroup and supplementalGroups, numeric) and `s` (supplementalGroupsPolicy
+/// Strict) then `r` (readOnlyRootFilesystem). None when it is not that shape.
+fn split_ident(raw: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let mut slashes = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c == b'/')
+        .map(|(i, _)| i);
+    let (_, _, Some(third)) = (slashes.next(), slashes.next(), slashes.next()) else {
+        return Some((raw, &[], &[]));
+    };
+    let fourth = slashes.next()?;
+    if slashes.next().is_some() {
+        return None;
+    }
+    let flags = raw.get(fourth + 1..)?;
+    if !matches!(flags, b"" | b"s" | b"r" | b"sr") {
+        return None;
+    }
+    Some((raw.get(..third)?, raw.get(third + 1..fourth)?, flags))
 }
 
 /// The user a container runs as, from field 18: the image's User alone, or
@@ -839,20 +985,21 @@ fn bind_options(binds: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// The FLXA bytes of graph `name`: the Graph object at
 /// `/graphs.nanocloud.io/<name>` read through `storage.object`, its
-/// `spec.flxa` decoded from hex into `out`. `None` when the object is
-/// absent, carries no flxa, is not hex, or is larger than `out` — a graph
+/// `spec.flxa` decoded from hex into `out`. [`Got::Absent`] when the object
+/// is absent, carries no flxa, is not hex, or is larger than `out` — a graph
 /// the node was not given is a workload it cannot run, reported
-/// `failed(-2)` by the caller. `Err(())` when the store has not answered yet
-/// (`EAGAIN`, or any refusal but `ENXIO`/`ENOENT` — [`refused`]): the op is
-/// asked again, never failed for it.
+/// `failed(-2)` by the caller. [`Got::Pending`] when the
+/// store has not answered yet (its "not yet": [`not_yet`]): the op is asked
+/// again, never failed for it. [`Got::Refused`] when the store refused the
+/// read for good: the op fails with that errno, never held for it.
 unsafe fn graph_source(
     sys: &SyscallTable,
     nag: &ReadNag,
     name: &[u8],
     out: &mut [u8],
-) -> Result<Option<usize>, ()> {
+) -> Got<usize> {
     if name.is_empty() || name.len() > MAX_GRAPH {
-        return Ok(None);
+        return Got::Absent;
     }
     let mut key = [0u8; GRAPHS_PREFIX.len() + MAX_GRAPH];
     key[..GRAPHS_PREFIX.len()].copy_from_slice(GRAPHS_PREFIX);
@@ -860,10 +1007,7 @@ unsafe fn graph_source(
     let klen = GRAPHS_PREFIX.len() + name.len();
     let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), klen);
     if h < 0 {
-        return match refusal::<()>(sys, nag, b"GET", &key[..klen], h) {
-            Got::Pending => Err(()),
-            _ => Ok(None),
-        };
+        return refusal(sys, nag, b"GET", &key[..klen], h);
     }
     // The object is JSON; its hex is twice the bytes. One read of the whole
     // record, then the `"flxa":"…"` string inside it.
@@ -877,12 +1021,12 @@ unsafe fn graph_source(
     (sys.provider_call)(h, OBJ_CLOSE, z.as_mut_ptr(), 0);
     // A refused read of an open handle is never absence.
     if got < 0 {
-        if got != STORE_EAGAIN {
-            say_refused(sys, nag, b"RANGE_GET", &key[..klen], got);
-        }
-        return Err(());
+        return range_refused(sys, nag, &key[..klen], got);
     }
-    Ok(graph_flxa(&rec, got, out))
+    match graph_flxa(&rec, got, out) {
+        Some(n) => Got::Found(n),
+        None => Got::Absent,
+    }
 }
 
 /// The `"flxa":"…"` hex of the Graph object `rec[..got]`, decoded into `out`.
@@ -915,29 +1059,19 @@ fn graph_flxa(rec: &[u8], got: i32, out: &mut [u8]) -> Option<usize> {
     Some(n / 2)
 }
 
-/// `EAGAIN` from a storage read: not answered yet — ask again, never absent.
-const STORE_EAGAIN: i32 = -11;
-
-/// A store value whole into `out`, or None (absent, or larger than `out`).
-/// `Err(())` when the store has not answered yet (`EAGAIN`, or any refusal
-/// but `ENXIO`/`ENOENT` — [`refused`]).
-unsafe fn store_get(
-    sys: &SyscallTable,
-    nag: &ReadNag,
-    key: &[u8],
-    out: &mut [u8],
-) -> Result<Option<usize>, ()> {
+/// A store value whole into `out`; [`Got::Absent`] when absent or larger
+/// than `out`, [`Got::Pending`] when the store has not answered yet (its
+/// "not yet": [`not_yet`]), [`Got::Refused`] when it refused the read for
+/// good ([`refused`]).
+unsafe fn store_get(sys: &SyscallTable, nag: &ReadNag, key: &[u8], out: &mut [u8]) -> Got<usize> {
     let mut k = [0u8; 256];
     if key.len() > k.len() {
-        return Ok(None);
+        return Got::Absent;
     }
     k[..key.len()].copy_from_slice(key);
     let h = (sys.provider_call)(-1, OBJ_GET, k.as_mut_ptr(), key.len());
     if h < 0 {
-        return match refusal::<()>(sys, nag, b"GET", key, h) {
-            Got::Pending => Err(()),
-            _ => Ok(None),
-        };
+        return refusal(sys, nag, b"GET", key, h);
     }
     let mut rg = [0u8; 20];
     rg[8..12].copy_from_slice(&(out.len() as u32).to_le_bytes());
@@ -946,12 +1080,13 @@ unsafe fn store_get(
     let mut z = [0u8; 1];
     (sys.provider_call)(h, OBJ_CLOSE, z.as_mut_ptr(), 0);
     if got < 0 {
-        if got != STORE_EAGAIN {
-            say_refused(sys, nag, b"RANGE_GET", key, got);
-        }
-        return Err(());
+        return range_refused(sys, nag, key, got);
     }
-    Ok((got >= 0 && (got as usize) < out.len()).then_some(got as usize))
+    if (got as usize) < out.len() {
+        Got::Found(got as usize)
+    } else {
+        Got::Absent
+    }
 }
 
 /// Hold op `req` for a later step: a store read it needs was not answered.
@@ -993,6 +1128,10 @@ unsafe fn create_header(
     let tasks = parse_u32(frame_bytes(req, 7));
     let addr = frame_bytes(req, 8);
     let prefix = parse_u32(frame_bytes(req, 9)).min(32) as u8;
+    // The identity's segment (field 22): the node's (node_net's
+    // `/sandbox-net`), whose gateway the workload reaches everything
+    // through; 0 none.
+    let segment = parse_u32(frame_bytes(req, 22)).min(u16::MAX as u32) as u16;
     for b in arg[..WL_CREATE_HEADER].iter_mut() {
         *b = 0;
     }
@@ -1026,9 +1165,67 @@ unsafe fn create_header(
         arg[18] = NET_ISO_OWN;
         arg[48] = NET_FAM_IPV4;
         arg[49] = if prefix == 0 { 24 } else { prefix };
+        for (d, b) in arg.iter_mut().skip(50).take(2).zip(segment.to_le_bytes()) {
+            *d = b;
+        }
         arg[52..56].copy_from_slice(&a);
     }
     true
+}
+
+/// The Tier-2 `net`/`resolver` entry for the resolver context `dns`
+/// (`<server> <search>…`, field 23, the Pod's resolv.conf as pod_resolve
+/// made it) into `out`: `[family][server:16][n_search]([len][name])×n`,
+/// the search names that fit the context's bound. Advisory: a backend that
+/// does not resolve for its workloads (Linux: the workload reads its own
+/// resolv.conf) ignores it; one that does (bare metal) holds it for the
+/// owner. 0 when there is none, or its server is not an IPv4 address.
+fn resolver_option(dns: &[u8], out: &mut [u8]) -> usize {
+    use abi::contracts::workload::resolver as rv;
+    let mut words = dns.split(|&c| c == b' ').filter(|w| !w.is_empty());
+    let Some(server) = words.next().and_then(parse_ipv4) else {
+        return 0;
+    };
+    let head = 1 + rv::NS.len() + 1 + rv::KEY.len() + 1 + 2;
+    let mut val = [0u8; rv::MAX];
+    val[0] = NET_FAM_IPV4;
+    for (d, &b) in val.iter_mut().skip(1).zip(server.iter()) {
+        *d = b;
+    }
+    let mut vl = rv::HEAD;
+    let mut n = 0u8;
+    for w in words {
+        if w.len() > 253 || vl + 1 + w.len() > rv::MAX || n == u8::MAX {
+            break;
+        }
+        if let Some(d) = val.get_mut(vl) {
+            *d = w.len() as u8;
+        }
+        for (d, &b) in val.iter_mut().skip(vl + 1).zip(w.iter()) {
+            *d = b;
+        }
+        vl += 1 + w.len();
+        n += 1;
+    }
+    val[rv::HEAD - 1] = n;
+    if head + vl > out.len() {
+        return 0;
+    }
+    let mut p = 0usize;
+    let mut push = |bytes: &[u8], p: &mut usize| {
+        for (d, &b) in out.iter_mut().skip(*p).zip(bytes.iter()) {
+            *d = b;
+        }
+        *p += bytes.len();
+    };
+    push(&[rv::NS.len() as u8], &mut p);
+    push(rv::NS, &mut p);
+    push(&[rv::KEY.len() as u8], &mut p);
+    push(rv::KEY, &mut p);
+    push(&[0], &mut p);
+    push(&(vl as u16).to_le_bytes(), &mut p);
+    push(val.get(..vl).unwrap_or(&[]), &mut p);
+    p
 }
 
 /// A live workload's slot, taken for `handle` and reported created.
@@ -1064,13 +1261,30 @@ unsafe fn asm_begin(s: &mut State, req: &[u8], cid: i64, id: &[u8], name: &[u8])
     key[MANIFESTS_PREFIX.len()..MANIFESTS_PREFIX.len() + name.len()].copy_from_slice(name);
     let mut rec = [0u8; MAX_MANIFEST];
     let kl = MANIFESTS_PREFIX.len() + name.len();
-    let Ok(got) = store_get(sys, &s.nag, &key[..kl], &mut rec) else {
-        hold_op(s, req);
-        return;
-    };
-    let Some(rl) = got else {
-        emit(s, cid, EV_STATUS, id, b"failed", -2, &[], Some(req));
-        return;
+    let rl = match store_get(sys, &s.nag, &key[..kl], &mut rec) {
+        Got::Found(rl) => rl,
+        Got::Pending => {
+            hold_op(s, req);
+            return;
+        }
+        // Refused for good: failed with the store's errno, never held.
+        Got::Refused(rc) => {
+            emit(
+                s,
+                cid,
+                EV_STATUS,
+                id,
+                b"failed",
+                i64::from(rc),
+                &[],
+                Some(req),
+            );
+            return;
+        }
+        Got::Absent => {
+            emit(s, cid, EV_STATUS, id, b"failed", -2, &[], Some(req));
+            return;
+        }
     };
     let rec = &rec[..rl];
     let a = &mut s.asm;
@@ -1108,8 +1322,12 @@ unsafe fn asm_begin(s: &mut State, req: &[u8], cid: i64, id: &[u8], name: &[u8])
         return;
     }
     let mods = n - 1;
-    // The CREATE arg: header, pack reference, a pin per module, the FLXA.
-    let arg_len = WL_CREATE_HEADER + PACK_REF + PIN * mods + a.size[0] as usize;
+    // The CREATE arg: header, pack reference, a pin per module, the FLXA,
+    // then its options (its resolver context).
+    let mut ropt = [0u8; RESOLVER_OPT];
+    let ol = resolver_option(frame_bytes(req, 23), &mut ropt);
+    a.opts_len = ol as u16;
+    let arg_len = WL_CREATE_HEADER + PACK_REF + PIN * mods + a.size[0] as usize + ol;
     a.at[0] = (WL_CREATE_HEADER + PACK_REF + PIN * mods) as u32;
     let pack_at = arg_len.div_ceil(16) * 16;
     let mut t = FXMT_HEADER + FXMT_ENTRY * mods;
@@ -1327,7 +1545,8 @@ unsafe fn asm_create(s: &mut State) {
         pack[e + 8..e + 12].copy_from_slice(&a.size[i].to_le_bytes());
         pack[e + 12] = mtype;
     }
-    let src_len = a.arg_len as usize - WL_CREATE_HEADER;
+    let ol = a.opts_len as usize;
+    let src_len = a.arg_len as usize - WL_CREATE_HEADER - ol;
     let rl = a.req_len as usize;
     let mut req = [0u8; REQ_BUF];
     req[..rl].copy_from_slice(&a.req[..rl]);
@@ -1337,7 +1556,16 @@ unsafe fn asm_create(s: &mut State) {
     let il = id.len().min(MAX_ID);
     idb[..il].copy_from_slice(&id[..il]);
     let id = &idb[..il];
-    if !create_header(arg, SOURCE_FMOD_PACK, id, req, src_len, 0) {
+    if !create_header(arg, SOURCE_FMOD_PACK, id, req, src_len, ol) {
+        asm_end(s, -22);
+        return;
+    }
+    let oat = WL_CREATE_HEADER + src_len;
+    let wrote = resolver_option(
+        frame_bytes(req, 23),
+        arg.get_mut(oat..oat + ol).unwrap_or(&mut []),
+    );
+    if wrote != ol {
         asm_end(s, -22);
         return;
     }
@@ -1463,29 +1691,53 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
     let mut src = [0u8; MAX_SRC];
     let mut opts = [0u8; MAX_OPTS];
     // A graph-backed workload: its source is the FLXA subgraph the node's
-    // render seeded at `/graphs/<name>`, not a process. No options: the
-    // kernel realises it as modules of the node's own image.
+    // render seeded at `/graphs/<name>`, not a process. Its one option is
+    // its resolver context: the kernel realises it as modules of the node's
+    // own image.
     let (sl, ol, kind) = if !graph.is_empty() {
         match graph_source(sys, &s.nag, graph, &mut src) {
-            Err(()) => {
+            Got::Pending => {
                 hold_op(s, req);
                 return;
             }
-            Ok(Some(n)) => (n, 0usize, SOURCE_FMOD_GRAPH),
-            Ok(None) => {
+            Got::Found(n) => (
+                n,
+                resolver_option(frame_bytes(req, 23), &mut opts),
+                SOURCE_FMOD_GRAPH,
+            ),
+            // Refused for good: failed with the store's errno, never held.
+            Got::Refused(rc) => {
+                emit(
+                    s,
+                    cid,
+                    EV_STATUS,
+                    id,
+                    b"failed",
+                    i64::from(rc),
+                    &[],
+                    Some(req),
+                );
+                return;
+            }
+            Got::Absent => {
                 emit(s, cid, EV_STATUS, id, b"failed", -2, &[], Some(req));
                 return;
             }
         }
     } else {
-        let (Some(sl), Some(ol)) = (
-            spawn_src(&mut src, req),
-            bind_options(frame_bytes(req, 10), &mut opts),
-        ) else {
+        let sl = match spawn_src(&mut src, req, s.hp_caps) {
+            Ok(n) => n,
+            Err(code) => {
+                emit(s, cid, EV_STATUS, id, b"failed", code, &[], Some(req));
+                return;
+            }
+        };
+        let Some(ol) = bind_options(frame_bytes(req, 10), &mut opts) else {
             emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
             return;
         };
-        (sl, ol, SOURCE_HOST_PROCESS)
+        let rl = resolver_option(frame_bytes(req, 23), opts.get_mut(ol..).unwrap_or(&mut []));
+        (sl, ol + rl, SOURCE_HOST_PROCESS)
     };
     // The spec is held in `cbuf` until the CREATE answers (it may stage).
     let st = s as *mut State;
@@ -1524,7 +1776,13 @@ unsafe fn op(s: &mut State, req: &[u8]) {
                 if !s.sandboxes[i].started
                     && (sys.provider_call)(s.sandboxes[i].handle, WL_START, z.as_mut_ptr(), 0) >= 0
                 {
-                    s.sandboxes[i].started = true;
+                    // The run's start, stamped as the process starts.
+                    let mut at = [0u8; MOMENT_MAX];
+                    let al = mo_now(sys, &mut at);
+                    let sb = &mut s.sandboxes[i];
+                    sb.started = true;
+                    sb.run_len = al.min(MOMENT_MAX) as u8;
+                    sb.run_at = at;
                     emit(s, cid, EV_STATUS, id, b"running", 0, &[], Some(req));
                 }
             }
@@ -1925,6 +2183,7 @@ pub unsafe extern "C" fn module_new(
         s.event_out = out_chan;
         s.resolved = 0;
         s.caps_ops = 0;
+        s.hp_caps = 0;
         s.next_input = 0;
         s.boot_len = 0;
         s.booted = 0;
@@ -1973,6 +2232,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 u16::from_le_bytes([buf[2], buf[3]])
             };
+            let hc = (sys.provider_call)(-1, hp::CAPS, core::ptr::null_mut(), 0);
+            s.hp_caps = if hc < 0 { 0 } else { hc as u32 };
             // This process's boot: a random nonce drawn at start, which no
             // restart repeats. Never the wall clock: a board reads 0 there
             // until its time protocol has answered, so every boot before

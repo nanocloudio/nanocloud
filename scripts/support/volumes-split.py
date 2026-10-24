@@ -116,8 +116,6 @@ __REPLICA_MODULES__"""
     to: {served}.request_in
   - from: {served}.response_out
     to: volume_relay.answer_in
-  - from: volume_relay.status
-    to: volume_relay.changes
 __REPLICA_WIRING__"""
     title = {
         "node": "# A node's half of the encrypted-volume pipelines (scripts/support/volumes-split.py,\n"

@@ -99,7 +99,7 @@ FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 4 "$FLUXOR_RUNTIME" \
 
 echo "== 4. verify the lifecycle + restart-policy decisions =="
 SB="$(store_last /sandbox-status/pod1)"
-[ "$SB" = "state=exited;code=0" ] || fail "pod1 sandbox status wrong: got '$SB'"
+[[ "$SB" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] || fail "pod1 sandbox status wrong (an exit with its run's start): got '$SB'"
 [ "$(store_last /pod-lifecycle-status/pod1)" = "phase=Succeeded" ] \
   || fail "pod1 (never, exit 0) should be Succeeded"
 [ "$(store_last /pod-lifecycle-status/pod-nf)" = "phase=Failed" ] \

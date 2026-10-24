@@ -7,7 +7,6 @@
 target: linux
 tick_us: 1000
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -106,8 +105,6 @@ modules:
   # Params compiled from modules/app/_chronicle/daemonset.uproc.
 
 wiring:
-  - from: dp_source.status
-    to: dp_source.changes
   - from: dp_source.record_out
     to: dp_current.request_in
   - from: dp_current.response_out
@@ -116,8 +113,6 @@ wiring:
     to: dp_apply.request_in
   - from: dp_apply.response_out
     to: dp_events.request_in
-  - from: rs_source.status
-    to: rs_source.changes
   - from: rs_source.record_out
     to: rs_prevget.request_in
   # Engine edges are byte FIFOs; the store_effect request edges are MAILBOXES

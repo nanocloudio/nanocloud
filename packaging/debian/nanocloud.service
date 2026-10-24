@@ -46,8 +46,24 @@ ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/sto
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/owners
 RuntimeDirectory=nanocloud
 RuntimeDirectoryMode=0700
+# The runtime's instance state (FLUXOR_STATE_DIR): it holds the instance lock
+# for the runtime's life, and the instance tag every host object the node
+# makes (links, routes, packet-policy tables, held addresses, tunables) is
+# named by is a digest of this path, so it is stable across restarts and a
+# restart's boot reclaim finds its previous life's objects. Distinct from the
+# store directory above.
+StateDirectory=nanocloud.io/instance
+StateDirectoryMode=0700
+Environment=FLUXOR_STATE_DIR=/var/lib/nanocloud.io/instance
 ExecStartPre=/usr/lib/nanocloud/nanocloud-graph.sh /etc/nanocloud.io/fluxor /run/nanocloud/graph.yaml
 ExecStart=/usr/bin/fluxor run /run/nanocloud/graph.yaml
+# Once the runtime is gone, collect what its instance left on the host. `+`
+# runs it with full privileges: without root a packet-policy table cannot be
+# removed and the reclaim stays pending. It exits 0 when the instance was
+# reclaimed (or held nothing), 2 when the instance is still live in another
+# runtime, and 1 on an error or a reclaim left pending (the log says which);
+# `-` keeps any of them from failing the unit, which has already stopped.
+ExecStopPost=-+/usr/bin/fluxor-linux reclaim
 StandardOutput=append:/var/log/nanocloud.log
 StandardError=append:/var/log/nanocloud.log
 Restart=on-failure

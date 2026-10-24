@@ -10,13 +10,15 @@
 //   /pod-specs/<uid>             pod rp_cmd graph  (its name, whether it
 //                                                   declares a readiness probe,
 //                                                   whether it is graph-backed)
-//   /sandbox-status/<uid>        state code        (what the runtime says)
+//   /sandbox-status/<uid>        state code        (what the runtime says;
+//                                started           `started`: the moment it
+//                                                  started this run's process,
+//                                                  on every status of the run —
+//                                                  a new value is a new run)
 //   /probe-status/<uid>          ready             (the readiness probe)
 //   /pod-resolved/<uid>          digest            (the image it runs: imageID)
 //   /pod-wait/<uid>              why msg           (its pull is failing:
 //                                                   pod_image.uproc)
-//   /pod-runtime/<uid>           run_started       (the lifecycle's run clock:
-//                                                   a new value is a new run)
 //   /pod-cond/<uid>              this chain's own memory, below
 //
 // ONE decision over the record (pl_ssrc -> pl_srep, a store_effect at `/`),
@@ -25,12 +27,16 @@
 //   memory  the moments, recorded ONCE each, on the edge that makes them,
 //           into /pod-cond/<uid> by MERGE: t0 (the node first saw the Pod:
 //           its startTime, and when it was scheduled and initialized),
-//           tr/rs (the running container's start, and the run clock it
-//           started under), tf/code/why (its termination), trdy/rdy (the
+//           tr/rs (the container's start: the runtime's `started` of the
+//           run, rs as the run it names, tr as its moment), tf/code/why (its
+//           termination), trdy/rdy (the
 //           Ready condition's last transition and the verdict it went to),
 //           and ltr/ltf/lcode/lwhy (the PREVIOUS run's termination:
 //           lastState). One edge per pass, and an edge's write is what wakes
-//           the next pass, so a Pod settles in a few steps.
+//           the next pass, so a Pod settles in a few steps. A run's start is
+//           the runtime's, never inferred from a pass having seen it running:
+//           a container that ends before any pass sees it run still reports
+//           when it started, as a terminated state always does.
 //   report  once no edge is left: PUT /podstatus/<uid> — put-if-changed, so
 //           a Pod whose status did not move spends no revision, on the node
 //           or on the plane. A Pod deleted (its spec names no Pod) has its
@@ -88,6 +94,7 @@ module nanocloud.podreport {
     graph: string = 72;     //   graph: a graph-backed Pod
     state: string = 80;     // /sandbox-status/
     scode: string = 81;
+    sst: string = 82;       //   started: the run's start, as the runtime stamped it
     t0: string = 90;        // /pod-cond/ (this chain's memory), as recorded
     tr: string = 91;
     rs: string = 92;
@@ -104,13 +111,12 @@ module nanocloud.podreport {
     digest: string = 120;   // /pod-resolved/
     wwhy: string = 130;     // /pod-wait/
     wmsg: string = 131;
-    runst: string = 140;    // /pod-runtime/ run_started
-    t0w: string = 150;      // /pod-cond/ moments `!wall`: Unix ms, or empty
-    trw: string = 151;
-    tfw: string = 152;
-    trdyw: string = 153;
-    ltrw: string = 154;
-    ltfw: string = 155;
+    t0w: string = 140;      // /pod-cond/ moments `!wall`: Unix ms, or empty
+    trw: string = 141;
+    tfw: string = 142;
+    trdyw: string = 143;
+    ltrw: string = 144;
+    ltfw: string = 145;
   }
   // A memory MERGE or the report's PUT, under the effect's `/`.
   message pr.St {
@@ -136,7 +142,11 @@ module nanocloud.podreport {
   // connector — not concatenated here, where every `+` copies into the
   // decision's 512-byte scratch.
   decision status(r: pr.Rec) -> pr.St {
-    when r.phase == "Terminating" && r.pod == "" ->
+    // A Pod gone from the plane (its spec names no Pod: the tomb's) has no
+    // report left to write — once its container's end is recorded below,
+    // which the node's teardown waits on.
+    when r.phase == "Terminating" && r.pod == ""
+         && !((r.state == "exited" || r.state == "failed" || r.state == "killed") && r.tf == "") ->
       pr.St { cid: r.seq, op: DELETE, key: "podstatus/", k2: r.key };
     // First sight: when the node took the Pod on; not ready.
     when r.t0 == "" && r.pod != "" ->
@@ -150,6 +160,20 @@ module nanocloud.podreport {
                v14: "t0=", v15: r.t0w, v16: ";tr=", v17: r.trw,
                v18: ";tf=", v19: r.tfw, v20: ";trdy=", v21: r.trdyw,
                v22: ";ltr=", v23: r.ltrw, v24: ";ltf=", v25: r.ltfw };
+    // A new run (the runtime started the process again: the start every
+    // status of a run carries is not the run recorded), recorded before
+    // anything else of it — whichever of its states a pass saw, its exit
+    // included, so its termination is its own and has its start. The run
+    // before becomes the last state — unless it was a refusal, which ran
+    // nothing.
+    when r.sst != "" && r.sst != r.rs && r.tf != "" && !r.code.startsWith("-") ->
+      pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,
+               v14: "ltr=", v15: r.tr, v16: ";ltf=", v17: r.tf,
+               v18: ";lcode=", v19: r.code, v20: ";lwhy=", v21: r.why,
+               v22: ";tf=;code=;why=;rs=", v23: r.sst, v24: ";tr=", v25: r.sst };
+    when r.sst != "" && r.sst != r.rs ->
+      pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,
+               v14: "tf=;code=;why=;rs=", v15: r.sst, v16: ";tr=", v17: r.sst };
     // A termination, once per run: its moment, its exit code and reason. A
     // signal is 128 + its number, as a container runtime reports it.
     when (r.state == "exited" || r.state == "failed" || r.state == "killed") && r.tf == "" && r.phase != "Running" && r.phase != "Paused" && r.state == "exited" ->
@@ -169,16 +193,6 @@ module nanocloud.podreport {
     when (r.state == "exited" || r.state == "failed" || r.state == "killed") && r.tf == "" && r.phase != "Running" && r.phase != "Paused" && r.state == "failed" ->
       pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,
                v14: "why=Error;code=" + r.scode + ";tf=", v15: r.now };
-    // A new run (the lifecycle's run clock moved): the termination before it
-    // becomes the last state — unless it was a refusal, which ran nothing.
-    when (r.phase == "Running" || r.phase == "Paused") && r.runst != "" && r.runst != "0" && r.rs != r.runst && r.tf != "" && !r.code.startsWith("-") ->
-      pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,
-               v14: "ltr=", v15: r.tr, v16: ";ltf=", v17: r.tf,
-               v18: ";lcode=", v19: r.code, v20: ";lwhy=", v21: r.why,
-               v22: ";tf=;code=;why=;rs=", v23: r.runst, v24: ";tr=", v25: r.now };
-    when (r.phase == "Running" || r.phase == "Paused") && r.runst != "" && r.runst != "0" && r.rs != r.runst ->
-      pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,
-               v14: "tf=;code=;why=;rs=", v15: r.runst, v16: ";tr=", v17: r.now };
     // The Ready condition's transitions.
     when (r.phase == "Running" || r.phase == "Paused") && (r.rp == "" || r.pready == "1") && r.rdy != "1" ->
       pr.St { cid: r.seq, op: MERGE, key: "pod-cond/", k2: r.key,

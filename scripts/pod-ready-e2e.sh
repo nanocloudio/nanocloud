@@ -383,6 +383,7 @@ assert st["phase"] == "Running", st["phase"]
 assert cs["state"]["waiting"]["reason"] == "CrashLoopBackOff", cs
 t = cs["lastState"]["terminated"]
 assert t["exitCode"] == 3 and t["reason"] == "Error" and t["startedAt"] and t["finishedAt"], t
+assert t["startedAt"] <= t["finishedAt"], t
 assert cs["ready"] is False and cs["restartCount"] >= 2, cs
 print("   waiting CrashLoopBackOff; lastState terminated exit", t["exitCode"], t["reason"], t["startedAt"], "->", t["finishedAt"], "; restartCount", cs["restartCount"])
 ' || fail "crashy: $(pod_json crashy | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["status"]))')"

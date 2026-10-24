@@ -222,8 +222,6 @@ const MAX_KEY: usize = 256;
 // Contracts the shared store fragment dispatches on; it takes its opcodes from
 // whoever mounts it.
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_PREFIX: usize = 64;
 const MAX_PATHS_SPEC: usize = 192;
 const MAX_VALUE: usize = 4096;
@@ -383,6 +381,12 @@ struct State {
     /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`];
     /// `wall = 2` also the recordable moment at [`MOMENT_FIELD`].
     wall: u32,
+    /// `merge_existing = 1`: a MERGE only ever edits a record that exists — 404
+    /// when the key is absent, and conditional on the revision it read (409
+    /// when the record moved meanwhile), as a MERGE with field 28 is. A chain
+    /// that adds one field to a record another chain owns cannot then bring
+    /// back a record that chain removed.
+    merge_existing: u32,
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
     /// A reply the output channel has not taken yet: `out_buf[out_at..out_len]`.
@@ -995,6 +999,9 @@ unsafe fn splice_value(sys: &Store, req: &[u8], spec: &[u8]) -> Result<(*mut u8,
     // asked again, the node's writes wedged behind it). A source whose
     // spliced subtrees did not move splices the same bytes; one whose
     // template moved builds another value, which the journal refuses.
+    if sys.refusal().is_some() {
+        return Err(500);
+    }
     if sys.silent() {
         return Err(503);
     }
@@ -1004,6 +1011,11 @@ unsafe fn splice_value(sys: &Store, req: &[u8], spec: &[u8]) -> Result<(*mut u8,
         Got::Pending => {
             sys.wait();
             return Err(503);
+        }
+        // Refused for good: the serve fails, never held for it.
+        Got::Refused(rc) => {
+            sys.refuse(rc);
+            return Err(500);
         }
         // Gone, or past the heap.
         Got::Absent => return Err(if exists(sys, src) { 413 } else { 404 }),
@@ -2371,6 +2383,9 @@ mod params_def {
 
         22, wall, u32, 0
             => |s, d, len| { s.wall = super::p_u32(d, len, 0, 0); };
+
+        23, merge_existing, u32, 0
+            => |s, d, len| { s.merge_existing = super::p_u32(d, len, 0, 0); };
     }
 }
 
@@ -2435,6 +2450,7 @@ pub unsafe extern "C" fn module_new(
         s.count_sel_len = 0;
         s.doc = 0;
         s.wall = 0;
+        s.merge_existing = 0;
         s.tomb_len = 0;
         s.blob_len = 0;
         s.patch_keys_len = 0;
@@ -3289,9 +3305,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // With an expected revision in field 28 the merge is into
                     // THAT record: 409 when it moved or is gone, so a merge
                     // never recreates a record another writer removed.
-                    let want = match frame_i64(req, 28) {
+                    // `merge_existing` takes the revision from the store,
+                    // read BEFORE the value: a write between the two then
+                    // fails the condition rather than being overwritten.
+                    let stated = match frame_i64(req, 28) {
                         Some(r) if r > 0 => r as u64,
                         _ => 0,
+                    };
+                    let (want, absent) = if stated == 0 && s.merge_existing != 0 {
+                        match head(sys, key) {
+                            Some(r) if r > 0 => (r, false),
+                            _ => (0, true),
+                        }
+                    } else {
+                        (stated, false)
                     };
                     let mut cur = [0u8; MAX_VALUE];
                     let got = get_value(sys, key, &mut cur);
@@ -3301,6 +3328,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let status = if ml == 0 && !value.is_empty() {
                         s.malformed = s.malformed.wrapping_add(1);
                         400
+                    } else if absent {
+                        404
                     } else if want == 0 {
                         match put_guarded(sys, key, &merged[..ml]) {
                             (false, _) => 500,
@@ -3613,8 +3642,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
                 OP_DELETE_FAMILY => {
-                    drop_family(sys, key);
-                    reply_projected(&mut out, cid, 200, &[], carry, &proj)
+                    // A family whose listing failed is left whole: 500.
+                    let status = if drop_family(sys, key) { 200 } else { 500 };
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
                 OP_TAKE => {
                     // 200 with the value, taken by this request alone; 404
@@ -3712,6 +3742,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
             }
+        };
+        // A read of this record refused for good: what the serve concluded
+        // from it — a miss, a listing ended short, a write refused unasked —
+        // is not the store's answer, and asking again answers the same. The
+        // record is answered 500, at once: never held, never a 404.
+        let flen = if s.journal.refusal().is_some() {
+            reply_projected(&mut out, cid, 500, &[], carry, &proj)
+        } else {
+            flen
         };
         if !staged.is_null() {
             heap_free(sys, staged);

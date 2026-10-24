@@ -6,8 +6,9 @@
 # and the whole chain sits idle without an error anyone would see.
 #
 # What it proves, in one boot: a ReplicaSet seeded into the store wakes the
-# `rs_` chain through a real namespace.change PUSH, the chain decides one
-# ordinal at a time, and three Pods are materialised — the same nodes and the
+# `rs_` chain through a real store change (the store rings the source's
+# event), the chain decides one ordinal at a time, and three Pods are
+# materialised — the same nodes and the
 # same compiled params `fluxor-controlplane.yaml` ships on Linux, unmodified.
 #
 # `store_seed` stands in for the API plane: on Linux an E2E seeds through the
@@ -28,7 +29,6 @@ platform:
     to: net
     monitor: true
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -113,12 +113,10 @@ modules:
     mode: 1
 
 wiring:
-  - from: store_probe.status
-    to: store_probe.changes
+  # store_seed's self-edge only places the portless seeder in the graph
+  # (fluxor's fixture keeps its two ports for it); nothing crosses it.
   - from: store_seed.status
     to: store_seed.changes
-  - from: rs_source.status
-    to: rs_source.changes
   - from: rs_source.record_out
     to: rs_prevget.request_in
   # Engine edges are byte FIFOs; the store_effect request edges are MAILBOXES
@@ -131,8 +129,6 @@ wiring:
     to: rs_apply.request_in
   - from: rs_apply.response_out
     to: rs_events.request_in
-  - from: pods_out.status
-    to: pods_out.changes
   - from: pods_out.record_out
     to: pods_log.data
     buffer_group: 90

@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULES_DIR="$ROOT/target/fluxor/aarch64/modules"
-GRAPH="$ROOT/packaging/cli/linux.yaml"
+GRAPH="$ROOT/packaging/debian/fluxor-cli.yaml"
 
 . "$ROOT/scripts/fluxor-env.sh"
 if [ -z "${FLUXOR_RUNTIME:-}" ]; then

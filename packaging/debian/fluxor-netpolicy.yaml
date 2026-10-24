@@ -272,85 +272,49 @@ modules:
     status_key: "/np-status/netpolicy"
 
 wiring:
-  - from: np_selsrc.status
-    to: np_selsrc.changes
   - from: np_selsrc.record_out
     to: np_selmap.record_in
   - from: np_selmap.result_out
     to: np_sel.request_in
-  - from: np_insrc.status
-    to: np_insrc.changes
   - from: np_insrc.record_out
     to: np_in.request_in
-  - from: np_outsrc.status
-    to: np_outsrc.changes
   - from: np_outsrc.record_out
     to: np_out.request_in
-  - from: np_pselsrc.status
-    to: np_pselsrc.changes
   - from: np_pselsrc.record_out
     to: np_psel.request_in
   - from: np_psel.response_out
     to: np_psel_drop.request_in
-  - from: np_prowsrc.status
-    to: np_prowsrc.changes
   - from: np_prowsrc.record_out
     to: np_prow.request_in
-  - from: np_rinsrc.status
-    to: np_rinsrc.changes
   - from: np_rinsrc.record_out
     to: np_rin.request_in
-  - from: np_routsrc.status
-    to: np_routsrc.changes
   - from: np_routsrc.record_out
     to: np_rout.request_in
-  - from: np_rulefsrc.status
-    to: np_rulefsrc.changes
   - from: np_rulefsrc.record_out
     to: np_rulef.request_in
-  - from: np_peersrc.status
-    to: np_peersrc.changes
   - from: np_peersrc.record_out
     to: np_peer.request_in
-  - from: np_peerfsrc.status
-    to: np_peerfsrc.changes
   - from: np_peerfsrc.record_out
     to: np_peerf.request_in
-  - from: np_nsfsrc.status
-    to: np_nsfsrc.changes
   - from: np_nsfsrc.record_out
     to: np_nsf.request_in
-  - from: np_ipfsrc.status
-    to: np_ipfsrc.changes
   - from: np_ipfsrc.record_out
     to: np_ipf.request_in
-  - from: np_allowsrc.status
-    to: np_allowsrc.changes
   - from: np_allowsrc.record_out
     to: np_allow.request_in
-  - from: np_nssrc.status
-    to: np_nssrc.changes
   - from: np_nssrc.record_out
     to: np_nsmap.record_in
   - from: np_nsmap.result_out
     to: np_peerns.request_in
-  - from: np_podsrc.status
-    to: np_podsrc.changes
   - from: np_podsrc.record_out
     to: np_podmap.record_in
   - from: np_podmap.result_out
     to: np_peerip.request_in
-  - from: np_ipsrc.status
-    to: np_ipsrc.changes
   - from: np_ipsrc.record_out
     to: np_ipget.request_in
   - from: np_ipget.response_out
     to: np_ipdrop.request_in
-  - from: np_arowsrc.status
-    to: np_arowsrc.changes
   - from: np_arowsrc.record_out
     to: np_aget.request_in
   - from: np_aget.response_out
     to: np_adrop.request_in
-  - from: np_apply.status
-    to: np_apply.changes

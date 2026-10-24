@@ -5,7 +5,6 @@
 target: linux
 tick_us: 1000
 
-# The self-edge below (change-sink allocator) is a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -25,9 +24,5 @@ modules:
     key_prefix: "/webhook-status/"
 
 wiring:
-  # The change sink (self-edge allocation) — the store pushes namespace.change
-  # here and the source re-emits the set.
-  - from: wh_source.status
-    to: wh_source.changes
   - from: wh_source.record_out
     to: wh_status.request_in

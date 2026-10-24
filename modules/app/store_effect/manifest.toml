@@ -93,7 +93,11 @@ hardware_targets = ["bcm2712", "linux"]
 # key, leaving every other key alone; an empty value removes a key). With an
 # expected revision in field 28 the merge is into THAT record: 409 when it
 # moved or is gone, so a merge never recreates a record another writer
-# removed.
+# removed. `merge_existing = 1` makes every MERGE so, at the revision the store
+# holds when the merge reads it: 404 when the key is absent, 409 when it moved
+# before the write. A chain that owns one field of a record another chain
+# creates and removes (a sandbox's `phase=`) sets it, so a record of its still
+# in flight when the owner removed the key cannot bring the key back.
 # `append_tally = "<from>:<to>"`: an APPEND (11) to `<from><rest>` also adds
 # the bytes it appended to the decimal count at `<to><rest>` — every byte ever
 # written, which the tail ring no longer says (a Pod's log, followed).
@@ -158,8 +162,10 @@ name = "response_out"
 direction = "output"
 content_type = "OctetStream"
 # Four records of reply ahead of the next stage. A control plane wires this
-# port some fifty times, and every ring comes out of the runtime's one 8 MiB
-# channel arena: a wider ring here is what leaves no room for the rest.
+# port and its store_stamped / store_big twins some hundred and thirty times,
+# and every ring comes out of the runtime's one 16 MiB channel arena, which
+# also holds the rings of every workload the node hosts: a wider ring here is
+# what leaves no room for the rest.
 buffer_size = 32768
 max_record = 8192
 # Optional: a TERMINAL writer has nobody to answer, and requiring a sink would
@@ -187,3 +193,9 @@ access = "read"
 
 [observability]
 exempt = "a read-only store effect at the graph edge — observed through the store it reads and the engine it answers"
+
+# Store subscriptions an instance opens: none — a request/response effect
+# never subscribes (it creates no event and opens no subscription). Declared
+# so the graph's subscription demand is stated by every store consumer.
+[capacities]
+store_subscriptions = 0

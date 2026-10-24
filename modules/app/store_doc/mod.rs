@@ -69,8 +69,6 @@ const OBJ_GET: u32 = 0x1421;
 const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 4096;
 const MAX_PREFIX: usize = 64;
@@ -689,7 +687,8 @@ impl State {
                     PodDel::Already => return self.reply(200, &[]),
                     // A read not answered yet: the request is held (the
                     // journal) and served again; never a delete decided
-                    // without it.
+                    // without it. One refused for good fails the request
+                    // (500, below).
                     PodDel::Wait => {
                         if !self.journal.held() {
                             self.reply(503, &[]);
@@ -1368,6 +1367,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         return 0;
     }
     s.held = 0;
+    if s.journal.refusal().is_some() {
+        // A read of this request was refused for good: what the serve
+        // concluded from it — absent, nothing running, a listing ended
+        // short — is not the store's answer, and asking again answers the
+        // same. Answered 500 at once, whatever it staged: nothing goes to the
+        // dialect on it.
+        s.reply(500, &[]);
+    }
     // Answered: the pre-images kept for a replay are not needed.
     s.journal.settle();
     if s.phase == PHASE_SEND && s.send() {

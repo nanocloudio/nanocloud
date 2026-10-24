@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Encrypted volumes, end to end: the packaged graph
-# (packaging/debian/fluxor-volumes.yaml) against Loam's admin gate (the
-# loam-admin template from a Loam checkout), under this node's capability,
+# (packaging/debian/fluxor-volumes.yaml) against Loam's admin gate (loam's
+# published `loam-admin` bundle), under this node's capability,
 # with Kagi's storage-key service, its ledger and custodians in the graph.
 #
 #   provision  a PersistentVolumeClaim of class `encrypted`: the Loam volume
@@ -23,8 +23,8 @@
 #   ./scripts/volumes-e2e.sh     (KEEP=1 keeps the work directory)
 #
 # Needs passwordless sudo (mount, NBD), nbd-client, mkfs.ext4, the nbd kernel
-# module and a Loam checkout ($LOAM_ROOT, default ../loam). Without them it
-# skips; NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
+# module and loam's `loam-admin` bundle pinned (`fluxor update`). Without them
+# it skips; NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,7 +43,7 @@ done
 sudo -n true 2>/dev/null || skip "needs passwordless sudo (mount, NBD)"
 command -v nbd-client >/dev/null || skip "needs nbd-client"
 command -v mkfs.ext4 >/dev/null || skip "needs mkfs.ext4"
-nc_loam_present || skip "no Loam checkout at $LOAM_ROOT (set LOAM_ROOT)"
+nc_loam_present || skip "loam-admin is not pinned (fluxor update)"
 sudo -n modprobe nbd 2>/dev/null || true
 [ -e /dev/nbd0 ] || skip "no NBD devices (the nbd kernel module)"
 

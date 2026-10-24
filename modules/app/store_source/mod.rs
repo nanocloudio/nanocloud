@@ -14,6 +14,7 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::contracts::storage::namespace::{self as ns, changes};
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
 use abi::SyscallTable;
 
@@ -27,6 +28,7 @@ include!("../_shared/docschema.rs");
 include!("../_shared/head_rev.rs");
 include!("../_shared/jsonq.rs");
 include!("../_shared/moment.rs");
+include!("../_shared/feedpos.rs");
 
 // Chronicle's stage executor, from its published cores — not restated. With
 // `ir_stages` the watch connector runs a Chronicle PIPELINE on each candidate
@@ -52,7 +54,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_CLOSE: u32 = 0x1425;
 const OBJ_DELETE: u32 = 0x1424;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -116,10 +117,20 @@ const MAX_CURSOR: usize = 255;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    sink: i32,
+    /// The kernel event every subscription of this source rings
+    /// (`store_event`), or -1: the store signals it on a change under a
+    /// watched prefix and writes no channel of ours.
+    event: i32,
+    /// The first subscription's handle (-1: none): the one a watch's
+    /// `CHANGES` read names, so the store rings it again after an `EAGAIN`.
+    sub: i32,
     record_out: i32,
     resolved: u8,
     subscribed: u8,
+    /// A scan (or, in `events` mode, a pass over the watchers) is owed: set
+    /// by a ring, a due timer or a pass that could not finish, cleared when
+    /// a pass starts. A pass the store refused is owed again `RETRY_MS`
+    /// later (`retry_later`), never left for a next change.
     dirty: u8,
     seq: i64,
     /// Scan state. A prefix can span many LIST pages, and a step must return —
@@ -346,6 +357,10 @@ struct State {
     /// Objects that qualified in the current scan (for `empty`).
     scan_hits: u32,
     timer_fd: i32,
+    /// When a pass the store refused runs again (`retry_later`, this boot's
+    /// ms clock); 0: none owed. The timer is armed for it, and every arming
+    /// of the timer keeps it.
+    retry_at: i64,
     scan_now: i64,
     /// Earliest deadline ahead of `scan_now` seen this scan; i64::MAX = none.
     next_due: i64,
@@ -523,11 +538,26 @@ struct State {
     st_slow: u32,
     watchers: [Watcher; MAX_WATCHERS],
     /// The watcher a pass is serving (`EV_IDLE` between passes), and its
-    /// batch of changes: `ev_buf[ev_at..ev_len]` still to emit.
+    /// page of changes: `ev_buf[ev_at..ev_end]` still to emit (`ev_len` the
+    /// page's bytes, 0: none in hand).
     ev_w: u8,
     ev_len: u32,
     ev_at: u32,
+    /// Where the page's records end (its trailer, the token, follows).
+    ev_end: u32,
     ev_fence: u64,
+    /// The page's `safe_rev`: the highest revision it delivered whole. An
+    /// event is stamped at most this, and the watcher's cursor follows it.
+    ev_safe: u64,
+    /// The page said `more`: the watcher's read continues from `ev_tok`.
+    ev_more: u8,
+    /// Pages read this step (bounded by `EV_PAGES_PER_STEP`).
+    ev_pages: u8,
+    /// The store's continuation while the watcher being served is mid-read
+    /// (`ev_tok_len` 0: at rest — its next read starts from its cursor).
+    /// Opaque, and never a revision handed to a client.
+    ev_tok_len: u16,
+    ev_tok: [u8; changes::TOKEN_MAX],
     ev_buf: [u8; EV_BUF],
     /// The LIST registration being served: its current page, the read
     /// position in it, whether it was the last, and whether `limit` cut the
@@ -915,20 +945,28 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
     core::ptr::copy_nonoverlapping(src, dst, n);
 }
 
-/// Whether a read of the pass in hand answered `EAGAIN` — or any refusal
-/// but the contract's absence (`ENXIO`/`ENOENT`, [`refused`]): not yet,
-/// never absent. Every reader below takes one; once set, the readers answer
-/// "nothing" without asking the store, and the pass that holds it decides
-/// nothing from what it read — it is run again on a later step from where
-/// it stood (`emit_page` at the key it was on, a watch's step restored
-/// whole). So a value the store has not handed over yet is never served as
-/// NotFound, an empty list, or a 410.
+/// Whether a read of the pass in hand answered the store's "not yet"
+/// ([`not_yet`]: `EAGAIN`, `EBUSY`) — never absent. Every reader below takes
+/// one; once set, the readers answer "nothing" without asking the store,
+/// and the pass that holds it decides nothing from what it read — it is run
+/// again on a later step from where it stood (`emit_page` at the key it was
+/// on, a watch's step restored whole). So a value the store has not handed
+/// over yet is never served as NotFound, an empty list, or a 410.
 ///
-/// It also carries the module's [`ReadNag`]: a refusal other than `EAGAIN`
-/// is said at ERROR, at most once per [`REFUSAL_SAY_MS`]. Only the flag is
-/// the pass's; the nag outlives it.
+/// A read refused for good — any refusal but absence (`ENXIO`/`ENOENT`) and
+/// "not yet" ([`refused`]) — stops the pass the same way, and is kept
+/// ([`Wait::refusal`]): asked again it answers the same for ever, so the
+/// pass is not run again. It FAILS instead: a scan is abandoned until the
+/// next change wakes it ([`scan_failed`]), and a watch, list or get is
+/// answered as failed ([`watcher_failed`]) — never a pass that spins.
+///
+/// It also carries the module's [`ReadNag`]: a final refusal is said at
+/// ERROR, at most once per [`REFUSAL_SAY_MS`]. Only the flags are the
+/// pass's; the nag outlives it.
 struct Wait {
     waited: core::cell::Cell<bool>,
+    /// The errno a read of this pass was refused with for good (0: none).
+    refused: core::cell::Cell<i32>,
     nag: ReadNag,
 }
 
@@ -936,23 +974,48 @@ impl Wait {
     const fn new(v: bool) -> Wait {
         Wait {
             waited: core::cell::Cell::new(v),
+            refused: core::cell::Cell::new(0),
             nag: ReadNag::new(),
         }
     }
 
+    /// Whether the pass has stopped: a read not answered yet, or refused.
     fn get(&self) -> bool {
         self.waited.get()
     }
 
+    /// Stop the pass (`true`), or begin a new one (`false`: both flags
+    /// cleared).
     fn set(&self, v: bool) {
         self.waited.set(v);
+        if !v {
+            self.refused.set(0);
+        }
+    }
+
+    /// A read refused for good with `rc`: the pass stops, and FAILS.
+    fn refuse(&self, rc: i32) {
+        self.waited.set(true);
+        if self.refused.get() == 0 {
+            self.refused.set(rc);
+        }
+    }
+
+    /// The errno a read of this pass was refused with for good, if one was.
+    fn refusal(&self) -> Option<i32> {
+        let r = self.refused.get();
+        (r != 0).then_some(r)
     }
 
     /// A read refused with `rc`: absence (`true`) only for `ENXIO`/`ENOENT`;
-    /// anything else waits the pass, said when it is not `EAGAIN`.
+    /// "not yet" waits the pass; anything else fails it, said at ERROR.
     unsafe fn absent(&self, sys: &SyscallTable, op: &[u8], key: &[u8], rc: i32) -> bool {
         match refusal::<()>(sys, &self.nag, op, key, rc) {
             Got::Absent => true,
+            Got::Refused(rc) => {
+                self.refuse(rc);
+                false
+            }
             _ => {
                 self.set(true);
                 false
@@ -961,12 +1024,15 @@ impl Wait {
     }
 
     /// A refused read of an open handle, or of a listing / change feed,
-    /// which have no "absent": the pass waits, said when it is not `EAGAIN`.
+    /// which have no "absent": "not yet" waits the pass; anything else fails
+    /// it, said at ERROR.
     unsafe fn refused_open(&self, sys: &SyscallTable, op: &[u8], key: &[u8], rc: i32) {
-        if rc != ERR_EAGAIN {
+        if not_yet(rc) {
+            self.set(true);
+        } else {
             say_refused(sys, &self.nag, op, key, rc);
+            self.refuse(rc);
         }
-        self.set(true);
     }
 }
 
@@ -974,7 +1040,8 @@ impl Wait {
 const ERR_EAGAIN: i32 = -11;
 
 /// storage.object GET+RANGE_GET+CLOSE — `key` into `dst`; its length, or
-/// `None` when absent, past `dst`, or not answered yet (`w` then set).
+/// `None` when absent, past `dst`, or not answered yet or refused for good
+/// (`w` then set).
 unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) -> Option<usize> {
     if w.get() {
         return None;
@@ -1027,8 +1094,8 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) ->
     Some(n as usize)
 }
 
-/// A key's store revision ([`head_rev`]); `None` when absent or not
-/// answered yet (`w` then set).
+/// A key's store revision ([`head_rev`]); `None` when absent, not answered
+/// yet or refused for good (`w` then set).
 unsafe fn head(sys: &SyscallTable, key: &[u8], w: &Wait) -> Option<u64> {
     if w.get() {
         return None;
@@ -1038,6 +1105,10 @@ unsafe fn head(sys: &SyscallTable, key: &[u8], w: &Wait) -> Option<u64> {
         Got::Absent => None,
         Got::Pending => {
             w.set(true);
+            None
+        }
+        Got::Refused(rc) => {
+            w.refuse(rc);
             None
         }
     }
@@ -1067,27 +1138,34 @@ fn sub_covered(one: &[u8], skip: usize, watches: &[u8]) -> bool {
     false
 }
 
-unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
+/// Create this source's subscription event (`kernel_abi::event::CREATE`):
+/// the event fd, or a negative errno. Every subscription it opens names it.
+unsafe fn store_event(sys: &SyscallTable) -> i32 {
+    (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
+}
+
+/// storage.namespace SUBSCRIBE: ring `event` on every change under `prefix`
+/// (`namespace::subscribe`). The handle — the same one again for the same
+/// prefix and event, so a subscribe run again leaks nothing — or the
+/// store's "not yet" ([`not_yet`]: nothing was made, asked again next step),
+/// or a refusal, said at ERROR.
+unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32) -> i32 {
     let mut arg = [0u8; MAX_KEY + 16];
-    if prefix.len() + 7 > arg.len() {
-        return -1;
-    }
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 4].copy_from_slice(&(sink as u32).to_le_bytes());
-    p += 4;
-    arg[p] = 0;
-    p += 1;
-    let rc = (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), p);
-    if rc < 0 && rc != ERR_EAGAIN {
-        // The store's subscription table is full (or the prefix is refused):
-        // this source still scans once, but a change here will never wake it
-        // again — a controller that looks converged and is not. Said at
-        // ERROR, naming the module (its scheduler index, as the kernel's own
-        // lines name it) and the prefix, every time.
+    let req = ns::subscribe::Request {
+        prefix,
+        event,
+        flags: 0,
+    };
+    let Some(len) = ns::subscribe::encode(&mut arg, &req) else {
+        return -22;
+    };
+    let rc = (sys.provider_call)(-1, ns::SUBSCRIBE, arg.as_mut_ptr(), len);
+    if rc < 0 && !not_yet(rc) {
+        // The store's subscription capacity is spent (or the prefix is
+        // refused): this source still scans once, but a change here will
+        // never wake it again — a controller that looks converged and is
+        // not. Said at ERROR, naming the module (its scheduler index, as the
+        // kernel's own lines name it) and the prefix, every time.
         sub_refused_log(sys, prefix, rc);
     }
     rc
@@ -1118,7 +1196,7 @@ unsafe fn sub_refused_log(sys: &SyscallTable, prefix: &[u8], rc: i32) {
     put(b" refused rc=-");
     let dn = dec_into(rc.unsigned_abs() as u64, &mut d);
     put(d.get(..dn).unwrap_or(&[]));
-    put(b": the store's subscription table is full - changes under it will NOT wake this source");
+    put(b": changes under it will NOT wake this source");
     dev_log(sys, 1, b.as_ptr(), n);
 }
 
@@ -1232,21 +1310,50 @@ unsafe fn trace_line(s: &State) {
     dev_log(&*s.syscalls, 3, b.as_ptr(), n);
 }
 
-unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
-    let mut n = 0u32;
-    let mut buf = [0u8; 512];
-    loop {
-        let poll = (sys.channel_poll)(sink, POLL_IN);
-        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-            break;
-        }
-        let r = (sys.channel_read)(sink, buf.as_mut_ptr(), buf.len());
-        if r <= 0 {
-            break;
-        }
-        n += 1;
+/// `TAKE_RUNG` handles one answer holds.
+const TAKE_BATCH: usize = 16;
+
+/// `event::POLL` this source's event and, when it fired, ask `TAKE_RUNG`
+/// which of its subscriptions rang (clearing their rung bits): how many
+/// were named. Non-zero means a pass is owed. The store keeps one rung bit
+/// per subscription and signals only when it was clear, so a burst of
+/// changes is one ring — and a pass dropped on a failure is never rung
+/// again for them.
+unsafe fn store_take(sys: &SyscallTable, event: i32) -> u32 {
+    if event < 0 {
+        return 0;
     }
-    n
+    let fired = (sys.provider_call)(event, abi::kernel_abi::event::POLL, core::ptr::null_mut(), 0);
+    if fired <= 0 {
+        return 0;
+    }
+    let mut named = 0u32;
+    // A take whose handles did not fit says `more`: taken again here, a few
+    // times; past that the store signals the event again for the next step.
+    for _ in 0..4 {
+        let mut out = [0u8; ns::take::HEAD_LEN + 4 * TAKE_BATCH];
+        let req = ns::take::Request {
+            event,
+            out_ptr: out.as_mut_ptr() as u64,
+            out_cap: out.len() as u32,
+        };
+        let mut arg = [0u8; ns::take::REQUEST_LEN];
+        let Some(len) = ns::take::encode(&mut arg, &req) else {
+            break;
+        };
+        let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
+        if n < 0 {
+            break;
+        }
+        let Some((more, handles)) = ns::take::decode(out.get(..n as usize).unwrap_or(&[])) else {
+            break;
+        };
+        named += handles.count() as u32;
+        if !more {
+            break;
+        }
+    }
+    named
 }
 
 /// One page of a storage.namespace LIST, RAW: `out` is handed to the provider
@@ -1258,10 +1365,11 @@ unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
 ///
 /// Returns (page length in bytes, cursor length written to `cursor_out`); a
 /// zero cursor length means the listing is complete. A page the provider
-/// has not answered yet (`EAGAIN`) — or refuses at all, said at error level
-/// rate-limited ([`Wait::refused_open`]) — is returned empty with `w` set:
-/// the caller's pass is then run again from the same cursor, never taken as
-/// the end of the listing.
+/// has not answered yet (its "not yet") is returned empty with `w` set: the
+/// caller's pass is then run again from the same cursor, never taken as the
+/// end of the listing. A page refused for good is returned empty with `w`
+/// set and the refusal kept ([`Wait::refused_open`], said at error level
+/// rate-limited): the pass fails, never taken as the end either.
 unsafe fn list_page(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -1322,7 +1430,8 @@ unsafe fn list_page_fenced(
     let n = (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p);
     if n < 0 {
         // Not yet — or refused, which a listing never answers for "empty":
-        // no page, no fence, and not the end. The pass waits and asks again.
+        // no page, no fence, and not the end. The pass waits and asks
+        // again, or (refused for good) fails.
         w.refused_open(sys, b"LIST", prefix, n);
         return (0, 0);
     }
@@ -4021,7 +4130,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
@@ -4039,9 +4148,11 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        // Port 0 pair: `changes` in (the store's push sink) and `record_out`
-        // out. Handed over directly rather than resolved by index.
-        s.sink = in_chan;
+        // `record_out` is output port 0, handed over directly rather than
+        // resolved by index. No input: a change rings the source's own kernel
+        // event, created at the first step.
+        s.event = -1;
+        s.sub = -1;
         s.record_out = out_chan;
         s.resolved = 0;
         s.subscribed = 0;
@@ -4096,6 +4207,7 @@ pub unsafe extern "C" fn module_new(
         s.related_len = 0;
         s.related_cut = 0;
         s.timer_fd = -1;
+        s.retry_at = 0;
         s.scan_now = 0;
         s.next_due = i64::MAX;
         s.rebased = core::cell::Cell::new(0);
@@ -4131,7 +4243,12 @@ pub unsafe extern "C" fn module_new(
         s.ev_w = EV_IDLE;
         s.ev_len = 0;
         s.ev_at = 0;
+        s.ev_end = 0;
         s.ev_fence = 0;
+        s.ev_safe = 0;
+        s.ev_more = 0;
+        s.ev_pages = 0;
+        s.ev_tok_len = 0;
         s.lp_n = 0;
         s.lp_rp = 0;
         s.lp_end = 0;
@@ -4242,15 +4359,25 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 dev_log(sys, 1, m.as_ptr(), m.len());
                 return -22;
             }
-            if s.sink >= 0 && s.prefix_len > 0 {
+            if s.event < 0 && s.prefix_len > 0 {
+                // One kernel event for every subscription of this source.
+                s.event = store_event(sys);
+                if s.event < 0 {
+                    let m = b"[store_source] ERROR no kernel event - changes will NOT wake this source";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                }
+            }
+            if s.event >= 0 && s.prefix_len > 0 {
                 // One subscription per prefix that no other of this source's
                 // prefixes covers: its own prefix and its extra watches all
                 // mean the same thing — "something changed, scan again" —
                 // so `/pod-specs/` beside a watch on `/pod-` is one
-                // subscription, not two. The store's subscription table is
-                // shared by every module of the node; a watch spelt
+                // subscription, not two. The store's subscription capacity
+                // is shared by every module of the node; a watch spelt
                 // coarsely (`/image-`, `/rbac-`) is how a source that reads
-                // a family of prefixes takes one seat instead of five.
+                // a family of prefixes takes one seat instead of five. A
+                // subscribe run again (after a "not yet") answers the same
+                // handle for a prefix already made.
                 let plen = s.prefix_len as usize;
                 let mut pfx = [0u8; MAX_PREFIX];
                 pfx[..plen].copy_from_slice(&s.prefix[..plen]);
@@ -4260,11 +4387,14 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 let watches = &wspec[..w];
                 s.st_phase = 1;
                 if !sub_covered(&pfx[..plen], usize::MAX, watches) {
-                    s.t_subrc = store_subscribe(sys, &pfx[..plen], s.sink);
-                    if s.t_subrc == ERR_EAGAIN {
+                    s.t_subrc = store_subscribe(sys, &pfx[..plen], s.event);
+                    if not_yet(s.t_subrc) {
                         // The store cannot take it yet: nothing was made, and
                         // it is asked again next step.
                         return 0;
+                    }
+                    if s.t_subrc >= 0 {
+                        s.sub = s.t_subrc;
                     }
                 }
                 // Extra watches: changes here re-arm the scan but are never
@@ -4276,9 +4406,12 @@ unsafe fn step_body(s: &mut State) -> i32 {
                     if one.starts_with(&pfx[..plen]) || sub_covered(one, i, watches) {
                         continue;
                     }
-                    let rc = store_subscribe(sys, one, s.sink);
+                    let rc = store_subscribe(sys, one, s.event);
                     if s.t_subrc >= 0 && rc < 0 {
                         s.t_subrc = rc;
+                    }
+                    if s.sub < 0 && rc >= 0 {
+                        s.sub = rc;
                     }
                 }
                 s.subscribed = 1;
@@ -4287,7 +4420,7 @@ unsafe fn step_body(s: &mut State) -> i32 {
             s.dirty = 1; // cold start: emit the current set once
         }
 
-        if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
+        if store_take(sys, s.event) > 0 {
             s.dirty = 1;
             s.t_wakes = s.t_wakes.wrapping_add(1);
         }
@@ -4304,6 +4437,7 @@ unsafe fn step_body(s: &mut State) -> i32 {
             if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                 let mut none = [0u8; 4];
                 (sys.provider_call)(s.timer_fd, TIMER_CANCEL, none.as_mut_ptr(), 0);
+                s.retry_at = 0;
                 s.dirty = 1;
             }
         }
@@ -4352,9 +4486,65 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 s.st_phase = 5;
                 emit_page(s);
             }
+            if let Some(rc) = s.waited.refusal() {
+                scan_failed(s, rc);
+            }
         }
         0
     }
+}
+
+/// A scan whose read the store refused for good (`rc`): asked again at once
+/// it answers the same, so the scan is not run again from where it stood.
+/// It is abandoned — nothing more of it goes out, and no end is claimed for
+/// it — and said at ERROR. The change that rang is still owed a scan and its
+/// ring is not repeated, so a fresh scan runs `RETRY_MS` later
+/// ([`retry_later`]), or sooner on the next change.
+unsafe fn scan_failed(s: &mut State, rc: i32) {
+    s.paging = 0;
+    s.counting = 0;
+    s.clen = 0;
+    s.page_off = 0;
+    s.exp_off = 0;
+    s.list_idx = 0;
+    s.total = 0;
+    s.waited.set(false);
+    let sys = &*s.syscalls;
+    let mut m = [0u8; 160];
+    let mut l = append_bytes(&mut m, 0, b"[store_source] ERROR scan of ");
+    l = append_bytes(&mut m, l, &s.prefix[..s.prefix_len as usize]);
+    l = append_bytes(&mut m, l, b" FAILED: the store refused a read rc=-");
+    let mut d = [0u8; 20];
+    let n = dec_into(u64::from(rc.unsigned_abs()), &mut d);
+    l = append_bytes(&mut m, l, &d[..n]);
+    l = append_bytes(&mut m, l, b" - abandoned, scanned again in RETRY_MS");
+    dev_log(sys, 1, m.as_ptr(), l);
+    retry_later(s);
+}
+
+/// How long after a pass the store refused it runs again.
+const RETRY_MS: i64 = 2000;
+
+/// Owe a pass `RETRY_MS` from now: the timer is armed for it (the fire sets
+/// `dirty`). A pass the store refused is not dropped to wait for a next
+/// change — coalesced rings are not repeated, so that change may already be
+/// the last.
+unsafe fn retry_later(s: &mut State) {
+    let sys = &*s.syscalls;
+    let at = (dev_millis(sys) as i64).saturating_add(RETRY_MS);
+    if s.retry_at == 0 || at < s.retry_at {
+        s.retry_at = at;
+    }
+    if s.timer_fd < 0 {
+        s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0);
+        if s.timer_fd < 0 {
+            let m = b"[store_source] no timer fd - a refused pass is run again only on the next change";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return;
+        }
+    }
+    let mut d = (RETRY_MS as u32).to_le_bytes();
+    (sys.provider_call)(s.timer_fd, TIMER_SET, d.as_mut_ptr(), 4);
 }
 
 /// The members of a JSON object: everything between its outer braces, with
@@ -4401,7 +4591,8 @@ fn parse_dec_u64(b: &[u8]) -> u64 {
 // In this mode the source's `prefix` holds watch REGISTRATIONS (one key per
 // watching connection, written by the request chain) and every record it
 // emits is ONE CHANGE for ONE registration, read from the store's CHANGES
-// feed strictly after that registration's cursor:
+// feed strictly after that registration's cursor, one bounded page at a
+// time:
 //
 //   registration  {"p": <watched prefix>, "rv": <resume revision>, "ts":
 //                  <timeoutSeconds>, "bm": <1 = bookmarks>, "k": <kind>,
@@ -4410,7 +4601,8 @@ fn parse_dec_u64(b: &[u8]) -> u64 {
 //                 listed object is, the registration projected by
 //                 `join_paths`/`join_each` (60.., 9x), and
 //                   70 type    ADDED | MODIFIED | DELETED | BOOKMARK | ERROR | CLOSE
-//                   71 rev     the change's revision (i64)
+//                   71 rev     the change's revision, never past the page's
+//                              `safe_rev` (i64)
 //                   72 line    the Kubernetes watch event, one JSON line
 //                   73 cid     the registration's connection (i64)
 //                   74 st      the status the answer opens with (i64)
@@ -4421,8 +4613,17 @@ fn parse_dec_u64(b: &[u8]) -> u64 {
 // key rewritten per event would cost a write per event per watcher. A
 // registration past the table is refused loudly, not dropped.
 //
-// Fail-closed: a cursor older than the store's history (LOST), or a burst of
-// changes larger than `EV_BUF`, answers 410 Expired on that watch and nothing
+// Resumable: every revision handed to a client — an event's resourceVersion,
+// a BOOKMARK's — is at most the page's `safe_rev`, the highest revision the
+// store delivered whole; the cursor follows `safe_rev`, never the store's
+// opaque continuation (held only while a read pages, `ev_tok`). A page cut
+// inside one revision stamps that revision's keys one less, so a client
+// resuming from any revision it was given is sent the rest of it. A relist
+// page with more to come has `safe_rev` 0: its events say 0 (resuming from
+// it relists) and no BOOKMARK is sent until the relist ends.
+//
+// Fail-closed: a cursor older than the store's history (LOST), or a record
+// larger than any buffer, answers 410 Expired on that watch and nothing
 // after it — the client relists, which every Kubernetes client does on 410.
 
 const EV_BUF: usize = 16384;
@@ -4436,10 +4637,16 @@ const DOC_MAX: usize = 3 << 20;
 /// A tomb's wrapping past the object it holds (`{"deadline":<ms>,"obj":…}`):
 /// a tomb of an object at [`DOC_MAX`] is still read whole.
 const TOMB_SLACK: usize = 4096;
-/// A change-feed batch grown on the heap stops here: past it, 410.
+/// A change-feed page grown on the heap stops here: a record past it, 410.
 const EVH_MAX: usize = 16 << 20;
-/// `ENOMEM`: the provider's answer when a CHANGES batch outgrows the buffer.
+/// `ENOMEM`: the provider's answer when a CHANGES page's first record is
+/// past the buffer.
 const ERR_ENOMEM: i32 = -12;
+/// The heap would not grow for a page: nothing decided, the read is asked
+/// again `RETRY_MS` later (`ENOBUFS`, never a provider's answer here).
+const ERR_NO_HEAP: i32 = -105;
+/// `CHANGES` pages one step reads for the watchers at most.
+const EV_PAGES_PER_STEP: u8 = 4;
 const MAX_WATCHERS: usize = 32;
 const WNAME: usize = 96;
 /// Bookmark cadence for a registration that asked for them — upstream sends
@@ -4450,7 +4657,6 @@ const BOOKMARK_MS: i64 = 60_000;
 const DEFAULT_WATCH_MS: i64 = 1_800_000;
 /// `ev_w` when no pass is in progress.
 const EV_IDLE: u8 = 0xFF;
-const NS_CHANGES: u32 = 0x1307;
 
 #[derive(Clone, Copy)]
 struct Watcher {
@@ -4463,6 +4669,12 @@ struct Watcher {
     /// The watched prefix — or, for a GET, the object's whole key.
     prefix: [u8; MAX_KEY],
     prefix_len: u16,
+    /// The revision the watch has been served whole up to: its client's
+    /// resourceVersion at registration, then each read's `safe_rev` — never
+    /// a store continuation, so every revision this hands out (an event's,
+    /// a bookmark's) is one a client can resume from and miss nothing. 0:
+    /// no revision — the first read is a relist (the current objects as
+    /// ADDED).
     cursor: u64,
     /// The connection the registration belongs to (its `cid`), emitted at 73.
     cid: i64,
@@ -4532,13 +4744,19 @@ const WATCHER_EMPTY: Watcher = Watcher {
     lbytes: 0,
 };
 
-/// `CHANGES(prefix, since)` into `out`: the byte count written and the fence
-/// revision, or the negative errno.
-/// `EAGAIN` (the store has not answered yet) sets `w`: not a lost history.
+/// One `CHANGES` page of `prefix` from `token` into `out`
+/// (`namespace::changes`): the byte count written and the fence revision, or
+/// the negative errno. `sub` is the subscription the read serves: the store
+/// rings it again once an `EAGAIN` it answered clears.
+/// "Not yet" (the store has not answered yet) sets `w`, and a final refusal
+/// sets it with the refusal kept: neither is a lost history. `ENOMEM` (the
+/// page's first record is past `out`) is the caller's, asked again on the
+/// heap.
 unsafe fn store_changes(
     sys: &SyscallTable,
     prefix: &[u8],
-    since: u64,
+    sub: i32,
+    token: &[u8],
     out: &mut [u8],
     fence_rev: &mut u64,
     w: &Wait,
@@ -4546,29 +4764,21 @@ unsafe fn store_changes(
     if w.get() {
         return ERR_EAGAIN;
     }
-    let mut arg = [0u8; MAX_KEY + 40];
-    if prefix.len() + 34 > arg.len() {
-        return -22;
-    }
+    let mut arg = [0u8; MAX_KEY + changes::TOKEN_MAX + changes::REQUEST_FIXED_LEN];
     let mut fence = [0u8; 64];
-    let mut p = 0usize;
-    arg[p..p + 2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 8].copy_from_slice(&since.to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 4].copy_from_slice(&(out.len() as u32).to_le_bytes());
-    p += 4;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), p);
-    // `ENOMEM` is decided — the batch is past `out`, asked again on the heap
-    // by the caller. Any other refusal is not yet: never a 410 for it.
+    let req = changes::Request {
+        prefix,
+        sub,
+        token,
+        out_ptr: out.as_mut_ptr() as u64,
+        out_cap: out.len().min(u32::MAX as usize) as u32,
+        fence_out_ptr: fence.as_mut_ptr() as u64,
+        fence_out_cap: fence.len() as u16,
+    };
+    let Some(len) = changes::encode_request(&mut arg, &req) else {
+        return -22;
+    };
+    let n = (sys.provider_call)(-1, ns::CHANGES, arg.as_mut_ptr(), len);
     if n < 0 && n != ERR_ENOMEM {
         w.refused_open(sys, b"CHANGES", prefix, n);
         return n;
@@ -4638,10 +4848,19 @@ unsafe fn ev_sync(s: &mut State, now: i64) {
     let sys = &*s.syscalls;
     if s.stale_at_open != 0 && s.stale_purged == 0 {
         if !purge_page(s) {
-            // Stale registrations are still going: the table is synced once
-            // they are gone, and this runs again next step until then.
-            s.dirty = 1;
-            return;
+            if s.waited.refusal().is_none() {
+                // Stale registrations are still going: the table is synced
+                // once they are gone, and this runs again next step until
+                // then.
+                s.dirty = 1;
+                return;
+            }
+            // Refused for good (said by the read): asked again it answers
+            // the same. The stale registrations stay, said, and the table
+            // is synced without them.
+            let m = b"[store_watch] ERROR stale registrations could not be listed - NOT purged";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            s.waited.set(false);
         }
         s.stale_purged = 1;
     }
@@ -4754,8 +4973,14 @@ unsafe fn ev_sync(s: &mut State, now: i64) {
     if s.waited.get() {
         // A page or a registration was not answered yet: the listing is
         // not the table, so nothing it did not see is dropped, and the
-        // table is synced again next step.
-        s.dirty = 1;
+        // table is synced again next step. One refused for good (said by
+        // the read) is not asked again at once: the table stays as it was,
+        // and is synced again `RETRY_MS` later (or on the next change).
+        if s.waited.refusal().is_none() {
+            s.dirty = 1;
+        } else {
+            retry_later(s);
+        }
         return;
     }
     for w in s.watchers.iter_mut() {
@@ -5469,10 +5694,17 @@ unsafe fn wire_more(s: &mut State) {
     }
 }
 
-/// CHANGES into a heap buffer when the batch outgrew `ev_buf`: the buffer
-/// doubled until it holds the batch or `EVH_MAX` is reached. The byte count,
-/// or the provider's error (`ENOMEM` past `EVH_MAX`, or with no heap).
-unsafe fn changes_on_heap(s: &mut State, prefix: &[u8], since: u64, fence: &mut u64) -> i32 {
+/// One CHANGES page into a heap buffer when its first record is past
+/// `ev_buf` (a large object): the buffer doubled until it holds the record
+/// or `EVH_MAX` is reached. The byte count, the provider's error (`ENOMEM`
+/// past `EVH_MAX`), or [`ERR_NO_HEAP`] when the heap would not grow.
+unsafe fn changes_on_heap(
+    s: &mut State,
+    prefix: &[u8],
+    sub: i32,
+    token: &[u8],
+    fence: &mut u64,
+) -> i32 {
     let sys = &*s.syscalls;
     let mut cap = if s.evh_cap == 0 {
         4 * EV_BUF
@@ -5487,13 +5719,13 @@ unsafe fn changes_on_heap(s: &mut State, prefix: &[u8], since: u64, fence: &mut 
                 heap_realloc(sys, s.evh, cap as u32)
             };
             if p.is_null() {
-                return ERR_ENOMEM;
+                return ERR_NO_HEAP;
             }
             s.evh = p;
             s.evh_cap = cap;
         }
         let dst = core::slice::from_raw_parts_mut(s.evh, s.evh_cap);
-        let n = store_changes(sys, prefix, since, dst, fence, &s.waited);
+        let n = store_changes(sys, prefix, sub, token, dst, fence, &s.waited);
         if n != ERR_ENOMEM || cap >= EVH_MAX {
             if n >= 0 {
                 s.ev_heap = 1;
@@ -6090,6 +6322,7 @@ unsafe fn events_step(s: &mut State) {
         s.ev_len = 0;
     }
     let now = s.scan_now;
+    s.ev_pages = 0;
     while (s.ev_w as usize) < MAX_WATCHERS {
         let wi = s.ev_w as usize;
         // A watcher's step that met a read the store had not answered yet
@@ -6099,6 +6332,13 @@ unsafe fn events_step(s: &mut State) {
         let stop = watcher_step(s, wi, now);
         if s.waited.get() {
             snap.restore(s, wi);
+            if let Some(rc) = s.waited.refusal() {
+                // Refused for good: run again it meets the same refusal, so
+                // its client is answered the failure now.
+                s.waited.set(false);
+                watcher_failed(s, wi, rc);
+                return;
+            }
             s.t_waits = s.t_waits.wrapping_add(1);
             return;
         }
@@ -6110,6 +6350,46 @@ unsafe fn events_step(s: &mut State) {
     ev_arm(s, sys);
 }
 
+/// End watcher `wi`, whose step the store refused a read for (`rc`): its
+/// registration is answered `FAILED` — the schema's `failed` Status as the
+/// body of a list or get, or as a watch's last `ERROR` event — and goes.
+/// Never a watcher left to meet the same refusal every step while its client
+/// waits.
+unsafe fn watcher_failed(s: &mut State, wi: usize, rc: i32) {
+    let w = s.watchers[wi];
+    s.watchers[wi].done = 1;
+    s.ev_w += 1;
+    s.ev_len = 0;
+    s.ev_heap = 0;
+    s.ev_tok_len = 0;
+    s.ev_more = 0;
+    s.lp_n = 0;
+    s.lp_rp = 0;
+    s.lp_end = 0;
+    s.lp_cut = 0;
+    let sys = &*s.syscalls;
+    let mut m = [0u8; 160];
+    let mut l = append_bytes(&mut m, 0, b"[store_source] ERROR ");
+    l = append_bytes(&mut m, l, &w.name[..w.name_len as usize]);
+    l = append_bytes(&mut m, l, b" FAILED: the store refused a read rc=-");
+    let mut d = [0u8; 20];
+    let n = dec_into(u64::from(rc.unsigned_abs()), &mut d);
+    l = append_bytes(&mut m, l, &d[..n]);
+    dev_log(sys, 1, m.as_ptr(), l.min(m.len()));
+    let sch = &s.schema[..s.schema_len as usize];
+    let mut obj = [0u8; 256];
+    let f = sch_get(sch, b"failed");
+    let ol = f.len().min(obj.len());
+    obj[..ol].copy_from_slice(&f[..ol]);
+    let reg_key = w.name;
+    let rk = &reg_key[..w.name_len as usize];
+    if w.list != 0 {
+        let _ = ev_emit(s, wi, b"FAILED", rk, 0, b"{}", &obj[..ol], false);
+    } else {
+        let _ = ev_event(s, wi, b"ERROR", rk, w.cursor, &obj[..ol], false);
+    }
+}
+
 /// What one watcher's step may move, to put it back when the step met a read
 /// not answered yet.
 struct EvSnap {
@@ -6117,7 +6397,12 @@ struct EvSnap {
     ev_w: u8,
     ev_len: u32,
     ev_at: u32,
+    ev_end: u32,
     ev_fence: u64,
+    ev_safe: u64,
+    ev_more: u8,
+    ev_tok_len: u16,
+    ev_tok: [u8; changes::TOKEN_MAX],
     ev_heap: u8,
     lp_n: usize,
     lp_rp: usize,
@@ -6136,7 +6421,12 @@ impl EvSnap {
             ev_w: s.ev_w,
             ev_len: s.ev_len,
             ev_at: s.ev_at,
+            ev_end: s.ev_end,
             ev_fence: s.ev_fence,
+            ev_safe: s.ev_safe,
+            ev_more: s.ev_more,
+            ev_tok_len: s.ev_tok_len,
+            ev_tok: s.ev_tok,
             ev_heap: s.ev_heap,
             lp_n: s.lp_n,
             lp_rp: s.lp_rp,
@@ -6154,7 +6444,12 @@ impl EvSnap {
         s.ev_w = self.ev_w;
         s.ev_len = self.ev_len;
         s.ev_at = self.ev_at;
+        s.ev_end = self.ev_end;
         s.ev_fence = self.ev_fence;
+        s.ev_safe = self.ev_safe;
+        s.ev_more = self.ev_more;
+        s.ev_tok_len = self.ev_tok_len;
+        s.ev_tok = self.ev_tok;
         s.ev_heap = self.ev_heap;
         s.lp_n = self.lp_n;
         s.lp_rp = self.lp_rp;
@@ -6185,50 +6480,109 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
     }
     let reg_key = &w.name[..w.name_len as usize];
     if s.ev_len == 0 {
-        // The watch's own end: timeoutSeconds.
-        if now >= w.deadline {
+        // The watch's own end: timeoutSeconds — at rest only, between reads.
+        if s.ev_tok_len == 0 && now >= w.deadline {
             s.watchers[wi].done = 1;
             s.ev_w += 1;
             ev_event(s, wi, b"CLOSE", reg_key, w.cursor, b"{}", false);
             return true;
         }
+        if s.ev_pages >= EV_PAGES_PER_STEP {
+            // The step has read its pages: the rest of this read is the
+            // next step's, from the continuation held.
+            return true;
+        }
+        s.ev_pages += 1;
+        // Where this read resumes: mid-read the store's continuation; at
+        // rest the watcher's revision — or, for a watch from no revision,
+        // the empty token, a relist: the current objects as ADDED.
+        let mut tok = [0u8; changes::TOKEN_MAX];
+        let cont = s.ev_tok.get(..s.ev_tok_len as usize).unwrap_or(&[]);
+        let tl = feed_token(cont, w.cursor, &mut tok);
         let mut fence = 0u64;
         s.ev_heap = 0;
-        let mut n = store_changes(
-            sys,
-            &w.prefix[..w.prefix_len as usize],
-            w.cursor,
-            &mut s.ev_buf,
-            &mut fence,
-            &s.waited,
-        );
-        // A batch past `ev_buf` (large objects): again, on the heap.
+        let pfx = &w.prefix[..w.prefix_len as usize];
+        let mut n = store_changes(sys, pfx, s.sub, &tok[..tl], &mut s.ev_buf, &mut fence, &s.waited);
+        // A page whose first record is past `ev_buf` (a large object):
+        // again, on the heap.
         if n == ERR_ENOMEM {
-            n = changes_on_heap(s, &w.prefix[..w.prefix_len as usize], w.cursor, &mut fence);
+            n = changes_on_heap(s, pfx, s.sub, &tok[..tl], &mut fence);
+        }
+        if s.waited.get() {
+            // Not answered yet (the store rings this source again when it
+            // can answer), or refused: `events_step` puts the watcher back.
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            return true;
+        }
+        if n == ERR_NO_HEAP {
+            // Nothing decided and nothing lost: this pass stops here, and
+            // a fresh one reads again `RETRY_MS` later. The watcher's
+            // cursor follows what it was served whole, so the read starts
+            // over from it.
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            s.ev_tok_len = 0;
+            s.ev_more = 0;
+            s.ev_w = EV_IDLE;
+            retry_later(s);
+            return true;
         }
         s.ev_len = if n > 0 { n as u32 } else { 0 };
-        let head5 = ev_bytes(s);
-        // LOST (history no longer reaches the cursor) or a batch past
-        // every buffer: 410, and the client relists.
-        if n < 5 || head5.first() == Some(&1) {
+        let page = changes::decode_page(ev_bytes(s));
+        // LOST (history no longer reaches the cursor), a record past every
+        // buffer, or a page that does not parse: 410, and the client
+        // relists.
+        let Some(page) = page.filter(|p| n > 0 && !p.lost) else {
             s.watchers[wi].done = 1;
             s.ev_w += 1;
             s.ev_len = 0;
             s.ev_heap = 0;
+            s.ev_tok_len = 0;
+            s.ev_more = 0;
             let mut ex = [0u8; 256];
             let el = expired(s, &mut ex);
             ev_event(s, wi, b"ERROR", reg_key, fence, &ex[..el], false);
             return true;
+        };
+        if page.more && page.token.is_empty() {
+            // A page that cannot be continued: nothing of it is taken, and
+            // the read starts over from the watcher's cursor next pass.
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            s.ev_tok_len = 0;
+            s.ev_more = 0;
+            s.ev_w += 1;
+            s.dirty = 1;
+            return false;
         }
-        let count = u32::from_le_bytes([head5[1], head5[2], head5[3], head5[4]]);
-        if count == 0 {
-            if s.watchers[wi].cursor == 0 {
-                s.watchers[wi].cursor = fence;
-            }
-            if now >= w.next_bm {
+        let end = (n as usize).saturating_sub(changes::TRAILER_FIXED_LEN + page.token.len());
+        s.ev_at = changes::HEAD_LEN as u32;
+        s.ev_end = end as u32;
+        s.ev_fence = fence;
+        s.ev_safe = page.safe_rev;
+        s.ev_more = u8::from(page.more);
+        // The continuation is kept only while the read goes on; a finished
+        // read rests at the cursor, which follows `safe_rev`.
+        if page.more && page.token.len() <= s.ev_tok.len() {
+            s.ev_tok[..page.token.len()].copy_from_slice(page.token);
+            s.ev_tok_len = page.token.len() as u16;
+        } else {
+            s.ev_tok_len = 0;
+        }
+        if page.count == 0 && !page.more {
+            // Nothing new: the watch rests at what it has been served
+            // whole — the only revision a BOOKMARK may carry, and never
+            // a relist's mid-way 0.
+            let c = &mut s.watchers[wi].cursor;
+            *c = feed_cursor_after(*c, page.safe_rev);
+            s.ev_len = 0;
+            s.ev_heap = 0;
+            s.ev_more = 0;
+            let bm = feed_bookmark(s.watchers[wi].cursor, false);
+            if let Some(rv) = bm.filter(|_| now >= w.next_bm) {
                 s.watchers[wi].next_bm = now.saturating_add(s.bookmark_ms as i64);
                 s.ev_w += 1;
-                let rv = s.watchers[wi].cursor;
                 let mut reg = [0u8; MAX_VALUE];
                 let rl = get_value(sys, reg_key, &mut reg, &s.waited).unwrap_or(0);
                 let mut obj = [0u8; 256];
@@ -6237,45 +6591,58 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
                 ev_event(s, wi, b"BOOKMARK", reg_key, rv, &obj[..ol], false);
                 return true;
             }
-            s.ev_len = 0;
-            s.ev_heap = 0;
             s.ev_w += 1;
             return false;
         }
-        s.ev_at = 5;
-        s.ev_fence = fence;
     }
-    // The next change of this watcher's batch.
+    // The next change of this watcher's page.
     let at = s.ev_at as usize;
-    let len = s.ev_len as usize;
-    if at + 15 > len {
-        let f = s.ev_fence;
+    let len = (s.ev_end as usize).min(s.ev_len as usize);
+    if at + changes::RECORD_FIXED_LEN > len {
+        // The page is served: the cursor follows its `safe_rev` (a relist
+        // page with more to come has none — 0 — and leaves it).
+        let safe = s.ev_safe;
         let c = &mut s.watchers[wi].cursor;
-        *c = (*c).max(f);
+        *c = feed_cursor_after(*c, safe);
         s.ev_len = 0;
         s.ev_heap = 0;
+        if s.ev_more != 0 {
+            // The read goes on from the continuation: same watcher.
+            s.ev_more = 0;
+            return false;
+        }
         s.ev_w += 1;
         return false;
     }
     let b = ev_bytes(s);
-    let rev = u64::from_le_bytes([
-        b[at],
-        b[at + 1],
-        b[at + 2],
-        b[at + 3],
-        b[at + 4],
-        b[at + 5],
-        b[at + 6],
-        b[at + 7],
-    ]);
+    // The event's revision: the record's own, but never past what the page
+    // delivered whole. A page cut inside one revision carries the rest of
+    // that revision's keys on the next page; a client resuming from a
+    // revision it was handed must still be sent them.
+    let rev = feed_event_rev(
+        u64::from_le_bytes([
+            b[at],
+            b[at + 1],
+            b[at + 2],
+            b[at + 3],
+            b[at + 4],
+            b[at + 5],
+            b[at + 6],
+            b[at + 7],
+        ]),
+        s.ev_safe,
+    );
     let kind = b[at + 8];
     let kl = u16::from_le_bytes([b[at + 9], b[at + 10]]) as usize;
     let vl = u32::from_le_bytes([b[at + 11], b[at + 12], b[at + 13], b[at + 14]]) as usize;
     let ks = at + 15;
     if ks + kl + vl > len || kl > MAX_KEY {
-        // A malformed batch: stop reading it rather than misreading.
+        // A record this connector cannot hold: stop reading rather than
+        // misreading.
         s.watchers[wi].done = 1;
         s.ev_len = 0;
+        s.ev_tok_len = 0;
+        s.ev_more = 0;
         s.ev_w += 1;
         let mut ex = [0u8; 256];
         let el = expired(s, &mut ex);
@@ -6321,8 +6688,6 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
             )
         }
     };
-    let c = &mut s.watchers[wi].cursor;
-    *c = (*c).max(rev);
     let o: &[u8] = if ol == 0 {
         doc
     } else if hp.is_null() {
@@ -6414,6 +6779,11 @@ unsafe fn ev_arm(s: &mut State, sys: &SyscallTable) {
         .map(|w| w.deadline.min(w.next_bm))
         .min()
         .unwrap_or(i64::MAX);
+    let next = if s.retry_at != 0 {
+        next.min(s.retry_at)
+    } else {
+        next
+    };
     if s.timer_fd < 0 {
         if next == i64::MAX {
             return;
@@ -6547,7 +6917,15 @@ unsafe fn arm_due(s: &mut State, sys: &SyscallTable) {
             s.next_due = d;
         }
     }
-    if s.due_len == 0 && s.cron_len == 0 && (s.recheck == 0 || s.next_due == i64::MAX) {
+    // A retry still owed keeps its alarm.
+    if s.retry_at != 0 && s.retry_at < s.next_due {
+        s.next_due = s.retry_at;
+    }
+    if s.due_len == 0
+        && s.cron_len == 0
+        && s.retry_at == 0
+        && (s.recheck == 0 || s.next_due == i64::MAX)
+    {
         return;
     }
     if s.timer_fd < 0 {

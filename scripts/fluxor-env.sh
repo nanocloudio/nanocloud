@@ -205,7 +205,7 @@ nc_cli_graph() {
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   [ -f "$dir/pki/peer.der" ] || nc_node_pki "$dir" || return 1
   mkdir -p "$dir/lattice"
-  nc_render_graph "$dir" "$root/packaging/cli/linux.yaml" "$out"
+  nc_render_graph "$dir" "$root/packaging/debian/fluxor-cli.yaml" "$out"
 }
 
 # nc_replica_get <dir> <key>

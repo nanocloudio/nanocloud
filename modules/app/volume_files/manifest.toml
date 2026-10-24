@@ -8,13 +8,18 @@ hardware_targets = ["bcm2712", "linux"]
 
 # The volumes a Pod brings itself rather than claims (volume.uproc, from
 # pod_resolve's list): each is a directory of the Pod's own on this node,
-# `<root>/<pod uid>/volumes/<volume>`, bound into every container of the Pod
-# that mounts it — one directory per Pod, whichever container asks first,
-# kept across its containers' restarts and removed once the Pod is gone, as
-# upstream's kubelet keeps them under its pods directory.
+# `<mount root>/<root>/<pod uid>/volumes/<volume>` (the mount root is the
+# platform's, `host_mount` ROOT: `FLUXOR_MOUNT_ROOT`), bound into every
+# container of the Pod that mounts it — one directory per Pod, whichever
+# container asks first, kept across its containers' restarts and removed
+# once the Pod is gone, as upstream's kubelet keeps them under its pods
+# directory.
 #
 #   emptyDir    made empty, mode 0777 (any user the container runs as can
-#               write it)
+#               write it) — or, with the Pod's fsGroup, given that group
+#               (`host_mount` GROUP_TREE: group-owned, setgid, group read,
+#               write and search; fsGroupChangePolicy Always walks it every
+#               time, OnRootMismatch only when its root does not match)
 #   a file      `@d/<vol>/<text, %XX-escaped>`: the text as
 #               `<vol>/resolv.conf`, mode 0644 — a Pod's /etc/resolv.conf
 #               by its dnsPolicy (pod_resolve, _shared/poddns.rs); the file,
@@ -22,32 +27,50 @@ hardware_targets = ["bcm2712", "linux"]
 #   configMap   each key of the ConfigMap's `data` (and `binaryData`), or
 #   secret      the Secret's `data` decoded (and `stringData`), as a file of
 #               that name — or only `items`, each at its `path` — mode
-#               `defaultMode` (the item's `mode`), 0644 unless stated.
+#               `defaultMode` (the item's `mode`), 0644 unless stated; with
+#               the Pod's fsGroup, group-owned by it with `0440` added (the
+#               volume is read-only). Written as one projection
+#               (`host_mount` PROJECT, upstream's AtomicWriter layout: the
+#               files in a `..<timestamp>` directory, `..data` naming it,
+#               each top-level name a link through `..data`), so an update
+#               is swapped in whole: a reader never sees a mix of two. A
+#               Secret's projection is on a memory filesystem (a runtime
+#               without CAP_SYS_ADMIN writes it to disk, and says so once).
 #               A ConfigMap or Secret that is missing and not `optional`
 #               (or an item's key missing) prepares nothing: the container
 #               waits, as upstream's does on a failed mount
+#   a claim     `@g/<vol>/<ns>/<claim>/<fsGroup>/<a|r>`: a
+#               PersistentVolumeClaim the Pod's fsGroup owns — its directory
+#               (`path` of `/volumes/<ns>/<claim>`, once bound) given the
+#               group as an emptyDir is, then bound. A directory outside the
+#               mount root keeps its ownership (said once)
 #
 # It sits in the volume chain in front of the store connector: a request
 # whose op is PREPARE (40) is this module's — field 3 the volume's spec
-# (`@e/<vol>`, `@c/<vol>/<ns>/<name>/<mode>/<optional>[/<key>=<path>[=<mode>]|…]`,
-# `@s/…` for a Secret), field 17 the sandbox id (`<pod uid>[~<container>]`)
-# — and leaves as a NOOP carrying the directory at field 39 (none when it
-# could not be prepared), which the store connector echoes to the chain's
-# next decision; any other request passes through untouched. A directory
-# whose contents are what it last wrote is not written again.
+# (`@e/<vol>[/<gid>/<a|r>]`,
+# `@c/<vol>/<ns>/<name>/<mode>/<optional>/<gid>[/<key>=<path>[=<mode>]|…]`,
+# `@s/…` for a Secret, `@g/…`), field 17 the sandbox id
+# (`<pod uid>[~<container>]`) — and leaves as a NOOP carrying the directory
+# at field 39 (none when it could not be prepared), which the store
+# connector echoes to the chain's next decision; any other request passes
+# through untouched. A directory whose contents are what it last wrote is
+# not written again.
 #
-# Files are written through `fs`; their modes, and a gone Pod's directory,
-# through the process executor: the node's grant must allow `chmod` and
-# `rm` (`SECTOR_PROC_ALLOW`). A volume whose mode could not be set is not
-# offered (its container waits): a 0600 file a non-root container cannot
-# read is not the volume it asked for. Every `gc_ms` the root is swept for
-# Pods whose record (`/pod-specs/<uid>`) is gone.
+# Modes, groups and removal are the platform's (`host_mount` PROJECT,
+# GROUP_TREE, REMOVE_TREE, each asked again until it answers): no tool is
+# spawned for them. The one exception is an emptyDir without fsGroup, whose
+# mode 0777 no platform op sets: `chmod` through the process executor (the
+# node's grant must allow it, `SECTOR_PROC_ALLOW`). A volume that could not
+# be given its mode or group is not offered (its container waits). Every
+# `gc_ms` the root is swept for Pods whose record (`/pod-specs/<uid>`) is
+# gone, and each one's directory removed (REMOVE_TREE: a Secret's memory
+# filesystem unmounted, never a mounted volume crossed).
 #
 # Parameters:
-# | Tag | Name  | Type | Default                    | Description |
-# |-----|-------|------|----------------------------|-------------|
-# | 1   | root  | str  | /var/lib/nanocloud.io/pods | Where the Pods' directories live |
-# | 2   | gc_ms | u32  | 30000                      | How often gone Pods' directories are removed |
+# | Tag | Name  | Type | Default | Description |
+# |-----|-------|------|---------|-------------|
+# | 1   | root  | str  | pods    | Where the Pods' directories live, relative to the mount root |
+# | 2   | gc_ms | u32  | 30000   | How often gone Pods' directories are removed |
 timer_class = "wall_clock"
 permissions = ["platform_raw"]
 
@@ -76,6 +99,12 @@ access = "read"
 requires_contract = "fs"
 access = "write"
 
+# Projections, group ownership and removal under the mount root.
+[[resources]]
+requires_contract = "host_mount"
+access = "write"
+
+# An emptyDir's mode 0777 (`chmod`).
 [[resources]]
 requires_contract = "proc"
 access = "write"

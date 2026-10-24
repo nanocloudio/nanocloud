@@ -163,8 +163,6 @@ modules:
     type: debug
     mode: 1
 wiring:
-  - from: store_source.status
-    to: store_source.changes
   - from: store_source.record_out
     to: owner.request_in
   - from: owner.response_out
@@ -172,14 +170,10 @@ wiring:
   - from: collect.response_out
     to: dbg.data
     buffer_group: 3
-  - from: rs_source.status
-    to: rs_source.changes
   - from: rs_source.record_out
     to: rs_owner.request_in
   - from: rs_owner.response_out
     to: rs_collect.request_in
-  - from: ev_source.status
-    to: ev_source.changes
   - from: ev_source.record_out
     to: ev_collect.request_in
 YAML

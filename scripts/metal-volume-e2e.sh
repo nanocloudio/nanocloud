@@ -12,10 +12,10 @@
 # and logs epoch=1; it is deleted and created again and logs epoch=2 — the
 # state lived in the volume between two lives of the Pod.
 #
-# Loam runs as its operators run it (the loam-admin template from a Loam
-# checkout, scripts/support/loam-admin.sh); the volume is created with the
-# operator's applet (`fluxor exec loam -- volume create`). Needs a Loam
-# checkout ($LOAM_ROOT, default ../loam); without one it skips, and
+# Loam runs as its operators run it (loam's published `loam-admin` bundle,
+# scripts/support/loam-admin.sh); the volume is created with the operator's
+# applet (`fluxor exec loam -- volume create`), loam's published `loam`
+# applet. Needs both pinned (`fluxor update`); without them it skips, and
 # NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
 #
 # The Graph object carries this node's TLS material and capability chains
@@ -36,7 +36,7 @@ skip() {
 }
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl not found"; exit 1; }
-nc_loam_present || skip "no Loam checkout at $LOAM_ROOT (set LOAM_ROOT)"
+nc_loam_present || skip "loam-admin is not pinned (fluxor update)"
 D="$(mktemp -d /tmp/nc-metal-volume-XXXXXX)"
 STORE="$D/store"
 mkdir -p "$STORE"
@@ -106,7 +106,7 @@ export FLUXOR_INSTALL_ROOT="${FLUXOR_INSTALL_ROOT:-$ROOT/../fluxor}"
 mkdir -p "$D/home/.config/loam"
 cp node.der "$D/home/.config/loam/client.der"
 cp node.key.der "$D/home/.config/loam/client.key.der"
-(cd "$LOAM_ROOT" && timeout 600 fluxor install packaging/cli/workload.toml) > "$D/install.log" 2>&1 || fail "installing loam's applet: $(tail -3 "$D/install.log")"
+(cd "$ROOT" && timeout 600 fluxor install loam) > "$D/install.log" 2>&1 || fail "installing loam's applet: $(tail -3 "$D/install.log")"
 timeout 120 fluxor exec loam -- --admin "localhost:$LOAM_PORT" --capability "$D/node.cap" \
   volume create nanocloud /default/volumes/probe 1048576 32768 > "$D/vcreate.log" 2>&1 \
   || fail "volume create: $(tail -3 "$D/vcreate.log")"

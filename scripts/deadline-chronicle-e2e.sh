@@ -103,8 +103,6 @@ modules:
     domain: main
     key_prefix: "/leases/"
 wiring:
-  - from: leases.status
-    to: leases.changes
   - from: leases.record_out
     to: reap.request_in
 YAML

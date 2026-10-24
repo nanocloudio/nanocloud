@@ -32,8 +32,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 4096;
 
@@ -114,7 +112,8 @@ struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
     answer_in: i32,
-    sink: i32,
+    /// The kernel event the subscription rings (`store_event`), or -1.
+    event: i32,
     response_out: i32,
     effect_out: i32,
     side: u8,
@@ -221,7 +220,7 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = sys;
     s.request_in = in_chan;
     s.answer_in = dev_channel_port(sys, 0, 1);
-    s.sink = dev_channel_port(sys, 0, 2);
+    s.event = -1;
     s.response_out = out_chan;
     s.effect_out = dev_channel_port(sys, 1, 1);
     s.issued = [SLOT_FREE; SLOTS];
@@ -266,14 +265,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
         if s.started == 0 {
-            s.started = 1;
             let prefix = if s.side == SIDE_NODE { NODE_OPS } else { ASKS };
-            if s.sink >= 0 {
-                store_subscribe(sys, prefix, s.sink, 0);
+            // The subscription rings the relay's own kernel event. The
+            // store's "not yet": no subscription was made, and it is asked
+            // again next step (the sweep, `poll_ms`, wakes the relay
+            // meanwhile). A final refusal is said by `store_subscribe`, and
+            // a missing event here; the sweep is then all that wakes it.
+            if s.event < 0 {
+                s.event = store_event(sys);
+                if s.event < 0 {
+                    let m = b"[volume_relay] ERROR no kernel event - only the sweep wakes this relay";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                }
+            }
+            if s.event < 0 || !not_yet(store_subscribe(sys, prefix, s.event, 0)) {
+                s.started = 1;
             }
             s.woken = 1;
         }
-        if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
+        if store_take(sys, s.event, |_| {}) > 0 {
             s.woken = 1;
         }
         let swept = now.wrapping_sub(s.last_sweep_ms) >= u64::from(s.poll_ms.max(10));
@@ -438,6 +448,14 @@ unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) -> boo
                     if store.waiting() {
                         continue; // not answered yet, not withdrawn
                     }
+                    if store.refusal().is_some() {
+                        // Refused for good (said by the read): its answer
+                        // cannot be read, so it is given up and withdrawn,
+                        // and the chain's own timeout answers it.
+                        s.given_up = s.given_up.wrapping_add(1);
+                        s.issued[i].phase = PHASE_WITHDRAW;
+                        continue;
+                    }
                     // Withdrawn under it (a restart's sweep): asked again by
                     // the chain.
                     s.issued[i] = SLOT_FREE;
@@ -483,7 +501,8 @@ unsafe fn issue(s: &mut State, sys: &SyscallTable, now: u64, swept: bool) -> boo
 
 /// Address effect `s.rec[..n]` and stage its request in slot `i`. False
 /// when the address could not be read yet (`EAGAIN`): nothing was staged,
-/// and the caller holds the effect for the next step.
+/// and the caller holds the effect for the next step. An address the store
+/// refused for good drops the effect (true): its chain's timeout answers it.
 unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64) -> bool {
     let rec = &s.rec[..n];
     let mut key = [0u8; MAX_KEY];
@@ -532,6 +551,13 @@ unsafe fn start_issue(s: &mut State, store: &Store, i: usize, n: usize, now: u64
         };
         if store.waiting() {
             return false;
+        }
+        if store.refusal().is_some() {
+            // Refused for good (said by the read): where it goes cannot be
+            // read, and asked again it answers the same. The chain's own
+            // timeout answers it.
+            s.dropped = s.dropped.wrapping_add(1);
+            return true;
         }
         let name = &node[..nl];
         rl_node_ok(name)

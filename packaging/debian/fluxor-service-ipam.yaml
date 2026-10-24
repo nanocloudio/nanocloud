@@ -77,8 +77,6 @@ modules:
     key_prefix: "/ipam/svc/"
 
 wiring:
-  - from: is_wait.status
-    to: is_wait.changes
   - from: is_wait.record_out
     to: is_cur.request_in
   - from: is_cur.response_out
@@ -87,16 +85,12 @@ wiring:
     to: is_bump.request_in
   - from: is_bump.response_out
     to: is_bind.request_in
-  - from: is_used.status
-    to: is_used.changes
   - from: is_used.record_out
     to: is_used_c.request_in
   - from: is_used_c.response_out
     to: is_ready.request_in
   - from: is_ready.response_out
     to: is_wake.request_in
-  - from: is_claims.status
-    to: is_claims.changes
   - from: is_claims.record_out
     to: is_owner.request_in
   - from: is_owner.response_out

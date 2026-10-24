@@ -30,8 +30,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 2048;
 
@@ -49,6 +47,15 @@ const MAX_PORTS: usize = 16;
 const SERVICES: &[u8] = b"/services/";
 const NP_CLAIMS: &[u8] = b"/ipam/nodeport/";
 const LB_CLAIMS: &[u8] = b"/ipam/lb/";
+const NODES: &[u8] = b"/nodes/";
+/// A node's Pod CIDR is held by `/ipam/podcidr/<index>`: its position in the
+/// cluster CIDR, counted in node-sized blocks.
+const CIDR_CLAIMS: &[u8] = b"/ipam/podcidr/";
+/// The cluster CIDR's default (NANOCLOUD_CLUSTER_CIDR), and a node's share
+/// of it: upstream's 10.244.0.0/16 cut into /24s.
+const CLUSTER_NET: u32 = 0x0AF4_0000;
+const CLUSTER_LEN: u8 = 16;
+const NODE_PREFIX: u8 = 24;
 
 /// What one pass did.
 enum Pass {
@@ -56,13 +63,21 @@ enum Pass {
     Idle,
     /// It acted (or must look again): run another pass next step.
     Again,
+    /// The store refused a read for good, or a listing failed: asked again
+    /// at once it answers the same, so the pass is run again `POLL_MS`
+    /// later — the change that rang is still owed a pass, and its ring is
+    /// not repeated. Nothing was written on what it read.
+    Failed,
 }
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    sink: i32,
+    /// The kernel event both subscriptions ring (`store_event`), or -1.
+    event: i32,
     subscribed: u32,
+    /// A pass is owed: set by a ring, a refused subscription's poll or a
+    /// failed pass's retry, cleared only when a pass runs.
     dirty: u32,
 
     lo: u16,
@@ -75,6 +90,16 @@ struct State {
     ports_len: u8,
     pool_txt: [u8; MAX_PARAM],
     pool_len: u8,
+    cl_txt: [u8; MAX_PARAM],
+    cl_len: u8,
+    np_txt: [u8; 8],
+    np_len: u8,
+    /// The cluster CIDR and the size of a node's block of it (0: Pod CIDRs
+    /// are not allocated here).
+    cluster_net: u32,
+    cluster_len: u8,
+    node_plen: u8,
+    cidr_cursor: u32,
 
     /// A write the store answered EINPROGRESS: asked again, byte-identical,
     /// before anything else.
@@ -93,7 +118,16 @@ struct State {
     allocated: u32,
     released: u32,
     dup_said: u8,
+    /// A subscription was refused for good: passes run every POLL_MS.
+    poll: u8,
+    /// A pass failed: it runs again POLL_MS after `poll_ms`.
+    retry: u8,
+    poll_ms: u64,
 }
+
+/// How often a module whose subscription the store refused looks again, and
+/// how long after a failed pass it runs one again.
+const POLL_MS: u64 = 2000;
 
 mod params_def {
     use super::ptr_copy;
@@ -116,6 +150,20 @@ mod params_def {
                 let n = if len > MAX_PARAM { 0 } else { len };
                 s.pool_len = n as u8;
                 if n > 0 { ptr_copy(s.pool_txt.as_mut_ptr(), d, n); }
+            };
+
+        3, cluster_cidr, str, 0
+            => |s, d, len| {
+                let n = if len > MAX_PARAM { 0 } else { len };
+                s.cl_len = n as u8;
+                if n > 0 { ptr_copy(s.cl_txt.as_mut_ptr(), d, n); }
+            };
+
+        4, node_prefix, str, 0
+            => |s, d, len| {
+                let n = if len > 8 { 0 } else { len };
+                s.np_len = n as u8;
+                if n > 0 { ptr_copy(s.np_txt.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -297,7 +345,7 @@ unsafe fn claim_held(s: &mut State, store: &Store, owner: &[u8], svc: &Svc) -> b
                     dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
                 }
             }
-            None if store.waiting() => return false,
+            None if store.stopped() => return false,
             None => {
                 let Some(vl) = put(&mut s.out, 0, owner) else {
                     continue;
@@ -309,7 +357,7 @@ unsafe fn claim_held(s: &mut State, store: &Store, owner: &[u8], svc: &Svc) -> b
     }
     if svc.lb && svc.lb_ip != 0 {
         let kl = claim_key(&mut k, LB_CLAIMS, svc.lb_ip as u64);
-        if get_value(store, &k[..kl], &mut cur).is_none() && !store.waiting() {
+        if get_value(store, &k[..kl], &mut cur).is_none() && !store.stopped() {
             let Some(vl) = put(&mut s.out, 0, owner) else {
                 return false;
             };
@@ -351,7 +399,7 @@ unsafe fn release(s: &mut State, store: &Store, prefix: &[u8], lb: bool) -> bool
             }
             None => false,
         };
-        if store.waiting() {
+        if store.stopped() {
             return false;
         }
         if !holds {
@@ -365,7 +413,8 @@ unsafe fn release(s: &mut State, store: &Store, prefix: &[u8], lb: bool) -> bool
 
 /// The next free claim of `prefix` at or after `cursor` in `[lo, lo+span)`,
 /// not in `taken`; the cursor advanced past it. None: none free within this
-/// step's probes (`*budget` spent), or the store has not answered.
+/// step's probes (`*budget` spent), or the store has not answered (or
+/// refused).
 unsafe fn free_one(
     store: &Store,
     prefix: &[u8],
@@ -387,7 +436,7 @@ unsafe fn free_one(
         if exists(store, &k[..kl]) {
             continue;
         }
-        if store.waiting() {
+        if store.stopped() {
             return None;
         }
         return Some(c);
@@ -439,7 +488,7 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
                     }
                 }
                 // None free this step: the search resumes on the next.
-                None => return true,
+                None => return store.refusal().is_none(),
             }
         }
     }
@@ -458,7 +507,7 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
         s.ip_cursor = cur;
         match got {
             Some(a) => lb_ip = a,
-            None => return true,
+            None => return store.refusal().is_none(),
         }
     }
     if picks.iter().all(|&p| p == 0) && lb_ip == 0 {
@@ -531,6 +580,233 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
     true
 }
 
+/// A Node's `spec.podCIDR` as its block index in the cluster CIDR; None
+/// when it has none, or one that is not a block of it.
+fn node_block(s: &State, doc: &[u8]) -> Option<u32> {
+    let c = j_get2(doc, b"spec", b"podCIDR")?;
+    let slash = c.iter().position(|&b| b == b'/')?;
+    let a = parse_ip4(c.get(..slash)?)?;
+    let n = parse_num(c.get(slash + 1..)?)?;
+    let cmask = if s.cluster_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - s.cluster_len as u32)
+    };
+    let host = 32 - s.node_plen as u32;
+    if n != s.node_plen as u32 || a & cmask != s.cluster_net || a & ((1u32 << host) - 1) != 0 {
+        return None;
+    }
+    Some((a - s.cluster_net) >> host)
+}
+
+/// Block `idx` as `"<a.b.c.d>/<n>"` (quoted, a JSON string) into `out`.
+fn block_json(s: &State, idx: u32, out: &mut [u8]) -> Option<usize> {
+    let a = s.cluster_net + (idx << (32 - s.node_plen as u32));
+    let e = put(out, 0, b"\"")?;
+    let e = put_ip(out, e, a)?;
+    let e = put(out, e, b"/")?;
+    let e = put_dec(out, e, s.node_plen as u64)?;
+    put(out, e, b"\"")
+}
+
+/// Every Node's Pod CIDR, carved from the cluster CIDR as upstream's node
+/// IPAM controller carves it (`--allocate-node-cidrs`): a block a Node holds
+/// and nobody has claimed is claimed for it; a claim whose Node is gone, or
+/// holds another block, is released; the first Node with none is given its
+/// own claim's block back (a renewal that did not carry it), else the
+/// lowest free block at or after the cursor — `spec.podCIDR` and
+/// `spec.podCIDRs`, written conditional on the revision read, and claimed by
+/// the next pass. True when it acted (or must look again).
+unsafe fn nodes_pass(s: &mut State, store: &Store) -> Pass {
+    if s.cluster_len == 0 {
+        return Pass::Idle;
+    }
+    let span = 1u32 << (s.node_plen - s.cluster_len) as u32;
+    let mut owed = [0u8; MAX_KEY];
+    let mut owed_len = 0usize;
+    let mut k = [0u8; MAX_KEY];
+    let mut cur = [0u8; MAX_KEY];
+    let mut walk = ListWalk::new(NODES);
+    while let Some(key) = walk.next(store) {
+        let kl = key.len().min(MAX_KEY);
+        for (d, &c) in k.iter_mut().zip(key.iter().take(kl)) {
+            *d = c;
+        }
+        let Some(dl) = get_value(store, k.get(..kl).unwrap_or(&[]), &mut s.doc) else {
+            continue;
+        };
+        let name_at = NODES.len();
+        let Some(idx) = node_block(s, s.doc.get(..dl).unwrap_or(&[])) else {
+            if owed_len == 0 {
+                owed_len = kl;
+                for (d, &c) in owed.iter_mut().zip(k.iter().take(kl)) {
+                    *d = c;
+                }
+            }
+            continue;
+        };
+        let mut ck = [0u8; MAX_KEY];
+        let ckl = claim_key(&mut ck, CIDR_CLAIMS, idx as u64);
+        let name = k.get(name_at..kl).unwrap_or(&[]);
+        match get_value(store, ck.get(..ckl).unwrap_or(&[]), &mut cur) {
+            Some(cl) => {
+                if cur.get(..cl) != Some(name) && s.dup_said & 2 == 0 {
+                    s.dup_said |= 2;
+                    let m = b"[svc_alloc] a podCIDR two Nodes name is held by the first";
+                    dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
+                }
+            }
+            None if store.stopped() => break,
+            None => {
+                let Some(vl) = put(&mut s.out, 0, name) else {
+                    continue;
+                };
+                let mut kb = [0u8; MAX_KEY];
+                for (d, &c) in kb.iter_mut().zip(ck.iter().take(ckl)) {
+                    *d = c;
+                }
+                act(s, kb.get(..ckl).unwrap_or(&[]), vl, false, PRE_ABSENT, 0);
+                return Pass::Again;
+            }
+        }
+    }
+    if store.refusal().is_some() || walk.failed {
+        return Pass::Failed;
+    }
+    if store.waiting() {
+        return Pass::Again;
+    }
+    // release, and find the owed Node's own claim
+    let owed_name_len = owed_len.saturating_sub(NODES.len());
+    let mut mine: Option<u32> = None;
+    let mut walk = ListWalk::new(CIDR_CLAIMS);
+    while let Some(key) = walk.next(store) {
+        let kl = key.len().min(MAX_KEY);
+        for (d, &c) in k.iter_mut().zip(key.iter().take(kl)) {
+            *d = c;
+        }
+        let Some(idx) = k.get(CIDR_CLAIMS.len()..kl).and_then(parse_num) else {
+            continue;
+        };
+        let Some(ol) = get_value(store, k.get(..kl).unwrap_or(&[]), &mut cur) else {
+            continue;
+        };
+        let owner = cur.get(..ol).unwrap_or(&[]);
+        if owed_len > 0 && Some(owner) == owed.get(NODES.len()..owed_len) && owed_name_len > 0 {
+            mine = Some(idx);
+        }
+        let mut nk = [0u8; MAX_KEY];
+        let Some(nkl) = put(&mut nk, 0, NODES).and_then(|p| put(&mut nk, p, owner)) else {
+            continue;
+        };
+        let holds = match get_value(store, nk.get(..nkl).unwrap_or(&[]), &mut s.doc) {
+            // A Node with no block (a renewal that did not carry it) keeps
+            // its claim: it is given the same block back.
+            Some(dl) => match node_block(s, s.doc.get(..dl).unwrap_or(&[])) {
+                Some(b) => b == idx,
+                None => true,
+            },
+            None => false,
+        };
+        if store.stopped() {
+            return Pass::Again;
+        }
+        if !holds {
+            let mut kb = [0u8; MAX_KEY];
+            for (d, &c) in kb.iter_mut().zip(k.iter().take(kl)) {
+                *d = c;
+            }
+            act(s, kb.get(..kl).unwrap_or(&[]), 0, true, PRE_ANY, 0);
+            s.released = s.released.wrapping_add(1);
+            return Pass::Again;
+        }
+    }
+    if store.refusal().is_some() || walk.failed {
+        return Pass::Failed;
+    }
+    if store.waiting() {
+        return Pass::Again;
+    }
+    if owed_len == 0 {
+        return Pass::Idle;
+    }
+    // allocate
+    let idx = match mine {
+        Some(i) => i,
+        None => {
+            let mut budget = PROBES;
+            let mut c = s.cidr_cursor;
+            let got = free_one(store, CIDR_CLAIMS, 0, span, &mut c, &[], &mut budget);
+            s.cidr_cursor = c;
+            match got {
+                Some(i) => i,
+                None if store.refusal().is_some() => return Pass::Failed,
+                None if store.waiting() || budget == 0 => return Pass::Again,
+                None => {
+                    if s.dup_said & 4 == 0 {
+                        s.dup_said |= 4;
+                        let m = b"[svc_alloc] ERROR the cluster CIDR has no free podCIDR left - a Node stays without one";
+                        dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
+                    }
+                    return Pass::Idle;
+                }
+            }
+        }
+    };
+    let Some((dl, rev)) = get_value_rev(store, owed.get(..owed_len).unwrap_or(&[]), &mut s.doc)
+    else {
+        return if store.waiting() {
+            Pass::Again
+        } else {
+            Pass::Idle
+        };
+    };
+    let mut v = [0u8; 48];
+    let Some(vl) = block_json(s, idx, &mut v) else {
+        return Pass::Idle;
+    };
+    let mut va = [0u8; 52];
+    let Some(val) = put(&mut va, 0, b"[")
+        .and_then(|e| put(&mut va, e, v.get(..vl).unwrap_or(&[])))
+        .and_then(|e| put(&mut va, e, b"]"))
+    else {
+        return Pass::Idle;
+    };
+    let n1 = j_set2(
+        s.doc.get(..dl).unwrap_or(&[]),
+        b"spec",
+        b"podCIDR",
+        v.get(..vl).unwrap_or(&[]),
+        &mut s.out,
+    );
+    if n1 == 0 || n1 >= OUT {
+        return Pass::Idle;
+    }
+    let n2 = j_set2(
+        s.out.get(..n1).unwrap_or(&[]),
+        b"spec",
+        b"podCIDRs",
+        va.get(..val).unwrap_or(&[]),
+        &mut s.doc,
+    );
+    if n2 == 0 || n2 >= DOC {
+        return Pass::Idle;
+    }
+    let Some(ol) = put(&mut s.out, 0, s.doc.get(..n2).unwrap_or(&[])) else {
+        return Pass::Idle;
+    };
+    act(
+        s,
+        owed.get(..owed_len).unwrap_or(&[]),
+        ol,
+        false,
+        PRE_ETAG,
+        rev,
+    );
+    s.allocated = s.allocated.wrapping_add(1);
+    Pass::Again
+}
+
 /// One pass: the first action owed, in the manifest's order.
 unsafe fn pass(s: &mut State) -> Pass {
     let sys = &*s.syscalls;
@@ -563,12 +839,18 @@ unsafe fn pass(s: &mut State) -> Pass {
             owed_len = kl;
         }
     }
-    if store.waiting() || walk.failed {
+    if store.refusal().is_some() || walk.failed {
+        return Pass::Failed;
+    }
+    if store.waiting() {
         return Pass::Again;
     }
     // release
     if release(s, &store, NP_CLAIMS, false) || release(s, &store, LB_CLAIMS, true) {
         return Pass::Again;
+    }
+    if store.refusal().is_some() {
+        return Pass::Failed;
     }
     if store.waiting() {
         return Pass::Again;
@@ -577,10 +859,14 @@ unsafe fn pass(s: &mut State) -> Pass {
     if owed_len > 0 && allocate(s, &store, &owed[..owed_len]) {
         return Pass::Again;
     }
+    if store.refusal().is_some() {
+        return Pass::Failed;
+    }
     if store.waiting() {
         return Pass::Again;
     }
-    Pass::Idle
+    // the Nodes' Pod CIDRs
+    nodes_pass(s, &store)
 }
 
 // ---- module ABI ----
@@ -603,7 +889,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
@@ -621,11 +907,17 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.sink = in_chan;
+        s.event = -1;
         s.subscribed = 0;
         s.dirty = 1;
         s.ports_len = 0;
         s.pool_len = 0;
+        s.cl_len = 0;
+        s.np_len = 0;
+        s.cidr_cursor = 0;
+        s.poll = 0;
+        s.retry = 0;
+        s.poll_ms = 0;
         s.owed = 0;
         s.port_cursor = 0;
         s.ip_cursor = 0;
@@ -682,6 +974,41 @@ pub unsafe extern "C" fn module_new(
                 }
             }
         }
+        // cluster_cidr: `<a.b.c.d>/<n>` (default 10.244.0.0/16), cut into
+        // node_prefix-sized blocks (default /24); `none` allocates none.
+        let cl = s.cl_txt.get(..s.cl_len as usize).unwrap_or(&[]);
+        let np = s.np_txt.get(..s.np_len as usize).unwrap_or(&[]);
+        let cidr = if cl.is_empty() {
+            Some((CLUSTER_NET, CLUSTER_LEN as u32))
+        } else if cl == b"none" {
+            Some((0, 0))
+        } else {
+            let slash = cl.iter().position(|&c| c == b'/');
+            slash.and_then(|i| Some((parse_ip4(cl.get(..i)?)?, parse_num(cl.get(i + 1..)?)?)))
+        };
+        let plen = if np.is_empty() {
+            Some(NODE_PREFIX as u32)
+        } else {
+            parse_num(np)
+        };
+        match (cidr, plen) {
+            (Some((_, 0)), _) => {
+                s.cluster_net = 0;
+                s.cluster_len = 0;
+                s.node_plen = 0;
+            }
+            // At most 2^16 blocks, each with room for a gateway and Pods.
+            (Some((a, n)), Some(p)) if n >= 8 && n < p && p <= 29 && p - n <= 16 => {
+                s.cluster_net = a & (u32::MAX << (32 - n));
+                s.cluster_len = n as u8;
+                s.node_plen = p as u8;
+            }
+            _ => {
+                let m = b"[svc_alloc] FAULT: `cluster_cidr` is not <a.b.c.d>/<n> holding `node_prefix` blocks (n >= 8, at most 2^16 blocks of /29 or larger)";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -3;
+            }
+        }
         0
     }
 }
@@ -698,16 +1025,45 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*s.syscalls;
-        if s.subscribed == 0 {
-            if s.sink < 0 {
-                s.sink = dev_channel_port(sys, PORT_INPUT, 0);
+        // One kernel event for both subscriptions: the store signals it, and
+        // `store_take` says which rang.
+        if s.event < 0 && s.subscribed == 0 {
+            s.event = store_event(sys);
+            if s.event < 0 {
+                let m = b"[svc_alloc] ERROR no kernel event - changes will NOT wake this module, it looks again every POLL_MS";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                s.poll = 1;
+                s.subscribed = 2;
             }
-            if s.sink >= 0 && store_subscribe(sys, SERVICES, s.sink, 0) == READ_WAIT {
+        }
+        // /services/, then /nodes/ (where Pod CIDRs are allocated).
+        while s.subscribed < 2 {
+            let prefix = if s.subscribed == 0 { SERVICES } else { NODES };
+            if s.subscribed == 1 && s.cluster_len == 0 {
+                s.subscribed = 2;
+                break;
+            }
+            let rc = store_subscribe(sys, prefix, s.event, 0);
+            if not_yet(rc) {
                 return 0;
             }
-            s.subscribed = 1;
+            // Refused (the store's capacity spent, said at ERROR): a change
+            // under it never wakes this module, so it looks again every
+            // POLL_MS instead of never.
+            if rc < 0 {
+                s.poll = 1;
+            }
+            s.subscribed += 1;
         }
-        if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
+        if s.poll != 0 || s.retry != 0 {
+            let now = dev_millis(sys);
+            if now.wrapping_sub(s.poll_ms) >= POLL_MS {
+                s.poll_ms = now;
+                s.retry = 0;
+                s.dirty = 1;
+            }
+        }
+        if store_take(sys, s.event, |_| {}) > 0 {
             s.dirty = 1;
         }
         if s.owed != 0 {
@@ -719,8 +1075,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if s.dirty != 0 {
             s.dirty = 0;
-            if let Pass::Again = pass(s) {
-                s.dirty = 1;
+            match pass(s) {
+                Pass::Again => s.dirty = 1,
+                Pass::Failed => {
+                    // Still owed: run again POLL_MS from now, not on a next
+                    // change that may never come.
+                    let m = b"[svc_alloc] ERROR a pass FAILED (the store refused a read, or a listing failed) - run again in POLL_MS";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                    s.retry = 1;
+                    s.poll_ms = dev_millis(sys);
+                }
+                Pass::Idle => {}
             }
         }
         0

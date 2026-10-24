@@ -6,7 +6,7 @@
 #
 # The store is single-process; the API plane's one Deployment is seeded into the
 # durable log ($D/store.log) and replayed at boot. The `dp_` chain projects the
-# ReplicaSet; its PUT synchronously pushes a namespace.change onto the `rs_`
+# ReplicaSet; its PUT rings the `rs_`
 # chain's source, which materialises the Pods — the whole cascade settles IN ONE
 # PROCESS, cooperating nodes over one store, end to end.
 #

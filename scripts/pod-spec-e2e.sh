@@ -17,8 +17,22 @@
 #              once the ConfigMap exists
 #   security   runAsUser/runAsGroup (container over Pod), runAsGroup alone
 #              keeping the image's uid; runAsNonRoot refusing an image that
-#              runs as root and one whose user is a name; readOnlyRootFilesystem
-#              and supplementalGroups refused (the runtime cannot give them)
+#              runs as root and one whose user is a name; fsGroup and
+#              supplementalGroups in the process's groups, with the image's
+#              /etc/group memberships (Merge) or without them (Strict);
+#              readOnlyRootFilesystem: a write to / refused, a volume still
+#              written
+#   fsGroup    an emptyDir group-owned by it (setgid, group-writable); a
+#              ConfigMap's and a Secret's files at their modes, group-owned
+#              by it with 0440 added (a 0400 Secret readable through it); a
+#              Secret's files on a memory filesystem, a ConfigMap's not
+#   projected  a downwardAPI volume (fieldRef, the labels map,
+#              resourceFieldRef) and a projected one (ConfigMap, Secret and
+#              downward API sources, at their modes, on a memory filesystem)
+#   atomic     a ConfigMap updated under a running reader: each update seen,
+#              whole (two keys read through one ..data never differ)
+#   gone       a deleted Pod's volume directory removed, its Secret's
+#              memory filesystem unmounted
 #   volumes    an emptyDir shared by an init container and two app
 #              containers, writable by a non-root user; a ConfigMap volume
 #              (its keys, an item at its path); a Secret volume (defaultMode
@@ -195,12 +209,20 @@ make_pod group1 '"restartPolicy":"Never","containers":[{"name":"c","image":"nano
 make_pod nonroot-ok '"restartPolicy":"Never","securityContext":{"runAsNonRoot":true,"runAsUser":1234},"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id"]}]'
 make_pod nonroot-name '"restartPolicy":"Never","securityContext":{"runAsNonRoot":true},"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id"]}]'
 make_pod nonroot-root '"restartPolicy":"Never","securityContext":{"runAsNonRoot":true},"containers":[{"name":"c","image":"nanocloud/rootprobe:1","command":["/bin/probe","id"]}]'
-make_pod rofs '"restartPolicy":"Never","containers":[{"name":"c","image":"nanocloud/probe:1","securityContext":{"readOnlyRootFilesystem":true}}]'
-make_pod supp '"restartPolicy":"Never","securityContext":{"supplementalGroups":[5000]},"containers":[{"name":"c","image":"nanocloud/probe:1"}]'
-for p in user1 group1 nonroot-ok; do pn_wait_phase "${U[$p]}" Succeeded; done
+make_pod rofs '"restartPolicy":"Never","volumes":[{"name":"w","emptyDir":{}}],"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","write","/x","y","write","/w/x","y","cat","/w/x","cat","/etc/resolv.conf"],"securityContext":{"readOnlyRootFilesystem":true},"volumeMounts":[{"name":"w","mountPath":"/w"}]}]'
+make_pod merge '"restartPolicy":"Never","securityContext":{"fsGroup":6000,"supplementalGroups":[5000]},"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id"]}]'
+make_pod strict '"restartPolicy":"Never","securityContext":{"fsGroup":6000,"supplementalGroups":[5000],"supplementalGroupsPolicy":"Strict"},"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id"]}]'
+for p in user1 group1 nonroot-ok rofs merge strict; do pn_wait_phase "${U[$p]}" Succeeded; done
 expect "user1 (container's runAsUser over the Pod's, the Pod's runAsGroup)" "$(pn_logs "${U[user1]}" | grep '^uid=' | cut -d' ' -f1,2)" "uid=1500 gid=3000"
 expect "group1 (runAsGroup alone keeps the image's uid)" "$(pn_logs "${U[group1]}" | grep '^uid=' | cut -d' ' -f1,2)" "uid=1234 gid=4000"
 expect "nonroot-ok" "$(pn_logs "${U[nonroot-ok]}" | grep '^uid=' | cut -d' ' -f1)" "uid=1234"
+# The image's app (1234:2345) is a member of extra (7777) in its /etc/group.
+expect "merge (fsGroup, supplementalGroups and the image's memberships)" "$(pn_logs "${U[merge]}" | grep '^uid=')" "uid=1234 gid=2345 groups=2345,5000,6000,7777"
+expect "strict (the primary gid, fsGroup and supplementalGroups only)" "$(pn_logs "${U[strict]}" | grep '^uid=')" "uid=1234 gid=2345 groups=2345,5000,6000"
+expect "rofs: a write to / refused" "$(pn_logs "${U[rofs]}" | sed -n 's|^write /x=||p')" "ERR"
+expect "rofs: its volume still written" "$(pn_logs "${U[rofs]}" | sed -n 's|^write /w/x=||p')/$(pn_logs "${U[rofs]}" | sed -n 's|^cat /w/x=||p')" "ok/y"
+case "$(pn_logs "${U[rofs]}" | sed -n 's|^cat /etc/resolv.conf=||p')" in nameserver*) ;; *) fail "rofs: its resolv.conf: $(pn_logs "${U[rofs]}")" ;; esac
+echo "   merge/strict groups as declared; rofs: / read-only, its emptyDir and resolv.conf in place"
 refused() { # refused <pod> <message substring>
   local w=""
   for _ in $(seq 60); do
@@ -216,8 +238,8 @@ w=cs[0].get("state",{}).get("waiting",{}); print(w.get("reason",""), "|", w.get(
 }
 refused nonroot-name "image has non-numeric user (app)"
 refused nonroot-root "image will run as root"
-refused rofs "readOnlyRootFilesystem is not supported"
-refused supp "supplementalGroups are not supported"
+make_pod badpol '"restartPolicy":"Never","securityContext":{"supplementalGroupsPolicy":"Loose"},"containers":[{"name":"c","image":"nanocloud/probe:1"}]'
+refused badpol "supplementalGroupsPolicy"
 
 echo "== 7. volumes and containers: init containers in order, two app containers, an emptyDir, a ConfigMap, a Secret, a hostPath =="
 echo "from-the-host" >"$D/host/note"
@@ -247,8 +269,73 @@ expect "the default mode" "$(pn_logs "$M" | sed -n 's|^mode /etc/all/greeting=||
 expect "a Secret, decoded, at defaultMode 0400 (unreadable to uid 1500)" "$(pn_logs "$M" | sed -n 's|^mode /etc/sec/token=||p') $(pn_logs "$M" | sed -n 's|^cat /etc/sec/token=||p')" "400 ERR"
 expect "a hostPath" "$(pn_logs "$M" | sed -n 's|^cat /host/note=||p')" "from-the-host|"
 expect "the second app container ran beside the first, sharing the emptyDir" "$(pn_logs "$M~c1" | sed -n 's|^wait /work/app=||p')/$(pn_logs "$M" | sed -n 's|^wait /work/side=||p')" "ok/ok"
-expect "the emptyDir is the Pod's, under the node's pods directory" "$(sudo -n cat "$D/pods/$M/volumes/work/side")" "y"
+expect "the emptyDir is the Pod's, under the node's pods directory (in the mount root)" "$(sudo -n cat "$D/mnt/pods/$M/volumes/work/side")" "y"
 echo "   i0 -> i1 -> app + side; work (emptyDir, uid 1500 writes), cfg (item), allcfg (keys, 0644), sec (0400), host"
+
+echo "== 7b. fsGroup: an emptyDir, a ConfigMap and a Secret owned by it; the Secret in memory =="
+make_pod fsg '"restartPolicy":"Never","securityContext":{"runAsUser":1500,"fsGroup":6000},
+  "volumes":[{"name":"work","emptyDir":{}},
+             {"name":"cfg","configMap":{"name":"cfg","items":[{"key":"greeting","path":"g"},{"key":"MODE","path":"sub/m","mode":256}]}},
+             {"name":"sec","secret":{"secretName":"sec","defaultMode":256}}],
+  "containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id","stat","/work","write","/work/f","x","stat","/work/f","stat","/etc/cfg/g","stat","/etc/cfg/sub/m","cat","/etc/cfg/sub/m","stat","/etc/sec/token","cat","/etc/sec/token","fstype","/etc/sec","sleep","600"],
+    "volumeMounts":[{"name":"work","mountPath":"/work"},{"name":"cfg","mountPath":"/etc/cfg"},{"name":"sec","mountPath":"/etc/sec"}]}]'
+FG="${U[fsg]}"
+pn_wait_log "$FG" "fstype /etc/sec=" 90
+CTX="$FG"
+st() { pn_logs "$FG" | sed -n "s|^stat $1=||p"; }
+expect "fsg's groups (fsGroup)" "$(pn_logs "$FG" | grep '^uid=')" "uid=1500 gid=0 groups=0,6000"
+expect "the emptyDir: the fsGroup's, setgid, group-writable" "$(st /work)" "2775 6000"
+expect "a file the container made there inherits the group" "$(pn_logs "$FG" | sed -n 's|^write /work/f=||p') $(st /work/f)" "ok 0644 6000"
+expect "a ConfigMap file (0644): the fsGroup's, 0440 added" "$(st /etc/cfg/g)" "0644 6000"
+expect "an item's mode (0400): 0440, the fsGroup's" "$(st /etc/cfg/sub/m)" "0440 6000"
+expect "the item readable through the group" "$(pn_logs "$FG" | sed -n 's|^cat /etc/cfg/sub/m=||p')" "fast"
+expect "a Secret at defaultMode 0400: 0440, the fsGroup's" "$(st /etc/sec/token)" "0440 6000"
+expect "the Secret readable to uid 1500 through the fsGroup" "$(pn_logs "$FG" | sed -n 's|^cat /etc/sec/token=||p')" "s3cr3t"
+expect "the Secret on a memory filesystem (in the container)" "$(pn_logs "$FG" | sed -n 's|^fstype /etc/sec=||p')" "1021994"
+VD="$D/mnt/pods/$FG/volumes"
+expect "the Secret's directory a memory mount of its own (on the node)" "$(findmnt -n -o SOURCE,FSTYPE -M "$VD/sec" | tr -s ' ')" "fluxor-projection tmpfs"
+expect "the ConfigMap's directory no mount of its own" "$(findmnt -n -o SOURCE -M "$VD/cfg" || true)" ""
+expect "the ConfigMap projected as upstream's AtomicWriter lays it out" "$(sudo -n readlink "$VD/cfg/g") $(sudo -n readlink "$VD/cfg/..data" | cut -c1-2)" "..data/g .."
+CTX=""
+echo "   fsg: emptyDir 2775:6000, ConfigMap/Secret files 0440/0644:6000, the Secret on tmpfs"
+
+echo "== 7c. a downwardAPI and a projected volume (ConfigMap, Secret and downward API sources) =="
+make_pod proj '"restartPolicy":"Never",
+  "volumes":[{"name":"dw","downwardAPI":{"items":[{"path":"name","fieldRef":{"fieldPath":"metadata.name"}},{"path":"meta/labels","fieldRef":{"fieldPath":"metadata.labels"}},{"path":"mem","resourceFieldRef":{"containerName":"c","resource":"limits.memory","divisor":"1Mi"}}]}},
+             {"name":"pj","projected":{"defaultMode":288,"sources":[{"configMap":{"name":"cfg","items":[{"key":"greeting","path":"g"}]}},{"secret":{"name":"sec","items":[{"key":"token","path":"s/t","mode":256}]}},{"downwardAPI":{"items":[{"path":"ns","fieldRef":{"fieldPath":"metadata.namespace"}}]}}]}}],
+  "containers":[{"name":"c","image":"nanocloud/rootprobe:1","resources":{"limits":{"memory":"32Mi"}},"command":["/bin/probe","cat","/dw/name","cat","/dw/meta/labels","cat","/dw/mem","mode","/dw/name","cat","/pj/g","mode","/pj/g","cat","/pj/s/t","mode","/pj/s/t","cat","/pj/ns","sleep","600"],
+    "volumeMounts":[{"name":"dw","mountPath":"/dw"},{"name":"pj","mountPath":"/pj"}]}]'
+PJ="${U[proj]}"
+pn_wait_log "$PJ" "cat /pj/ns=" 90
+CTX="$PJ"
+pv() { pn_logs "$PJ" | sed -n "s|^$1=||p"; }
+expect "downwardAPI metadata.name" "$(pv 'cat /dw/name')" "proj"
+expect "downwardAPI metadata.labels (key=\"value\" lines)" "$(pv 'cat /dw/meta/labels')" 'tier="a b"|'
+expect "downwardAPI limits.memory in 1Mi" "$(pv 'cat /dw/mem')" "32"
+expect "downwardAPI default mode" "$(pv 'mode /dw/name')" "644"
+expect "projected ConfigMap item at the volume's defaultMode (0440)" "$(pv 'cat /pj/g') $(pv 'mode /pj/g')" "hello world 440"
+expect "projected Secret item at its mode" "$(pv 'cat /pj/s/t') $(pv 'mode /pj/s/t')" "s3cr3t 400"
+expect "projected downward API item" "$(pv 'cat /pj/ns')" "default"
+VP="$D/mnt/pods/$PJ/volumes"
+expect "the projected volume on a memory filesystem" "$(findmnt -n -o SOURCE,FSTYPE -M "$VP/pj" | tr -s ' ')" "fluxor-projection tmpfs"
+expect "the downwardAPI volume not" "$(findmnt -n -o SOURCE -M "$VP/dw" || true)" ""
+CTX=""
+echo "   proj: downwardAPI (name, labels, limits.memory), projected (ConfigMap, Secret, downward API) on tmpfs"
+
+echo "== 7d. a ConfigMap updated under a reader: each update seen, whole =="
+pn_create /api/v1/namespaces/default/configmaps '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"pairs"},"data":{"a":"1","b":"1"}}'
+make_pod reader '"restartPolicy":"Never","volumes":[{"name":"p","configMap":{"name":"pairs"}}],
+  "containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","pair","/etc/p","120"],"volumeMounts":[{"name":"p","mountPath":"/etc/p"}]}]'
+RD="${U[reader]}"
+pn_wait_log "$RD" "pair=1" 90
+for v in 2 3 4 5; do
+  r="$(api PUT /api/v1/namespaces/default/configmaps/pairs '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"pairs"},"data":{"a":"'"$v"'","b":"'"$v"'"}}')"
+  case "$r" in 200\|*) ;; *) fail "PUT pairs: ${r:0:200}" ;; esac
+  pn_wait_log "$RD" "pair=$v" 60
+done
+case "$(pn_logs "$RD")" in *MIX*) fail "the reader saw a mix of two projections: $(pn_logs "$RD" | grep MIX | head -3)" ;; esac
+expect "every update seen in order" "$(pn_logs "$RD" | sed -n 's/^pair=\([0-9]\)$/\1/p' | paste -sd, -)" "1,2,3,4,5"
+echo "   reader: 1 -> 2 -> 3 -> 4 -> 5, never a mix"
 
 echo "== 8. an init container that fails under restartPolicy Never fails the Pod =="
 make_pod initfail '"restartPolicy":"Never","initContainers":[{"name":"i0","image":"nanocloud/probe:1","command":["/bin/probe","exit","3"]}],"containers":[{"name":"app","image":"nanocloud/probe:1","command":["/bin/probe","argv"]}]'
@@ -285,7 +372,9 @@ r="$(api PATCH /api/v1/namespaces/default/pods/sleeper '{"metadata":{"annotation
 case "$r" in 200\|*) ;; *) fail "PATCH paused: ${r:0:200}" ;; esac
 st=""
 for _ in $(seq 60); do st="$(pn_nodekey "sandbox-status/$S")"; case "$st" in *paused*) break ;; esac; sleep 1; done
-[ "$st" = "state=paused;code=0" ] || fail "the paused sandbox: '$st' pause='$(pn_nodekey "sandbox-pause/$S")' spec='$(pn_nodekey "pod-specs/$S" | tr ';' '\n' | grep paused)' log='$(grep -i "pause\|freez" "$D/run.log" | tail -5)'"
+# A pause is the same run: its status keeps the run's start (`started`).
+[[ "$st" =~ ^state=paused\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] || fail "the paused sandbox: '$st' pause='$(pn_nodekey "sandbox-pause/$S")' spec='$(pn_nodekey "pod-specs/$S" | tr ';' '\n' | grep paused)' log='$(grep -i "pause\|freez" "$D/run.log" | tail -5)'"
+RUN="${st#*;started=}"
 pn_wait_phase "$S" Paused 30
 cgf="$(grep -l . "$CG"/*/cgroup.freeze 2>/dev/null | xargs -r grep -l '^1$' | head -1)"
 [ -n "$cgf" ] || fail "no frozen cgroup under $CG"
@@ -293,7 +382,7 @@ echo "   sleeper: paused (frozen: $cgf)"
 r="$(api PATCH /api/v1/namespaces/default/pods/sleeper '{"metadata":{"annotations":{"nanocloud.io/paused":null}}}')"
 case "$r" in 200\|*) ;; *) fail "PATCH unpause: ${r:0:200}" ;; esac
 for _ in $(seq 60); do st="$(pn_nodekey "sandbox-status/$S")"; case "$st" in *running*) break ;; esac; sleep 1; done
-expect "the resumed sandbox" "$st" "state=running;code=0"
+expect "the resumed sandbox (the run it was paused in)" "$st" "state=running;code=0;started=$RUN"
 pn_wait_phase "$S" Running 30
 expect "restarts while paused" "$(pn_nodekey "pod-runtime/$S" | tr ';' '\n' | sed -n 's/^restarts=//p')" ""
 echo "   sleeper: resumed, never restarted"
@@ -428,4 +517,15 @@ expect "forced's end (SIGKILL)" "$(end "$F2")" "Error 137"
 case "$(pn_nodekey "pod-specs/$F2")" in *grace=0\;*) ;; *) fail "forced's spec: '$(pn_nodekey "pod-specs/$F2" | cut -c1-200)'" ;; esac
 echo "   forced: Terminating (grace 60), then --force --grace-period=0 -> gone and killed in ${took} s"
 
-echo "== E2E green: a Pod's spec — env, config, securityContext, volumes, init and app containers, pause, DNS, deletion — as Kubernetes runs it =="
+echo "-- 12e. a deleted Pod's volumes: its directory removed, its Secret's memory filesystem unmounted"
+[ -d "$D/mnt/pods/$FG/volumes/work" ] || fail "fsg's volumes are not there to remove: $(sudo -n ls -la "$D/mnt/pods/$FG/volumes" 2>&1)"
+k delete pod fsg --timeout=60s >"$D/del-fsg.out" 2>&1 || fail "kubectl delete pod fsg: $(cat "$D/del-fsg.out")"
+for _ in $(seq $((TOMB_S + 60))); do
+  sudo -n test -e "$D/mnt/pods/$FG" || break
+  sleep 1
+done
+sudo -n test -e "$D/mnt/pods/$FG" && fail "fsg's volume directory outlived it: $(sudo -n ls -la "$D/mnt/pods/$FG/volumes" 2>&1) $(grep volume_files "$D/run.log" | tail -5)"
+expect "fsg's Secret unmounted" "$(findmnt -n -o TARGET | grep -c "$D/mnt/pods/$FG" || true)" "0"
+echo "   fsg: gone, and with it $D/mnt/pods/$FG (its Secret's tmpfs unmounted)"
+
+echo "== E2E green: a Pod's spec — env, config, securityContext (groups, read-only root), volumes (fsGroup, modes, memory-backed Secrets, atomic updates), init and app containers, pause, DNS, deletion — as Kubernetes runs it =="

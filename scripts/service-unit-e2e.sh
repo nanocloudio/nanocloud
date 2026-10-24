@@ -75,8 +75,9 @@ grep -q '^ExecStart=/usr/bin/fluxor run /run/nanocloud/graph.yaml$' "$UNIT" \
 # one-voter group, its peer PKI; and a reader for the test.
 nc_controlplane_graph "$STORE" "$D/controlplane.yaml" || fail "the control plane did not render"
 
+EXTRA=()   # more environment for a start (step 6: a private host registry)
 start() { # start <log>: `fluxor run` as ExecStart, in the unit's environment
-  env -C "$STORE" -u FLUXOR_STORE_DIR "${ENVV[@]}" RUST_LOG=warn \
+  env -C "$STORE" -u FLUXOR_STORE_DIR "${ENVV[@]}" "${EXTRA[@]}" RUST_LOG=warn \
     FLUXOR_SEAL_KEY="$(printf '%064x' 7)" \
     fluxor run "$D/controlplane.yaml" >"$1" 2>&1 &
   RUNTIME_PID=$!
@@ -118,5 +119,50 @@ stop
 case "$got" in *'"from":"host store"'*) ;; *) fail "the object did not survive the restart: '$got'" ;; esac
 [ -f "$STORE/store.log" ] || fail "the host log was removed (it is the record of what was imported)"
 echo "   kept across the restart, the host log imported once"
+
+echo "== 6. the instance: a state directory of its own, reclaimed after stop =="
+# The unit gives the runtime its state directory (StateDirectory=, named
+# by FLUXOR_STATE_DIR): the instance lock lives there and the instance's
+# tag is a digest of it, so a restart is the same instance. And once the
+# runtime is gone, ExecStopPost collects what it left on the host,
+# privileged (`+`), through the runtime the package links into /usr/bin.
+SD="$(unit_val StateDirectory)"
+SDIR=""
+for kv in "${ENVV[@]}"; do [ "${kv%%=*}" = FLUXOR_STATE_DIR ] && SDIR="${kv#*=}"; done
+[ -n "$SD" ] || fail "the unit has no StateDirectory="
+[ "$SDIR" = "$(map "/var/lib/$SD")" ] || fail "FLUXOR_STATE_DIR ($SDIR) is not the unit's StateDirectory ($SD)"
+[ -f "$SDIR/instance.lock" ] || fail "the runtime did not hold its instance lock in $SDIR"
+grep -qx 'ExecStopPost=-+/usr/bin/fluxor-linux reclaim' "$UNIT" \
+  || fail "the unit does not reclaim its instance, privileged, after stop"
+grep -q '"${STAGING_ROOT}/usr/bin/fluxor-linux"' "$ROOT/packaging/debian/build.sh" \
+  || fail "the package does not install /usr/bin/fluxor-linux, which ExecStopPost runs"
+RT="$(nc_fluxor_runtime "$ROOT")" || fail "no runtime to reclaim with"
+reclaim() { # reclaim [privileged]: the unit's ExecStopPost, in its environment
+  local pre=()
+  # Privileged as `+` runs it, in a throwaway network namespace: the host's
+  # own packet-policy tables are never touched.
+  [ "${1:-}" = privileged ] && pre=(sudo -n unshare -n)
+  "${pre[@]}" env -u FLUXOR_STORE_DIR "${ENVV[@]}" FLUXOR_RUN_DIR="$D/run" RUST_LOG=warn "$RT" reclaim
+}
+mkdir -p "$D/run"
+EXTRA=(FLUXOR_RUN_DIR="$D/run")
+start "$D/run3.log"
+rc=0; out="$(reclaim 2>&1)" || rc=$?
+[ "$rc" = 2 ] || fail "reclaim of a live instance exited $rc, not 2: $out"
+echo "   live: $(printf '%s\n' "$out" | grep '^reclaim:')"
+stop
+# Unprivileged, its packet-policy tables cannot even be listed: the reclaim
+# stays pending (exit 1), which is why the unit runs it with `+`.
+rc=0; out="$(reclaim 2>&1)" || rc=$?
+[ "$rc" = 1 ] || fail "an unprivileged reclaim after stop exited $rc, not 1 (pending): $out"
+echo "   stopped, unprivileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
+if sudo -n true 2>/dev/null; then
+  rc=0; out="$(reclaim privileged 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || fail "a privileged reclaim after stop exited $rc, not 0: $out"
+  case "$out" in *"reclaimed"*) ;; *) fail "reclaim after stop named no instance: $out" ;; esac
+  echo "   stopped, privileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
+else
+  echo "   (no passwordless sudo: the privileged reclaim is not exercised)"
+fi
 
 echo "== E2E green: the installed control plane keeps its store in lattice, and an upgraded node's objects come with it =="

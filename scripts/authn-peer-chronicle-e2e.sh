@@ -102,8 +102,6 @@ modules:
     type: debug
     mode: 1
 wiring:
-  - from: store_source.status
-    to: store_source.changes
   # Engine inputs are byte FIFOs: a Chronicle engine self-frames.
   - from: store_source.record_out
     to: get.request_in

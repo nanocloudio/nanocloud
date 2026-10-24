@@ -74,7 +74,10 @@ fn pl_waits(pod: &[u8]) -> bool {
 
 /// Whether anything of the Pod `uid` runs on `node`: a sandbox of any of its
 /// containers (`/~node/<node>/sandbox-status/<uid>[~…]`) running or paused.
-/// `None` while a read is not answered yet (the pass waits: ask again).
+/// `None` while a read is not answered yet (the pass waits: ask again) — or
+/// when the store refused one for good (the pass has failed:
+/// [`Store::refusal`]); never "nothing runs" on a listing that did not
+/// complete.
 unsafe fn pl_live(st: &Store, node: &[u8], uid: &[u8]) -> Option<bool> {
     let mut pre = [0u8; MAX_KEY];
     let mut n = append(&mut pre, 0, b"/~node/");
@@ -108,7 +111,7 @@ unsafe fn pl_live(st: &Store, node: &[u8], uid: &[u8]) -> Option<bool> {
             }
         }
     }
-    if walk.pending || st.waiting() {
+    if walk.pending || walk.failed || st.waiting() || st.refusal().is_some() {
         return None;
     }
     Some(live)

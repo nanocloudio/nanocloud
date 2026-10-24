@@ -31,8 +31,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 2048;
 
@@ -46,13 +44,24 @@ const MAX_PARAM: usize = 96;
 /// Steps between re-applies while a failure stands (nft missing, a refused
 /// table): retried, not spun.
 const RETRY_STEPS: u32 = 1000;
+/// Steps between reads of an applied table's state while it is not yet in
+/// force (`enforced=pending`): an enforcer reports what it applied when it
+/// has, and nothing pushes that here.
+const POLL_STEPS: u32 = 100;
+/// The most prefixes `prefix` lists (`,`-separated): one subscription each.
+const MAX_PREFIXES: usize = 2;
+const MAX_NODE_NAME: usize = 64;
+const EAGAIN: i32 = -11;
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    sink: i32,
+    /// The kernel event every subscription rings (`store_event`), or -1.
+    event: i32,
     resolved: u32,
     subscribed: u32,
+    /// An apply is owed: set by a ring (and at start), cleared only when
+    /// one runs; a failed one is owed again after `RETRY_STEPS`.
     dirty: u32,
     backoff: u32,
 
@@ -64,6 +73,10 @@ struct State {
     status_key_len: u16,
     node_addr: [u8; 16],
     node_addr_len: u8,
+    /// This node's name (`node_name`): a row whose backend runs here is
+    /// node-local, for the traffic policies that keep to such backends.
+    node_name: [u8; MAX_NODE_NAME],
+    node_name_len: u8,
     /// The status record owed to the store: written, and asked again each
     /// step until the store has decided it.
     status_val: [u8; 128],
@@ -74,6 +87,14 @@ struct State {
     /// re-render the platform's policy on every store change.
     applied_hash: u64,
     applied_any: u32,
+    /// The last applied table, as its status says it: rules, generation, and
+    /// what the provider could not honour (`NOTE_*`).
+    last_rules: u32,
+    last_gen: u64,
+    last_notes: u8,
+    /// Steps to the next read of its state while it is not in force (0: in
+    /// force, or nothing applied).
+    poll: u32,
 
     applied: u32,
     refused: u32,
@@ -117,6 +138,13 @@ mod params_def {
                 let n = if len > 16 { 0 } else { len };
                 s.node_addr_len = n as u8;
                 if n > 0 { ptr_copy(s.node_addr.as_mut_ptr(), d, n); }
+            };
+
+        5, node_name, str, 0
+            => |s, d, len| {
+                let n = if len > super::MAX_NODE_NAME { 0 } else { len };
+                s.node_name_len = n as u8;
+                if n > 0 { ptr_copy(s.node_name.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -272,13 +300,17 @@ struct Out<'a> {
 
 impl Out<'_> {
     fn push(&mut self, rec: &[u8]) {
-        if self.len + rec.len() > self.buf.len() {
-            self.full = true;
-            return;
+        let end = self.len + rec.len();
+        match self.buf.get_mut(self.len..end) {
+            Some(d) => {
+                for (o, &i) in d.iter_mut().zip(rec.iter()) {
+                    *o = i;
+                }
+                self.len = end;
+                self.rules += 1;
+            }
+            None => self.full = true,
         }
-        self.buf[self.len..self.len + rec.len()].copy_from_slice(rec);
-        self.len += rec.len();
-        self.rules += 1;
     }
 }
 
@@ -290,24 +322,86 @@ fn dir_of(b: &[u8]) -> Option<u8> {
     }
 }
 
-/// Encode one row. False when the row is not one this grammar knows.
-/// One DNAT record: `(proto, addr, port)` to `be:tport`.
-fn dnat(out: &mut Out, proto: u8, addr: u32, port: u16, be: u32, tport: u16) {
-    let len = wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND;
-    let mut r = [0u8; 2 + wire::rule::DNAT_HEAD + wire::rule::DNAT_BACKEND];
-    r[0] = wire::rule::DNAT;
-    r[1] = len as u8;
-    r[2] = proto;
-    r[3..7].copy_from_slice(&addr.to_be_bytes());
-    r[7..9].copy_from_slice(&port.to_be_bytes());
-    r[9] = 1;
-    r[10..14].copy_from_slice(&be.to_be_bytes());
-    r[14..16].copy_from_slice(&tport.to_be_bytes());
-    out.push(&r);
+/// What the provider realizes of DNAT, read from its CAPS before a table is
+/// built, and what this node is: the flags each record carries, and which
+/// backends a node-local traffic policy keeps.
+struct Node<'a> {
+    /// This node's address: its node ports' and host ports' target.
+    addr: Option<u32>,
+    /// This node's name, matched against a row's `node=`.
+    name: &'a [u8],
+    /// `scope = local` on every record: the provider translates only
+    /// traffic originated on this node (`DNAT_LOCAL` without `DNAT`).
+    local_only: bool,
+    /// `translate_source` other than never is realized.
+    xlate: bool,
 }
 
-/// Encode one row; `node` is this node's address (its node ports' target).
-fn encode(row: &[u8], out: &mut Out, node: Option<u32>) -> bool {
+/// What a table holds that the provider cannot honour, said in its status.
+const NOTE_INBOUND: u8 = 1 << 0;
+const NOTE_XLATE: u8 = 1 << 1;
+
+/// The flags byte of one DNAT record: `xlate` (`XLATE_*`) where the provider
+/// realizes source translation, `scope = local` where it translates only
+/// locally originated traffic. `inbound`: the record translates traffic
+/// arriving from outside (a node port, a load-balancer address, a host port),
+/// which a local-only provider cannot honour — noted, never dropped silently.
+fn dnat_flags(n: &Node, xlate: u8, inbound: bool, notes: &mut u8) -> u8 {
+    let mut f = xlate;
+    if !n.xlate && xlate != wire::rule::XLATE_NEVER {
+        f = wire::rule::XLATE_NEVER;
+        *notes |= NOTE_XLATE;
+    }
+    if n.local_only {
+        f |= wire::rule::DNAT_SCOPE_LOCAL;
+        if inbound {
+            *notes |= NOTE_INBOUND;
+        }
+    }
+    f
+}
+
+/// One DNAT record: `(proto, addr, port)` to `be` (`addr:port`), or to no
+/// backend at all (`None`: the address rejects, as a Service with no
+/// endpoints does — the records for one address merge, so this one adds
+/// nothing beside one that names a backend).
+/// `[proto][vip:4][vport:2][n][flags][backend:4 port:2]×n`.
+fn dnat(out: &mut Out, proto: u8, addr: u32, port: u16, be: Option<(u32, u16)>, flags: u8) {
+    const HEAD: usize = wire::rule::DNAT_HEAD;
+    let n = be.is_some() as usize;
+    let mut r = [0u8; 2 + HEAD + wire::rule::DNAT_BACKEND];
+    let a = addr.to_be_bytes();
+    let p = port.to_be_bytes();
+    r[0] = wire::rule::DNAT;
+    r[1] = (HEAD + n * wire::rule::DNAT_BACKEND) as u8;
+    r[2] = proto;
+    r[3] = a[0];
+    r[4] = a[1];
+    r[5] = a[2];
+    r[6] = a[3];
+    r[7] = p[0];
+    r[8] = p[1];
+    r[9] = n as u8;
+    r[10] = flags;
+    if let Some((b, bp)) = be {
+        let b = b.to_be_bytes();
+        let bp = bp.to_be_bytes();
+        r[11] = b[0];
+        r[12] = b[1];
+        r[13] = b[2];
+        r[14] = b[3];
+        r[15] = bp[0];
+        r[16] = bp[1];
+    }
+    out.push(
+        r.get(..2 + HEAD + n * wire::rule::DNAT_BACKEND)
+            .unwrap_or(&[]),
+    );
+}
+
+/// Encode one row for this node (`n`); what it holds that the provider
+/// cannot honour is added to `notes`.
+fn encode(row: &[u8], out: &mut Out, n: &Node, notes: &mut u8) -> bool {
     let get = |t: &[u8]| field(row, t).unwrap_or(&[]);
     match get(b"kind=") {
         k @ (b"allow" | b"drop") => {
@@ -389,6 +483,31 @@ fn encode(row: &[u8], out: &mut Out, node: Option<u32>) -> bool {
             else {
                 return false;
             };
+            // Whether the backend runs on this node: what a `Local` traffic
+            // policy keeps (`internalTrafficPolicy` for the Service's own
+            // address, `externalTrafficPolicy` for its node ports and its
+            // load-balancer address). A backend elsewhere still adds its
+            // address with no backend, so an address none of whose backends
+            // is here rejects rather than reaching the node itself.
+            let here = !n.name.is_empty() && get(b"node=") == n.name;
+            let int_local = get(b"itp=") == b"Local";
+            let ext_local = get(b"etp=") == b"Local";
+            // ClusterIP: a client that is its own backend comes back through
+            // the node (hairpin). NodePort and LoadBalancer: `Cluster`
+            // translates the source, so the reply returns through this node
+            // whichever node the backend is on; `Local` keeps the client's
+            // address, its backends all here.
+            let cf = dnat_flags(n, wire::rule::XLATE_HAIRPIN, false, notes);
+            let ef = dnat_flags(
+                n,
+                if ext_local {
+                    wire::rule::XLATE_NEVER
+                } else {
+                    wire::rule::XLATE_ALWAYS
+                },
+                true,
+                notes,
+            );
             let (vports, tports, protos) = (get(b"vports="), get(b"tports="), get(b"protos="));
             for i in 0..count(vports) {
                 let (Some(proto), Some(vport)) =
@@ -409,16 +528,62 @@ fn encode(row: &[u8], out: &mut Out, node: Option<u32>) -> bool {
                         None => continue,
                     }
                 };
-                dnat(out, proto, vip, vport, be, tport);
+                let to = Some((be, tport));
+                dnat(
+                    out,
+                    proto,
+                    vip,
+                    vport,
+                    if int_local && !here { None } else { to },
+                    cf,
+                );
                 // The node's own address at the port's nodePort, and the
                 // load-balancer address at the port: the same backend.
+                let ext = if ext_local && !here { None } else { to };
                 let np = nth(get(b"nports="), i);
-                if let (Some(node), Some(np)) = (node, parse_port(np)) {
-                    dnat(out, proto, node, np, be, tport);
+                if let (Some(node), Some(np)) = (n.addr, parse_port(np)) {
+                    dnat(out, proto, node, np, ext, ef);
                 }
                 if let Some(lb) = parse_ip4(get(b"lbip=")) {
-                    dnat(out, proto, lb, vport, be, tport);
+                    dnat(out, proto, lb, vport, ext, ef);
                 }
+            }
+            true
+        }
+        b"hostport" => {
+            // A Pod's container ports that name a hostPort, on the node the
+            // Pod runs on: that node's address (or the port's hostIP) at the
+            // hostPort leads to the Pod's address at the containerPort.
+            if n.name.is_empty() || get(b"node=") != n.name {
+                return true; // another node's Pod: nothing here
+            }
+            let Some(be) = parse_ip4(get(b"backend=")) else {
+                return false;
+            };
+            let (hports, tports, protos, hips) = (
+                get(b"hports="),
+                get(b"tports="),
+                get(b"protos="),
+                get(b"hostips="),
+            );
+            let f = dnat_flags(n, wire::rule::XLATE_HAIRPIN, true, notes);
+            for i in 0..count(hports) {
+                let (Some(proto), Some(hp), Some(tp)) = (
+                    parse_proto(nth(protos, i)),
+                    parse_port(nth(hports, i)),
+                    parse_port(nth(tports, i)),
+                ) else {
+                    continue; // no hostPort on this port (`-`), or no port
+                };
+                let at = match parse_ip4(nth(hips, i)) {
+                    Some(a) if a != 0 => Some(a),
+                    _ => n.addr,
+                };
+                let Some(at) = at else { continue };
+                if at == be && hp == tp {
+                    continue; // a Pod on the node's own network: already there
+                }
+                dnat(out, proto, at, hp, Some((be, tp)), f);
             }
             true
         }
@@ -469,12 +634,104 @@ unsafe fn ask_status(s: &mut State, sys: &SyscallTable) {
     }
 }
 
-/// Rebuild the table from the rows and apply it. True when the platform took
-/// it (or it was unchanged).
-unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
-    let prefix_len = s.prefix_len as usize;
-    let mut prefix = [0u8; MAX_PARAM];
-    prefix[..prefix_len].copy_from_slice(&s.prefix[..prefix_len]);
+/// What an [`apply`] came to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// The platform took the table (or it was unchanged).
+    Taken,
+    /// Not this time: asked again after `RETRY_STEPS`.
+    Retry,
+    /// The store refused a read for good: asked again at once it answers
+    /// the same, so the old table stands, the status says so, and it is
+    /// asked again after `RETRY_STEPS` — the change that rang is still owed
+    /// an apply, and its ring is not repeated.
+    Failed,
+    /// The provider answered `EAGAIN`: asked again next step.
+    Again,
+}
+
+/// The provider's CAPS (0 when it does not answer).
+unsafe fn provider_caps(sys: &SyscallTable) -> u32 {
+    let mut caps = [0u8; 4];
+    if (sys.provider_call)(-1, wire::CAPS, caps.as_mut_ptr(), 4) == 0 {
+        u32::from_le_bytes(caps)
+    } else {
+        0
+    }
+}
+
+/// This module's table's state flags (`wire::state::*`), read back from the
+/// provider: `None` when it did not answer this time (`EAGAIN`, no table).
+unsafe fn table_flags(s: &State, sys: &SyscallTable) -> Option<u32> {
+    let name_len = (s.table_len as usize).min(wire::MAX_TABLE_NAME);
+    let mut st = [0u8; wire::state::BYTES];
+    let mut arg = [0u8; 1 + wire::MAX_TABLE_NAME + 20];
+    arg[0] = name_len as u8;
+    for (d, &c) in arg[1..].iter_mut().zip(s.table[..name_len].iter()) {
+        *d = c;
+    }
+    let mut p = 1 + name_len;
+    // No rules are asked for (`out_cap` 0): the state alone, which READ
+    // writes whatever the rules' size (`ERANGE` then).
+    for (i, b) in 0u64.to_le_bytes().iter().enumerate() {
+        arg[p + i] = *b;
+    }
+    p += 8;
+    for (i, b) in 0u32.to_le_bytes().iter().enumerate() {
+        arg[p + i] = *b;
+    }
+    p += 4;
+    for (i, b) in (st.as_mut_ptr() as u64).to_le_bytes().iter().enumerate() {
+        arg[p + i] = *b;
+    }
+    p += 8;
+    let r = (sys.provider_call)(-1, wire::READ, arg.as_mut_ptr(), p);
+    if r < 0 && r != -34 {
+        return None; // EAGAIN (a writer kept it moving), ENOENT, …
+    }
+    let f = wire::state::FLAGS;
+    Some(u32::from_le_bytes([st[f], st[f + 1], st[f + 2], st[f + 3]]))
+}
+
+/// The status of the table last applied, from its state now:
+/// `enforced=1` (the table's enforcer applied exactly this generation),
+/// `pending` (an enforcer is bound, or the provider can enforce, and has not
+/// yet applied it), or `0` (the provider records it and nothing enforces
+/// it). Arms the poll while it is not in force.
+unsafe fn say_applied(s: &mut State, sys: &SyscallTable) {
+    let flags = table_flags(s, sys);
+    let caps = provider_caps(sys);
+    let word: &[u8] = match flags {
+        Some(f) if f & wire::state::ENFORCED != 0 => b"enforced=1;rules=",
+        Some(f) if f & wire::state::BOUND != 0 => b"enforced=pending;rules=",
+        _ if caps & wire::caps::ENFORCED != 0 => b"enforced=pending;rules=",
+        // No answer this time, or none it could give: as it stands, nothing
+        // enforces the table; read again.
+        _ => b"enforced=0;rules=",
+    };
+    s.poll = if matches!(flags, Some(f) if f & wire::state::ENFORCED != 0) {
+        0
+    } else {
+        POLL_STEPS
+    };
+    let mut st = [0u8; 128];
+    let q = append(&mut st, 0, word);
+    let q = put_dec(&mut st, q, s.last_rules as u64);
+    let q = append(&mut st, q, b";generation=");
+    let mut q = put_dec(&mut st, q, s.last_gen);
+    if s.last_notes & NOTE_INBOUND != 0 {
+        // Node ports, load-balancer addresses and host ports this provider
+        // translates for the node's own traffic only.
+        q = append(&mut st, q, b";inbound=unsupported");
+    }
+    if s.last_notes & NOTE_XLATE != 0 {
+        q = append(&mut st, q, b";translate=unsupported");
+    }
+    status(s, sys, &st[..q]);
+}
+
+/// Rebuild the table from the rows and apply it.
+unsafe fn apply(s: &mut State, sys: &SyscallTable) -> Applied {
     let mut rules = [0u8; TABLE];
     let mut out = Out {
         buf: &mut rules,
@@ -483,62 +740,117 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
         full: false,
     };
     let store = Store::plain(sys, &s.nag);
-    let mut walk = ListWalk::new(&prefix[..prefix_len]);
     let mut skipped = 0u32;
-    let node = parse_ip4(&s.node_addr[..s.node_addr_len as usize]);
-    while let Some(key) = walk.next(&store) {
-        let mut k = [0u8; MAX_KEY];
-        let kl = key.len().min(MAX_KEY);
-        k[..kl].copy_from_slice(&key[..kl]);
-        let mut row = [0u8; MAX_VALUE];
-        let Some(n) = get_value(&store, &k[..kl], &mut row) else {
+    let caps = provider_caps(sys);
+    let nl = (s.node_name_len as usize).min(MAX_NODE_NAME);
+    let mut name = [0u8; MAX_NODE_NAME];
+    for (d, &c) in name.iter_mut().zip(s.node_name[..nl].iter()) {
+        *d = c;
+    }
+    let node = Node {
+        addr: parse_ip4(&s.node_addr[..s.node_addr_len as usize]),
+        name: &name[..nl],
+        local_only: caps & wire::caps::DNAT == 0 && caps & wire::caps::DNAT_LOCAL != 0,
+        xlate: caps & wire::caps::SOURCE_TRANSLATE != 0,
+    };
+    let mut notes = 0u8;
+    let pl = (s.prefix_len as usize).min(MAX_PARAM);
+    let mut prefixes = [0u8; MAX_PARAM];
+    for (d, &c) in prefixes.iter_mut().zip(s.prefix[..pl].iter()) {
+        *d = c;
+    }
+    let mut listed = true;
+    for prefix in prefixes[..pl].split(|&c| c == b',').take(MAX_PREFIXES) {
+        if prefix.is_empty() {
             continue;
-        };
-        if !encode(&row[..n], &mut out, node) {
-            skipped += 1;
         }
-        if out.full {
+        let mut walk = ListWalk::new(prefix);
+        while let Some(key) = walk.next(&store) {
+            let mut k = [0u8; MAX_KEY];
+            let kl = key.len().min(MAX_KEY);
+            for (d, &c) in k.iter_mut().zip(key[..kl].iter()) {
+                *d = c;
+            }
+            let mut row = [0u8; MAX_VALUE];
+            let Some(n) = get_value(&store, &k[..kl], &mut row) else {
+                continue;
+            };
+            if !encode(&row[..n], &mut out, &node, &mut notes) {
+                skipped += 1;
+            }
+            if out.full {
+                break;
+            }
+        }
+        listed &= !walk.failed;
+        if out.full || store.waiting() || store.refusal().is_some() {
             break;
         }
     }
     if store.waiting() {
         // A row or a page was not answered yet (`EAGAIN`): what was read is
         // not the table, so the old one stands and this is asked again.
-        return false;
+        return Applied::Retry;
     }
     s.skipped = s.skipped.wrapping_add(skipped);
     let mut st = [0u8; 128];
-    if walk.failed {
+    if let Some(rc) = store.refusal() {
+        // A row or a page refused for good (said by the read): what was read
+        // is not the table, and asking again answers the same.
+        let p = append(&mut st, 0, b"error=store-refused;rc=-");
+        let p = put_dec(&mut st, p, u64::from(rc.unsigned_abs()));
+        let p = append(&mut st, p, b";rules=0");
+        status(s, sys, &st[..p]);
+        return Applied::Failed;
+    }
+    if !listed {
         // Could not list: the old table stands, and this is retried.
         let p = append(&mut st, 0, b"error=list;rules=0");
         status(s, sys, &st[..p]);
-        return false;
+        return Applied::Retry;
     }
     if out.full {
         let p = append(&mut st, 0, b"error=table-full;rules=");
         let p = put_dec(&mut st, p, out.rules as u64);
         status(s, sys, &st[..p]);
-        return false;
+        return Applied::Retry;
     }
     let (len, n_rules) = (out.len, out.rules);
-    let h = fnv(&rules[..len]);
+    let h = fnv(rules.get(..len).unwrap_or(&[]));
     if s.applied_any != 0 && h == s.applied_hash {
-        return true;
+        return Applied::Taken;
     }
 
-    let name_len = s.table_len as usize;
+    let name_len = (s.table_len as usize).min(wire::MAX_TABLE_NAME);
     let mut gen = 0u64;
     let mut arg = [0u8; 1 + wire::MAX_TABLE_NAME + 20];
     arg[0] = name_len as u8;
-    arg[1..1 + name_len].copy_from_slice(&s.table[..name_len]);
+    for (d, &c) in arg[1..].iter_mut().zip(s.table[..name_len].iter()) {
+        *d = c;
+    }
     let mut p = 1 + name_len;
-    arg[p..p + 8].copy_from_slice(&(rules.as_ptr() as u64).to_le_bytes());
+    for (i, b) in (rules.as_ptr() as u64).to_le_bytes().iter().enumerate() {
+        arg[p + i] = *b;
+    }
     p += 8;
-    arg[p..p + 4].copy_from_slice(&(len as u32).to_le_bytes());
+    for (i, b) in (len as u32).to_le_bytes().iter().enumerate() {
+        arg[p + i] = *b;
+    }
     p += 4;
-    arg[p..p + 8].copy_from_slice(&(&mut gen as *mut u64 as u64).to_le_bytes());
+    for (i, b) in (&mut gen as *mut u64 as u64)
+        .to_le_bytes()
+        .iter()
+        .enumerate()
+    {
+        arg[p + i] = *b;
+    }
     p += 8;
     let r = (sys.provider_call)(-1, wire::REPLACE, arg.as_mut_ptr(), p);
+    if r == EAGAIN {
+        // Another writer kept the tables moving for every bounded retry:
+        // nothing was replaced, and it is asked again next step.
+        return Applied::Again;
+    }
     if r != 0 {
         s.refused = s.refused.wrapping_add(1);
         let q = append(&mut st, 0, b"error=");
@@ -546,29 +858,19 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> bool {
         let q = append(&mut st, q, b";rules=");
         let q = put_dec(&mut st, q, n_rules as u64);
         status(s, sys, &st[..q]);
-        return false;
+        return Applied::Retry;
     }
     s.applied = s.applied.wrapping_add(1);
     s.applied_hash = h;
     s.applied_any = 1;
-    // What the platform ENFORCES, asked rather than assumed.
-    let mut caps = [0u8; 4];
-    let enforced = (sys.provider_call)(-1, wire::CAPS, caps.as_mut_ptr(), 4) == 0
-        && (u32::from_le_bytes(caps) & wire::caps::ENFORCED) != 0;
-    let q = append(
-        &mut st,
-        0,
-        if enforced {
-            b"enforced=1;rules="
-        } else {
-            b"enforced=0;rules="
-        },
-    );
-    let q = put_dec(&mut st, q, n_rules as u64);
-    let q = append(&mut st, q, b";generation=");
-    let q = put_dec(&mut st, q, gen);
-    status(s, sys, &st[..q]);
-    true
+    s.last_rules = n_rules;
+    s.last_gen = gen;
+    s.last_notes = notes;
+    // Whether THIS table is in force, asked rather than assumed: its
+    // enforcer reports the generation it applied, and until it equals this
+    // one the table is pending.
+    say_applied(s, sys);
+    Applied::Taken
 }
 
 // ---- module ABI ----
@@ -591,7 +893,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
@@ -609,7 +911,7 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.sink = in_chan;
+        s.event = -1;
         s.resolved = 0;
         s.subscribed = 0;
         s.dirty = 1;
@@ -618,8 +920,13 @@ pub unsafe extern "C" fn module_new(
         s.table_len = 0;
         s.status_key_len = 0;
         s.node_addr_len = 0;
+        s.node_name_len = 0;
         s.applied_hash = 0;
         s.applied_any = 0;
+        s.last_rules = 0;
+        s.last_gen = 0;
+        s.last_notes = 0;
+        s.poll = 0;
         s.applied = 0;
         s.refused = 0;
         s.skipped = 0;
@@ -647,22 +954,41 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*s.syscalls;
-        if s.subscribed == 0 {
-            if s.sink < 0 {
-                s.sink = dev_channel_port(sys, PORT_INPUT, 0);
-            }
-            if s.sink >= 0 {
-                let pl = s.prefix_len as usize;
-                let mut p = [0u8; MAX_PARAM];
-                p[..pl].copy_from_slice(&s.prefix[..pl]);
-                if store_subscribe(sys, &p[..pl], s.sink, 0) == READ_WAIT {
-                    // Not yet: no subscription was made; asked next step.
-                    return 0;
+        // One subscription per prefix, in order: `subscribed` counts those
+        // made, and one not made yet is asked again next step.
+        if (s.subscribed as usize) < MAX_PREFIXES + 1 {
+            // One kernel event for all of them.
+            if s.event < 0 && s.subscribed == 0 {
+                s.event = store_event(sys);
+                if s.event < 0 {
+                    let m = b"[net_apply] ERROR no kernel event - changes will NOT wake this module";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
                 }
             }
-            s.subscribed = 1;
+            let pl = (s.prefix_len as usize).min(MAX_PARAM);
+            let mut p = [0u8; MAX_PARAM];
+            for (d, &c) in p.iter_mut().zip(s.prefix[..pl].iter()) {
+                *d = c;
+            }
+            if s.event >= 0 {
+                let mut i = 0u32;
+                for one in p[..pl].split(|&c| c == b',').take(MAX_PREFIXES) {
+                    if one.is_empty() {
+                        continue;
+                    }
+                    if i >= s.subscribed {
+                        if not_yet(store_subscribe(sys, one, s.event, 0)) {
+                            // Not yet: no subscription was made; asked next step.
+                            return 0;
+                        }
+                        s.subscribed = i + 1;
+                    }
+                    i += 1;
+                }
+            }
+            s.subscribed = MAX_PREFIXES as u32 + 1;
         }
-        if s.sink >= 0 && drain_changes(sys, s.sink) > 0 {
+        if store_take(sys, s.event, |_| {}) > 0 {
             s.dirty = 1;
         }
         if s.status_owed != 0 {
@@ -676,8 +1002,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if s.dirty != 0 && s.backoff == 0 {
             s.dirty = 0;
-            if !apply(s, sys) {
-                s.backoff = RETRY_STEPS;
+            match apply(s, sys) {
+                Applied::Retry | Applied::Failed => s.backoff = RETRY_STEPS,
+                Applied::Again => s.dirty = 1,
+                _ => {}
+            }
+        } else if s.poll > 0 && s.status_owed == 0 {
+            // Applied, not yet in force: its state read again until it is.
+            s.poll -= 1;
+            if s.poll == 0 {
+                say_applied(s, sys);
             }
         }
         0

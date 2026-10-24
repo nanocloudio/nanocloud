@@ -18,8 +18,6 @@ platform:
   net:
     write_buf_kib: 8192
 
-# Every reconciler self-wires status -> changes (a 1-node cycle) to allocate its
-# store-change sink channel.
 scheduler:
   accept_cycles: true
 
@@ -303,8 +301,9 @@ modules:
     # carries, what a GET of nothing answers, how a view reads — a Scale
     # rendered from the object, a Pod's log as its sandbox's output tail —
     # and the watch wire: an event's framing, the 410 a watch past its
-    # history ends with, a bookmark's object, and a List's tail.
-    schema: "rv=metadata.resourceVersion;missing={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404};view.scale=tpl:{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\",\"metadata\":{\"name\":{{metadata.name}},\"namespace\":{{metadata.namespace}},\"uid\":{{metadata.uid}},\"creationTimestamp\":{{metadata.creationTimestamp}}},\"spec\":{\"replicas\":{{spec.replicas|1}}},\"status\":{\"replicas\":{{status.replicas|0}},\"selector\":\"{{pairs:spec.selector.matchLabels}}\"}};view.log=text:/~node/|spec.nodeName|/sandbox-logs/|metadata.uid;event={\"type\":\"{{type}}\",\"object\":{{object}}};expired={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"too old resource version\",\"reason\":\"Expired\",\"code\":410};bookmark={\"kind\":\"{{kind}}\",\"apiVersion\":\"{{av}}\",\"metadata\":{\"resourceVersion\":\"{{rv}}\"}};list.tail=],\"metadata\":{\"resourceVersion\":\"{{rv}}\"{{?continue:,\"continue\":\"$\"}}}};table.head={\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"columnDefinitions\":[{{cols}}],\"rows\":[;table.col={\"name\":\"{{name}}\",\"type\":\"string\",\"format\":\"{{format}}\",\"description\":\"\",\"priority\":0};table.row={\"cells\":[{{cells}}],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{{metadata}}}};table.end=]}"
+    # history ends with, the 500 a watch, list or get the store refused ends
+    # with, a bookmark's object, and a List's tail.
+    schema: "rv=metadata.resourceVersion;missing={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotFound\",\"code\":404};view.scale=tpl:{\"kind\":\"Scale\",\"apiVersion\":\"autoscaling/v1\",\"metadata\":{\"name\":{{metadata.name}},\"namespace\":{{metadata.namespace}},\"uid\":{{metadata.uid}},\"creationTimestamp\":{{metadata.creationTimestamp}}},\"spec\":{\"replicas\":{{spec.replicas|1}}},\"status\":{\"replicas\":{{status.replicas|0}},\"selector\":\"{{pairs:spec.selector.matchLabels}}\"}};view.log=text:/~node/|spec.nodeName|/sandbox-logs/|metadata.uid;event={\"type\":\"{{type}}\",\"object\":{{object}}};expired={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"too old resource version\",\"reason\":\"Expired\",\"code\":410};failed={\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the store refused a read\",\"reason\":\"InternalError\",\"code\":500};bookmark={\"kind\":\"{{kind}}\",\"apiVersion\":\"{{av}}\",\"metadata\":{\"resourceVersion\":\"{{rv}}\"}};list.tail=],\"metadata\":{\"resourceVersion\":\"{{rv}}\"{{?continue:,\"continue\":\"$\"}}}};table.head={\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"columnDefinitions\":[{{cols}}],\"rows\":[;table.col={\"name\":\"{{name}}\",\"type\":\"string\",\"format\":\"{{format}}\",\"description\":\"\",\"priority\":0};table.row={\"cells\":[{{cells}}],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{{metadata}}}};table.end=]}"
     prefix: "/watch-reg/"
     watch: "/"
     events: 1
@@ -330,7 +329,7 @@ modules:
   - name: ws_emit
     type: store_effect
     # chronicle-source: modules/app/_chronicle/apiplane_watch.uproc w_emit
-    decision: {hex: "04050000000f0001000246000000120300454e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004105000000110001000246000000120500434c4f53452000160000006d000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f00000012000040200000001000000000000000004021000000100000000000000000402400000041050000001100010002460000001205004552524f5220001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001400010002460000001208004e4f54464f554e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e000000109401000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004117000000710001000201000000400100000010000000000000000040020000001200004003000000100000000000000000401200000001000249000000401e0000000100024a000000401f0000000100024800000040200000001005000000000000004021000000100000000000000000402400000041"}
+    decision: {hex: "05050000000f0001000246000000120300454e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004105000000110001000246000000120500434c4f53452000160000006d000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f00000012000040200000001000000000000000004021000000100000000000000000402400000041050000001100010002460000001205004552524f5220001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010c800000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001200010002460000001206004641494c454420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e00000010f401000000000000401f0000000100024800000040200000001000000000000000004021000000100000000000000000402400000041050000001400010002460000001208004e4f54464f554e4420001700000071000100020100000040010000001004000000000000004002000000120000400300000001000249000000401200000001000249000000401e000000109401000000000000401f000000010002480000004020000000100000000000000000402100000010000000000000000040240000004117000000710001000201000000400100000010000000000000000040020000001200004003000000100000000000000000401200000001000249000000401e0000000100024a000000401f0000000100024800000040200000001005000000000000004021000000100000000000000000402400000041"}
     key_prefix: "/watch-reg/"
   # A deleted object's last state (se_act `tomb`), kept for a watch's DELETED
   # event and expired by its deadline (ttl.uproc).
@@ -1939,19 +1938,23 @@ __API_IDENTITY__
     type: store_source
     prefix: "/ipam-request/"
     unless: "/ipam-lease/"
+    # The request's CIDR: its node's (pod_resolve's `cidr=`), which the
+    # address is taken from; a request naming none takes /ipam-pool's.
+    flat: 1
+    ints: "cidr!ip4,cidr!prefix"
     count: 1
     watch: "/ipam-"
   - name: ip_cur
     type: store_effect
     # chronicle-source: modules/app/_chronicle/ipam_pod.uproc pa_cur
-    decision: {hex: "010500000012000100021400000010000000000000000020000d00000035000100020100000040010000001001000000000000004002000000120300706f6440030000000100020300000042011e40fe000000410d0000003200010002010000004001000000100000000000000000400200000012000040030000000100020300000042011e40fe00000041"}
+    decision: {hex: "020f0000003600010002140000001000000000000000002001000233000000100000000000000000243001000233000000101e000000000000002330001b00000065000100020100000040010000001001000000000000004002000000120300706f644003000000010002030000000100023200000010010000000000000010200000000000000001000233000000515317001003000000000000005142031e232440fe000000410500000012000100021400000010000000000000000020001100000049000100020100000040010000001001000000000000004002000000120300706f6440030000000100020300000010000000000000000010000000000000000042031e232440fe00000041110000004600010002010000004001000000100000000000000000400200000012000040030000000100020300000010000000000000000010000000000000000042031e232440fe00000041"}
     key_prefix: "/ipam-cursor/"
     flat: 1
     ints: "n,net,span"
   - name: ip_claim
     type: store_effect
     # chronicle-source: modules/app/_chronicle/ipam_pod.uproc pa_claim
-    decision: {hex: "010a00000024000100020200000010c80000000000000020010002340000001000000000000000002430004a000000000101000201000000400100000010080000000000000040020000000100023300000010010000000000000050010002320000000100023200000001000234000000560100023400000052515040030000001206006f776e65723d4004000000010002fe000000021e00000040050000001204003b69703d4006000000010002330000001001000000000000005001000232000000010002320000000100023400000056010002340000005251504007000000010002fe000000021e000000010002320000000100023300000010010000000000000050010002320000000100023200000001000234000000560100023400000052515042031e1f2040fe000000411b0000007500010002010000004001000000100000000000000000400200000010000000000000000040030000001200004004000000120000400500000012000040060000001000000000000000004007000000010002fe000000021e0000000100023200000010000000000000000042031e1f2040fe00000041"}
+    decision: {hex: "020b00000029000100020200000010c80000000000000020010002fe0000000224000000100000000000000000243000530000002d010100020100000040010000001008000000000000004002000000010002fe0000000223000000100200000000000000500100023200000001000232000000010002fe000000022400000056010002fe000000022400000052515040030000001206006f776e65723d4004000000010002fe000000021e00000040050000001204003b69703d4006000000010002fe0000000223000000100200000000000000500100023200000001000232000000010002fe000000022400000056010002fe00000002240000005251504007000000010002fe000000021e00000001000232000000010002fe0000000223000000100200000000000000500100023200000001000232000000010002fe000000022400000056010002fe000000022400000052515042031e1f2040fe000000410a00000024000100020200000010c8000000000000002001000234000000100100000000000000243000560000003c01010002010000004001000000100800000000000000400200000001000233000000100200000000000000500100023200000001000232000000010002340000001001000000000000005156010002340000001001000000000000005152515040030000001206006f776e65723d4004000000010002fe000000021e00000040050000001204003b69703d40060000000100023300000010020000000000000050010002320000000100023200000001000234000000100100000000000000515601000234000000100100000000000000515251504007000000010002fe000000021e0000000100023200000001000233000000100200000000000000500100023200000001000232000000010002340000001001000000000000005156010002340000001001000000000000005152515042031e1f2040fe000000411b0000007500010002010000004001000000100000000000000000400200000010000000000000000040030000001200004004000000120000400500000012000040060000001000000000000000004007000000010002fe000000021e0000000100023200000010000000000000000042031e1f2040fe00000041"}
     key_prefix: "/ipam/pod/"
   - name: ip_bump
     type: store_effect
@@ -2011,9 +2014,14 @@ __API_IDENTITY__
     # chronicle-source: modules/app/_chronicle/ipam_pod_release.uproc pr_free
     decision: {hex: "020b00000029000100020200000010940100000000000020010002fe00000002220000001094010000000000002030000a0000002c000100020100000040010000001004000000000000004002000000010002fe000000021e0000004003000000410e0000003100010002fe000000022200000010c80000000000000020010002fe0000000223000000010002fe000000021f0000002130000a0000002c000100020100000040010000001004000000000000004002000000010002fe000000021e0000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"}
     key_prefix: "/ipam/pod/"
+  # Only a request naming no node: a node's own (pod_resolve's, `node=`)
+  # outlives this store's /sandboxes/ view and is released by that node
+  # (node_net), once its Pod and its sandbox are gone.
   - name: ip_orphan
     type: store_source
     prefix: "/ipam-request/"
+    flat: 1
+    where: "node="
     unless: "/sandboxes/"
     watch: "/sandboxes/"
   - name: ip_orphan_l
@@ -2116,8 +2124,6 @@ wiring:
     to: tls.cipher_in
   - from: tls.cipher_out
     to: linux_net.net_in
-  - from: dp_source.status
-    to: dp_source.changes
   - from: dp_source.record_out
     to: dp_current.request_in
   - from: dp_current.response_out
@@ -2126,8 +2132,6 @@ wiring:
     to: dp_apply.request_in
   - from: dp_apply.response_out
     to: dp_events.request_in
-  - from: rs_source.status
-    to: rs_source.changes
   - from: rs_source.record_out
     to: rs_prevget.request_in
   # Engine edges are byte FIFOs; the store_effect request edges are MAILBOXES
@@ -2140,154 +2144,100 @@ wiring:
     to: rs_apply.request_in
   - from: rs_apply.response_out
     to: rs_events.request_in
-  - from: ds_nodes.status
-    to: ds_nodes.changes
   - from: ds_nodes.record_out
     to: ds_mark.request_in
-  - from: ds_ngone.status
-    to: ds_ngone.changes
   - from: ds_ngone.record_out
     to: ds_unmark.request_in
-  - from: ds_source.status
-    to: ds_source.changes
   - from: ds_source.record_out
     to: ds_exists.request_in
   - from: ds_exists.response_out
     to: ds_apply.request_in
-  - from: ds_pods.status
-    to: ds_pods.changes
   - from: ds_pods.record_out
     to: ds_known.request_in
   - from: ds_known.response_out
     to: ds_collect.request_in
-  - from: st_source.status
-    to: st_source.changes
   - from: st_source.record_out
     to: st_nbget.request_in
   - from: st_nbget.response_out
     to: st_selfget.request_in
   - from: st_selfget.response_out
     to: st_apply.request_in
-  - from: pdb_src.status
-    to: pdb_src.changes
   - from: pdb_src.record_out
     to: pdb_exp.request_in
   - from: pdb_exp.response_out
     to: pdb_hlt.request_in
   - from: pdb_hlt.response_out
     to: pdb_put.request_in
-  - from: q_exp.status
-    to: q_exp.changes
   - from: q_exp.record_out
     to: q_cnt.request_in
   - from: q_cnt.response_out
     to: q_put.request_in
   - from: q_put.response_out
     to: q_json.request_in
-  - from: q_st.status
-    to: q_st.changes
   - from: q_st.record_out
     to: q_stp.request_in
-  - from: q_gcsrc.status
-    to: q_gcsrc.changes
   - from: q_gcsrc.record_out
     to: q_gc.request_in
-  - from: pc_sys.status
-    to: pc_sys.changes
   - from: pc_sys.record_out
     to: pc_sys1.request_in
   - from: pc_sys1.response_out
     to: pc_sys2.request_in
-  - from: pc_cls.status
-    to: pc_cls.changes
   - from: pc_cls.record_out
     to: pc_def.request_in
-  - from: pc_dsrc.status
-    to: pc_dsrc.changes
   - from: pc_dsrc.record_out
     to: pc_dgc.request_in
-  - from: pc_pods.status
-    to: pc_pods.changes
   - from: pc_pods.record_out
     to: pc_list.request_in
   - from: pc_list.response_out
     to: pc_get.request_in
   - from: pc_get.response_out
     to: pc_patch.request_in
-  - from: cj_src.status
-    to: cj_src.changes
   - from: cj_src.record_out
     to: cj_run.request_in
   - from: cj_run.response_out
     to: cj_rec.request_in
-  - from: cj_jobs.status
-    to: cj_jobs.changes
   - from: cj_jobs.record_out
     to: cj_aget.request_in
   - from: cj_aget.response_out
     to: cj_aput.request_in
   - from: cj_aput.response_out
     to: cj_alast.request_in
-  - from: cj_status.status
-    to: cj_status.changes
   - from: cj_status.record_out
     to: cj_stpatch.request_in
-  - from: cj_hjobs.status
-    to: cj_hjobs.changes
   - from: cj_hjobs.record_out
     to: cj_hget.request_in
   - from: cj_hget.response_out
     to: cj_hcount.request_in
   - from: cj_hcount.response_out
     to: cj_hdel.request_in
-  - from: cj_actsrc.status
-    to: cj_actsrc.changes
   - from: cj_actsrc.record_out
     to: cj_actget.request_in
   - from: cj_actget.response_out
     to: cj_actdel.request_in
-  - from: cj_lastsrc.status
-    to: cj_lastsrc.changes
   - from: cj_lastsrc.record_out
     to: cj_lastgc.request_in
-  - from: jb_jobs.status
-    to: jb_jobs.changes
   - from: jb_jobs.record_out
     to: jb_seed.request_in
-  - from: jb_ctl.status
-    to: jb_ctl.changes
   - from: jb_ctl.record_out
     to: jb_count.request_in
   - from: jb_count.response_out
     to: jb_w1.request_in
   - from: jb_w1.response_out
     to: jb_w2.request_in
-  - from: jb_status.status
-    to: jb_status.changes
   - from: jb_status.record_out
     to: jb_stpatch.request_in
-  - from: jb_launch.status
-    to: jb_launch.changes
   - from: jb_launch.record_out
     to: jb_create.request_in
-  - from: jb_idx.status
-    to: jb_idx.changes
   - from: jb_idx.record_out
     to: jb_icount.request_in
   - from: jb_icount.response_out
     to: jb_iput.request_in
-  - from: jb_irec.status
-    to: jb_irec.changes
   - from: jb_irec.record_out
     to: jb_icreate.request_in
-  - from: jb_kpods.status
-    to: jb_kpods.changes
   - from: jb_kpods.record_out
     to: jb_kget.request_in
   - from: jb_kget.response_out
     to: jb_kill.request_in
-  - from: hp_source.status
-    to: hp_source.changes
   - from: hp_source.record_out
     to: hp_depget.request_in
   - from: hp_depget.response_out
@@ -2298,118 +2248,78 @@ wiring:
     to: hp_stab.record_in
   - from: hp_stab.result_out
     to: hp_patch.request_in
-  - from: gc_pod_source.status
-    to: gc_pod_source.changes
   - from: gc_pod_source.record_out
     to: gc_pod_owner.request_in
   - from: gc_pod_owner.response_out
     to: gc_pod_collect.request_in
-  - from: gc_rs_source.status
-    to: gc_rs_source.changes
   - from: gc_rs_source.record_out
     to: gc_rs_owner.request_in
   - from: gc_rs_owner.response_out
     to: gc_rs_collect.request_in
-  - from: gc_job_source.status
-    to: gc_job_source.changes
   - from: gc_job_source.record_out
     to: gc_job_owner.request_in
   - from: gc_job_owner.response_out
     to: gc_job_collect.request_in
-  - from: gc_cj_source.status
-    to: gc_cj_source.changes
   - from: gc_cj_source.record_out
     to: gc_cj_owner.request_in
   - from: gc_cj_owner.response_out
     to: gc_cj_collect.request_in
-  - from: gc_ev_source.status
-    to: gc_ev_source.changes
   - from: gc_ev_source.record_out
     to: gc_ev_collect.request_in
-  - from: ns_objects.status
-    to: ns_objects.changes
   - from: ns_objects.record_out
     to: ns_collect.request_in
-  - from: ns_source.status
-    to: ns_source.changes
   - from: ns_source.record_out
     to: ns_remove.request_in
-  - from: sc_unbound.status
-    to: sc_unbound.changes
   - from: sc_unbound.record_out
     to: sc_victim.request_in
   - from: sc_victim.response_out
     to: sc_patch.request_in
   - from: sc_patch.response_out
     to: sc_events.request_in
-  - from: te_pods.status
-    to: te_pods.changes
   - from: te_pods.record_out
     to: te_act.request_in
-  - from: te_due.status
-    to: te_due.changes
   - from: te_due.record_out
     to: te_evict.request_in
-  - from: nl_nodes.status
-    to: nl_nodes.changes
   - from: nl_nodes.record_out
     to: nl_seen.request_in
-  - from: nl_leases.status
-    to: nl_leases.changes
   - from: nl_leases.record_out
     to: nl_stale.request_in
-  - from: ps_pods.status
-    to: ps_pods.changes
   - from: ps_pods.record_out
     to: ps_resolve.request_in
   - from: ps_resolve.forward_out
     to: ps_spec.request_in
   - from: ps_resolve.request_out
     to: ps_rput.request_in
-  - from: pvb_pv.status
-    to: pvb_pv.changes
   - from: pvb_pv.record_out
     to: pvb_pvput.request_in
   - from: pvb_pvput.response_out
     to: pvb_pvst.request_in
-  - from: pvb_pvc.status
-    to: pvb_pvc.changes
   - from: pvb_pvc.record_out
     to: pvb_pvget.request_in
   - from: pvb_pvget.response_out
     to: pvb_pvcput.request_in
   - from: pvb_pvcput.response_out
     to: pvb_pvcst.request_in
-  - from: pst_source.status
-    to: pst_source.changes
   - from: pst_source.record_out
     to: pst_get.request_in
   - from: pst_get.response_out
     to: pst_node.request_in
   - from: pst_node.response_out
     to: pst_patch.request_in
-  - from: pst_csrc.status
-    to: pst_csrc.changes
   - from: pst_csrc.record_out
     to: pst_cs.request_in
-  - from: rss_src.status
-    to: rss_src.changes
   - from: rss_src.record_out
     to: rss_all.request_in
   - from: rss_all.response_out
     to: rss_rdy.request_in
   - from: rss_rdy.response_out
     to: rss_put.request_in
-  - from: dps_src.status
-    to: dps_src.changes
   - from: dps_src.record_out
     to: dps_rs.request_in
   - from: dps_rs.response_out
     to: dps_upd.request_in
   - from: dps_upd.response_out
     to: dps_put.request_in
-  - from: dss_src.status
-    to: dss_src.changes
   - from: dss_src.record_out
     to: dss_want.request_in
   - from: dss_want.response_out
@@ -2418,20 +2328,14 @@ wiring:
     to: dss_rdy.request_in
   - from: dss_rdy.response_out
     to: dss_put.request_in
-  - from: sss_src.status
-    to: sss_src.changes
   - from: sss_src.record_out
     to: sss_all.request_in
   - from: sss_all.response_out
     to: sss_rdy.request_in
   - from: sss_rdy.response_out
     to: sss_put.request_in
-  - from: ps_tombs.status
-    to: ps_tombs.changes
   - from: ps_tombs.record_out
     to: ps_gone.request_in
-  - from: is_wait.status
-    to: is_wait.changes
   - from: is_wait.record_out
     to: is_cur.request_in
   - from: is_cur.response_out
@@ -2440,22 +2344,16 @@ wiring:
     to: is_bump.request_in
   - from: is_bump.response_out
     to: is_bind.request_in
-  - from: is_used.status
-    to: is_used.changes
   - from: is_used.record_out
     to: is_used_c.request_in
   - from: is_used_c.response_out
     to: is_ready.request_in
   - from: is_ready.response_out
     to: is_wake.request_in
-  - from: is_claims.status
-    to: is_claims.changes
   - from: is_claims.record_out
     to: is_owner.request_in
   - from: is_owner.response_out
     to: is_free.request_in
-  - from: ip_wait.status
-    to: ip_wait.changes
   - from: ip_wait.record_out
     to: ip_cur.request_in
   - from: ip_cur.response_out
@@ -2464,8 +2362,6 @@ wiring:
     to: ip_bump.request_in
   - from: ip_bump.response_out
     to: ip_lease.request_in
-  - from: ip_used.status
-    to: ip_used.changes
   - from: ip_used.record_out
     to: ip_used_c.request_in
   - from: ip_used_c.response_out
@@ -2474,22 +2370,16 @@ wiring:
     to: ip_ready.request_in
   - from: ip_ready.response_out
     to: ip_wake.request_in
-  - from: ip_claims.status
-    to: ip_claims.changes
   - from: ip_claims.record_out
     to: ip_owner.request_in
   - from: ip_owner.response_out
     to: ip_req.request_in
   - from: ip_req.response_out
     to: ip_free.request_in
-  - from: ip_orphan.status
-    to: ip_orphan.changes
   - from: ip_orphan.record_out
     to: ip_orphan_l.request_in
   - from: ip_orphan_l.response_out
     to: ip_orphan_r.request_in
-  - from: dv_source.status
-    to: dv_source.changes
   - from: dv_source.record_out
     to: dv_dec.record_in
   - from: dv_dec.result_out
@@ -2504,8 +2394,6 @@ wiring:
     to: dv_ca.request_in
   - from: dv_http.response_out
     to: dv_status.request_in
-  - from: tk_req.status
-    to: tk_req.changes
   - from: tk_req.record_out
     to: tk_dec.record_in
   - from: tk_dec.result_out
@@ -2521,8 +2409,6 @@ wiring:
     buffer_group: 10
   - from: tk_mint.response_out
     to: tk_resp.request_in
-  - from: sn_source.status
-    to: sn_source.changes
   - from: sn_source.record_out
     to: sn_contents.request_in
   - from: sn_contents.response_out
@@ -2640,8 +2526,6 @@ wiring:
     to: tk_mint.request_in
   - from: tk_mint.response_out
     to: reply.record_in
-  - from: gc_src.status
-    to: gc_src.changes
   - from: gc_src.record_out
     to: gc_blob.request_in
   - from: gc_blob.response_out
@@ -2650,12 +2534,8 @@ wiring:
   # MergeModule inserted automatically for two edges into one input; it clears
   # `buffer_group`, which is why the merge lands on a Chronicle engine input
   # (they self-frame) rather than on `http_chain.reply_in`.
-  - from: ws_evt.status
-    to: ws_evt.changes
   - from: ws_evt.record_out
     to: ws_emit.request_in
-  - from: tomb_src.status
-    to: tomb_src.changes
   - from: tomb_src.record_out
     to: tomb_gc.request_in
   - from: tomb_gc.response_out
@@ -2667,98 +2547,62 @@ wiring:
   - from: enc_http.result_out
     to: http_chain.reply_in
     buffer_group: 7
-  - from: rb_roles.status
-    to: rb_roles.changes
   - from: rb_roles.record_out
     to: rb_roles_e.request_in
-  - from: rb_croles.status
-    to: rb_croles.changes
   - from: rb_croles.record_out
     to: rb_croles_e.request_in
-  - from: rb_rules.status
-    to: rb_rules.changes
   - from: rb_rules.record_out
     to: rb_rules_e.request_in
-  - from: rb_rbs.status
-    to: rb_rbs.changes
   - from: rb_rbs.record_out
     to: rb_rbs_e.request_in
-  - from: rb_crbs.status
-    to: rb_crbs.changes
   - from: rb_crbs.record_out
     to: rb_crbs_e.request_in
-  - from: rb_perms.status
-    to: rb_perms.changes
   - from: rb_perms.record_out
     to: rb_src_e.request_in
   - from: rb_src_e.response_out
     to: rb_g_e.request_in
-  - from: rb_prule.status
-    to: rb_prule.changes
   - from: rb_prule.record_out
     to: rb_prule_get.request_in
   - from: rb_prule_get.response_out
     to: rb_prule_del.request_in
-  - from: rb_pbind.status
-    to: rb_pbind.changes
   - from: rb_pbind.record_out
     to: rb_pbind_get.request_in
   - from: rb_pbind_get.response_out
     to: rb_pbind_del.request_in
-  - from: rb_pperm.status
-    to: rb_pperm.changes
   - from: rb_pperm.record_out
     to: rb_pperm_chk.request_in
   - from: rb_pperm_chk.response_out
     to: rb_pperm_del.request_in
-  - from: rb_aggselsrc.status
-    to: rb_aggselsrc.changes
   - from: rb_aggselsrc.record_out
     to: rb_aggsel.request_in
-  - from: rb_mirrorsrc.status
-    to: rb_mirrorsrc.changes
   - from: rb_mirrorsrc.record_out
     to: rb_mirror.request_in
-  - from: rb_paggsel.status
-    to: rb_paggsel.changes
   - from: rb_paggsel.record_out
     to: rb_paggsel_get.request_in
   - from: rb_paggsel_get.response_out
     to: rb_paggsel_del.request_in
-  - from: rb_pagg.status
-    to: rb_pagg.changes
   - from: rb_pagg.record_out
     to: rb_pagg_get.request_in
   - from: rb_pagg_get.response_out
     to: rb_pagg_del.request_in
-  - from: rb_paggrole.status
-    to: rb_paggrole.changes
   - from: rb_paggrole.record_out
     to: rb_paggrole_chk.request_in
   - from: rb_paggrole_chk.response_out
     to: rb_paggrole_del.request_in
-  - from: rb_pmirror.status
-    to: rb_pmirror.changes
   - from: rb_pmirror.record_out
     to: rb_pmirror_chk.request_in
   - from: rb_pmirror_chk.response_out
     to: rb_pmirror_del.request_in
-  - from: rb_aggsrc.status
-    to: rb_aggsrc.changes
   - from: rb_aggsrc.record_out
     to: rb_aggmap.record_in
   - from: rb_aggmap.result_out
     to: rb_agg.request_in
-  - from: rb_psrc.status
-    to: rb_psrc.changes
   - from: rb_psrc.record_out
     to: rb_psrc_p.request_in
   - from: rb_psrc_p.response_out
     to: rb_psrc_bp.request_in
   - from: rb_psrc_bp.response_out
     to: rb_psrc_del.request_in
-  - from: rb_pg.status
-    to: rb_pg.changes
   - from: rb_pg.record_out
     to: rb_pg_del.request_in
   # ── The router's writes and fenced reads, through the group ─────────

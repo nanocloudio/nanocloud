@@ -24,8 +24,6 @@
 target: linux
 tick_us: 1000
 
-# Every reconciler self-wires status -> changes (a 1-node cycle) to allocate its
-# store-change sink channel.
 scheduler:
   accept_cycles: true
 
@@ -553,20 +551,14 @@ modules:
   # modules/app/_chronicle/scheduler.uproc.
 
 wiring:
-  - from: sc_unbound.status
-    to: sc_unbound.changes
   - from: sc_unbound.record_out
     to: sc_victim.request_in
   - from: sc_victim.response_out
     to: sc_patch.request_in
   - from: sc_patch.response_out
     to: sc_events.request_in
-  - from: ds_nodes.status
-    to: ds_nodes.changes
   - from: ds_nodes.record_out
     to: ds_mark.request_in
-  - from: dp_source.status
-    to: dp_source.changes
   - from: dp_source.record_out
     to: dp_current.request_in
   - from: dp_current.response_out
@@ -575,8 +567,6 @@ wiring:
     to: dp_apply.request_in
   - from: dp_apply.response_out
     to: dp_events.request_in
-  - from: rs_source.status
-    to: rs_source.changes
   - from: rs_source.record_out
     to: rs_prevget.request_in
   # Engine edges are byte FIFOs; the store_effect request edges are MAILBOXES
@@ -589,64 +579,42 @@ wiring:
     to: rs_apply.request_in
   - from: rs_apply.response_out
     to: rs_events.request_in
-  - from: ds_source.status
-    to: ds_source.changes
   - from: ds_source.record_out
     to: ds_exists.request_in
   - from: ds_exists.response_out
     to: ds_apply.request_in
-  - from: ds_pods.status
-    to: ds_pods.changes
   - from: ds_pods.record_out
     to: ds_known.request_in
   - from: ds_known.response_out
     to: ds_collect.request_in
-  - from: st_source.status
-    to: st_source.changes
   - from: st_source.record_out
     to: st_nbget.request_in
   - from: st_nbget.response_out
     to: st_selfget.request_in
   - from: st_selfget.response_out
     to: st_apply.request_in
-  - from: jb_jobs.status
-    to: jb_jobs.changes
   - from: jb_jobs.record_out
     to: jb_seed.request_in
-  - from: jb_ctl.status
-    to: jb_ctl.changes
   - from: jb_ctl.record_out
     to: jb_count.request_in
   - from: jb_count.response_out
     to: jb_w1.request_in
   - from: jb_w1.response_out
     to: jb_w2.request_in
-  - from: jb_status.status
-    to: jb_status.changes
   - from: jb_status.record_out
     to: jb_stpatch.request_in
-  - from: jb_launch.status
-    to: jb_launch.changes
   - from: jb_launch.record_out
     to: jb_create.request_in
-  - from: jb_idx.status
-    to: jb_idx.changes
   - from: jb_idx.record_out
     to: jb_icount.request_in
   - from: jb_icount.response_out
     to: jb_iput.request_in
-  - from: jb_irec.status
-    to: jb_irec.changes
   - from: jb_irec.record_out
     to: jb_icreate.request_in
-  - from: jb_kpods.status
-    to: jb_kpods.changes
   - from: jb_kpods.record_out
     to: jb_kget.request_in
   - from: jb_kget.response_out
     to: jb_kill.request_in
-  - from: hp_source.status
-    to: hp_source.changes
   - from: hp_source.record_out
     to: hp_depget.request_in
   - from: hp_depget.response_out
@@ -657,27 +625,17 @@ wiring:
     to: hp_stab.record_in
   - from: hp_stab.result_out
     to: hp_patch.request_in
-  - from: gc_pod_source.status
-    to: gc_pod_source.changes
   - from: gc_pod_source.record_out
     to: gc_pod_owner.request_in
   - from: gc_pod_owner.response_out
     to: gc_pod_collect.request_in
-  - from: gc_rs_source.status
-    to: gc_rs_source.changes
   - from: gc_rs_source.record_out
     to: gc_rs_owner.request_in
   - from: gc_rs_owner.response_out
     to: gc_rs_collect.request_in
-  - from: gc_ev_source.status
-    to: gc_ev_source.changes
   - from: gc_ev_source.record_out
     to: gc_ev_collect.request_in
-  - from: ns_objects.status
-    to: ns_objects.changes
   - from: ns_objects.record_out
     to: ns_collect.request_in
-  - from: ns_source.status
-    to: ns_source.changes
   - from: ns_source.record_out
     to: ns_remove.request_in

@@ -547,8 +547,6 @@ modules:
     key_file: /etc/nanocloud/volumes/kagi.key.der
 
 wiring:
-  - from: vp_pvc.status
-    to: vp_pvc.changes
   - from: vp_pvc.record_out
     to: vp_ask.record_in
   - from: vp_ask.result_out
@@ -557,8 +555,6 @@ wiring:
     to: vp_open.record_in
   - from: vp_open.result_out
     to: vp_create.request_in
-  - from: vp_src.status
-    to: vp_src.changes
   - from: vp_src.record_out
     to: vp_step.record_in
   - from: vp_step.result_out
@@ -569,8 +565,6 @@ wiring:
     to: vp_record.record_in
   - from: vp_record.result_out
     to: vp_out.request_in
-  - from: va_src.status
-    to: va_src.changes
   - from: va_src.record_out
     to: va_attach.record_in
   - from: va_attach.result_out
@@ -595,14 +589,10 @@ wiring:
     to: va_out.request_in
   - from: va_vk_record.result_out
     to: va_out.request_in
-  - from: ve_kept.status
-    to: ve_kept.changes
   - from: ve_kept.record_out
     to: ve_retain.record_in
   - from: ve_retain.result_out
     to: ve_ask.request_in
-  - from: vg_src.status
-    to: vg_src.changes
   - from: vg_src.record_out
     to: vg_step.record_in
   - from: vg_step.result_out
@@ -613,8 +603,6 @@ wiring:
     to: vg_record.record_in
   - from: vg_record.result_out
     to: vg_out.request_in
-  - from: vt_src.status
-    to: vt_src.changes
   - from: vt_src.record_out
     to: vt_prepare.record_in
   - from: vt_prepare.result_out
@@ -629,8 +617,6 @@ wiring:
     to: vt_record.record_in
   - from: vt_record.result_out
     to: vt_out.request_in
-  - from: vs_src.status
-    to: vs_src.changes
   - from: vs_src.record_out
     to: vs_step.record_in
   - from: vs_step.result_out
@@ -641,8 +627,6 @@ wiring:
     to: vs_record.record_in
   - from: vs_record.result_out
     to: vs_out.request_in
-  - from: vr_src.status
-    to: vr_src.changes
   - from: vr_src.record_out
     to: vr_recover.record_in
   - from: vr_recover.result_out
@@ -657,8 +641,6 @@ wiring:
     to: vr_record.record_in
   - from: vr_record.result_out
     to: vr_out.request_in
-  - from: vd_src.status
-    to: vd_src.changes
   - from: vd_src.record_out
     to: ve_step.record_in
   - from: ve_step.result_out
@@ -669,8 +651,6 @@ wiring:
     to: vd_record.record_in
   - from: vd_record.result_out
     to: vd_out.request_in
-  - from: vc_src.status
-    to: vc_src.changes
   - from: vc_src.record_out
     to: vc_claim.record_in
   - from: vc_claim.result_out

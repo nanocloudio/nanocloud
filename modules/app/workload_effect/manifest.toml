@@ -27,7 +27,14 @@ hardware_targets = ["bcm2712", "linux"]
 #                 18 user (`uid[:gid]` | `name[:group]`, or
 #                 `<that>/<runAsUser>/<runAsGroup>`: composed as upstream's
 #                 runtime composes a securityContext with the image's User,
-#                 a runAsGroup alone keeping the image's uid) — the process gets
+#                 a runAsGroup alone keeping the image's uid), then, when
+#                 the spec states any, `/<gid>,…/<flags>`: the supplementary
+#                 groups (fsGroup, supplementalGroups) and `s` (their policy
+#                 Strict: the primary gid and the listed only; else the
+#                 root's /etc/group memberships too) and `r` (a read-only
+#                 root, with iso only) — what the host's
+#                 `host_process::CAPS` does not realize fails -95, never runs
+#                 without it — the process gets
 #                 exactly HOSTNAME, that env and a default PATH when it names
 #                 none, never the runtime's environment; 14-18 escaped `%XX`
 #                 19 cpu (millicores)  20 mem (bytes)  21 eph (bytes): the
@@ -65,7 +72,7 @@ hardware_targets = ["bcm2712", "linux"]
 #                 this module faulted mid-call, or before a restart of this
 #                 module) is adopted through LOOKUP by identity, never
 #                 created twice
-#   op 2 START    → running
+#   op 2 START    → running (its run's start moment at 9)
 #   op 3 DESTROY  → destroyed (an id this module holds no handle for is
 #                 destroyed by identity: a workload it lost track of, or one
 #                 still being staged, is torn down rather than leaked)
@@ -83,6 +90,12 @@ hardware_targets = ["bcm2712", "linux"]
 #                 event once they are queued for the pty
 # Out (`event_out`): 1 correlation (0 when spontaneous)  2 kind  3 id / tail
 #   4 label  5 code (i64)  6 bytes  7 boot  8 code as decimal text
+#   9 started: on every status of a workload START started, the moment its
+#   process started (stamped as START answers: Unix ms when the node's clock
+#   is trusted, else `m<monotonic ms>@<boot>`, _shared/moment.rs) — one
+#   value for the whole run, its exit included, so a run's start is said by
+#   the runtime that started it, however few of its states a reader saw;
+#   empty on every other event
 #   30..39 carry
 #   kind 1 status (created running paused exited failed killed destroyed)
 #   kind 2 log (bytes: the workload's merged stdout/stderr)

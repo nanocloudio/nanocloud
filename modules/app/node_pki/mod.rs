@@ -37,8 +37,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 160;
 
 const PORT_INPUT: u8 = 0;
@@ -1028,6 +1026,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
                     break;
                 }
             }
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 // A page or a probe was not answered yet: asked next step.
                 return;
@@ -1055,6 +1059,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
                 return;
             };
             let present = exists(&st, &key[..kl]);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 return; // not answered yet (`EAGAIN`): asked next step
             }
@@ -1091,6 +1101,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let kl = token_key(s, b"/token-resp/join-", &mut key);
             let mut val = [0u8; TOKEN_MAX + 16];
             let got = get_value(&st, &key[..kl], &mut val);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 return; // not answered yet (`EAGAIN`), not absent
             }
@@ -1131,6 +1147,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let mut key = [0u8; 48];
             let kl = token_key(s, b"/token-req/join-", &mut key);
             let present = exists(&st, &key[..kl]);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 return;
             }
@@ -1145,6 +1167,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let mut key = [0u8; 48];
             let kl = token_key(s, b"/token-resp/join-", &mut key);
             let present = exists(&st, &key[..kl]);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 return;
             }
@@ -1172,6 +1200,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let at = join_record(s);
             // Published once it reads back; asked at most every REASK_MS.
             let present = exists(&st, &key[..kl]);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 return;
             }
@@ -1215,6 +1249,12 @@ unsafe fn join_step(s: &mut State, sys: &SyscallTable) {
             let mut kl = put(&mut key, 0, JOIN_PREFIX).unwrap_or(0);
             kl = put(&mut key, kl, &s.secret).unwrap_or(kl);
             let present = exists(&st, &key[..kl]);
+            if st.refusal().is_some() {
+                // Refused for good (said by the read): nothing is concluded
+                // from it, and the join is asked again after RETRY_MS.
+                s.next_at = now + RETRY_MS;
+                return;
+            }
             if st.waiting() {
                 // Not answered yet: the secret is not spent on a read that
                 // has not come back.
@@ -1435,8 +1475,9 @@ unsafe fn ask_token(s: &mut State, sys: &SyscallTable) {
     let st = Store::plain(sys, &s.nag);
     let now = dev_millis(sys);
     let present = exists(&st, &key[..kl]);
-    // A probe not answered yet (`EAGAIN`) asks nothing: asked again later.
-    if !present && !st.waiting() && (s.wrote_at == 0 || now - s.wrote_at >= REASK_MS) {
+    // A probe not answered yet (`EAGAIN`), or refused, asks nothing: asked
+    // again later.
+    if !present && !st.stopped() && (s.wrote_at == 0 || now - s.wrote_at >= REASK_MS) {
         s.wrote_at = now;
         let _ = put_value(&st, &key[..kl], &val[..at]);
     }

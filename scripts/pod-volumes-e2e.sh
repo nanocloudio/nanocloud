@@ -12,6 +12,12 @@
 #               <template>-<pod>, created once; a Pod deleted (scaled away) and made again
 #               (a new UID) mounts the same claim and reads what its
 #               predecessor wrote, the other ordinal its own
+#   fsGroup     a claim whose directory lies under the node's mount root,
+#               mounted by a Pod with an fsGroup: the directory and what was
+#               in it group-owned by the fsGroup (setgid, group-writable), so
+#               a non-root container that is neither its owner nor in its
+#               group writes it, and what it writes is the fsGroup's;
+#               OnRootMismatch leaves a matching root's contents alone
 #
 # A Pod's own storage — the owner root its runtime keys by the Pod's UID — is
 # ephemeral, as an emptyDir is upstream: what must outlive a Pod belongs in a
@@ -39,7 +45,7 @@ sudo -n true 2>/dev/null || skip "passwordless sudo unavailable (the node runs a
 D="$(mktemp -d /tmp/nc-podvol-XXXXXX)"
 chmod 755 "$D"
 STORE="$D/store"
-mkdir -p "$STORE" "$D/blobs" "$D/rootfs" "$D/owners" "$D/pods" "$D/pv/data" "$D/pv/other" "$D/pv/db-0" "$D/pv/db-1"
+mkdir -p "$STORE" "$D/blobs" "$D/rootfs" "$D/owners" "$D/pods" "$D/pv/data" "$D/pv/other" "$D/pv/db-0" "$D/pv/db-1" "$D/mnt/pv/fsg"
 nc_lattice_prepare "$STORE"
 . "$ROOT/scripts/support/workload-node.sh"
 . "$ROOT/scripts/support/pod-node.sh"
@@ -183,4 +189,31 @@ expect "and its claim holds both incarnations' writes" "$(sudo -n cat "$D/pv/db-
 expect "still one claim per ordinal" "$(jget /api/v1/namespaces/default/persistentvolumeclaims '" ".join(sorted(i["metadata"]["name"] for i in d["items"] if i["metadata"]["name"].startswith("data-db-")))')" "data-db-0 data-db-1"
 echo "   db-1 again ($NEW1, a new UID): read db-1 from data-db-1"
 
-echo "== E2E green: claims bound to static volumes, a Deployment's data across a rollout, a StatefulSet's per-ordinal claims across recreation =="
+echo "== 5. fsGroup: a claim under the mount root owned by the Pod's fsGroup =="
+# The volume's directory, as an operator made it: owned by this user (not
+# the container's), a file already in it, nothing writable by others.
+echo "before" >"$D/mnt/pv/fsg/old"
+chmod 755 "$D/mnt/pv/fsg"
+chmod 644 "$D/mnt/pv/fsg/old"
+pn_create /api/v1/persistentvolumes '{"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pv-fsg"},"spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],"storageClassName":"","claimRef":{"namespace":"default","name":"fsg"},"local":{"path":"'"$D/mnt/pv/fsg"'"}}}'
+pn_create /api/v1/namespaces/default/persistentvolumeclaims '{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"fsg"},"spec":{"accessModes":["ReadWriteOnce"],"storageClassName":"","resources":{"requests":{"storage":"1Gi"}}}}'
+wait_for "claim fsg never Bound: $(nc_store_get "$STORE" /volumes/default/fsg)" 60 bound fsg
+pn_create /api/v1/namespaces/default/pods '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"fsg"},"spec":{"restartPolicy":"Never","securityContext":{"runAsUser":1500,"fsGroup":4321},"volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"fsg"}}],"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","id","write","/data/new","x","stat","/data","stat","/data/new","stat","/data/old"],"volumeMounts":[{"name":"d","mountPath":"/data"}]}]}}'
+FSG="$CREATED_UID"
+pn_wait_phase "$FSG" Succeeded 120
+expect "the container holds the fsGroup" "$(pn_logs "$FSG" | grep '^uid=')" "uid=1500 gid=0 groups=0,4321"
+expect "uid 1500 writes the claim through the fsGroup" "$(pn_logs "$FSG" | sed -n 's|^write /data/new=||p')" "ok"
+expect "the claim's directory: the fsGroup's, setgid, group-writable" "$(stat -c '%a %g' "$D/mnt/pv/fsg")" "2775 4321"
+expect "what was in it: the fsGroup's, group read and write added" "$(stat -c '%a %g' "$D/mnt/pv/fsg/old")" "664 4321"
+expect "what the container wrote: the fsGroup's (setgid)" "$(sudo -n stat -c '%g' "$D/mnt/pv/fsg/new")" "4321"
+echo "   fsg: $D/mnt/pv/fsg 2775:4321, its old file 664:4321, uid 1500 wrote new (4321)"
+# OnRootMismatch: the root already matches, so what is inside is left as is.
+sudo -n touch "$D/mnt/pv/fsg/later"
+sudo -n chgrp 0 "$D/mnt/pv/fsg/later"
+pn_create /api/v1/namespaces/default/pods '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"fsg2"},"spec":{"restartPolicy":"Never","securityContext":{"runAsUser":1500,"fsGroup":4321,"fsGroupChangePolicy":"OnRootMismatch"},"volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"fsg"}}],"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","stat","/data/later"],"volumeMounts":[{"name":"d","mountPath":"/data"}]}]}}'
+FSG2="$CREATED_UID"
+pn_wait_phase "$FSG2" Succeeded 120
+expect "OnRootMismatch on a matching root leaves its contents" "$(pn_logs "$FSG2" | sed -n 's|^stat /data/later=||p')" "0644 0"
+echo "   fsg2 (OnRootMismatch): the matching root's contents left alone"
+
+echo "== E2E green: claims bound to static volumes, a Deployment's data across a rollout, a StatefulSet's per-ordinal claims across recreation, a claim owned by the Pod's fsGroup =="

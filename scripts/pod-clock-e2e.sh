@@ -278,11 +278,15 @@ for k, v in times.items():
     assert t(v) < set_, (k, v, set_)
 print("   " + ", ".join(f"{k} {v}" for k, v in sorted(times.items())))
 ' "$T_BOOT" "$T_RUN" "$T_SET" || fail "the moments once the clock is trusted: $(pod | head -c 1500)"
+# Every moment of the memory (t0 tr tf trdy ltr ltf). `rs` is no moment: it
+# names the run by the runtime's own `started` stamp, the value the report
+# compares the sandbox's status with, and stays exactly as the runtime said.
+monotonic() { printf '%s' "$1" | tr ';' '\n' | grep -Eq '^(t0|tr|tf|trdy|ltr|ltf)=m'; }
 for _ in $(seq 30); do
   MEM="$(nc_store_get "$STORE" "/~node/node-1/pod-cond/$UIDP")"
-  case "$MEM" in *"=m"*) sleep 1 ;; *) break ;; esac
+  monotonic "$MEM" && sleep 1 || break
 done
-case "$MEM" in *"=m"*) fail "the memory was not rewritten as wall-clock time: '$MEM'" ;; esac
+monotonic "$MEM" && fail "the memory was not rewritten as wall-clock time: '$MEM'"
 echo "   the node's memory, now wall-clock time: ${MEM:0:90}…"
 
 echo "== E2E green: a node with no trusted clock reports its moments as absent, never 1970, and resolves them to when they happened once it has one =="

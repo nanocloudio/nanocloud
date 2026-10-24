@@ -6,7 +6,6 @@
 target: linux
 tick_us: 1000
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -44,11 +43,7 @@ modules:
   # modules/app/_chronicle/scheduler.uproc.
 
 wiring:
-  - from: ns_objects.status
-    to: ns_objects.changes
   - from: ns_objects.record_out
     to: ns_collect.request_in
-  - from: ns_source.status
-    to: ns_source.changes
   - from: ns_source.record_out
     to: ns_remove.request_in

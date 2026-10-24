@@ -100,12 +100,8 @@ modules:
     decision: {hex: "${DEC_FIN}"}
     key_prefix: "/namespaces/"
 wiring:
-  - from: objects.status
-    to: objects.changes
   - from: objects.record_out
     to: collect.request_in
-  - from: namespaces.status
-    to: namespaces.changes
   - from: namespaces.record_out
     to: remove.request_in
 YAML

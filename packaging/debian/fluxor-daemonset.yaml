@@ -6,7 +6,6 @@
 target: linux
 tick_us: 1000
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -65,18 +64,12 @@ modules:
   # highest-first without a budget. Params from modules/app/_chronicle/statefulset.uproc.
 
 wiring:
-  - from: ds_nodes.status
-    to: ds_nodes.changes
   - from: ds_nodes.record_out
     to: ds_mark.request_in
-  - from: ds_source.status
-    to: ds_source.changes
   - from: ds_source.record_out
     to: ds_exists.request_in
   - from: ds_exists.response_out
     to: ds_apply.request_in
-  - from: ds_pods.status
-    to: ds_pods.changes
   - from: ds_pods.record_out
     to: ds_known.request_in
   - from: ds_known.response_out

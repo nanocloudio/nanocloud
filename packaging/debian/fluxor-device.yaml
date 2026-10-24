@@ -50,8 +50,6 @@ modules:
     key_prefix: "/devices.nanocloud.io/"
 
 wiring:
-  - from: dv_source.status
-    to: dv_source.changes
   - from: dv_source.record_out
     to: dv_dec.record_in
   - from: dv_dec.result_out

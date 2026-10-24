@@ -31,6 +31,14 @@ hardware_targets = ["bcm2712", "linux"]
 #             written back conditional on the revision read — and is claimed
 #             by the next pass's `claim`, before anything else is allocated
 #
+# And for every Node, its Pod CIDR, as upstream's node IPAM controller
+# (`--allocate-node-cidrs`) carves it: a block of `node_prefix` bits of
+# `cluster_cidr`, written into `spec.podCIDR` and `spec.podCIDRs` and held by
+# `/ipam/podcidr/<index>` (the block's position, the Node's name as the
+# claim's value) — claimed, released and allocated in the same order. A Node
+# whose podCIDR a renewal did not carry back is given its own claim's block
+# again, never a second one. node_net writes the node's segment from it.
+#
 # A port two Services both name (written so by hand) is claimed by the first
 # and said once for the other; its traffic is the proxy's to merge.
 # A write the store answers EINPROGRESS is asked again, byte-identical, before
@@ -41,12 +49,11 @@ hardware_targets = ["bcm2712", "linux"]
 # |-----|------------|------|-------------|-------------|
 # | 1   | node_ports | str  | 30000-32767 | the NodePort range, `<lo>-<hi>` |
 # | 2   | lb_pool    | str  | (none)      | the load-balancer pool, `<a.b.c.d>/<n>` (its network and broadcast addresses excepted) |
-timer_class = "agnostic"
-
-[[ports]]
-name = "changes"
-direction = "input"
-content_type = "OctetStream"
+# | 3   | cluster_cidr | str | 10.244.0.0/16 | the cluster's Pod CIDR (NANOCLOUD_CLUSTER_CIDR); `none` allocates no Pod CIDRs |
+# | 4   | node_prefix | str  | 24          | the prefix length of each Node's block |
+# Reads the clock only to look again when a subscription was refused or a
+# pass failed.
+timer_class = "wall_clock"
 
 [[ports]]
 name = "status"
@@ -61,5 +68,17 @@ access = "read"
 requires_contract = "storage.object"
 access = "write"
 
+# Both subscriptions ring the module's one kernel event: the store writes no
+# channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
 [observability]
 exempt = "control-plane allocator — one store action per change, not a data path"
+
+# Store subscriptions an instance opens: /services/ and /nodes/ (the second
+# only while Pod CIDRs are allocated), on one kernel event.
+[capacities]
+store_subscriptions = 2
+store_subscribers = 1

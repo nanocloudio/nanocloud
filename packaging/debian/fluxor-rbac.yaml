@@ -259,97 +259,61 @@ modules:
     key_prefix: "/rbac-g/"
 
 wiring:
-  - from: rb_roles.status
-    to: rb_roles.changes
   - from: rb_roles.record_out
     to: rb_roles_e.request_in
-  - from: rb_croles.status
-    to: rb_croles.changes
   - from: rb_croles.record_out
     to: rb_croles_e.request_in
-  - from: rb_rules.status
-    to: rb_rules.changes
   - from: rb_rules.record_out
     to: rb_rules_e.request_in
-  - from: rb_rbs.status
-    to: rb_rbs.changes
   - from: rb_rbs.record_out
     to: rb_rbs_e.request_in
-  - from: rb_crbs.status
-    to: rb_crbs.changes
   - from: rb_crbs.record_out
     to: rb_crbs_e.request_in
-  - from: rb_perms.status
-    to: rb_perms.changes
   - from: rb_perms.record_out
     to: rb_src_e.request_in
   - from: rb_src_e.response_out
     to: rb_g_e.request_in
-  - from: rb_prule.status
-    to: rb_prule.changes
   - from: rb_prule.record_out
     to: rb_prule_get.request_in
   - from: rb_prule_get.response_out
     to: rb_prule_del.request_in
-  - from: rb_pbind.status
-    to: rb_pbind.changes
   - from: rb_pbind.record_out
     to: rb_pbind_get.request_in
   - from: rb_pbind_get.response_out
     to: rb_pbind_del.request_in
-  - from: rb_pperm.status
-    to: rb_pperm.changes
   - from: rb_pperm.record_out
     to: rb_pperm_chk.request_in
   - from: rb_pperm_chk.response_out
     to: rb_pperm_del.request_in
-  - from: rb_aggselsrc.status
-    to: rb_aggselsrc.changes
   - from: rb_aggselsrc.record_out
     to: rb_aggsel.request_in
-  - from: rb_mirrorsrc.status
-    to: rb_mirrorsrc.changes
   - from: rb_mirrorsrc.record_out
     to: rb_mirror.request_in
-  - from: rb_paggsel.status
-    to: rb_paggsel.changes
   - from: rb_paggsel.record_out
     to: rb_paggsel_get.request_in
   - from: rb_paggsel_get.response_out
     to: rb_paggsel_del.request_in
-  - from: rb_pagg.status
-    to: rb_pagg.changes
   - from: rb_pagg.record_out
     to: rb_pagg_get.request_in
   - from: rb_pagg_get.response_out
     to: rb_pagg_del.request_in
-  - from: rb_paggrole.status
-    to: rb_paggrole.changes
   - from: rb_paggrole.record_out
     to: rb_paggrole_chk.request_in
   - from: rb_paggrole_chk.response_out
     to: rb_paggrole_del.request_in
-  - from: rb_pmirror.status
-    to: rb_pmirror.changes
   - from: rb_pmirror.record_out
     to: rb_pmirror_chk.request_in
   - from: rb_pmirror_chk.response_out
     to: rb_pmirror_del.request_in
-  - from: rb_aggsrc.status
-    to: rb_aggsrc.changes
   - from: rb_aggsrc.record_out
     to: rb_aggmap.record_in
   - from: rb_aggmap.result_out
     to: rb_agg.request_in
-  - from: rb_psrc.status
-    to: rb_psrc.changes
   - from: rb_psrc.record_out
     to: rb_psrc_p.request_in
   - from: rb_psrc_p.response_out
     to: rb_psrc_bp.request_in
   - from: rb_psrc_bp.response_out
     to: rb_psrc_del.request_in
-  - from: rb_pg.status
-    to: rb_pg.changes
   - from: rb_pg.record_out
     to: rb_pg_del.request_in

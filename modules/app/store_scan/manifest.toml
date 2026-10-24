@@ -25,18 +25,14 @@ name     = "full"
 features = ["strings", "math", "encoders", "bindings", "doc_heap"]
 default  = true
 
-[[ports]]
-name = "changes"
-direction = "input"
-content_type = "OctetStream"
-
 # record_out is the PRIMARY output: `module_new` hands it over directly, so the
 # hot path never depends on resolving a port by index.
 [[ports]]
 name = "record_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 65536
+# store_source's ring: two records (see its manifest).
+buffer_size = 16384
 max_record = 8192
 required = true
 # NOT declared `framed`. Whether this edge needs mailbox delivery is the
@@ -68,5 +64,18 @@ access = "read"
 requires_contract = "timer"
 access = "write"
 
+# Every subscription rings the module's one kernel event: the store writes
+# no channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
 [observability]
 exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"
+
+# Store subscriptions an instance opens: its prefix plus each uncovered
+# extra watch, as store_source — counted per instance from its `prefix`
+# (tag 1) and `watch` (tag 7) params. One kernel event carries them all.
+[capacities]
+demand_from_params = { pool = "store_subs", tags = [1, 7] }
+store_subscribers = 1

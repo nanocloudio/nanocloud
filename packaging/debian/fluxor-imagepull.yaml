@@ -394,24 +394,16 @@ wiring:
     to: fetch.net_in
   - from: fetch.net_out
     to: linux_net.net_in
-  - from: im_req.status
-    to: im_req.changes
   - from: im_req.record_out
     to: im_qm.request_in
-  - from: im_cfg.status
-    to: im_cfg.changes
   - from: im_cfg.record_out
     to: im_qc.request_in
-  - from: im_lay.status
-    to: im_lay.changes
   - from: im_lay.record_out
     to: im_lm.request_in
   - from: im_lm.response_out
     to: im_le.request_in
   - from: im_le.response_out
     to: im_lr.request_in
-  - from: im_q.status
-    to: im_q.changes
   - from: im_q.record_out
     to: im_fq.record_in
   - from: im_fq.result_out
@@ -424,8 +416,6 @@ wiring:
     to: im_bo.request_in
   - from: im_bo.response_out
     to: im_bf.request_in
-  - from: im_ps.status
-    to: im_ps.changes
   - from: im_ps.record_out
     to: im_pa1.request_in
   - from: im_pa1.response_out
@@ -436,8 +426,6 @@ wiring:
     to: im_pa4.request_in
   - from: im_pa4.response_out
     to: im_pa5.request_in
-  - from: im_asm.status
-    to: im_asm.changes
   - from: im_asm.record_out
     to: im_as1.request_in
   - from: im_as1.response_out
@@ -446,12 +434,8 @@ wiring:
     to: im_as3.request_in
   - from: im_as3.response_out
     to: im_as4.request_in
-  - from: im_aretry.status
-    to: im_aretry.changes
   - from: im_aretry.record_out
     to: im_ar.request_in
-  - from: im_hsrc.status
-    to: im_hsrc.changes
   - from: im_hsrc.record_out
     to: im_h1.request_in
   - from: im_h1.response_out
@@ -462,16 +446,12 @@ wiring:
     to: im_h4.request_in
   - from: im_h4.response_out
     to: im_h5.request_in
-  - from: im_gu.status
-    to: im_gu.changes
   - from: im_gu.record_out
     to: im_gu1.request_in
   - from: im_gu1.response_out
     to: im_gu2.request_in
   - from: im_gu2.response_out
     to: im_gu3.request_in
-  - from: im_gc.status
-    to: im_gc.changes
   - from: im_gc.record_out
     to: im_gc1.request_in
   - from: im_gc1.response_out
@@ -480,8 +460,6 @@ wiring:
     to: im_gc3.request_in
   - from: im_gc3.response_out
     to: im_gc4.request_in
-  - from: im_gd.status
-    to: im_gd.changes
   - from: im_gd.record_out
     to: im_gd1.request_in
   - from: im_gd1.response_out
@@ -496,16 +474,12 @@ wiring:
     to: im_rm.request_in
   - from: im_rm.response_out
     to: im_gd6.request_in
-  - from: im_gj.status
-    to: im_gj.changes
   - from: im_gj.record_out
     to: im_gj1.request_in
   - from: im_gj1.response_out
     to: im_gj2.request_in
   - from: im_gj2.response_out
     to: im_gj3.request_in
-  - from: im_gl.status
-    to: im_gl.changes
   - from: im_gl.record_out
     to: im_gl1.request_in
   - from: im_gl1.response_out

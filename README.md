@@ -322,15 +322,27 @@ and what is not yet:
   the Pod's; a `runAsGroup` alone keeps the image's uid), else the image's
   `User` (`uid[:gid]`, or a name in the image's own `/etc/passwd` and
   `/etc/group`). `runAsNonRoot` refuses a root user, and an image user given
-  as a name it cannot verify (CreateContainerConfigError).
+  as a name it cannot verify (CreateContainerConfigError). The Pod's
+  `fsGroup` and `supplementalGroups` are the process's supplementary groups,
+  with the image's `/etc/group` memberships (`supplementalGroupsPolicy`
+  Merge, the default) or without them (Strict); `readOnlyRootFilesystem`
+  makes the container's root read-only, its volumes keeping their own access.
 - **Volumes** (`volumes` + `volumeMounts`, `readOnly`): a
   PersistentVolumeClaim (an encrypted Loam volume once attached and mounted on
   the node, or a statically provisioned `hostPath`/`local` PersistentVolume
   bound to it by `claimRef` or `volumeName`); an `emptyDir` (the Pod's own
   directory on its node, kept across its containers' restarts, removed with
   the Pod); a `configMap` or `secret` (each key a file, or `items` at their
-  paths, `defaultMode`/`mode`, `optional`, read-only); a `hostPath` (refused
-  under the namespace's Pod Security level `baseline` or `restricted`). A
+  paths, `defaultMode`/`mode`, `optional`, read-only; written as upstream's
+  AtomicWriter writes them, so an update to the object reaches a running
+  container whole; a Secret's files on a memory filesystem); a `downwardAPI`
+  volume (`fieldRef`, the labels and annotations maps, `resourceFieldRef`)
+  and a `projected` one (ConfigMap, Secret and downward-API sources, on a
+  memory filesystem); a `hostPath` (refused
+  under the namespace's Pod Security level `baseline` or `restricted`). With
+  the Pod's `fsGroup` an emptyDir, a claim it may write (under the node's
+  mount root) and the projected files are group-owned by it
+  (`fsGroupChangePolicy` Always or OnRootMismatch). A
   StatefulSet's `volumeClaimTemplates` give each ordinal its own claim,
   `<template>-<pod>`, created once and kept across the Pod's recreations.
 - **DNS**: `/etc/resolv.conf` by `dnsPolicy` (ClusterFirst: the cluster DNS,
@@ -394,12 +406,13 @@ and what is not yet:
 
 Not implemented yet: `grpc` and HTTPS `httpGet` probes (not run: a Pod
 declaring only those is Ready while it runs, never restarted by a probe);
-`securityContext.readOnlyRootFilesystem`, `supplementalGroups` and
-`privileged` (the node's runtime cannot give them: such a container is
-refused, CreateContainerConfigError, never run without them); `fsGroup`,
+`securityContext.privileged` (the node's runtime cannot give it: such a
+container is refused, CreateContainerConfigError, never run without it);
 capabilities, `allowPrivilegeEscalation` and seccomp (not applied);
-`subPath`, `downwardAPI` and `projected` volumes (refused); a ConfigMap or
-Secret volume is projected when its container starts, not updated in place;
+`subPath` and the `serviceAccountToken`, `clusterTrustBundle` and
+`podCertificate` projected sources (refused); a runtime that cannot give
+groups or a read-only root (unprivileged) fails such a container rather than
+run it without them;
 `containerStatuses` and `initContainerStatuses` for containers past the
 first (the Pod's phase and its one status entry are the first app
 container's); rolling a StatefulSet's or DaemonSet's Pods to a changed
@@ -430,12 +443,14 @@ it in its own kernel:
   `_<port>._<proto>.<svc>.<ns>.svc.cluster.local` the SRV of a named port
   (headless: one per backend, at `<a-b-c-d>.<svc>.<ns>.svc.cluster.local`,
   which resolves); every other name is forwarded to the node's own resolver.
-  The resolver's address is kept at `/cluster-dns`.
+  It is fronted by a ClusterIP Service, `kube-system/kube-dns`
+  (10.96.0.10 by default, `NANOCLOUD_DNS_SERVICE_IP`), whose address is kept
+  at `/cluster-dns`: what every Pod's resolv.conf names, translated by each
+  node's proxy to the resolver.
 - **NetworkPolicy** (`podSelector`, `namespaceSelector`, `ipBlock` with
   `except`, ports, both directions) computed on the control plane and
-  enforced by each node — opt-in, `NANOCLOUD_NETPOLICY=1` in cluster.env: a
-  single node that also pulls images may not hold its chain in the runtime's
-  config arena.
+  enforced by every node that runs Pods (on by default;
+  `NANOCLOUD_NETPOLICY=0` in cluster.env leaves it out).
 - **`kubectl logs`** (`--tail`, `--limit-bytes`) for a Pod on any node: its
   node's record of the Pod's output. `-f` answers what is recorded and ends;
   it does not stream: the node keeps a Pod's output as a bounded tail with

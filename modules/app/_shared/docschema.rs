@@ -376,6 +376,9 @@ fn sch_view_patch(
 //   event=<tpl>       one change: {{type}}, {{object}} (the object streams in
 //                     chunks between the parts before and after it)
 //   expired=<json>    the event a watch past its history ends with
+//   failed=<json>     what a watch, list or get the store refused ends with:
+//                     a watch's last ERROR event's object, a list's or a
+//                     get's whole body
 //   bookmark=<tpl>    a bookmark's object: {{kind}}, {{av}}, {{rv}}
 //   list.tail=<tpl>   what closes a list: {{rv}}, {{continue}}
 

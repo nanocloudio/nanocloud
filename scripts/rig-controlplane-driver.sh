@@ -62,6 +62,12 @@ join() {
 # nothing else is listening.
 listen() {
   [ -n "$LISTENER" ] && return
+  # The run captures until its verdict, which can land after the steps
+  # before this one: wait for it to let go of the port (its timeout_s).
+  for i in $(seq 300); do
+    python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 6666))' 2>/dev/null && break
+    sleep 2
+  done
   python3 -u - "$TLOG" <<'PY' &
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

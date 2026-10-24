@@ -59,6 +59,11 @@ strip --strip-debug "${STAGING_ROOT}/usr/bin/fluxor" \
 # `nanocloud` is a busybox multi-call symlink to fluxor: argv[0]=nanocloud →
 # `fluxor exec nanocloud` (the nanocloud_cli applet fmod).
 ln -sf fluxor "${STAGING_ROOT}/usr/bin/nanocloud"
+# The runtime by a fixed name, for what calls it outside `fluxor run`: the
+# unit's post-stop reclaim (`ExecStopPost=+/usr/bin/fluxor-linux reclaim`)
+# names no target triple.
+ln -sf "../lib/nanocloud/fluxor/target/${FLUXOR_TARGET}/release/fluxor-linux" \
+    "${STAGING_ROOT}/usr/bin/fluxor-linux"
 
 echo "==> Staging the fluxor project (palette fmods + scaffolding)"
 mkdir -p "${FXROOT}/target/fluxor/${MODULE_ABI}/modules"
@@ -108,10 +113,10 @@ install -Dm644 "${SCRIPT_DIR}/nanocloud.default" "${STAGING_ROOT}/etc/default/na
 
 # The `nanocloud` CLI applet bundle source (postinst runs `fluxor install`) + the
 # profile snippet that points interactive shells at the system applet registry.
-install -Dm644 "${REPO_ROOT}/packaging/cli/workload.toml" "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/app.fluxor.toml"
+install -Dm644 "${SCRIPT_DIR}/fluxor-cli-app.fluxor.toml" "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/app.fluxor.toml"
 # The applet's graph is a template (this node's replica): postinst renders
 # linux.yaml from it before installing the applet.
-install -Dm644 "${REPO_ROOT}/packaging/cli/linux.yaml"       "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/linux.yaml.in"
+install -Dm644 "${SCRIPT_DIR}/fluxor-cli.yaml"           "${STAGING_ROOT}/usr/share/nanocloud/fluxor/cli/linux.yaml.in"
 install -Dm644 "${SCRIPT_DIR}/nanocloud-profile.sh"       "${STAGING_ROOT}/etc/profile.d/nanocloud.sh"
 
 # The image-assembly effect script: run as a host workload by the sandbox runtime

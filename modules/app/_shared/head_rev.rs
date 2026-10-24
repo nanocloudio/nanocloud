@@ -7,32 +7,46 @@
 // It also carries [`Got`], the answer of every live read, because both halves
 // read through it.
 
-/// What a live storage read answered: the value, its absence, or not yet.
+/// What a live storage read answered: the value, its absence, not yet, or
+/// a refusal that is final.
 ///
-/// `storage.object` lets `GET`, `HEAD` and `RANGE_GET` answer `EAGAIN` while
-/// the value is not available yet (a board store whose device is busy with a
-/// write, or a store still recovering), and `storage.namespace` providers
-/// answer `LIST` and an initial-listing `SUBSCRIBE` the same way. That is
-/// "ask again", never "absent": a reader that folds it into absence answers
-/// NotFound for a key it has just written. So is any other refusal that is
-/// not `ENXIO`/`ENOENT` ([`refused`]). A `match` on a `Got` has to say
-/// what it does with [`Got::Pending`], which is the point.
+/// The storage contract has one way to say "not yet": `storage.object`
+/// lets `GET`, `HEAD` and `RANGE_GET` answer `EAGAIN` while the value is
+/// not available yet (a board store whose device is busy with a write, or
+/// a store still recovering), and `storage.namespace` providers answer
+/// `LIST` and an initial-listing `SUBSCRIBE` the same way; a provider whose
+/// single slot is taken answers `EBUSY`, and the write path's `EINPROGRESS`
+/// is the same statement ([`not_yet`]). That is "ask again", never
+/// "absent": a reader that folds it into absence answers NotFound for a key
+/// it has just written.
+///
+/// Every other refusal is the provider's DECISION: `ENOSYS` (the op is not
+/// served — a graph whose module lacks the contract), `EACCES`, `EINVAL`,
+/// `EIO`, … Asking again gets the same answer for ever, so it is never
+/// waited on: it is [`Got::Refused`], which the caller answers as a failure
+/// — never as absence, which would answer NotFound for a record that is
+/// there. A `match` on a `Got` has to say what it does with each, which is
+/// the point.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Got<T> {
     Found(T),
-    /// Absent, or refused (a value past the reader's buffer, a malformed
-    /// answer): decided, and not worth asking again this pass.
+    /// Absent (`ENXIO`/`ENOENT`), or refused for the reader's own reason (a
+    /// value past its buffer, a malformed answer): decided, and not worth
+    /// asking again this pass.
     Absent,
-    /// `EAGAIN`, or any refusal that is not the contract's absence
-    /// ([`refused`]): not decided. Asked again on a later step; nothing may be
-    /// concluded from it.
+    /// The contract's "not yet" ([`not_yet`]): not decided. Asked again on a
+    /// later step; nothing may be concluded from it.
     Pending,
+    /// The store refused the read with this errno, and will again: decided,
+    /// and neither absence nor a value. The caller fails what it was doing
+    /// and answers that failure.
+    Refused(i32),
 }
 
 impl<T> Got<T> {
-    /// The value, `None` for both other answers: only for a caller that has
-    /// already handled [`Got::Pending`].
+    /// The value, `None` for every other answer: only for a caller that has
+    /// already handled [`Got::Pending`] and [`Got::Refused`].
     fn found(self) -> Option<T> {
         match self {
             Got::Found(v) => Some(v),
@@ -41,20 +55,28 @@ impl<T> Got<T> {
     }
 }
 
-/// `EAGAIN` from a read: ask again.
-const READ_WAIT: i32 = abi::kernel_abi::errno::EAGAIN;
+/// Whether `rc` is the storage contract's "not yet": `EAGAIN` (a read, a
+/// listing or a subscription that cannot be answered yet), `EINPROGRESS` (a
+/// request taken and not yet decided) or `EBUSY` (the provider's slot for
+/// it is taken until an earlier request finishes). Each is asked again on a
+/// later step; every other refusal is final.
+fn not_yet(rc: i32) -> bool {
+    rc == abi::kernel_abi::errno::EAGAIN
+        || rc == abi::kernel_abi::errno::EINPROGRESS
+        || rc == abi::kernel_abi::errno::EBUSY
+}
 
 /// What a refused read means. Only the contract's absence — `ENXIO` (an
 /// absent key, as storage.object answers it) or `ENOENT` (a file-backed
-/// provider) — is absence. Any other refusal is undecided and asked again
-/// on a later step: an error is not evidence that a key is missing (a busy
-/// store has answered a HEAD `-1`), and folding it into absence answers
-/// NotFound for a record that is there.
+/// provider) — is absence; the contract's "not yet" ([`not_yet`]) is asked
+/// again; any other refusal is final ([`Got::Refused`]).
 fn refused<T>(rc: i32) -> Got<T> {
     if rc == abi::kernel_abi::errno::ENXIO || rc == abi::kernel_abi::errno::ENOENT {
         Got::Absent
-    } else {
+    } else if not_yet(rc) {
         Got::Pending
+    } else {
+        Got::Refused(rc)
     }
 }
 
@@ -62,11 +84,11 @@ fn refused<T>(rc: i32) -> Got<T> {
 const REFUSAL_SAY_MS: u64 = 10_000;
 
 /// When this module last said a refused read, and how many refusals it has
-/// kept quiet since. A store that keeps refusing is asked again every step,
-/// so saying each refusal would be a log storm; saying none hides a broken
-/// store behind reads that never end. Kept in the module's state (all zero
-/// is a fresh one) because a [`Got::Pending`] read is asked again on a later
-/// step, by a pass that is new.
+/// kept quiet since. A module that meets a refusing store fails that pass,
+/// and a reconciler runs its pass again on its next trigger, which may be
+/// every step: saying each refusal would be a log storm, and saying none
+/// hides a broken store behind passes that never succeed. Kept in the
+/// module's state (all zero is a fresh one) because each pass is new.
 struct ReadNag {
     said_ms: core::cell::Cell<u64>,
     said: core::cell::Cell<bool>,
@@ -131,19 +153,32 @@ unsafe fn say_past_buffer(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) {
     dev_log(sys, 1, b.as_ptr(), n);
 }
 
-/// A read the store refused with `rc`, as [`refused`] classifies it. An
-/// undecided refusal that is not `EAGAIN` (the contract's "not yet") is a
-/// store answering out of contract: said at ERROR — the module, the op, the
-/// key and the errno — at most once per [`REFUSAL_SAY_MS`] per module.
+/// A read the store refused with `rc`, as [`refused`] classifies it. A
+/// final refusal is said at ERROR — the module, the op, the key and the
+/// errno — at most once per [`REFUSAL_SAY_MS`] per module; absence and the
+/// contract's "not yet" are not refusals to say.
 unsafe fn refusal<T>(sys: &SyscallTable, nag: &ReadNag, op: &[u8], key: &[u8], rc: i32) -> Got<T> {
     let got = refused(rc);
-    if matches!(got, Got::Pending) && rc != READ_WAIT {
+    if matches!(got, Got::Refused(_)) {
         say_refused(sys, nag, op, key, rc);
     }
     got
 }
 
-/// Say a refused read at ERROR, rate-limited by `nag` ([`refusal`]).
+/// A `RANGE_GET` of an open handle refused with `rc`: the contract's "not
+/// yet" is [`Got::Pending`] (the handle is closed and the whole read asked
+/// again later); anything else is [`Got::Refused`], said at ERROR — the
+/// handle names a value, so not even `ENXIO`/`ENOENT` is absence here.
+unsafe fn range_refused<T>(sys: &SyscallTable, nag: &ReadNag, key: &[u8], rc: i32) -> Got<T> {
+    if not_yet(rc) {
+        return Got::Pending;
+    }
+    say_refused(sys, nag, b"RANGE_GET", key, rc);
+    Got::Refused(rc)
+}
+
+/// Say a read refused for good at ERROR, rate-limited by `nag`
+/// ([`refusal`]).
 unsafe fn say_refused(sys: &SyscallTable, nag: &ReadNag, op: &[u8], key: &[u8], rc: i32) {
     let now = dev_millis(sys);
     if nag.said.get() && now.wrapping_sub(nag.said_ms.get()) < REFUSAL_SAY_MS {
@@ -180,7 +215,7 @@ unsafe fn say_refused(sys: &SyscallTable, nag: &ReadNag, op: &[u8], key: &[u8], 
         put(b"-");
     }
     put(nag_digits(u64::from(rc.unsigned_abs()), &mut d));
-    put(b": undecided, NOT absent - asked again on a later step (");
+    put(b": final, NOT absent - what read it FAILS, and is not asked again (");
     put(nag_digits(u64::from(quiet), &mut d));
     put(b" more refused since the last said)");
     dev_log(sys, 1, b.as_ptr(), n);
@@ -204,7 +239,8 @@ fn nag_digits(mut v: u64, d: &mut [u8; 20]) -> &[u8] {
 
 /// storage.object HEAD — the key's current revision (the etag's first eight
 /// bytes), [`Got::Absent`] when the key is absent (`ENXIO`/`ENOENT`),
-/// [`Got::Pending`] for any other refusal ([`refusal`]). The opcode is local because only a
+/// [`Got::Pending`] while the store cannot answer yet and [`Got::Refused`]
+/// for any other refusal ([`refusal`]). The opcode is local because only a
 /// conditional writer needs it, and the fragment's contract is that an
 /// including module names only the opcodes every module shares.
 unsafe fn head_rev(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<u64> {

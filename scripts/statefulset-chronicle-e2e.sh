@@ -92,8 +92,6 @@ modules:
     decision: {hex: "${DEC_ACT}"}
     key_prefix: "/pods/"
 wiring:
-  - from: store_source.status
-    to: store_source.changes
   - from: store_source.record_out
     to: nbget.request_in
   - from: nbget.response_out

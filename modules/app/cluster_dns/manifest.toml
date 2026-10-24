@@ -36,6 +36,18 @@ hardware_targets = ["bcm2712", "linux"]
 # kept at `/cluster-dns` once the port is bound — the nameserver a Pod's
 # resolv.conf names (`_shared/poddns.rs`).
 #
+# With `service_ip` too, it is fronted by a ClusterIP Service, as Kubernetes
+# fronts its DNS: `kube-system/kube-dns` (no selector; UDP 53 to `port`), its
+# address claimed in the Service pool (`/ipam/svc/<u32>`, create-only, owned
+# as the allocator owns one — never another Service's), its one endpoint
+# this resolver (`/endpointslices/kube-system/kube-dns/cluster-dns-<a-b-c-d>`
+# = `address`), and `/cluster-dns` is then the ClusterIP: every node's proxy
+# translates it to this resolver, so a Pod on any node (and a workload that
+# reaches the cluster only through service translation) resolves through
+# it. Written once each, put-if-changed. When the address is another
+# Service's, nothing is published, `/cluster-dns` is `address`, and the log
+# says so.
+#
 # A read the store answers EAGAIN holds the query and asks again on a later
 # step — never answered as absent.
 timer_class = "wall_clock"
@@ -54,9 +66,11 @@ content_type = "NetProto"
 buffer_size = 16384
 required = true
 
+# Read: the Services and Endpoints answered. Written: `/cluster-dns`, and
+# the kube-dns Service, its claim and its endpoint (`service_ip`).
 [[resources]]
 requires_contract = "storage.object"
-access = "read"
+access = "write"
 
 [observability]
 exempt = "control-plane resolver — discrete queries answered from the store, not a sustained byte data path"

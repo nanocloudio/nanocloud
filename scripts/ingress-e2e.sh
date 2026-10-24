@@ -151,8 +151,6 @@ wiring:
   - from: http.net_out
     to: tls.clear_in
     buffer_bytes: 32768
-  - from: http.routes_sink
-    to: http.routes_changes
 YAML
 
 echo "== 4. seed the compiled Route → /dataplane/edge/ row =="

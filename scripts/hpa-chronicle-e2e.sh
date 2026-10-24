@@ -141,8 +141,6 @@ modules:
     decision: {hex: "${DEC_SA}"}
     key_prefix: "/synth/"
 wiring:
-  - from: hpas.status
-    to: hpas.changes
   - from: hpas.record_out
     to: depget.request_in
   - from: depget.response_out
@@ -153,8 +151,6 @@ wiring:
     to: stab.record_in
   - from: stab.result_out
     to: patch.request_in
-  - from: synth.status
-    to: synth.changes
   - from: synth.record_out
     to: synth_put.request_in
   - from: synth_put.response_out

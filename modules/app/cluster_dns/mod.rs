@@ -31,14 +31,18 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 2048;
 
 const MAX_PARAM: usize = 64;
 /// Where this resolver's address is kept for the Pods' resolv.conf.
 const CLUSTER_DNS_KEY: &[u8] = b"/cluster-dns";
+/// The Service fronting it (`service_ip`), as Kubernetes names it.
+const DNS_NS_KEY: &[u8] = b"/namespaces/kube-system";
+const DNS_SVC_KEY: &[u8] = b"/services/kube-system/kube-dns";
+const DNS_SLICE_PREFIX: &[u8] = b"/endpointslices/kube-system/kube-dns/cluster-dns-";
+const DNS_CLAIM_PREFIX: &[u8] = b"/ipam/svc/";
+const DNS_OWNER: &[u8] = b"owner=kube-system/kube-dns;ip=";
 /// The classic UDP ceiling: a query or an answer past it is not served.
 const DNS_MAX: usize = 512;
 const DNS_HDR: usize = 12;
@@ -141,6 +145,8 @@ struct SvcInfo {
 enum Lookup {
     /// The store has not answered yet: held, asked again.
     Wait,
+    /// The store refused the read for good: answered SERVFAIL, never held.
+    Failed,
     /// No such name.
     None,
     /// The name, with these addresses (possibly none).
@@ -183,7 +189,27 @@ struct State {
     address: [u8; 16],
     address_len: u8,
     address_owed: u8,
+    /// The ClusterIP of the Service fronting this resolver (`service_ip`):
+    /// what Pods name instead of `address` once published (`Publish`).
+    service_ip: [u8; 16],
+    service_ip_len: u8,
+    /// How far the Service's publication has come (`PUB_*`).
+    publish: u8,
 }
+
+/// The Service's publication, in order: each step a write asked until the
+/// store decides it, then the next.
+const PUB_NS: u8 = 0;
+/// The ClusterIP's claim read first: another Service's, and nothing is
+/// written. (The Service is written before the claim: the claims' release
+/// frees a claim whose owner it cannot find.)
+const PUB_CHECK: u8 = 1;
+const PUB_SVC: u8 = 2;
+const PUB_CLAIM: u8 = 3;
+const PUB_SLICE: u8 = 4;
+/// Done, or given up (the address is another Service's): `/cluster-dns`
+/// says whichever this resolver is reached at.
+const PUB_DONE: u8 = 5;
 
 mod params_def {
     use super::p_u16;
@@ -224,6 +250,13 @@ mod params_def {
                 let n = if len > 16 { 0 } else { len };
                 s.address_len = n as u8;
                 if n > 0 { ptr_copy(s.address.as_mut_ptr(), d, n); }
+            };
+
+        7, service_ip, str, 0
+            => |s, d, len| {
+                let n = if len > 16 { 0 } else { len };
+                s.service_ip_len = n as u8;
+                if n > 0 { ptr_copy(s.service_ip.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -483,6 +516,7 @@ unsafe fn load(s: &mut State, svc: &[u8], ns: &[u8]) -> Lookup {
     };
     let n = match get_value_live(sys, &s.nag, &key[..p], &mut s.doc) {
         Got::Pending => return Lookup::Wait,
+        Got::Refused(_) => return Lookup::Failed,
         Got::Absent => return Lookup::None,
         Got::Found(n) => n,
     };
@@ -549,6 +583,7 @@ unsafe fn backends(s: &mut State, svc: &[u8], ns: &[u8]) -> Lookup {
     };
     let n = match get_value_live(sys, &s.nag, &key[..p], &mut s.doc) {
         Got::Pending => return Lookup::Wait,
+        Got::Refused(_) => return Lookup::Failed,
         Got::Absent => return Lookup::Addrs(0),
         Got::Found(n) => n,
     };
@@ -731,6 +766,11 @@ unsafe fn query(s: &mut State, ip: u32, port: u16, pkt: &[u8]) -> bool {
     let (sv, nv) = (&sv[..svc.len()], &nv[..ns.len()]);
     match load(s, sv, nv) {
         Lookup::Wait => return false,
+        Lookup::Failed => {
+            let n = answer(&mut s.out, pkt, qend, RC_SERVFAIL, false, &[], 0);
+            reply(s, ip, port, n);
+            return true;
+        }
         Lookup::None => {
             let n = answer(&mut s.out, pkt, qend, RC_NXDOMAIN, true, &[], ttl);
             reply(s, ip, port, n);
@@ -743,6 +783,11 @@ unsafe fn query(s: &mut State, ip: u32, port: u16, pkt: &[u8]) -> bool {
     if kind == K_HEADLESS && (pod || srv || qt == T_A || qt == T_ANY) {
         match backends(s, sv, nv) {
             Lookup::Wait => return false,
+            Lookup::Failed => {
+                let n = answer(&mut s.out, pkt, qend, RC_SERVFAIL, false, &[], 0);
+                reply(s, ip, port, n);
+                return true;
+            }
             Lookup::Addrs(n) => k = n,
             Lookup::None => {}
         }
@@ -871,6 +916,184 @@ unsafe fn hold(s: &mut State, ip: u32, port: u16, pkt: &[u8]) {
 
 // ---- module ABI ----
 
+/// What making a key hold a value came to.
+enum Ensured {
+    /// It holds it (written now, or already).
+    Done,
+    /// Not decided yet: asked again next step, byte-identical.
+    Wait,
+    /// Create-only and the key exists with another value: its length (in
+    /// the caller's scratch, `cur`).
+    Taken(usize),
+    /// Refused for good.
+    Failed,
+}
+
+/// Make `key` hold `val`: read, and write only when it differs —
+/// create-only (`ABSENT`) when `create`, so a key another writer holds is
+/// never overwritten (answered [`Ensured::Taken`]).
+unsafe fn ensure(store: &Store, key: &[u8], val: &[u8], create: bool) -> Ensured {
+    let mut cur = [0u8; 512];
+    let held = get_value(store, key, &mut cur);
+    if store.refusal().is_some() {
+        return Ensured::Failed;
+    }
+    if store.waiting() {
+        return Ensured::Wait;
+    }
+    if let Some(n) = held {
+        if cur.get(..n) == Some(val) {
+            return Ensured::Done;
+        }
+        if create {
+            return Ensured::Taken(n);
+        }
+    }
+    let a = if create {
+        put_cond(store, key, val, PRE_ABSENT, 0)
+    } else {
+        put_value(store, key, val)
+    };
+    match a {
+        WriteAnswer::Pending => Ensured::Wait,
+        WriteAnswer::Decided(rc) if not_yet(rc) => Ensured::Wait,
+        WriteAnswer::Decided(0) => Ensured::Done,
+        // Lost to a writer between the read and the create: read again.
+        WriteAnswer::Decided(ERR_EEXIST) => Ensured::Wait,
+        WriteAnswer::Decided(_) => Ensured::Failed,
+    }
+}
+
+/// The digits of `v`, at `at`.
+fn put_num(out: &mut [u8], at: usize, v: u32) -> usize {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    let mut u = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    append(out, at, tmp.get(i..).unwrap_or(&[]))
+}
+
+/// One step of the Service's publication (kube-dns style): the
+/// `kube-system` namespace; a read of the claim on its ClusterIP in the
+/// Service pool (another Service's, and nothing is published); the Service
+/// itself (UDP 53 to this resolver's port); the claim (create-only, owned as
+/// the allocator owns one, so no other Service is given the address); its one
+/// endpoint (this resolver's address — a Service without a selector, so the
+/// endpoints chain leaves it be); and then `/cluster-dns`, its ClusterIP.
+unsafe fn publish(s: &mut State, sys: &SyscallTable) {
+    let store = Store::plain(sys, &s.nag);
+    let sl = s.service_ip_len as usize;
+    let al = s.address_len as usize;
+    let mut sip_b = [0u8; 16];
+    let mut adr_b = [0u8; 16];
+    for (d, &c) in sip_b.iter_mut().zip(s.service_ip[..sl.min(16)].iter()) {
+        *d = c;
+    }
+    for (d, &c) in adr_b.iter_mut().zip(s.address[..al.min(16)].iter()) {
+        *d = c;
+    }
+    let sip = sip_b.get(..sl).unwrap_or(&[]);
+    let adr = adr_b.get(..al).unwrap_or(&[]);
+    let sip_n = parse_ip4(sip).unwrap_or(0);
+    let mut key = [0u8; 96];
+    let mut val = [0u8; 512];
+    let (kl, vl, create) = match s.publish {
+        PUB_NS => {
+            let v = b"{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"kube-system\"}}";
+            (
+                append(&mut key, 0, DNS_NS_KEY),
+                append(&mut val, 0, v),
+                true,
+            )
+        }
+        PUB_CHECK | PUB_CLAIM => {
+            let k = append(&mut key, 0, DNS_CLAIM_PREFIX);
+            let k = put_num(&mut key, k, sip_n);
+            let v = append(&mut val, 0, DNS_OWNER);
+            (k, put_num(&mut val, v, sip_n), true)
+        }
+        PUB_SVC => {
+            let v = append(&mut val, 0, b"{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"name\":\"kube-dns\",\"namespace\":\"kube-system\",\"labels\":{\"k8s-app\":\"kube-dns\",\"kubernetes.io/cluster-service\":\"true\",\"kubernetes.io/name\":\"KubeDNS\"}},\"spec\":{\"type\":\"ClusterIP\",\"clusterIP\":\"");
+            let v = append(&mut val, v, sip);
+            let v = append(&mut val, v, b"\",\"clusterIPs\":[\"");
+            let v = append(&mut val, v, sip);
+            let v = append(&mut val, v, b"\"],\"ports\":[{\"name\":\"dns\",\"protocol\":\"UDP\",\"port\":53,\"targetPort\":");
+            let v = put_num(&mut val, v, u32::from(s.port));
+            let v = append(&mut val, v, b"}]}}");
+            (append(&mut key, 0, DNS_SVC_KEY), v, false)
+        }
+        PUB_SLICE => {
+            // One endpoint per resolver, named by its address: a cluster of
+            // several control planes has as many.
+            let mut k = append(&mut key, 0, DNS_SLICE_PREFIX);
+            for &c in adr {
+                k = append(
+                    &mut key,
+                    k,
+                    if c == b'.' {
+                        &b"-"[..]
+                    } else {
+                        core::slice::from_ref(&c)
+                    },
+                );
+            }
+            (k, append(&mut val, 0, adr), false)
+        }
+        _ => {
+            s.publish = PUB_DONE;
+            return;
+        }
+    };
+    let k = key.get(..kl).unwrap_or(&[]);
+    let v = val.get(..vl).unwrap_or(&[]);
+    if s.publish == PUB_CHECK {
+        // Read only: absent or ours goes on; another owner's is `Taken`.
+        let mut cur = [0u8; 128];
+        let held = get_value(&store, k, &mut cur);
+        if store.waiting() {
+            return;
+        }
+        let theirs =
+            store.refusal().is_none() && matches!(held, Some(n) if cur.get(..n) != Some(v));
+        if !theirs {
+            s.publish += 1;
+            return;
+        }
+    }
+    let answer = if s.publish == PUB_CHECK {
+        Ensured::Taken(0)
+    } else {
+        ensure(&store, k, v, create)
+    };
+    match answer {
+        Ensured::Wait => {}
+        Ensured::Done => s.publish += 1,
+        Ensured::Taken(_) if s.publish == PUB_NS => s.publish += 1,
+        Ensured::Taken(_) => {
+            // The ClusterIP is another Service's: Pods are given this
+            // resolver's own address instead, and the gap is said.
+            let m = b"[cluster_dns] ERROR service_ip is claimed by another Service - kube-dns is NOT published; Pods name the resolver's own address";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            s.service_ip_len = 0;
+            s.publish = PUB_DONE;
+        }
+        Ensured::Failed => {
+            let m = b"[cluster_dns] ERROR the store refused a write of the kube-dns Service - Pods name the resolver's own address";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            s.service_ip_len = 0;
+            s.publish = PUB_DONE;
+        }
+    }
+    // Past the endpoint (PUB_DONE): `/cluster-dns` next, as its ClusterIP.
+}
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
@@ -921,6 +1144,8 @@ pub unsafe extern "C" fn module_new(
         s.forwarded = 0;
         s.refused_said = 0;
         s.address_len = 0;
+        s.service_ip_len = 0;
+        s.publish = PUB_DONE;
         s.svc = SvcInfo {
             kind: 0,
             cip: 0,
@@ -943,6 +1168,18 @@ pub unsafe extern "C" fn module_new(
         }
         let al = s.address_len as usize;
         s.address_owed = (al > 0 && parse_ip4(&s.address[..al]).is_some()) as u8;
+        let sl = s.service_ip_len as usize;
+        if sl > 0 {
+            if parse_ip4(&s.service_ip[..sl]).is_none() {
+                let m = b"[cluster_dns] FAULT: `service_ip` is not an IPv4 address";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -3;
+            }
+            // The Service needs where it leads: this resolver's address.
+            if s.address_owed != 0 {
+                s.publish = PUB_NS;
+            }
+        }
         let ul = s.upstream_txt_len as usize;
         if ul > 0 {
             match parse_ip4(&s.upstream_txt[..ul]) {
@@ -979,18 +1216,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 .poll_bind(sys, s.net_out, 0, s.net_buf.as_mut_ptr(), NET_BUF);
         }
 
-        // `/cluster-dns`: this resolver's address, once serving.
-        if s.address_owed != 0 && s.server.is_ready() {
-            let store = Store::plain(sys, &s.nag);
-            let al = s.address_len as usize;
-            let mut cur = [0u8; 16];
-            let held = get_value(&store, CLUSTER_DNS_KEY, &mut cur);
-            if !store.waiting()
-                && (held.map(|n| &cur[..n]) == Some(&s.address[..al])
-                    || put_value(&store, CLUSTER_DNS_KEY, &s.address[..al])
-                        == WriteAnswer::Decided(0))
-            {
-                s.address_owed = 0;
+        // `/cluster-dns`: where Pods reach this resolver, once serving — the
+        // ClusterIP of the Service fronting it, published first, or (no
+        // `service_ip`, or that address another Service's) its own address.
+        if s.server.is_ready() {
+            if s.publish != PUB_DONE {
+                publish(s, sys);
+            } else if s.address_owed != 0 {
+                let store = Store::plain(sys, &s.nag);
+                // A publication given up cleared `service_ip`.
+                let (v, vl) = if s.service_ip_len > 0 {
+                    (s.service_ip, s.service_ip_len as usize)
+                } else {
+                    (s.address, s.address_len as usize)
+                };
+                match ensure(&store, CLUSTER_DNS_KEY, v.get(..vl).unwrap_or(&[]), false) {
+                    Ensured::Wait => {}
+                    Ensured::Done | Ensured::Taken(_) => s.address_owed = 0,
+                    Ensured::Failed => {
+                        let m = b"[cluster_dns] ERROR the store refused /cluster-dns - this resolver's address is NOT published";
+                        dev_log(sys, 1, m.as_ptr(), m.len());
+                        s.address_owed = 0;
+                    }
+                }
             }
         }
 

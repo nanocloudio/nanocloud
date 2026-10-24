@@ -77,5 +77,18 @@ required = true
 requires_contract = "storage.object"
 access = "write"
 
+# A Pod's graceful DELETE lists its containers' sandboxes on its node
+# (`_shared/podlive.rs`). READ only: it lists, and never subscribes or writes
+# a namespace.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
 [observability]
 exempt = "a record adapter at the store edge — observed through the dialect and executor it drives"
+
+# Store subscriptions an instance opens: none — a request/response effect
+# never subscribes (it creates no event and opens no subscription). Declared
+# so the graph's subscription demand is stated by every store consumer.
+[capacities]
+store_subscriptions = 0

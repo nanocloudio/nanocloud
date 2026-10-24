@@ -12,8 +12,9 @@
 // that would quietly break it.
 //
 // The including module must define the opcodes and bounds these helpers name:
-// `MAX_KEY`, `MAX_VALUE`, `EVENT_HEADER_SIZE`, `OBJ_GET`, `OBJ_PUT`,
-// `OBJ_RANGE_GET`, `OBJ_CLOSE`, `OBJ_DELETE`, `NS_LIST` and `NS_SUBSCRIBE`.
+// `MAX_KEY`, `MAX_VALUE`, `OBJ_GET`, `OBJ_PUT`, `OBJ_RANGE_GET`, `OBJ_CLOSE`,
+// `OBJ_DELETE` and `NS_LIST`. The subscription helpers take their opcodes and
+// layouts from the SDK (`namespace::{subscribe, take, changes}`).
 //
 // The object and namespace helpers reach the store through a [`Store`]: the
 // syscall table, and — while a module serves a record — that record's
@@ -23,19 +24,29 @@
 // pending write, which is asked again exactly as it was first asked. So a
 // write is never made twice and a serve never sees its own write half-way.
 //
-// A storage READ may answer `EAGAIN`: not yet (the board's store answers it
-// while its device is busy with a write). That is never absence — and nor is
-// any refusal but the contract's absence (`ENXIO`, or a file-backed
-// provider's `ENOENT`): a read refused otherwise is undecided, handled
-// exactly as `EAGAIN` is, and said loudly but at most once per
-// `REFUSAL_SAY_MS` per module (its [`ReadNag`]). In a serve
-// it holds the record exactly as a pending write does: the read is not
-// recorded, every later call of the serve answers without reaching the
-// store, and the next serve replays what was recorded and asks that read
-// again. Outside a serve the [`Store`] remembers it ([`Store::waiting`]):
-// every later call through it answers without reaching the store, and the
-// caller drops the pass and runs it again on a later step. The `*_live`
-// readers answer a [`Got`], whose `Pending` a caller has to handle.
+// A storage READ may answer the contract's "not yet" (`EAGAIN`, or `EBUSY`
+// from a provider whose slot is taken: [`not_yet`]) — the board's store
+// answers it while its device is busy with a write. That is never absence.
+// In a serve it holds the record exactly as a pending write does: the read
+// is not recorded, every later call of the serve answers without reaching
+// the store, and the next serve replays what was recorded and asks that
+// read again. Outside a serve the [`Store`] remembers it
+// ([`Store::waiting`]): every later call through it answers without
+// reaching the store, and the caller drops the pass and runs it again on a
+// later step.
+//
+// Any OTHER refusal but the contract's absence (`ENXIO`, or a file-backed
+// provider's `ENOENT`) is the provider's decision — `ENOSYS` from a graph
+// whose module lacks the contract, `EACCES`, `EINVAL`, `EIO` — and asking
+// again gets it again for ever. It is never waited on: the [`Store`]
+// remembers it ([`Store::refusal`]), every later call of the pass answers
+// without reaching the store, every write the pass would make is refused
+// unasked (nothing is written on what a refused read let it conclude), and
+// the caller answers the failure — a serve its record, with an error,
+// never a record held for a read that will not be answered. It is said at
+// ERROR, at most once per `REFUSAL_SAY_MS` per module (its [`ReadNag`]).
+// The `*_live` readers answer a [`Got`], whose `Pending` and `Refused` a
+// caller has to handle.
 //
 // A VALUE PAST THE JOURNAL. The journal holds 16 KiB; an object the API
 // keeps may be 3 MiB. Its bytes are never recorded — only what tells the
@@ -154,6 +165,11 @@ struct Journal {
     /// recorded: it cannot be served again faithfully, so it makes no
     /// further write and its record is answered as refused.
     broken: bool,
+    /// A read of this serve was refused for good (an errno that is neither
+    /// absence nor "not yet"; 0: none): the serve makes no further call,
+    /// its writes are refused unasked, and its record is answered as
+    /// failed — never held for an answer that will not come.
+    refused: i32,
     /// The serving module's refused reads, said rate-limited. Not reset with
     /// the record: the limit is the module's, across records.
     nag: ReadNag,
@@ -183,6 +199,7 @@ impl Journal {
         self.used = 0;
         self.stalled = false;
         self.broken = false;
+        self.refused = 0;
     }
 
     /// A serve of the held record begins: its calls replay from the first.
@@ -194,7 +211,13 @@ impl Journal {
     /// Whether this serve's record must be held (a write is undecided, or
     /// a read has to be asked again).
     fn held(&self) -> bool {
-        self.stalled && !self.broken
+        self.stalled && !self.broken && self.refused == 0
+    }
+
+    /// The errno a read of this serve was refused with for good, if one
+    /// was: its record is answered as failed.
+    fn refusal(&self) -> Option<i32> {
+        (self.refused != 0).then_some(self.refused)
     }
 
     /// The recorded call this one replays, if any: `Err` when the serve
@@ -281,7 +304,7 @@ impl Journal {
 
     /// Whether a call must answer without reaching the store.
     fn silent(&self) -> bool {
-        self.stalled || self.broken
+        self.stalled || self.broken || self.refused != 0
     }
 }
 
@@ -290,7 +313,8 @@ impl Journal {
 ///
 /// One `Store` is one pass: a caller outside a serve makes a new one each
 /// step, and once a read through it has answered `EAGAIN` it is
-/// [`waiting`](Store::waiting) for the rest of the pass.
+/// [`waiting`](Store::waiting) for the rest of the pass — or, once one was
+/// refused for good, [`refused`](Store::refusal).
 struct Store {
     sys: *const SyscallTable,
     j: *mut Journal,
@@ -299,6 +323,8 @@ struct Store {
     nag: *const ReadNag,
     /// A read of this pass answered `EAGAIN`.
     waited: core::cell::Cell<bool>,
+    /// A read of this pass was refused for good: its errno (0: none).
+    refused: core::cell::Cell<i32>,
 }
 
 impl core::ops::Deref for Store {
@@ -318,6 +344,7 @@ impl Store {
             j: core::ptr::null_mut(),
             nag,
             waited: core::cell::Cell::new(false),
+            refused: core::cell::Cell::new(0),
         }
     }
 
@@ -330,6 +357,7 @@ impl Store {
             j,
             nag,
             waited: core::cell::Cell::new(false),
+            refused: core::cell::Cell::new(0),
         }
     }
 
@@ -345,7 +373,8 @@ impl Store {
 
     /// Whether this pass has to be run again on a later step, deciding
     /// nothing now: a read answered `EAGAIN`, or (in a serve) a write is
-    /// undecided. What the pass read since is not the store's answer —
+    /// undecided. A pass refused for good ([`refusal`](Store::refusal)) is
+    /// not waiting: it has failed. What the pass read since is not the store's answer —
     /// a read answers absent, a walk ends, a write answers `Pending` — so a
     /// caller that sees this drops what it concluded.
     fn waiting(&self) -> bool {
@@ -353,8 +382,8 @@ impl Store {
         self.waited.get() || unsafe { self.j.as_ref() }.is_some_and(|j| j.held())
     }
 
-    /// A read answered `EAGAIN` (or another undecided refusal): the pass
-    /// waits, and in a serve the record is held.
+    /// A read answered the contract's "not yet": the pass waits, and in a
+    /// serve the record is held.
     unsafe fn wait(&self) {
         self.waited.set(true);
         if let Some(j) = self.j.as_mut() {
@@ -362,9 +391,45 @@ impl Store {
         }
     }
 
+    /// A read was refused for good with `rc`: the pass FAILS. Nothing more
+    /// of it reaches the store, its writes are refused unasked, and in a
+    /// serve the record is answered as failed, not held. The first refusal
+    /// is the one kept.
+    unsafe fn refuse(&self, rc: i32) {
+        if self.refused.get() == 0 {
+            self.refused.set(rc);
+        }
+        if let Some(j) = self.j.as_mut() {
+            if j.refused == 0 {
+                j.refused = rc;
+            }
+        }
+    }
+
+    /// The errno a read of this pass was refused with for good, if one
+    /// was. A caller that sees it answers a failure — never what the pass
+    /// concluded, since every read after it answered without the store
+    /// (absent, a walk ended short) and every write was refused.
+    fn refusal(&self) -> Option<i32> {
+        let r = self.refused.get();
+        if r != 0 {
+            return Some(r);
+        }
+        // SAFETY: the journal, when there is one, outlives the `Store`.
+        unsafe { self.j.as_ref() }.and_then(Journal::refusal)
+    }
+
+    /// Whether nothing may be concluded from this pass's reads: it is
+    /// [`waiting`](Store::waiting) (run it again later) or
+    /// [`refused`](Store::refusal) (it has failed). A read that answered
+    /// "nothing" in it is neither absence nor an empty listing.
+    fn stopped(&self) -> bool {
+        self.waiting() || self.refusal().is_some()
+    }
+
     /// Whether a call must answer without reaching the store.
     unsafe fn silent(&self) -> bool {
-        self.waited.get() || self.j.as_ref().is_some_and(|j| j.silent())
+        self.waited.get() || self.refused.get() != 0 || self.j.as_ref().is_some_and(|j| j.silent())
     }
 }
 
@@ -469,8 +534,9 @@ fn value_digest(v: &[u8]) -> u64 {
 }
 
 /// True iff `key` currently exists (open+close a GET handle).
-/// False when absent — or when the pass is [`waiting`](Store::waiting),
-/// which the caller checks before acting on it.
+/// False when absent — or when the pass is [`waiting`](Store::waiting) or
+/// [`refused`](Store::refusal), which the caller checks before acting on
+/// it.
 unsafe fn exists(sys: &Store, key: &[u8]) -> bool {
     let kh = key_hash(key);
     if sys.silent() {
@@ -486,6 +552,10 @@ unsafe fn exists(sys: &Store, key: &[u8]) -> bool {
     let found = match exists_live(sys.table(), sys.nag(), key) {
         Got::Pending => {
             sys.wait();
+            return false;
+        }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
             return false;
         }
         Got::Found(()) => true,
@@ -514,7 +584,8 @@ unsafe fn exists_live(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<()> 
 
 /// storage.object GET+RANGE_GET+CLOSE — read `key` into `dst`. Returns
 /// length; `None` when absent — or when the pass is
-/// [`waiting`](Store::waiting), which the caller checks before acting on it.
+/// [`waiting`](Store::waiting) or [`refused`](Store::refusal), which the
+/// caller checks before acting on it.
 unsafe fn get_value(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<usize> {
     let kh = key_hash(key);
     if sys.silent() {
@@ -540,6 +611,10 @@ unsafe fn get_value(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<usize> {
             sys.wait();
             return None;
         }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
+            return None;
+        }
         Got::Found(n) => Some(n),
         Got::Absent => None,
     };
@@ -562,6 +637,7 @@ unsafe fn get_value_live(
         Got::Found((n, _)) => Got::Found(n),
         Got::Absent => Got::Absent,
         Got::Pending => Got::Pending,
+        Got::Refused(rc) => Got::Refused(rc),
     }
 }
 
@@ -570,8 +646,9 @@ unsafe fn get_value_live(
 /// conditional write on that revision is conditional on exactly this
 /// value — a separate HEAD may answer for another one, or (a board's store
 /// whose device made the HEAD wait) answer nothing at all. `None` when
-/// absent — or when the pass is [`waiting`](Store::waiting), which the
-/// caller checks before acting on it. The revision is 0 when the provider
+/// absent — or when the pass is [`waiting`](Store::waiting) or
+/// [`refused`](Store::refusal), which the caller checks before acting on
+/// it. The revision is 0 when the provider
 /// gives the handle no fence.
 unsafe fn get_value_rev(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<(usize, u64)> {
     let kh = key_hash(key);
@@ -598,6 +675,10 @@ unsafe fn get_value_rev(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<(usiz
     let got = match get_live(sys.table(), sys.nag(), key, dst, true) {
         Got::Pending => {
             sys.wait();
+            return None;
+        }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
             return None;
         }
         Got::Found(v) => Some(v),
@@ -658,10 +739,10 @@ unsafe fn get_live(
     // loses `;phase=start` is created and never started — so the check belongs
     // here, for every reader, rather than in each buffer's size.
     let mut truncated = false;
-    // A range the provider cannot serve yet — or refuses at all: a refused
-    // read of an open handle is never absence — the handle is closed and the
+    // A range the provider cannot serve yet: the handle is closed and the
     // whole read asked again later (a GET answers from the key as it then
-    // is, so nothing is lost by opening it again).
+    // is, so nothing is lost by opening it again). A range refused for good
+    // fails the read. Neither is absence: the handle is open.
     let mut wait = n < 0;
     let mut rc = n;
     if n >= 0 && n as usize == dst.len() {
@@ -682,10 +763,7 @@ unsafe fn get_live(
     let mut carg = [0u8; 4];
     (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
     if wait {
-        if rc != READ_WAIT {
-            say_refused(sys, nag, b"RANGE_GET", key, rc);
-        }
-        return Got::Pending;
+        return range_refused(sys, nag, key, rc);
     }
     if truncated {
         say_past_buffer(sys, nag, key);
@@ -697,8 +775,8 @@ unsafe fn get_live(
 /// A value too large for a caller's fixed buffer, read WHOLE onto this
 /// module's heap (the buffer doubled as it fills, up to `max`). `None` when
 /// absent, past `max`, or the module has no heap (or it is exhausted) — or
-/// when the pass is [`waiting`](Store::waiting). The caller frees it with
-/// `heap_free`.
+/// when the pass is [`waiting`](Store::waiting) or
+/// [`refused`](Store::refusal). The caller frees it with `heap_free`.
 ///
 /// In a serve the journal records its length, revision and digest, never
 /// its bytes: the replay hands out the pre-image kept for it (a key the
@@ -733,6 +811,10 @@ unsafe fn read_whole(sys: &Store, key: &[u8], max: usize) -> Option<(*mut u8, us
                         sys.wait();
                         None
                     }
+                    Got::Refused(rc) => {
+                        sys.refuse(rc);
+                        None
+                    }
                     Got::Found((p, n, rev)) if whole_same(rec, c.rc, p, n, rev) => Some((p, n)),
                     got => {
                         if let Got::Found((p, _, _)) = got {
@@ -752,6 +834,10 @@ unsafe fn read_whole(sys: &Store, key: &[u8], max: usize) -> Option<(*mut u8, us
     let got = match read_whole_rev_live(sys.table(), sys.nag(), key, max) {
         Got::Pending => {
             sys.wait();
+            return None;
+        }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
             return None;
         }
         Got::Found(v) => Some(v),
@@ -799,10 +885,11 @@ unsafe fn whole_same(rec: (u64, u64), rc: i64, p: *const u8, n: usize, rev: u64)
 /// of the same key is read again (still the pre-image: the write is not
 /// asked yet) and kept on the heap, checked against its record. A replay
 /// then hands out what the serve first read, though its own write has moved
-/// the key. `false` when a read waits (the write is not asked: the record
-/// is held); a pre-image that is not the one recorded, or finds no room,
-/// is not kept, and a replay that needs it diverges.
-unsafe fn keep_pre_images(sys: &Store, j: &mut Journal, key: &[u8], kh: u32) -> bool {
+/// the key. `Pending` when a read waits (the write is not asked: the record
+/// is held), `Refused` when one is refused for good (the write is not asked
+/// either: the serve fails); a pre-image that is not the one recorded, or
+/// finds no room, is not kept, and a replay that needs it diverges.
+unsafe fn keep_pre_images(sys: &Store, j: &mut Journal, key: &[u8], kh: u32) -> Got<()> {
     let mut i = 0usize;
     while i < j.n as usize {
         let c = j.calls[i];
@@ -812,7 +899,8 @@ unsafe fn keep_pre_images(sys: &Store, j: &mut Journal, key: &[u8], kh: u32) -> 
         }
         let rec = whole_rec(j.data(&c));
         match read_whole_rev_live(sys.table(), sys.nag(), key, c.rc as usize + 1) {
-            Got::Pending => return false,
+            Got::Pending => return Got::Pending,
+            Got::Refused(rc) => return Got::Refused(rc),
             Got::Found((p, n, rev)) => {
                 if !(whole_same(rec, c.rc, p, n, rev) && j.keep((i - 1) as u16, p, n)) {
                     heap_free(sys.table(), p);
@@ -821,7 +909,7 @@ unsafe fn keep_pre_images(sys: &Store, j: &mut Journal, key: &[u8], kh: u32) -> 
             Got::Absent => {}
         }
     }
-    true
+    Got::Found(())
 }
 
 unsafe fn read_whole_live(
@@ -834,6 +922,7 @@ unsafe fn read_whole_live(
         Got::Found((p, n, _)) => Got::Found((p, n)),
         Got::Absent => Got::Absent,
         Got::Pending => Got::Pending,
+        Got::Refused(rc) => Got::Refused(rc),
     }
 }
 
@@ -870,11 +959,9 @@ unsafe fn read_whole_rev_live(
         if n < 0 {
             heap_free(sys, p);
             // Not yet: closed, and the whole read asked again later. A
-            // refused read of an open handle is never absence.
-            if n != READ_WAIT {
-                say_refused(sys, nag, b"RANGE_GET", key, n);
-            }
-            break Got::Pending;
+            // range refused for good fails the read. Neither is absence:
+            // the handle is open.
+            break range_refused(sys, nag, key, n);
         }
         len += n as usize;
         if len < cap {
@@ -893,7 +980,8 @@ unsafe fn read_whole_rev_live(
 }
 
 /// A key's store revision ([`head_rev`]), as the serve first saw it. `None`
-/// when absent — or when the pass is [`waiting`](Store::waiting).
+/// when absent — or when the pass is [`waiting`](Store::waiting) or
+/// [`refused`](Store::refusal).
 unsafe fn head(sys: &Store, key: &[u8]) -> Option<u64> {
     let kh = key_hash(key);
     if sys.silent() {
@@ -917,6 +1005,10 @@ unsafe fn head(sys: &Store, key: &[u8]) -> Option<u64> {
             sys.wait();
             return None;
         }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
+            return None;
+        }
         Got::Found(r) => Some(r),
         Got::Absent => None,
     };
@@ -929,28 +1021,52 @@ unsafe fn head(sys: &Store, key: &[u8]) -> Option<u64> {
     got
 }
 
-/// storage.namespace SUBSCRIBE — push namespace.change for `prefix` onto `sink`.
-/// `flags` bit0 = include-initial-listing. Returns the provider rc: a
-/// handle, or `READ_WAIT` (`EAGAIN`) when the provider cannot list yet — no
-/// subscription was made, and the caller subscribes again on a later step.
-unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32, flags: u8) -> i32 {
+// ── Store subscriptions: one kernel event, rung bits, a read owed ──────────
+//
+// `storage.namespace` SUBSCRIBE names a kernel event the module owns, not a
+// channel: the store signals it when a watched prefix changes and writes no
+// byte anywhere. A module creates ONE event ([`store_event`]) for every
+// prefix it watches and subscribes each with it ([`store_subscribe`]). Each
+// step it asks [`store_take`], which polls the event and, when it fired, asks
+// `TAKE_RUNG` which of its subscriptions rang — the store keeps one rung bit
+// per subscription and signals only when the bit was clear, so a burst of
+// changes is one ring.
+//
+// What a ring owes is a READ that starts after it: a rescan, or a `CHANGES`
+// read of the subscription. The module keeps that read owed (`dirty`,
+// `pending`) until a pass COMPLETES — not merely until one started. A pass
+// the store answered "not yet" (`EAGAIN`), `ENOMEM`, LOST or a refusal leaves
+// it owed and is run again on the module's timer: a coalesced ring is not
+// repeated, so a read dropped on a failure would wait for a change that may
+// never come. A `CHANGES` read that names its subscription (`sub`) and is
+// answered `EAGAIN` is rung again by the store once it can answer.
+
+/// Create the module's subscription event (`kernel_abi::event::CREATE`): the
+/// event fd, or a negative errno. Once per module; every subscription names
+/// it.
+unsafe fn store_event(sys: &SyscallTable) -> i32 {
+    (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
+}
+
+/// storage.namespace SUBSCRIBE — ring `event` (the caller's, from
+/// [`store_event`]) on every change under `prefix`. `flags` bit 0
+/// (`subscribe::FLAG_RING_NOW`) rings it once at once. Returns the provider
+/// rc: a subscription handle (idempotent — subscribing the same prefix with
+/// the same event again answers the same handle), or the contract's "not
+/// yet" ([`not_yet`]) — no subscription was made, and the caller subscribes
+/// again on a later step — or a refusal (`ENOMEM`: the store's subscription
+/// capacity or this module's quota is spent; `EINVAL`: the event is not the
+/// caller's), said at ERROR here; the caller then rescans on its timer.
+unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32, flags: u8) -> i32 {
+    use abi::contracts::storage::namespace as ns;
     let mut arg = [0u8; MAX_KEY + 16];
-    if 2 + prefix.len() + 4 + 1 > arg.len() {
-        return -1;
-    }
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 4].copy_from_slice(&(sink as u32).to_le_bytes());
-    p += 4;
-    arg[p] = flags;
-    p += 1;
-    let rc = (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), p);
-    if rc < 0 && rc != READ_WAIT {
-        // The store's subscription table is full (or the prefix refused):
-        // a change under it will never wake this module. Said at ERROR,
+    let req = ns::subscribe::Request { prefix, event, flags };
+    let Some(len) = ns::subscribe::encode(&mut arg, &req) else {
+        return abi::kernel_abi::errno::EINVAL;
+    };
+    let rc = (sys.provider_call)(-1, ns::SUBSCRIBE, arg.as_mut_ptr(), len);
+    if rc < 0 && !not_yet(rc) {
+        // A change under it will never wake this module: said at ERROR,
         // naming the module (its scheduler index) and the prefix.
         let mut b = [0u8; 256];
         let mut n = 0usize;
@@ -991,34 +1107,91 @@ unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32, flags: u
         put(b" refused rc=-");
         let k = num(rc.unsigned_abs(), &mut d);
         put(d.get(..k).unwrap_or(&[]));
-        put(b": the store's subscription table is full - changes under it will NOT wake this module");
+        put(b": changes under it will NOT wake this module - it rescans on its timer");
         dev_log(sys, 1, b.as_ptr(), n);
     }
     rc
 }
 
-/// Drain all pending namespace.change events off `sink`; returns the count.
-unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
-    let mut n_ev = 0u32;
-    let mut hdr = [0u8; EVENT_HEADER_SIZE];
-    loop {
-        let n = (sys.channel_read)(sink, hdr.as_mut_ptr(), EVENT_HEADER_SIZE);
-        if n != EVENT_HEADER_SIZE as i32 {
-            break; // EAGAIN / no full header → done
+/// Handles one `TAKE_RUNG` answer holds; more are taken in the same call.
+const TAKE_BATCH: usize = 16;
+/// `TAKE_RUNG` calls one [`store_take`] makes at most: a module with more
+/// rung subscriptions than this takes the rest on its next step (the store
+/// signals the event again when they did not fit).
+const TAKE_CALLS: usize = 4;
+
+/// `event::POLL` the module's subscription event and, when it fired, ask
+/// `TAKE_RUNG` which of the caller's subscriptions on it rang — clearing
+/// their rung bits — calling `rung` with each handle named. Returns how many
+/// were named: non-zero means a read is owed. A store that cannot answer the
+/// take (`EAGAIN`) answers 0 here; it signals the event again.
+unsafe fn store_take(sys: &SyscallTable, event: i32, mut rung: impl FnMut(i32)) -> u32 {
+    use abi::contracts::storage::namespace as ns;
+    if event < 0 {
+        return 0;
+    }
+    let fired = (sys.provider_call)(event, abi::kernel_abi::event::POLL, core::ptr::null_mut(), 0);
+    if fired <= 0 {
+        return 0;
+    }
+    let mut named = 0u32;
+    for _ in 0..TAKE_CALLS {
+        let mut out = [0u8; ns::take::HEAD_LEN + 4 * TAKE_BATCH];
+        let req = ns::take::Request {
+            event,
+            out_ptr: out.as_mut_ptr() as u64,
+            out_cap: out.len() as u32,
+        };
+        let mut arg = [0u8; ns::take::REQUEST_LEN];
+        let Some(len) = ns::take::encode(&mut arg, &req) else {
+            break;
+        };
+        let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
+        if n < 0 {
+            break;
         }
-        n_ev += 1;
-        let mut left = u16::from_le_bytes([hdr[30], hdr[31]]) as usize;
-        let mut discard = [0u8; 512];
-        while left > 0 {
-            let take = left.min(512);
-            let r = (sys.channel_read)(sink, discard.as_mut_ptr(), take);
-            if r <= 0 {
-                break;
-            }
-            left -= r as usize;
+        let Some((more, handles)) = ns::take::decode(out.get(..n as usize).unwrap_or(&[])) else {
+            break;
+        };
+        for h in handles {
+            named += 1;
+            rung(h);
+        }
+        if !more {
+            break;
         }
     }
-    n_ev
+    named
+}
+
+/// One `CHANGES` page read of `prefix` from `token` into `out`
+/// (`namespace::changes`): `sub` is the subscription the read serves (the
+/// store rings it again after an `EAGAIN`), or -1. The byte count written,
+/// or a negative errno; `fence` receives the encoded fence (at least
+/// `fence::WIRE_MAX_LEN` bytes).
+unsafe fn store_changes_page(
+    sys: &SyscallTable,
+    prefix: &[u8],
+    sub: i32,
+    token: &[u8],
+    out: &mut [u8],
+    fence: &mut [u8],
+) -> i32 {
+    use abi::contracts::storage::namespace as ns;
+    let mut arg = [0u8; MAX_KEY + ns::changes::TOKEN_MAX + ns::changes::REQUEST_FIXED_LEN];
+    let req = ns::changes::Request {
+        prefix,
+        sub,
+        token,
+        out_ptr: out.as_mut_ptr() as u64,
+        out_cap: out.len().min(u32::MAX as usize) as u32,
+        fence_out_ptr: fence.as_mut_ptr() as u64,
+        fence_out_cap: fence.len().min(u16::MAX as usize) as u16,
+    };
+    let Some(len) = ns::changes::encode_request(&mut arg, &req) else {
+        return abi::kernel_abi::errno::EINVAL;
+    };
+    (sys.provider_call)(-1, ns::CHANGES, arg.as_mut_ptr(), len)
 }
 
 /// A paged walk over every key under `prefix`, in key order.
@@ -1037,14 +1210,21 @@ unsafe fn drain_changes(sys: &SyscallTable, sink: i32) -> u32 {
 /// A page the walk cannot parse is a provider fault, reported at error level
 /// and ending the walk with `failed` set — never passed off as the end.
 ///
-/// A page the provider answers `EAGAIN` (not yet) — or refuses at all: a
-/// listing has no "absent", and a refused page is never the end — ends
-/// nothing: `next` answers `None` with `pending` set, the pass is
-/// [`waiting`](Store::waiting), and a walk kept to a later step resumes at
-/// the same cursor. A refusal other than `EAGAIN` is said at ERROR,
-/// rate-limited ([`say_refused`]). A caller that ran out of keys checks
-/// `pending` (or the store's `waiting`) before it takes the listing as
-/// complete.
+/// A page the provider answers with the contract's "not yet" ([`not_yet`]:
+/// `EAGAIN`, `EBUSY`) ends nothing: `next` answers `None` with `pending`
+/// set, the pass is [`waiting`](Store::waiting), and a walk kept to a later
+/// step resumes at the same cursor.
+///
+/// A page refused otherwise is refused for good — `ENOSYS` from a module
+/// whose graph does not grant it `storage.namespace`, `EACCES`, `EINVAL`, or
+/// `ENOENT` for a namespace that is not there (a listing has no "absent"
+/// key: a refused page is never the end, and never empty). Asked again it
+/// answers the same for ever, so it is never waited on: the walk ends with
+/// `failed` set, the pass is [`refused`](Store::refusal) (its writes are
+/// refused unasked), and the refusal is said at ERROR, rate-limited
+/// ([`say_refused`]). A caller that ran out of keys checks `pending` and
+/// `failed` (or the store's `waiting` and `refusal`) before it takes the
+/// listing as complete, and answers a failed one as the failure it is.
 ///
 /// Usage:
 ///     let mut walk = ListWalk::new(PREFIX);
@@ -1059,12 +1239,13 @@ struct ListWalk {
     clen: usize,
     /// The provider has said the listing is complete (or the walk failed).
     done: bool,
-    /// Set when a page could not be parsed. Callers that must distinguish
-    /// "no keys" from "could not list" read this after the walk.
+    /// Set when a page could not be parsed, or was refused for good (or the
+    /// pass was already refused). Callers that must distinguish "no keys"
+    /// from "could not list" read this after the walk.
     failed: bool,
-    /// The next page has not been answered yet (`EAGAIN` or another
-    /// refusal, or the pass was already waiting): the walk stopped short of
-    /// its end, at its cursor.
+    /// The next page has not been answered yet (the contract's "not yet",
+    /// or the pass was already waiting): the walk stopped short of its end,
+    /// at its cursor.
     pending: bool,
     started: bool,
 }
@@ -1106,6 +1287,12 @@ impl ListWalk {
             self.done = true;
             return false;
         }
+        if sys.refusal().is_some() {
+            // The pass has failed: this walk cannot complete either.
+            self.failed = true;
+            self.done = true;
+            return false;
+        }
         if sys.silent() {
             // The pass answers nothing more: stopped at the cursor.
             self.pending = true;
@@ -1127,20 +1314,25 @@ impl ListWalk {
             }
         }
         let n = self.fetch_live(sys.table());
-        if n < 0 {
+        if n < 0 && not_yet(n) {
             // Not yet: nothing recorded, the cursor kept for the ask again.
-            // A refused page is not the end of the listing either.
-            if n != READ_WAIT {
-                say_refused(
-                    sys.table(),
-                    sys.nag(),
-                    b"LIST",
-                    &self.prefix[..self.plen],
-                    n,
-                );
-            }
             sys.wait();
             self.pending = true;
+            return false;
+        }
+        if n < 0 {
+            // Refused for good: not the end of the listing, and never
+            // answered by asking again. The walk fails, and so does its pass.
+            say_refused(
+                sys.table(),
+                sys.nag(),
+                b"LIST",
+                &self.prefix[..self.plen],
+                n,
+            );
+            sys.refuse(n);
+            self.failed = true;
+            self.done = true;
             return false;
         }
         if let Some(j) = sys.j.as_mut() {
@@ -1264,7 +1456,9 @@ impl ListWalk {
 }
 
 /// Live key count under `prefix` — a full walk, counting. `Pending` when a
-/// page was not answered yet (the count would be short).
+/// page was not answered yet, `Refused` when the walk failed (a page refused
+/// for good, or one that could not be parsed: `EIO`): the count would be
+/// short.
 unsafe fn list_count(sys: &Store, prefix: &[u8]) -> Got<usize> {
     let mut walk = ListWalk::new(prefix);
     let mut n = 0usize;
@@ -1273,6 +1467,8 @@ unsafe fn list_count(sys: &Store, prefix: &[u8]) -> Got<usize> {
     }
     if walk.pending {
         Got::Pending
+    } else if walk.failed {
+        Got::Refused(sys.refusal().unwrap_or(ERR_DIVERGED))
     } else {
         Got::Found(n)
     }
@@ -1323,6 +1519,17 @@ const ERR_NO_ROOM: i32 = -28;
 /// `EIO`: a write of a serve that took another path than its record.
 const ERR_DIVERGED: i32 = -5;
 
+/// What a write of a pass whose read was refused for good (`rc`) answers,
+/// unasked: the refusal — never one a conditional caller takes for a lost
+/// precondition (`EEXIST`, `EAGAIN`), which reads as "someone else won".
+fn unasked(rc: i32) -> i32 {
+    if rc == ERR_EEXIST || rc == ERR_EAGAIN {
+        ERR_DIVERGED
+    } else {
+        rc
+    }
+}
+
 /// Encode a revision as the contract's 32-byte etag. Both stores key the etag
 /// on the per-key revision, little-endian in the first eight bytes.
 fn etag_of(rev: u64) -> [u8; 32] {
@@ -1356,6 +1563,12 @@ unsafe fn delete_cond(sys: &Store, key: &[u8], pre: u8, rev: u64) -> WriteAnswer
 /// same write. Any other value is divergence, refused unasked.
 unsafe fn write(sys: &Store, key: &[u8], value: Option<&[u8]>, pre: u8, rev: u64) -> WriteAnswer {
     let Some(j) = sys.j.as_mut() else {
+        if let Some(rc) = sys.refusal() {
+            // A read of this pass was refused for good: whatever led here is
+            // not the store's answer, so nothing is asked, and the pass
+            // fails.
+            return WriteAnswer::Decided(unasked(rc));
+        }
         if sys.waited.get() {
             // A read of this pass is not answered yet: whatever led here is
             // not the store's answer, so nothing is asked. The caller asks
@@ -1364,6 +1577,9 @@ unsafe fn write(sys: &Store, key: &[u8], value: Option<&[u8]>, pre: u8, rev: u64
         }
         return write_live(sys.table(), key, value, pre, rev);
     };
+    if let Some(rc) = j.refusal() {
+        return WriteAnswer::Decided(unasked(rc));
+    }
     if j.stalled {
         return WriteAnswer::Pending;
     }
@@ -1446,9 +1662,16 @@ unsafe fn write(sys: &Store, key: &[u8], value: Option<&[u8]>, pre: u8, rev: u64
     }
     // What this serve read whole of the key it now writes is kept: its
     // replay must see what it first read, not its own write.
-    if !keep_pre_images(sys, j, key, kh) {
-        sys.wait();
-        return WriteAnswer::Pending;
+    match keep_pre_images(sys, j, key, kh) {
+        Got::Pending => {
+            sys.wait();
+            return WriteAnswer::Pending;
+        }
+        Got::Refused(rc) => {
+            sys.refuse(rc);
+            return WriteAnswer::Decided(unasked(rc));
+        }
+        Got::Found(()) | Got::Absent => {}
     }
     let a = write_live(sys.table(), key, value, pre, rev);
     match a {
@@ -1543,14 +1766,13 @@ enum Took {
     Taken(usize),
     /// Not there: never stored, or taken already (by any take).
     Absent,
-    /// Not decided this step — a read waits (`EAGAIN`, or any refusal but
-    /// `ENXIO`/`ENOENT`) or a write is pending (`EINPROGRESS`). In a serve
-    /// the record is held and served again; nothing may be answered from
-    /// it, least of all "absent".
+    /// Not decided this step — a read waits (the contract's "not yet") or
+    /// a write is pending (`EINPROGRESS`). In a serve the record is held and
+    /// served again; nothing may be answered from it, least of all "absent".
     Waiting,
     /// Not taken, and not known absent: the record kept moving under every
-    /// try, the store refused a write, or the record is past the reader's
-    /// buffer.
+    /// try, the store refused a read or a write for good, or the record is
+    /// past the reader's buffer.
     Failed,
 }
 
@@ -1625,6 +1847,9 @@ unsafe fn take_value(
     let mut have: Option<usize> = None;
     for _ in 0..TAKE_TRIES {
         let Some((n, mut rev)) = get_value_rev(sys, key, scratch) else {
+            if sys.refusal().is_some() {
+                return Took::Failed;
+            }
             if sys.waiting() {
                 return Took::Waiting;
             }
@@ -1632,7 +1857,9 @@ unsafe fn take_value(
             // record the read refused for itself (past `scratch`) is there,
             // and answering it absent would spend nothing and say "missing".
             let there = exists(sys, key);
-            return if sys.waiting() {
+            return if sys.refusal().is_some() {
+                Took::Failed
+            } else if sys.waiting() {
                 Took::Waiting
             } else if there {
                 Took::Failed
@@ -1664,6 +1891,7 @@ unsafe fn take_value(
             // A provider without read fences: its HEAD's revision.
             match head(sys, key) {
                 Some(r) => rev = r,
+                None if sys.refusal().is_some() => return Took::Failed,
                 None if sys.waiting() => return Took::Waiting,
                 None => continue,
             }

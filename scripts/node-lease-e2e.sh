@@ -7,6 +7,7 @@
 #   renew  (node)   /nodes/<self>: absent or due -> ready, heartbeat now
 #   seen   (plane)  /nodes/ -> /node-seen/<node> rev, at (the plane's clock)
 #   stale  (plane)  unchanged 30 s -> /nodes/<node> status.ready false
+#   spec   (node)   a renewal restates the Node's spec.podCIDR (svc_alloc's)
 #
 # One store, two graphs: the node's chain plus the plane's, and the plane's
 # alone — a node that has died.
@@ -118,16 +119,10 @@ YAML
 }
 plane_wiring() {
   cat <<YAML
-  - from: nl_nodes.status
-    to: nl_nodes.changes
   - from: nl_nodes.record_out
     to: nl_seen.request_in
-  - from: nl_leases.status
-    to: nl_leases.changes
   - from: nl_leases.record_out
     to: nl_stale.request_in
-  - from: ds_nodes.status
-    to: ds_nodes.changes
   - from: ds_nodes.record_out
     to: ds_mark.request_in
 YAML
@@ -143,7 +138,7 @@ graph() { # graph <with-node: 0|1>
     type: store_source
     prefix: "/nodes/"
     where: "metadata.name=node-a"
-    paths: "status.ready,metadata.labels"
+    paths: "status.ready,metadata.labels,spec.podCIDR"
     ints: "status.heartbeat"
     count: 1
     empty: 1
@@ -161,8 +156,6 @@ YAML
     echo "wiring:"
     plane_wiring
     if [ "$1" = 1 ]; then cat <<YAML
-  - from: nl_self.status
-    to: nl_self.changes
   - from: nl_self.record_out
     to: nl_renew.request_in
 YAML
@@ -218,5 +211,17 @@ run 1 5
 has "$(store_last /nodes/node-a)" '"ready":true' || fail "the node did not renew"
 [ "$(store_last /ready-nodes/node-a)" = "1" ] || fail "the renewed node is not ready"
 echo "   ready again"
+
+echo "== 5. its Pod CIDR, allocated beside it, is carried by every renewal =="
+# As svc_alloc writes it: spec.podCIDR and spec.podCIDRs on the record. A
+# heartbeat of 0 has the node renew at once (a whole-record PUT).
+N="$(store_last /nodes/node-a)"
+N2="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['spec']={'podCIDR':'10.244.4.0/24','podCIDRs':['10.244.4.0/24']}; d['status']['heartbeat']=0; print(json.dumps(d,separators=(',',':')))" "$N")"
+store_put /nodes/node-a "$N2"
+run 1 5
+N="$(store_last /nodes/node-a)"
+python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert d['status']['heartbeat']>0, 'not renewed'; assert d['spec']=={'podCIDR':'10.244.4.0/24','podCIDRs':['10.244.4.0/24']}, d.get('spec'); assert d['status']['ready'] is True" "$N" \
+  || fail "a renewal did not restate the Node's podCIDR: '$N'"
+echo "   renewed (heartbeat stamped), spec.podCIDR and spec.podCIDRs kept: 10.244.4.0/24"
 
 echo "== E2E green: a node registers and renews its lease; a silent one is taken out of service and comes back =="

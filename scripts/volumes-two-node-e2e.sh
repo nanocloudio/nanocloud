@@ -2,8 +2,8 @@
 # Encrypted volumes placed across the control plane and a node, end to end:
 # two runtimes on one replicated store, each holding its half of the
 # pipelines (scripts/support/volumes-split.py, from
-# packaging/debian/fluxor-volumes.yaml), against Loam's admin gate (the
-# loam-admin template from a Loam checkout) under the node's capability.
+# packaging/debian/fluxor-volumes.yaml), against Loam's admin gate (loam's
+# published `loam-admin` bundle) under the node's capability.
 #
 #   plane   replica 0, the group's one voter: provisioning, grants,
 #           snapshots and the rest, Kagi's storage-key service with its
@@ -29,8 +29,8 @@
 # machine's address toward it (PLANE_ADDR overrides).
 #
 # Needs passwordless sudo (mount, NBD), nbd-client, mkfs.ext4 and the nbd
-# kernel module where node-a runs, and redis-cli and a Loam checkout
-# ($LOAM_ROOT, default ../loam) here. Without them it skips;
+# kernel module where node-a runs, and redis-cli and loam's `loam-admin`
+# bundle pinned (`fluxor update`) here. Without them it skips;
 # NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
 set -euo pipefail
 
@@ -69,7 +69,7 @@ fi
 on_node "command -v nbd-client" >/dev/null || skip "needs nbd-client where node-a runs"
 on_node "command -v mkfs.ext4" >/dev/null || skip "needs mkfs.ext4 where node-a runs"
 command -v redis-cli >/dev/null || skip "needs redis-cli"
-nc_loam_present || skip "no Loam checkout at $LOAM_ROOT (set LOAM_ROOT)"
+nc_loam_present || skip "loam-admin is not pinned (fluxor update)"
 on_node "modprobe nbd" 2>/dev/null || true
 on_node "test -e /dev/nbd0" || skip "no NBD devices (the nbd kernel module) where node-a runs"
 

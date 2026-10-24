@@ -21,6 +21,17 @@
 #     so do the modules doing public-key work in a step (tls handshakes,
 #     token_verify's signature checks), and fat32, whose own step issues
 #     synchronous device commands;
+#   - `ip` is declared here rather than left to the net stack, with the
+#     capacities the node's workloads need (lanes, peers, held addresses,
+#     datagram flows, resolver entries) and the packet-policy tables it
+#     enforces on metal (`policy_tables`: NetworkPolicy's and the proxy's);
+#   - the packet-policy chain (fluxor-netpolicy.yaml) is rendered
+#     (NANOCLOUD_NETPOLICY=1), and with the pod plane its `np_apply` writes
+#     the board's table beside the proxy's `px_apply`;
+#   - with the pod plane, the node's net_route writer (node_net): the
+#     board's Pod CIDR as its segment row (ip realizes it), its peer routes,
+#     its held addresses (deliver only), and addresses of their own for its
+#     graph-backed Pods;
 #   - `sntp` anchors the wall clock, so token expiry and certificate validity
 #     are judged against trusted time;
 #   - this node registers itself and keeps its lease (node_lease.uproc `renew`,
@@ -60,8 +71,9 @@ PEERS="${NANOCLOUD_RIG_PEERS:-$(cat "$WORK/peers" 2>/dev/null || echo 0=127.0.0.
 
 # ── The shipped template, rendered as the E2Es render it (one voter), with
 # the cluster's own authority behind the peer links.
+# The packet-policy chain is on: `ip` enforces its table on metal.
 NANOCLOUD_CLUSTER_ENV=/nonexistent NANOCLOUD_PEER_TRUST=authority NANOCLOUD_NODE_NAME="$NODE" \
-  NANOCLOUD_PEER_PORT=7450 NANOCLOUD_PEERS="$PEERS" \
+  NANOCLOUD_NETPOLICY=1 NANOCLOUD_PEER_PORT=7450 NANOCLOUD_PEERS="$PEERS" \
   NANOCLOUD_REPLICA_FRAGMENT="$ROOT/packaging/debian/fluxor-replica.yaml" \
   sh "$ROOT/packaging/debian/nanocloud-graph.sh" \
   "$ROOT/packaging/debian/fluxor-controlplane.yaml" "$WORK/cp.linux.yaml"
@@ -205,8 +217,38 @@ lease = (m.group(1).replace("__NODE_NAME__", node).replace("__NODE_FACTS__", fac
 disk = ("  # ── Metal: the board's disk under the store and the log ──────────────\n"
         "  - name: nvme\n    bind: m2_primary\n    namespace: 1\n    queue_depth: 32\n"
         "  - name: fat32\n    path: /\n    init_free_hint: 20000\n    clear_free_region: 4096\n")
+# The node's IP stack, declared here so it takes the params below (the net
+# stack's own `ip` would carry its defaults only; the stack keeps its
+# rp1_gem -> conn_guard -> ip wiring for a module of this name). Its
+# defaults otherwise: DHCP, no static address.
+#   lanes          workload lanes (networked Pods), stated to the kernel at
+#                  NET_PROVIDE; ip's address table holds 1 + lanes + max_held
+#   lane_endpoints datagram endpoints per lane: lanes x this stays inside the
+#                  wire's 256 (a u8 endpoint id)
+#   max_peers      the other nodes of the group (its declared slots), for the
+#                  ARP table and the peer routes
+#   max_held       addresses the node answers for (node-terminated services)
+#   max_dg_flows   datagram flows: at least (lanes + 1) x the per-lane floor
+#                  (16), which construction checks
+#   dns_cache / dns_pending  resolver entries per owner, sized for a Pod's
+#                  search list (three domains and the bare name)
+#   policy_tables  the packet-policy tables ip enforces and translates:
+#                  NetworkPolicy's (np_apply) and the proxy's (px_apply)
+# Every table lives in ip's heap, whose default cap (16 MiB, elastic on
+# aarch64: it commits what the tables touch) holds these several times over
+# (~0.7 MiB: 33 owners' 8 KiB stashes, resolver and event entries, 1024
+# flows, two policy tables twice over), so no `heap.arena_bytes` is given.
+LANES = 32
+peer_slots = [p for p in os.environ.get("NANOCLOUD_RIG_PEERS", "").split() if "=" in p]
+ip_mod = (
+    "  # ── Metal: the node's IP stack, with its capacities and policy tables ──\n"
+    "  - name: ip\n    params:\n"
+    f"      lanes: {LANES}\n      lane_endpoints: {256 // LANES}\n"
+    f"      max_peers: {max(len(peer_slots) - 1, 1)}\n      max_held: 16\n"
+    f"      max_dg_flows: 1024\n      dns_cache: 16\n      dns_pending: 8\n"
+    '      policy_tables: "netpolicy,proxy"\n')
 head, rest = g.split("\nmodules:\n", 1)
-g = head + "\nmodules:\n" + disk + rest
+g = head + "\nmodules:\n" + disk + ip_mod + rest
 
 extra = [
     "  # ── Metal: trusted wall-clock time (four public servers, quorum two) ──\n",
@@ -261,14 +303,35 @@ if podplane:
     pod = "".join(kept_mods).rstrip("\n") + "\n"
     # The node's Service enforcement (fluxor-proxy.yaml's net_apply, as
     # nanocloud-graph.sh splices it into a node): the proxy rows as the
-    # board's packet filter, its node ports DNATed at the board's address.
+    # board's packet filter, its node ports DNATed at the board's address,
+    # its own backends known by its name (a `Local` traffic policy, host
+    # ports). The board's filter translates only its own traffic
+    # (`DNAT_LOCAL`): node ports and host ports are rendered scope=local and
+    # the status says `inbound=unsupported`.
     proxy = open(f"{root}/packaging/debian/fluxor-proxy.yaml").read()
     m = re.search(r"(  - name: px_apply\n(?:    .*\n)+)", proxy)
     if not m:
         sys.exit("render: fluxor-proxy.yaml has no px_apply")
     pod += m.group(1).replace('    table: "proxy"\n',
-                              f'    table: "proxy"\n    node_address: "{board_ip}"\n')
-    kube_edges += "  - from: px_apply.status\n    to: px_apply.changes\n"
+                              f'    table: "proxy"\n    node_address: "{board_ip}"\n    node_name: "{node}"\n')
+    # NetworkPolicy's rows (fluxor-netpolicy.yaml's np_apply, spliced as
+    # nanocloud-graph.sh splices it with NANOCLOUD_NETPOLICY=1): the board's
+    # packet filter, which ip enforces (`policy_tables`).
+    npol = open(f"{root}/packaging/debian/fluxor-netpolicy.yaml").read()
+    m = re.search(r"(  - name: np_apply\n(?:    .*\n)+)", npol)
+    if not m:
+        sys.exit("render: fluxor-netpolicy.yaml has no np_apply")
+    pod += m.group(1)
+    # The node's net_route writer (node_net, as nanocloud-graph.sh splices
+    # it into a node): its segment from its Pod CIDR (svc_alloc's) — the row
+    # ip TAKEs and realizes — its peer routes to every other node's, and the
+    # load-balancer addresses it may answer for (`deliver` only, the board's
+    # HOLD_DELIVER: a Service it terminates itself; one backed by its
+    # workloads reads `unsupported`). Its graph-backed Pods get addresses of
+    # their own on it (`graph_pods`: ip attaches module workloads).
+    cluster_cidr = os.environ.get("NANOCLOUD_CLUSTER_CIDR", "10.244.0.0/16")
+    pod += (f'  - name: node_net\n    type: node_net\n    node_name: "{node}"\n'
+            f'    cluster_cidr: "{cluster_cidr}"\n    graph_pods: "1"\n')
     if images:
         pod = pod.replace('    blobs: "/var/lib/nanocloud.io/image/blobs"\n', '    blobs: "/blobs"\n')
     extra.append(pod)
@@ -320,7 +383,6 @@ consumers.update({"http"})
 # answers every FS call ENOSYS (the store quarantines). NOT nvme: with a
 # budget and `tolerate` on it the board boots dark.
 consumers.update({"fat32"})
-edges.append("  - from: nl_self.status\n    to: nl_self.changes\n")
 edges.append("  - from: nl_self.record_out\n    to: nl_renew.request_in\n")
 
 mods, wiring = g.split("\nwiring:\n", 1)

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # loam_effect against Loam's admin gate over mutual TLS, under capabilities.
 #
-# Loam runs as its operators run it: the loam-admin template (../loam,
-# packaging/mtls/loam-admin), rendered with a CA, the node's server identity
-# and a mesh root, under `fluxor run`. The connector runs in a real graph,
+# Loam runs as its operators run it: loam's published `loam-admin` bundle,
+# run by name under `fluxor run` with a CA, the node's server identity and a
+# mesh root as its params. The connector runs in a real graph,
 # once per capability file, each instance behind a client-mode tls under the
 # node's certificate, its effects arriving on a listening remote_channel. A
 # Python driver sends each pipeline op and checks the outcome.
@@ -24,9 +24,8 @@
 #
 #   ./scripts/loam-effect-e2e.sh     (KEEP=1 keeps the work directory)
 #
-# Needs a Loam checkout ($LOAM_ROOT, default ../loam) for its template and
-# renderer; without one it skips, and NANOCLOUD_REQUIRE_E2E=1 makes that a
-# failure.
+# Needs loam's `loam-admin` bundle pinned (`fluxor update`); without it it
+# skips, and NANOCLOUD_REQUIRE_E2E=1 makes that a failure.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +38,7 @@ skip() {
 }
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 command -v openssl >/dev/null || { echo "FAIL: openssl not on PATH"; exit 1; }
-nc_loam_present || skip "no Loam checkout at $LOAM_ROOT (set LOAM_ROOT)"
+nc_loam_present || skip "loam-admin is not pinned (fluxor update)"
 for m in loam_effect remote_channel tls; do
   [ -e "$MODULES_DIR/$m.fmod" ] || { echo "FAIL: missing $m.fmod (fluxor modules build --target bcm2712)"; exit 1; }
 done

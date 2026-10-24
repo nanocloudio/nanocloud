@@ -143,7 +143,7 @@ ST="$(store_last /sandbox-status/pod-pz)"
 PH="$(store_last /pod-lifecycle-status/pod-pz)"
 if [ "$FULL" = 1 ]; then
   echo "== 5. FULL (root): paused projected, phase=Paused, no restart =="
-  [ "$ST" = "state=paused;code=0" ] || fail "pod-pz should project state=paused, got '$ST'"
+  [[ "$ST" =~ ^state=paused\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] || fail "pod-pz should project state=paused with its run's start, got '$ST'"
   [ "$PH" = "phase=Paused" ] || fail "pod-pz should be phase=Paused, got '$PH'"
 else
   echo "== 5. DEGRADED (unprivileged: cgroup containment unavailable — the"

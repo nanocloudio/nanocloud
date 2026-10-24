@@ -36,6 +36,13 @@ loam = "0.0.1"
 # by the control plane.
 clustor = "0.0.1"
 
+# Bundles the e2e scripts run by name, which no graph names: loam's admin
+# plane (`fluxor run loam-admin`, scripts/support/loam-admin.sh) and its
+# operator applet (`fluxor install loam`). `fluxor update` pins each from
+# loam's published index.
+[uses]
+bundles = ["loam-admin", "loam"]
+
 [ci]
 # Module targets to build in CI. Nanocloud nodes are Pi 5; the deb
 # ships `bcm2712` `.fmod` artefacts run as PIC on linux/aarch64.

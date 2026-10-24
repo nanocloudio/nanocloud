@@ -13,11 +13,14 @@
 //   /pod-specs/<uid>    cmd desired restart rootfs graph grace   (the ask;
 //                       restart defaulted to always by pod_specs, as the
 //                       API server defaults restartPolicy)
-//   /sandbox-status/    state code                               (the world)
+//   /sandbox-status/    state code started   (the world; started: the
+//                       moment the runtime started the run's process)
 //   /probe-status/      live                                     (liveness)
 //   /sandboxes/         cmd                    (does the artifact exist yet)
 //   /pod-init/<pod uid> failed                 (an init container failed
 //                                               for good: the Pod Failed)
+//   /pod-cond/<uid>     tf rs                  (its end is recorded, and
+//                                               for which run)
 module nanocloud.podlifecycle {
 
   // The context each chain here carries across its effects: ONE nested
@@ -56,6 +59,9 @@ module nanocloud.podlifecycle {
     pod: string = 76;      // /pod-specs/ pod: the Pod's "<ns>/<name>"
     state: string = 80;
     code: string = 81;
+    // /sandbox-status/ started: the moment the runtime started this run's
+    // process ("" for a workload it never started: a refusal).
+    started: string = 82;
     live: string = 90;
     sb_cmd: string = 100;
     // /sandbox-boot: the runtime's boot now, and /sandbox-boot-of/<uid>: the
@@ -66,6 +72,14 @@ module nanocloud.podlifecycle {
     // /pod-init/<pod uid> failed: an init container of the Pod failed and
     // its restartPolicy (Never) does not run it again.
     ifail: string = 130;
+    // /pod-cond/<uid> tf rs: the moment the Pod's report recorded a run's
+    // termination, and the run it recorded (the runtime's `started` of it:
+    // pod_report.uproc). A terminated container is destroyed only once ITS
+    // end is recorded — `tf` under this run's start, or with no start to
+    // name for a workload never started: the teardown overwrites the status
+    // the report reads its exit from.
+    tf: string = 140;
+    rs: string = 141;
   }
 
   // The transition, as a MERGE of the fields that changed — never a PUT: this
@@ -110,15 +124,20 @@ module nanocloud.podlifecycle {
       pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "", pod: "Pending", kill: "", rst: d.restarts, metal: "", podkey: d.pod } };
 
     // ── desired = deleted ──────────────────────────────────────────────
-    // Immediate (grace=0) or nothing live to signal: the direct delete flow,
-    // consuming the kill key if one was in flight. A status recorded under
-    // another boot is nothing live: the node restarted and the workload with
-    // it, so there is no process to signal and a kill key would never be
-    // consumed.
-    when d.desired == "deleted" && (d.grace == 0 || d.state == "" || d.state == "exited" || d.state == "failed" || d.state == "killed" || d.state == "destroyed" || (d.state == "running" && d.live == "0") || (has(d.sboot) && has(d.boot) && d.sboot != d.boot)) && d.kill_phase != 0 ->
+    // Nothing to signal: the direct delete flow, consuming the kill key if
+    // one was in flight. A container that ended goes once its report has
+    // recorded how (`tf`, for this run: `rs`). A graph-backed Pod is a module subgraph, with no
+    // process and no SIGTERM window: its node tears it down at once. A status
+    // recorded under another boot is nothing live either: the node restarted
+    // and the workload with it, so there is no process to signal and a kill
+    // key would never be consumed. A live process is always signalled,
+    // however short its grace: an immediate delete (grace=0) is the
+    // escalation below at once, so the container ends `Error 137` as
+    // upstream's force-deleted one does, never torn down with no exit to say.
+    when d.desired == "deleted" && (d.graph != "" || d.state == "" || ((d.state == "exited" || d.state == "failed" || d.state == "killed") && d.tf != "" && (d.started == "" || d.rs == d.started)) || d.state == "destroyed" || (d.state == "running" && d.live == "0") || (has(d.sboot) && has(d.boot) && d.sboot != d.boot)) && d.kill_phase != 0 ->
       pl.Step { cid: d.seq, op: MERGE, key: d.key,
                 v1: "kill_phase=0;kill_deadline=0", ctx: Ctx { key: d.key, sb: "delete", pod: "Terminating", kill: "clear", rst: d.restarts, metal: d.graph, podkey: d.pod } };
-    when d.desired == "deleted" && (d.grace == 0 || d.state == "" || d.state == "exited" || d.state == "failed" || d.state == "killed" || d.state == "destroyed" || (d.state == "running" && d.live == "0") || (has(d.sboot) && has(d.boot) && d.sboot != d.boot)) ->
+    when d.desired == "deleted" && (d.graph != "" || d.state == "" || ((d.state == "exited" || d.state == "failed" || d.state == "killed") && d.tf != "" && (d.started == "" || d.rs == d.started)) || d.state == "destroyed" || (d.state == "running" && d.live == "0") || (has(d.sboot) && has(d.boot) && d.sboot != d.boot)) ->
       pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "delete", pod: "Terminating", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
     // Phase 1: ask nicely, and record the deadline the timer will wake us on.
     // While the signal is pending the sandbox phase is LEFT ALONE (`sb: ""`):
@@ -129,15 +148,23 @@ module nanocloud.podlifecycle {
     when d.desired == "deleted" && d.kill_phase == 0 ->
       pl.Step { cid: d.seq, op: MERGE, key: d.key,
                 v1: "kill_phase=1;kill_deadline=", v2: d.now + d.grace * 1000, ctx: Ctx { key: d.key, sb: "", pod: "Terminating", kill: "term", rst: d.restarts, metal: d.graph, podkey: d.pod } };
-    // Grace expired: escalate, then let the delete flow DESTROY.
-    when d.desired == "deleted" && d.kill_phase == 1 && d.now >= d.kill_deadline ->
+    // Grace expired, or none is given (an immediate delete): SIGKILL, and
+    // wait for it to land before the sandbox is destroyed. Destroying in the
+    // same step races the kill: a DESTROY that wins tears a live container
+    // down with no exit to say, where the kill ends it `Error 137`. Once the
+    // kill is seen (`killed`), the direct delete flow above destroys it.
+    when d.desired == "deleted" && d.kill_phase == 1 && (d.now >= d.kill_deadline || d.grace == 0) ->
       pl.Step { cid: d.seq, op: MERGE, key: d.key,
-                v1: "kill_phase=2", ctx: Ctx { key: d.key, sb: "delete", pod: "Terminating", kill: "kill", rst: d.restarts, metal: d.graph, podkey: d.pod } };
-    when d.desired == "deleted" && d.kill_phase == 1 ->
+                v1: "kill_phase=2;kill_deadline=", v2: d.now + 2000, ctx: Ctx { key: d.key, sb: "", pod: "Terminating", kill: "kill", rst: d.restarts, metal: d.graph, podkey: d.pod } };
+    // A signal in flight (its grace, or the 2 s a SIGKILL is given to land),
+    // or a container that ended and whose end is not recorded yet.
+    when d.desired == "deleted" && (d.kill_phase == 1 || d.now < d.kill_deadline
+         || ((d.state == "exited" || d.state == "failed" || d.state == "killed") && !(d.tf != "" && (d.started == "" || d.rs == d.started)))) ->
       pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "", pod: "Terminating", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
+    // A SIGKILL that did not land (a sandbox created but never started has
+    // no process to take it): destroy it regardless.
     when d.desired == "deleted" ->
       pl.Step { cid: d.seq, op: NOOP, key: "", ctx: Ctx { key: d.key, sb: "delete", pod: "Terminating", kill: "", rst: d.restarts, metal: d.graph, podkey: d.pod } };
-
     // ── terminated (a real exit, or liveness past its threshold) ────
     // The backoff bookkeeping happens on the terminal EDGE only: the terminal
     // status persists until the teardown completes, and `was_terminal` is what

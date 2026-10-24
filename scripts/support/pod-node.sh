@@ -14,13 +14,20 @@
 # that runs its arguments as a script of steps, printing what each finds:
 #   argv | env | id | cwd           what the process is
 #   cat <f> | mode <f> | ls <d>     what a file holds, its mode, a listing
+#   stat <f>                        its mode (setgid included, octal) and group
+#   fstype <d>                      its filesystem's magic (statfs f_type, hex)
+#   pair <d> <s>                    for <s> seconds, files a and b of the
+#                                   projection <d> read through one open of
+#                                   <d>/..data: each new value once, MIX if
+#                                   the two ever differ
 #   write <f> <text> | append <f> <text> | appendenv <f> <VAR>
 #   sleep <s> | wait <f> <s>        wait (for a file to appear)
 #   exit <n>                        end with that status
 #   onterm <s>                      on SIGTERM: print onterm=got, take <s>
 #                                   seconds, print onterm=done, exit 0
 #   ignoreterm                      ignore SIGTERM (only SIGKILL ends it)
-# and an /etc/passwd (root, app 1234:2345) and /etc/group.
+# and an /etc/passwd (root, app 1234:2345) and /etc/group (app's own group,
+# and `extra` 7777 naming app a member).
 pn_probe_image() {
   local repo="$1" user="$2" cmd="${3:-[\"argv\"]}"
   if [ ! -x "$D/probe-bin" ]; then
@@ -31,6 +38,8 @@ pn_probe_image() {
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <signal.h>
 extern char **environ;
@@ -67,6 +76,38 @@ int main(int argc, char **argv) {
       struct stat st; const char *f = argv[++i];
       if (stat(f, &st)) printf("mode %s=ERR\n", f);
       else printf("mode %s=%o\n", f, st.st_mode & 0777);
+    }
+    else if (!strcmp(s, "stat") && i + 1 < argc) {
+      struct stat st; const char *f = argv[++i];
+      if (stat(f, &st)) printf("stat %s=ERR\n", f);
+      else printf("stat %s=%04o %d\n", f, st.st_mode & 07777, (int)st.st_gid);
+    }
+    else if (!strcmp(s, "fstype") && i + 1 < argc) {
+      struct statfs sf; const char *f = argv[++i];
+      if (statfs(f, &sf)) printf("fstype %s=ERR\n", f);
+      else printf("fstype %s=%lx\n", f, (unsigned long)sf.f_type);
+    }
+    else if (!strcmp(s, "pair") && i + 2 < argc) {
+      const char *d = argv[i + 1]; int t = atoi(argv[i + 2]) * 50; i += 2;
+      char last[64] = "", a[64], b[64], p[512];
+      snprintf(p, sizeof p, "%s/..data", d);
+      while (t-- > 0) {
+        int fd = open(p, O_RDONLY | O_DIRECTORY);
+        if (fd >= 0) {
+          int fa = openat(fd, "a", O_RDONLY), fb = openat(fd, "b", O_RDONLY);
+          ssize_t na = fa >= 0 ? read(fa, a, sizeof a - 1) : -1;
+          ssize_t nb = fb >= 0 ? read(fb, b, sizeof b - 1) : -1;
+          if (fa >= 0) close(fa);
+          if (fb >= 0) close(fb);
+          close(fd);
+          a[na > 0 ? na : 0] = 0; b[nb > 0 ? nb : 0] = 0;
+          if (strcmp(a, b)) printf("pair=MIX %s %s\n", a, b);
+          else if (strcmp(a, last)) { printf("pair=%s\n", a); strcpy(last, a); }
+          fflush(stdout);
+        }
+        usleep(20000);
+      }
+      printf("pair=end\n");
     }
     else if (!strcmp(s, "ls") && i + 1 < argc) {
       DIR *d = opendir(argv[++i]); struct dirent *e;
@@ -114,7 +155,7 @@ EOF
   chmod 1777 "$l/tmp"
   cp "$D/probe-bin" "$l/bin/probe"
   printf 'root:x:0:0:root:/root:/bin/sh\napp:x:1234:2345:app:/home/app:/bin/sh\n' >"$l/etc/passwd"
-  printf 'root:x:0:\napp:x:2345:\n' >"$l/etc/group"
+  printf 'root:x:0:\napp:x:2345:\nextra:x:7777:app\n' >"$l/etc/group"
   tar -czf "$D/reg/$repo/layer.tgz" -C "$l" bin etc tmp
   python3 - "$D/reg/$repo" "$user" "$cmd" <<'PY'
 import hashlib, json, os, sys
@@ -138,16 +179,22 @@ PY
 }
 
 # pn_render: the node's graph at $D/graph.yaml (config $D/config.bin), its
-# API on $PORT, its Pods' own volumes under $D/pods. PN_TOMB_MS: how long a
+# API on $PORT, its Pods' own volumes under $D/mnt/pods (volume_files' root,
+# `pods`, under the platform's mount root: pn_run's FLUXOR_MOUNT_ROOT). PN_TOMB_MS: how long a
 # deleted Pod's tomb (and so its node's records) stays — the API's delete
 # (se_probe) and the kubelet's final one (ps_rput) — when not the default.
+# The node keeps its own lease, as nanocloud-graph.sh gives a node that runs
+# Pods (fluxor-worker.yaml `nl_self`/`nl_renew`): node-1, advertising
+# PN_NODE_ADDRESS (default 127.0.0.1) and PN_NODE_CAPACITY (JSON members,
+# default 4 CPUs, 4Gi, 110 Pods). Without it the plane takes the node out of
+# service 30 s after it last saw the Node change, and nothing is scheduled.
 pn_render() {
   nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
   sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
   PN_DROP="${PN_DROP:-jb_ cj_ pc_ hp_ sn_ dv_ dss_ ip_ ns_ q_ pdb_ te_ gc_}" \
-  python3 - "$D/graph.yaml" "$ROOT" node-1 "$D/blobs" "localhost:$REG_PORT" "$PORT" "$D/pods" <<'PY' || fail "the splice did not apply"
+  python3 - "$D/graph.yaml" "$ROOT" node-1 "$D/blobs" "localhost:$REG_PORT" "$PORT" <<'PY' || fail "the splice did not apply"
 import os, re, sys
-out, root, node, blobs, registry, port, pods = sys.argv[1:8]
+out, root, node, blobs, registry, port = sys.argv[1:7]
 g = open(out).read()
 def sub(old, new, text):
     if text.count(old) != 1: sys.exit(f"expected 1 x {old[:50]!r}, found {text.count(old)}")
@@ -193,7 +240,7 @@ g = head + "modules:\n" + "".join(keep_blocks).rstrip("\n") + "\n\nwiring:\n" + 
 # The kubelet, WHOLE, and its image plane.
 kmods, kblocks, kpairs, kextra, _ = parts(open(f"{root}/packaging/debian/fluxor-podlifecycle.yaml").read())
 kube = sub('    blobs: "/var/lib/nanocloud.io/image/blobs"\n', f'    blobs: "{blobs}"\n', "".join(kblocks))
-kube = sub("    type: volume_files\n", f'    type: volume_files\n    root: "{pods}"\n    gc_ms: 2000\n', kube)
+kube = sub("    type: volume_files\n", '    type: volume_files\n    gc_ms: 2000\n', kube)
 imods, iblocks, ipairs, iextra, _ = parts(open(f"{root}/packaging/debian/fluxor-imagepull.yaml").read())
 img = "".join(iblocks)
 img = sub('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"', img)
@@ -201,8 +248,19 @@ img = sub('dir: "/var/lib/nanocloud.io/image/blobs"', f'dir: "{blobs}"', img)
 m2, w2 = g.split("\nwiring:\n", 1)
 def edges(pairs, extra):
     return "".join(f"  - from: {a}\n    to: {b}\n" + "".join(l + "\n" for l in extra.get(i, [])) for i, (a, b) in enumerate(pairs))
+# The node's lease, as the render splices the worker's for a node with Pods.
+wk = open(f"{root}/packaging/debian/fluxor-worker.yaml").read()
+lease = wk[wk.index("  - name: nl_self\n"):wk.index("\nwiring:")]
+facts = f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux","kubernetes.io/hostname":"{node}"'
+for k, v in (("__NODE_NAME__", node), ("__NODE_FACTS__", facts),
+             ("__NODE_ADDRESS__", os.environ.get("PN_NODE_ADDRESS", "127.0.0.1")),
+             ("__NODE_CAPACITY__", os.environ.get("PN_NODE_CAPACITY", '"cpu":"4","memory":"4Gi","pods":"110"'))):
+    if k not in lease: sys.exit(f"no {k} in fluxor-worker.yaml's lease")
+    lease = lease.replace(k, v)
+lease_wiring = "  - from: nl_self.record_out\n    to: nl_renew.request_in\n"
 g = (m2.rstrip("\n") + "\n  # ── The kubelet and its image plane ──\n" + kube.rstrip("\n") + "\n"
-     + img.rstrip("\n") + "\n\nwiring:\n" + w2.rstrip("\n") + "\n" + edges(kpairs, kextra) + edges(ipairs, iextra))
+     + img.rstrip("\n") + "\n  # ── The node's lease ──\n" + lease.rstrip("\n") + "\n\nwiring:\n"
+     + w2.rstrip("\n") + "\n" + edges(kpairs, kextra) + edges(ipairs, iextra) + lease_wiring)
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules ({len(dropped)} controllers left out)")
 PY
@@ -211,11 +269,14 @@ PY
   echo "   config: $(stat -c %s "$D/config.bin") bytes"
 }
 
-# pn_run: the node, as root (pivot_root, setuid, cgroups, chmod), with a
-# delegated cgroup base at $CG; its pid in RUNTIME_PID.
+# pn_run: the node, as root (pivot_root, setuid, cgroups, its Pods' volumes
+# under the mount root $D/mnt), with a delegated cgroup base at $CG; its pid
+# in RUNTIME_PID. The process executor allows `chmod` alone: an emptyDir
+# without fsGroup is the one mode no platform op sets.
 pn_run() {
-  sudo -n mkdir -p "$CG"
-  sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef SECTOR_PROC_ALLOW="chmod rm" \
+  sudo -n mkdir -p "$CG" "$D/mnt"
+  sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef SECTOR_PROC_ALLOW="chmod" \
+    FLUXOR_MOUNT_ROOT="$D/mnt" \
     FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_HOST_CGROUP_ROOT="$CG" RUST_LOG=info "$FLUXOR_RUNTIME" \
     --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
@@ -254,6 +315,12 @@ pn_cleanup() {
     done
     sudo -n rmdir "$CG" 2>/dev/null || true
   fi
+  # What the runtime mounted under its mount root and left (a live Pod's
+  # Secret projections, memory filesystems): unmounted before the removal.
+  local m
+  for m in $(findmnt -rn -o TARGET 2>/dev/null | grep "^$D/" | sort -r || true); do
+    sudo -n umount -l "$m" 2>/dev/null || true
+  done
   if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else sudo -n rm -rf "$D" 2>/dev/null || rm -rf "$D"; fi
 }
 

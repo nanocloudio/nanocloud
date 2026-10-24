@@ -37,8 +37,6 @@ modules:
     key_prefix: "/token-resp/"
 
 wiring:
-  - from: tk_req.status
-    to: tk_req.changes
   - from: tk_req.record_out
     to: tk_dec.record_in
   - from: tk_dec.result_out

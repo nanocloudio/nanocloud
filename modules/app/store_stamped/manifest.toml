@@ -41,7 +41,8 @@ required = true
 name = "response_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 65536
+# store_effect's ring: four records of reply (see its manifest).
+buffer_size = 32768
 max_record = 8192
 # Optional: a TERMINAL writer has nobody to answer, and requiring a sink would
 # put a `debug` node in a production graph purely to swallow replies. Wire it
@@ -68,3 +69,9 @@ access = "read"
 
 [observability]
 exempt = "a read-only store effect at the graph edge — observed through the store it reads and the engine it answers"
+
+# Store subscriptions an instance opens: none — a request/response effect
+# never subscribes (it creates no event and opens no subscription). Declared
+# so the graph's subscription demand is stated by every store consumer.
+[capacities]
+store_subscriptions = 0

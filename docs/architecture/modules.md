@@ -46,7 +46,7 @@ fluxor contracts:
 | Contract | Class | What it gives |
 | -------- | ----- | ------------- |
 | `storage.object` | `0x14` | keyed byte values, compare-and-swap on a precondition, ranged reads, delete |
-| `storage.namespace` | `0x13` | prefix LIST with a cursor, and SUBSCRIBE — a pushed change stream with a revision fence |
+| `storage.namespace` | `0x13` | prefix LIST with a cursor, SUBSCRIBE — a ring on the subscriber's own kernel event — and CHANGES, the paged change feed since a revision |
 
 The Kubernetes object model rides on it as keys: `/pods/<ns>/<name>`,
 `/services/<ns>/<name>`, `/deployments.apps/<ns>/<name>`, one prefix per
@@ -220,13 +220,17 @@ and the platform realizes it — nftables on Linux, the packet filter on bare
 metal, a recorded no-op on wasm — with whether it is ENFORCED written to
 `/np-status/<table>`. The chains run on the control plane; every node that
 runs Pods runs the two `net_apply`s for itself, its status in its own records
-(`/~node/<node>/np-status/<table>`). NetworkPolicy is opt-in
-(`NANOCLOUD_NETPOLICY=1`): its chain does not fit beside the image pull in a
-single node's runtime config arena (fluxor's `CONFIG_ARENA_SIZE`, 256 KiB):
+(`/~node/<node>/np-status/<table>`), its name and address rendered in, so a
+`Local` traffic policy keeps to its own backends and its host ports are its
+own. NetworkPolicy is on by default (`NANOCLOUD_NETPOLICY=0` leaves it out).
+A table is `enforced=1` only once its enforcer has applied exactly the
+generation written (`pending` until then); the platform's tables are named
+`fx_<instance>_<table>`:
 
 | Prefix | Params | Rows |
 | ------ | ------ | ---- |
-| `px_` | `proxy.uproc` | `/services/` JOIN their `/endpointslices/` → each backend's Pod read for its named ports → one DNAT row per (Service, ready backend), ports as aligned lists (with the node ports and the load-balancer address), a named targetPort resolved against that backend's Pod; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves. `px_alloc` (`svc_alloc`) gives NodePort and LoadBalancer Services their node ports and pool address, claimed create-only at `/ipam/nodeport/<port>` and `/ipam/lb/<u32>`, released when no longer held |
+| `px_` | `proxy.uproc` | `/services/` JOIN their `/endpointslices/` → each backend's Pod read for its named ports → one DNAT row per (Service, ready backend), ports as aligned lists (with the node ports and the load-balancer address), a named targetPort resolved against that backend's Pod; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves. `px_alloc` (`svc_alloc`) gives NodePort and LoadBalancer Services their node ports and pool address, claimed create-only at `/ipam/nodeport/<port>` and `/ipam/lb/<u32>`, released when no longer held. Each row carries the Service's traffic policies and the backend's node (net_apply keeps a `Local` policy to that node's backends); ClusterIP translates the source on hairpin, a `Cluster` node port or load-balancer address always, `Local` never |
+| `hp_` | `proxy.uproc` | `/pods/` one record per container → a row per container with hostPorts, for the node its Pod runs on, at `/np-rows/hostport/`; that node DNATs its address at each hostPort to the Pod. Pruned with the Pod |
 | `np_` | `netpolicy.uproc` | `/networkpolicies/` JOIN `/pods/` by podSelector → `/np-sel/` selections → per-rule ALLOW rows and a per-direction ISOLATE (Kubernetes' policyTypes reading); a selector peer allows nothing it cannot name. Selections and rows pruned by digest and pod address, conditional on the revision judged |
 
 ### The controller chains
@@ -321,10 +325,16 @@ observed `/sandbox-status/`, the IPAM lease, the pod's bound volumes
 (a status recorded under another boot is a workload that no longer exists).
 `workload_effect` performs the op and owns only what cannot live in the store:
 the live handles and their continuous observation (WAIT, READ, the PTY pump),
-reported as events the chain writes back. Nanocloud owns the image→rootfs
-and pod-spec→argv mapping, and the backend reads no OCI format.
+reported as events the chain writes back. A run's start is one of them: START
+stamps the moment it starts the process, and every status of that run carries
+it (`/sandbox-status/<uid>` `state=;code=;started=`), its exit included. The
+Pod's report (`pod_report.uproc`) takes a container's `startedAt` — and what
+counts as a new run — from it, never from having observed the run running, so
+a container that ends before any pass sees it run still reports a terminated
+state with both its start and its finish. Nanocloud owns the image→rootfs and
+pod-spec→argv mapping, and the backend reads no OCI format.
 
-`platform_raw` is the tree's privileged grant, and exactly four modules carry
+`platform_raw` is the tree's privileged grant, and exactly five modules carry
 it — each because its one effect rewrites the host, and each on a module that
 decides nothing:
 
@@ -332,6 +342,7 @@ decides nothing:
 | ------ | ---------------- |
 | `workload_effect` | namespaces, cgroups and the processes in them (`workload`) |
 | `net_apply` | the host's packet policy (`net_policy`) |
+| `node_net` | the node's segment, peer routes and held addresses (`net_route`) |
 | `mount_effect` | the mount table (`host_mount`, `proc`) |
 | `volume_host` | a node's block devices and their unlocked mappings (`workload`, `proc`) |
 
@@ -362,7 +373,8 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Six request inputs, so the runtime's chains feed it without a merge |
 | `net_apply` | `net_policy` (`0x1E`) | rows under a prefix → one `net.policy` table, replaced whole (a row set that does not fit is not applied); the platform's ENFORCED bit and the generation at `/np-status/<table>` |
 | `cluster_dns` | the net pair (datagram) | the cluster's DNS: `<svc>.<ns>.svc.cluster.local` answered from the store as the API keeps it — a Service's ClusterIP, a headless one's ready backends (its `/endpoints/` document), an ExternalName's CNAME, a named port's SRV, NXDOMAIN for no such Service — and every other name forwarded to the node's resolver |
-| `svc_alloc` | `storage.object`, `storage.namespace` | NodePort and LoadBalancer allocation: node ports and a pool address claimed create-only, written into the Service conditional on its revision, released when no longer held (one module rather than two `is_`-shaped chains: a chain per allocator costs ~3.5 KiB of the runtime's config arena, this ~50 bytes) |
+| `svc_alloc` | `storage.object`, `storage.namespace` | NodePort and LoadBalancer allocation: node ports and a pool address claimed create-only, written into the Service conditional on its revision, released when no longer held (one module rather than two `is_`-shaped chains: a chain per allocator costs ~3.5 KiB of the runtime's config arena, this ~50 bytes); and every Node's Pod CIDR, a /24 of the cluster CIDR claimed at `/ipam/podcidr/<index>` and written into `spec.podCIDR`/`podCIDRs` |
+| `node_net` | `net_route` (`0x20`), `storage.object`, `storage.namespace` | a node's one `net_route` writer: its segment from its Node's podCIDR (gateway the CIDR's first address, cluster prefixes the Pod and Service ranges), a peer route to every other node's podCIDR via its InternalIP, and the LoadBalancer addresses it holds the claim of (`/net-hold/<u32>`, one node each, taken over from a node out of service; `Local` only where an endpoint is); what took effect (READ) at `/node-net/<node>` and `/sandbox-net`; its graph-backed Pods' address requests (`graph_pods`, bare metal) and the release of its Pods' leases once Pod and sandbox are gone |
 | `http_fetch` | net pair, `fs` | one GET at a time (behind `tls`, or plaintext); the answer comes back as the JSON members the record asked for (`a[].b` collect, `a[k=v].b` select), or lands as a sha256-verified file (optionally in Range chunks); a request whose result already exists is answered 304 without a byte on the wire |
 | `http_chain` | Wave's `http` (an exchange PROVIDER on an application route) | each exchange → one request envelope for a chain, a large body staged in the store; the chain's reply envelopes → the exchange's response, a watch held open, within the server's credit |
 | `http_effect` | an HTTP endpoint, in the graph or through Wave's `http` client (an exchange REQUESTER) | a record → one exchange (kagi's `certificate_endpoint`) → the answer, with chosen top-level JSON members lifted, as a record |
@@ -397,7 +409,7 @@ below it is debt — it is the platform working as designed.
 | Surface | Class | Provides |
 | ------- | ----- | -------- |
 | `storage.object` | `0x14` | keyed byte values, CAS, ranged read, delete |
-| `storage.namespace` | `0x13` | prefix LIST with cursor, change SUBSCRIBE with a revision fence |
+| `storage.namespace` | `0x13` | prefix LIST with cursor, change SUBSCRIBE (an event ring), paged CHANGES since a revision |
 | `workload` | `0x1A` | isolated workload lifecycle: typed CREATE header (identity, posture, resource intents, network identity) + a backend-opaque options envelope; CREATE/START/READ/SIGNAL/WAIT/DESTROY plus exec and TTY |
 | `fs` | `0x09` | files — the blob cache `http_fetch` lands image layers in |
 | `net_policy` | `0x1E` | the host's packet policy as a table, replaced whole; the platform realizes it and reports whether it is enforced |
@@ -503,11 +515,17 @@ A new module is a directory under `modules/app/` with `mod.rs` and
   stays correct under an adaptive tick.
 - **Own your prefixes.** One writer per prefix, named in the manifest header.
   Two modules writing one key is a design error, not a race to fix.
-- **Take your change sink from a self-edge.** A module cannot open a channel,
-  so a graph gives it one by wiring its own `status` output back to its
-  `changes` input (a one-node cycle); the module hands that channel to
-  SUBSCRIBE and drains the pushed events. Declare both ports even though
-  nothing writes `status`.
+- **Subscribe on one kernel event, and keep a ring owed until a pass ends.**
+  The store writes no channel of a subscriber's: a module creates ONE event
+  (`_shared/store.rs` `store_event`, the manifest's `event` resource) and
+  names it in every SUBSCRIBE; each step `store_take` asks which
+  subscriptions rang. A ring is coalesced — one per burst — so the pass it
+  owes stays owed (`dirty`) until a pass COMPLETES: one the store answered
+  `EAGAIN`, `ENOMEM` or a refusal is run again on the module's timer, never
+  left for a next change that may not come. Declare the demand: a
+  `store_subscriptions` constant, or `demand_from_params` counting the
+  params that name prefixes, and `store_subscribers = 1`; a subscriber never
+  attests `resume_after_fault`.
 - **Prove it live.** Add a `scripts/<name>-e2e.sh` that boots the real `.fmod`
   in a runtime and asserts on the store. Inline `#[cfg(test)]` is forbidden
   under `modules/`: in a `no_std` module it compiles away silently.

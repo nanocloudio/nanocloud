@@ -2,7 +2,7 @@
 # under clustor's consensus and durability, every peer link under mutual
 # TLS. One fragment for every graph a node runs — the control plane
 # (fluxor-controlplane.yaml, a voter), a worker (fluxor-worker.yaml, a
-# learner) and the CLI (packaging/cli/linux.yaml, this node's replica run
+# learner) and the CLI (packaging/debian/fluxor-cli.yaml, this node's replica run
 # offline): `nanocloud-graph.sh` splices its modules at a template's
 # `__REPLICA_MODULES__` and its wiring at `__REPLICA_WIRING__`, then renders
 # this node's values (cluster.env, its PKI).

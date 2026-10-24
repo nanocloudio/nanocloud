@@ -1,0 +1,109 @@
+name = "node_net"
+version = "0.1.0"
+description = "The node's own segment, its peer routes and the load-balancer addresses it answers for, written to net.route as its one writer, with what took effect stated"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The `net_route` writer of a node — one per node, the tables' single writer.
+# What the CNI plugin and the load balancer's speaker do on a Kubernetes node,
+# from the cluster's records, through fluxor's `net_route` contract (0x20):
+#
+#   SEGMENTS  the node's segment, from its Node's spec.podCIDR (svc_alloc
+#             carves it from the cluster CIDR): id 1, the CIDR, its gateway
+#             (the CIDR's first address, which ipam_pod never leases), egress
+#             translated, cluster prefixes = `cluster_cidr` + `service_cidr`.
+#             Written before any Pod of the node is given its own address: a
+#             Pod is created on segment 1 only once this node said the
+#             segment is in place (/node-net/, /sandbox-net).
+#   ROUTES    a peer route to every other node: its spec.podCIDR via its
+#             InternalIP (status.addresses).
+#   HOLD      the addresses of LoadBalancer Services
+#             (status.loadBalancer.ingress[0].ip, svc_alloc's pool), each
+#             answered by ONE node: the node holding its claim
+#             `/net-hold/<address as u32>` (created under ABSENT, value
+#             `node=<name>`) arms it, every other node fences it. A node
+#             claims an address it may answer for — any ready node for
+#             `externalTrafficPolicy: Cluster`; for `Local` only a node with
+#             an endpoint of the Service of its own (an address in its
+#             podCIDR, or its own address) — and gives the claim up when it
+#             may no longer. A claim whose node is not ready (the control
+#             plane's node lease, node_lease.uproc `stale`) is taken over:
+#             deleted conditional on the revision read, then claimed. Mode
+#             by the provider's CAPS: `announce` where HOLD_ANNOUNCE (Linux),
+#             else `deliver` where HOLD_DELIVER (bare metal: node-terminated
+#             only), else none and the address reads `unsupported`.
+#
+# What took effect is the provider's to say (READ), polled every 2 s and
+# written put-if-changed:
+#
+#   /node-net/<node>  seg=1|0;cidr=<cidr>;gw=<gateway>;segment=<state>;
+#                     routes=<realized>/<n>[:<why>];held=<addr>:<armed|fenced>:
+#                     <state>,…;caps=<bits>;gen=<generation>[;why=<reason>]
+#                     — seg=1 once segment 1 is in the table and not refused
+#                     (what pod_resolve gives a Pod its own address on)
+#   /sandbox-net      seg=<1|0>: the node's own copy (scoped to it under
+#                     /~node/<node>), what the sandbox chain's CREATE puts in
+#                     the workload's network identity (sandbox.uproc)
+#
+# With `graph_pods = 1` (a runtime that attaches its module workloads to the
+# segment: bare metal), its graph-backed Pods (/metal-sandboxes/) are given
+# addresses too: node_net asks for each (`/ipam-request/<uid>`, as
+# pod_resolve does for a container Pod), and /sandbox-net says `graph=1`, so
+# their CREATE waits for the lease (sandbox.uproc `mspec`).
+#
+# And the node's own Pod-IP requests (`/ipam-request/<uid>` naming
+# `node=<this node>`, pod_resolve's) are released here once their Pod is
+# gone (no `/pods/<ns>/<name>` of that uid) and its sandbox with it (none, or
+# destroyed): the request, then its lease (a lease of the node's CIDR left
+# with no request) — what frees the address (ipam_pod_release).
+#
+# A store write the store answers EINPROGRESS is asked again, byte-identical,
+# before anything else; a read answered EAGAIN drops the pass and runs it
+# again.
+#
+# Parameters:
+# | Tag | Name         | Type | Default        | Description |
+# |-----|--------------|------|----------------|-------------|
+# | 1   | node_name    | str  | (required)     | this node's name |
+# | 2   | cluster_cidr | str  | 10.244.0.0/16  | the cluster's Pod CIDR (NANOCLOUD_CLUSTER_CIDR) |
+# | 3   | service_cidr | str  | 10.96.0.0/16   | the Service range (ipam_svc's) |
+# | 4   | mtu          | str  | 1500           | the segment's MTU |
+# | 5   | graph_pods   | str  | (off)          | `1`: graph-backed Pods get addresses of their own (bare metal) |
+timer_class = "wall_clock"
+# SEGMENTS, ROUTES and HOLD rewrite the host's routing: privileged.
+permissions = ["platform_raw"]
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "net_route"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# Every subscription rings the module's one kernel event: the store writes
+# no channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
+[observability]
+exempt = "node agent — one table replace or store action per change, not a data path"
+
+# Store subscriptions an instance opens: /nodes/, /services/ and /net-hold/
+# (an endpoint, a request or a sandbox moving is picked up by its periodic
+# pass, every 5 s).
+[capacities]
+store_subscriptions = 3
+store_subscribers = 1

@@ -87,8 +87,6 @@ modules:
     decision: {hex: "${DEC_BD}"}
     key_prefix: "/volumesnapshots.snapshot.storage.k8s.io/"
 wiring:
-  - from: snaps.status
-    to: snaps.changes
   - from: snaps.record_out
     to: contents.request_in
   - from: contents.response_out

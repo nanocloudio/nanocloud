@@ -7,7 +7,7 @@
 #
 # A ReplicaSet is seeded into the store; the `rs_` chain — the same nodes and
 # the same compiled params fluxor-controlplane.yaml ships on Linux — wakes on
-# the namespace.change PUSH and materialises one Pod per ordinal. The observer
+# the store's ring of its event and materialises one Pod per ordinal. The observer
 # source logs whatever landed under /pods/.
 #
 # Pass signal: `pods=3` counted IN THE STORE by a module that provably logs from

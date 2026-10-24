@@ -163,8 +163,10 @@ hardware_targets = ["bcm2712", "linux"]
 # next minute arms the timer.
 timer_class = "wall_clock"
 
-# The store pushes namespace.change events onto this input. The graph allocates
-# the channel by self-wiring `status` -> `changes`.
+# A change under the prefix (or an extra `watch`) rings the source's own
+# kernel event — the `event` resource — which it creates at its first step
+# and names in every subscription; the store writes no channel of the
+# source's, so no port receives it and no graph wires one.
 # The watch connector's filter (`ir_stages`) runs Chronicle's stage executor
 # with the whole pinned CEL extension surface — the same `full` feature set
 # Chronicle's own `pipeline` module builds with, so a param that runs there
@@ -174,18 +176,19 @@ name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
 default  = true
 
-[[ports]]
-name = "changes"
-direction = "input"
-content_type = "OctetStream"
-
 # record_out is the PRIMARY output: `module_new` hands it over directly, so the
 # hot path never depends on resolving a port by index.
 [[ports]]
 name = "record_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 65536
+# Two records: one whole record ahead of the one the consumer is reading,
+# which is what its `request_in` asks for too. A deeper ring buys nothing —
+# the writer downstream takes one record a step, and a page that does not fit
+# is staged and resumed at the key it stopped on (`emit_page`) — and this port
+# is wired over a hundred times in a control plane, every ring out of the
+# runtime's one channel arena.
+buffer_size = 16384
 max_record = 8192
 required = true
 # NOT declared `framed`. Whether this edge needs mailbox delivery is the
@@ -217,5 +220,21 @@ access = "read"
 requires_contract = "timer"
 access = "write"
 
+# Every subscription rings the module's one kernel event: the store writes
+# no channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
 [observability]
 exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"
+
+# Store subscriptions an instance opens: one for its prefix and one per
+# extra watch no other of its prefixes covers — at most the entries of its
+# `prefix` (tag 1) and `watch` (tag 7) params, which the composer counts per
+# instance (1..15 across the deb renders) and sums into the store's
+# subscription capacity, beside the reserve kept for the workloads a node
+# admits later. One kernel event per instance carries them all.
+[capacities]
+demand_from_params = { pool = "store_subs", tags = [1, 7] }
+store_subscribers = 1

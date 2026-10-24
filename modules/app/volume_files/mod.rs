@@ -11,6 +11,7 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::platform::linux::host_mount as hm;
 use abi::platform::linux::host_process as hp;
 use abi::SyscallTable;
 
@@ -24,8 +25,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 4096;
 
@@ -36,11 +35,8 @@ include!("../_shared/poddns.rs");
 include!("../_shared/podres.rs");
 
 const FS_CLOSE: u32 = 0x0903;
-const FS_WRITE: u32 = 0x0906;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
 const FS_MKDIR: u32 = 0x090B;
 const EAGAIN: i32 = -11;
 const EINPROGRESS: i32 = -36;
@@ -54,8 +50,12 @@ const REC: usize = 8192;
 const OBJ: usize = 64 * 1024;
 /// One file's content, decoded.
 const FILE: usize = 64 * 1024;
+/// A projection as one `PROJECT` argument: every file of the volume.
+const HM_ARG: usize = 72 * 1024;
 const PATH: usize = 256;
 const CMD: usize = 512;
+/// A PREPARE's volume spec (field 3).
+const SPEC: usize = 2048;
 const OP_NOOP: i64 = 0;
 const OP_PREPARE: i64 = 40;
 /// The chain's carry field the directory rides back in.
@@ -65,18 +65,30 @@ const CACHE: usize = 64;
 /// Gone Pods' directories found by one sweep.
 const SWEEP: usize = 16;
 
-/// Where a PREPARE is.
+/// Where a PREPARE (or the sweep) is.
 const J_IDLE: u8 = 0;
+/// Reading what the volume holds, and asking the platform for it.
 const J_RUN: u8 = 1;
+/// An emptyDir's mode, through the process executor.
 const J_CHMOD: u8 = 2;
+/// A `host_mount` op of the PREPARE in flight, asked again byte-identical.
+const J_HM: u8 = 3;
+/// A gone Pod's directory being removed (`REMOVE_TREE`).
+const J_SWEEP: u8 = 4;
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
     request_out: i32,
+    /// The Pods' directories, relative to the platform's mount root.
     root: [u8; 128],
     root_len: u8,
+    /// The mount root (`host_mount::ROOT`), absolute; 0 until asked.
+    mroot: [u8; 128],
+    mroot_len: u8,
+    /// `host_mount::PRIV` (-1 until asked).
+    privs: i32,
     gc_ms: u32,
     /// The request held while it is served.
     rec: [u8; REC],
@@ -85,17 +97,21 @@ struct State {
     out: [u8; REC],
     out_len: usize,
     job: u8,
-    /// Files whose mode is set (the chmod pass's cursor) and how many
-    /// there are; the content's digest, cached once done.
-    next_mode: usize,
-    files: usize,
+    /// The held PREPARE's content digest, cached once done.
     digest: u64,
+    /// What the held PREPARE binds once its op succeeds.
+    bind: [u8; PATH],
+    bind_len: usize,
     proc_h: i32,
     proc_ok: bool,
+    /// The `host_mount` op in flight and its argument.
+    hm_op: u32,
+    hm_len: usize,
     obj: [u8; OBJ],
     obj_len: usize,
     file: [u8; FILE],
     tmp: [u8; FILE],
+    hm: [u8; HM_ARG],
     cache: [[u64; 2]; CACHE],
     cache_next: usize,
     /// The sweep: gone Pods' names, and the next to remove.
@@ -109,6 +125,10 @@ struct State {
     last_hb_ms: u64,
     last_hb_sum: u32,
     said_proc: bool,
+    said_root: bool,
+    said_memory: bool,
+    said_outside: bool,
+    said_rc: bool,
     drain: [u8; 256],
     nag: ReadNag,
 }
@@ -139,6 +159,14 @@ pub extern "C" fn module_state_size() -> u32 {
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
+
+/// A root the platform can take: relative, no empty, `.` or `..` part.
+fn rel_ok(p: &[u8]) -> bool {
+    !p.is_empty()
+        && p.first() != Some(&b'/')
+        && p.split(|&c| c == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..")
+}
 
 /// # Safety
 /// Kernel module-ABI entry point: `state`/`syscalls` are the loader-owned
@@ -171,19 +199,21 @@ pub unsafe extern "C" fn module_new(
     s.proc_h = -1;
     s.gone_n = 0;
     s.cache_next = 0;
+    s.mroot_len = 0;
+    s.privs = -1;
     set_defaults(s);
     if !params.is_null() && params_len >= 4 {
         parse_tlv(s, params, params_len);
     }
     if s.root_len == 0 {
-        let d = b"/var/lib/nanocloud.io/pods";
+        let d = b"pods";
         for (o, &c) in s.root.iter_mut().zip(d.iter()) {
             *o = c;
         }
         s.root_len = d.len() as u8;
     }
-    if s.root.first() != Some(&b'/') {
-        let m = b"[volume_files] root is not an absolute path - REFUSED";
+    if !rel_ok(s.root.get(..s.root_len as usize).unwrap_or(&[])) {
+        let m = b"[volume_files] root is not a path relative to the mount root - REFUSED";
         dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
         return -22;
     }
@@ -215,8 +245,21 @@ unsafe fn step(s: &mut State, sys: &SyscallTable) {
         }
         s.out_len = 0;
     }
-    if s.proc_h >= 0 && !poll_proc(s, sys) {
-        return;
+    if s.proc_h >= 0 {
+        if !poll_proc(s, sys) {
+            return;
+        }
+        if s.job == J_CHMOD {
+            let ok = s.proc_ok;
+            return prepared(s, sys, ok);
+        }
+    }
+    if s.job == J_HM || s.job == J_SWEEP {
+        let rc = (sys.provider_call)(-1, s.hm_op, s.hm.as_mut_ptr(), s.hm_len);
+        if later(rc) {
+            return;
+        }
+        return hm_done(s, sys, rc);
     }
     if s.job == J_IDLE && s.rec_len == 0 {
         if sweep(s, sys) {
@@ -233,10 +276,8 @@ unsafe fn step(s: &mut State, sys: &SyscallTable) {
         }
         s.job = J_RUN;
     }
-    match s.job {
-        J_RUN => run(s, sys),
-        J_CHMOD => chmod_next(s, sys),
-        _ => {}
+    if s.job == J_RUN {
+        run(s, sys);
     }
 }
 
@@ -254,6 +295,10 @@ struct Vol<'a> {
     optional: bool,
     items: &'a [u8],
     uid: &'a [u8],
+    /// The group the volume is given (the Pod's fsGroup), if any.
+    group: Option<u32>,
+    /// fsGroupChangePolicy OnRootMismatch (`r`), else Always.
+    on_mismatch: bool,
 }
 
 fn seg(s: &[u8], n: usize) -> &[u8] {
@@ -269,6 +314,34 @@ fn name_ok(n: &[u8]) -> bool {
         && n != b".."
 }
 
+/// A group ID as pod_resolve writes one (decimal, 0..=2147483647).
+fn gid_of(g: &[u8]) -> Option<u32> {
+    if g.is_empty() || g.len() > 10 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in g {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u64::from(c - b'0');
+    }
+    (v <= 0x7FFF_FFFF).then_some(v as u32)
+}
+
+/// `<gid>/<a|r>` at segments `at`, `at + 1`: the fsGroup and its policy.
+fn fs_group(spec: &[u8], at: usize) -> Option<(Option<u32>, bool)> {
+    let g = seg(spec, at);
+    if g.is_empty() {
+        return Some((None, false));
+    }
+    let pol = seg(spec, at + 1);
+    if pol != b"a" && pol != b"r" {
+        return None;
+    }
+    Some((Some(gid_of(g)?), pol == b"r"))
+}
+
 fn parse_vol<'a>(spec: &'a [u8], id: &'a [u8]) -> Option<Vol<'a>> {
     let uid = match id.iter().position(|&c| c == b'~') {
         Some(t) => id.get(..t)?,
@@ -282,30 +355,79 @@ fn parse_vol<'a>(spec: &'a [u8], id: &'a [u8]) -> Option<Vol<'a>> {
     if !name_ok(vol) {
         return None;
     }
+    let bare = Vol {
+        kind,
+        vol,
+        ns: &[],
+        name: &[],
+        mode: &[],
+        optional: false,
+        items: &[],
+        uid,
+        group: None,
+        on_mismatch: false,
+    };
     match kind {
-        b'e' => Some(Vol {
-            kind,
-            vol,
-            ns: &[],
-            name: &[],
-            mode: &[],
-            optional: false,
-            items: &[],
-            uid,
-        }),
+        b'e' => {
+            let (group, on_mismatch) = fs_group(spec, 2)?;
+            Some(Vol {
+                group,
+                on_mismatch,
+                ..bare
+            })
+        }
         // A file the Pod's spec states whole (its resolv.conf): its text
         // `%XX`-escaped, the rest of the spec.
         b'd' => {
             let at = 3 + vol.len() + 1;
             Some(Vol {
-                kind,
-                vol,
-                ns: &[],
-                name: &[],
-                mode: &[],
-                optional: false,
                 items: spec.get(at..).unwrap_or(&[]),
-                uid,
+                ..bare
+            })
+        }
+        // A claim the fsGroup owns: `@g/<vol>/<ns>/<claim>/<gid>/<a|r>`.
+        b'g' => {
+            let (ns, name) = (seg(spec, 2), seg(spec, 3));
+            let (group, on_mismatch) = fs_group(spec, 4)?;
+            if !name_ok(ns) || !name_ok(name) || group.is_none() {
+                return None;
+            }
+            Some(Vol {
+                ns,
+                name,
+                group,
+                on_mismatch,
+                ..bare
+            })
+        }
+        // A downwardAPI (`@w`) or projected (`@p`) volume:
+        // `/<ns>/<mode>/<gid>/<item>|…`, each item `<path>=<mode>=<source>`.
+        b'w' | b'p' => {
+            let (ns, mode, g) = (seg(spec, 2), seg(spec, 3), seg(spec, 4));
+            if !name_ok(ns) || mode.len() != 3 || !mode.iter().all(|c| (b'0'..=b'7').contains(c)) {
+                return None;
+            }
+            let group = if g.is_empty() { None } else { Some(gid_of(g)?) };
+            let mut at = 0usize;
+            let mut n = 0usize;
+            for (i, &c) in spec.iter().enumerate() {
+                if c == b'/' {
+                    n += 1;
+                    if n == 5 {
+                        at = i + 1;
+                        break;
+                    }
+                }
+            }
+            if at == 0 {
+                return None;
+            }
+            Some(Vol {
+                ns,
+                mode,
+                items: spec.get(at..)?,
+                group,
+                ..bare
             })
         }
         b'c' | b's' => {
@@ -317,13 +439,15 @@ fn parse_vol<'a>(spec: &'a [u8], id: &'a [u8]) -> Option<Vol<'a>> {
             {
                 return None;
             }
+            let g = seg(spec, 6);
+            let group = if g.is_empty() { None } else { Some(gid_of(g)?) };
             // Items run to the end (their paths hold `/`).
             let mut at = 0usize;
             let mut n = 0usize;
             for (i, &c) in spec.iter().enumerate() {
                 if c == b'/' {
                     n += 1;
-                    if n == 6 {
+                    if n == 7 {
                         at = i + 1;
                         break;
                     }
@@ -331,58 +455,65 @@ fn parse_vol<'a>(spec: &'a [u8], id: &'a [u8]) -> Option<Vol<'a>> {
             }
             let items = if at == 0 { &[][..] } else { spec.get(at..)? };
             Some(Vol {
-                kind,
-                vol,
                 ns,
                 name,
                 mode,
                 optional: opt == b"1",
                 items,
-                uid,
+                group,
+                ..bare
             })
         }
         _ => None,
     }
 }
 
-/// What a volume binds: its directory, or (`@d`) its one file.
-fn target(s: &State, v: &Vol, out: &mut [u8; PATH]) -> Option<usize> {
-    if v.kind == b'd' {
-        vol_path(s, v, b"resolv.conf", out)
-    } else {
-        vol_path(s, v, &[], out)
-    }
-}
-
-/// `root/<uid>/volumes/<vol>[/<rel>]` into `out`.
-fn vol_path(s: &State, v: &Vol, rel: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
+/// `<root>/<uid>/volumes/<vol>`, relative to the mount root, into `out`.
+fn vol_rel(s: &State, v: &Vol, out: &mut [u8; PATH]) -> Option<usize> {
     let mut n = 0usize;
-    let mut put = |b: &[u8], n: &mut usize| -> Option<()> {
-        for &c in b {
-            *out.get_mut(*n)? = c;
-            *n += 1;
-        }
-        Some(())
-    };
-    put(s.root.get(..s.root_len as usize)?, &mut n)?;
-    put(b"/", &mut n)?;
-    put(v.uid, &mut n)?;
-    put(b"/volumes/", &mut n)?;
-    put(v.vol, &mut n)?;
-    if !rel.is_empty() {
-        put(b"/", &mut n)?;
-        put(rel, &mut n)?;
+    for &c in s
+        .root
+        .get(..s.root_len as usize)?
+        .iter()
+        .chain(b"/")
+        .chain(v.uid)
+        .chain(b"/volumes/")
+        .chain(v.vol)
+    {
+        *out.get_mut(n)? = c;
+        n += 1;
     }
     Some(n)
 }
 
-/// An fs answer that is not yet a decision.
+/// `rel` (relative to the mount root) made absolute, `/<leaf>` after it
+/// when one is given.
+fn abs_of(s: &State, rel: &[u8], leaf: &[u8], out: &mut [u8; PATH]) -> Option<usize> {
+    let mut n = 0usize;
+    let sep: &[u8] = if leaf.is_empty() { b"" } else { b"/" };
+    for &c in s
+        .mroot
+        .get(..s.mroot_len as usize)?
+        .iter()
+        .chain(b"/")
+        .chain(rel)
+        .chain(sep)
+        .chain(leaf)
+    {
+        *out.get_mut(n)? = c;
+        n += 1;
+    }
+    Some(n)
+}
+
+/// An fs or platform answer that is not yet a decision.
 fn later(rc: i32) -> bool {
     rc == EAGAIN || rc == EINPROGRESS
 }
 
 /// Every directory from the root down to `path` (inclusive), made. False
-/// when the provider has not answered yet; an error is the write's to meet.
+/// when the provider has not answered yet; an error is the next op's to
+/// meet.
 unsafe fn mkdirs(sys: &SyscallTable, path: &[u8]) -> bool {
     let mut buf = [0u8; PATH];
     for (i, &c) in path.iter().enumerate() {
@@ -397,6 +528,116 @@ unsafe fn mkdirs(sys: &SyscallTable, path: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// The platform's mount root and privileges, asked once. False (said once)
+/// when the platform has no mount root: no volume of a Pod's own can be
+/// made on this node.
+unsafe fn platform(s: &mut State, sys: &SyscallTable) -> bool {
+    if s.mroot_len == 0 {
+        let rc = (sys.provider_call)(-1, hm::ROOT, s.mroot.as_mut_ptr(), s.mroot.len());
+        if rc <= 0 || rc as usize >= s.mroot.len() || s.mroot.first() != Some(&b'/') {
+            if !s.said_root {
+                s.said_root = true;
+                let m = b"[volume_files] the platform names no mount root (host_mount ROOT) - no Pod volume can be made";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+            }
+            return false;
+        }
+        // The root without a trailing `/`.
+        let mut n = rc as usize;
+        while n > 1 && s.mroot.get(n - 1) == Some(&b'/') {
+            n -= 1;
+        }
+        s.mroot_len = n as u8;
+    }
+    if s.privs < 0 {
+        let p = (sys.provider_call)(-1, hm::PRIV, core::ptr::null_mut(), 0);
+        s.privs = p.max(0);
+    }
+    true
+}
+
+/// `bytes` at `buf[at..]`; the end.
+fn put_at(buf: &mut [u8], at: usize, bytes: &[u8]) -> Option<usize> {
+    let end = at.checked_add(bytes.len())?;
+    let dst = buf.get_mut(at..end)?;
+    for (d, &c) in dst.iter_mut().zip(bytes) {
+        *d = c;
+    }
+    Some(end)
+}
+
+/// The `host_mount` op `op` over `s.hm[..len]`, asked from the next step
+/// until it answers; what the PREPARE binds once it does is `s.bind`.
+fn hm_begin(s: &mut State, op: u32, len: usize) {
+    s.hm_op = op;
+    s.hm_len = len;
+    s.job = J_HM;
+}
+
+/// `GROUP_TREE` of `rel` (relative to the mount root) to the volume's group.
+fn group_tree(s: &mut State, v: &Vol, rel: &[u8]) -> Option<()> {
+    let group = v.group?;
+    let dl = u16::try_from(rel.len()).ok()?;
+    let b = &mut s.hm;
+    let mut p = put_at(b, 0, &dl.to_le_bytes())?;
+    p = put_at(b, p, rel)?;
+    p = put_at(b, p, &group.to_le_bytes())?;
+    let pol = if v.on_mismatch {
+        hm::GT_ON_ROOT_MISMATCH
+    } else {
+        hm::GT_ALWAYS
+    };
+    p = put_at(b, p, &[pol])?;
+    hm_begin(s, hm::GROUP_TREE, p);
+    Some(())
+}
+
+/// The held PREPARE's bind: `path`.
+fn set_bind(s: &mut State, path: &[u8]) -> Option<()> {
+    let dst = s.bind.get_mut(..path.len())?;
+    for (d, &c) in dst.iter_mut().zip(path) {
+        *d = c;
+    }
+    s.bind_len = path.len();
+    Some(())
+}
+
+/// The volume's octal mode digits as a mode.
+fn mode_of(m: &[u8; 3]) -> u16 {
+    m.iter()
+        .fold(0u16, |v, &c| (v << 3) | u16::from(c.wrapping_sub(b'0') & 7))
+}
+
+/// The field `name` of a flat `k=v;…` record.
+fn flat_field<'a>(rec: &'a [u8], name: &[u8]) -> &'a [u8] {
+    for kv in rec.split(|&c| c == b';') {
+        if kv.len() > name.len()
+            && kv.get(..name.len()) == Some(name)
+            && kv.get(name.len()) == Some(&b'=')
+        {
+            return kv.get(name.len() + 1..).unwrap_or(&[]);
+        }
+    }
+    &[]
+}
+
+/// The held PREPARE's spec (field 3) and sandbox id (field 17), copied out.
+fn held(s: &State, spec: &mut [u8; SPEC], id: &mut [u8; 160]) -> (usize, usize) {
+    let rec = s.rec.get(..n_of(s)).unwrap_or(&[]);
+    let a = frame_bytes(rec, 3);
+    let b = frame_bytes(rec, 17);
+    if a.len() > SPEC || b.len() > 160 {
+        return (0, 0);
+    }
+    for (d, &c) in spec.iter_mut().zip(a) {
+        *d = c;
+    }
+    for (d, &c) in id.iter_mut().zip(b) {
+        *d = c;
+    }
+    (a.len(), b.len())
 }
 
 /// The file `rel` of volume `v`: what it holds (into `s.file`) and its mode,
@@ -537,77 +778,168 @@ fn fnv(h: u64, b: &[u8]) -> u64 {
 
 /// Run the held PREPARE as far as it goes this step.
 unsafe fn run(s: &mut State, sys: &SyscallTable) {
-    let n = n_of(s);
-    let mut spec = [0u8; 512];
+    let mut spec = [0u8; SPEC];
     let mut id = [0u8; 160];
-    let (sl, il) = {
-        let rec = s.rec.get(..n).unwrap_or(&[]);
-        let a = frame_bytes(rec, 3);
-        let b = frame_bytes(rec, 17);
-        for (d, &c) in spec.iter_mut().zip(a) {
-            *d = c;
-        }
-        for (d, &c) in id.iter_mut().zip(b) {
-            *d = c;
-        }
-        (a.len().min(512), b.len().min(160))
-    };
+    let (sl, il) = held(s, &mut spec, &mut id);
     let Some(v) = parse_vol(spec.get(..sl).unwrap_or(&[]), id.get(..il).unwrap_or(&[])) else {
-        return finish(s, sys, None);
+        return finish(s, sys, false);
     };
-    let mut dir = [0u8; PATH];
-    let Some(dl) = vol_path(s, &v, &[], &mut dir) else {
-        return finish(s, sys, None);
-    };
-    if !mkdirs(sys, dir.get(..dl).unwrap_or(&[])) {
-        return;
+    if !platform(s, sys) {
+        return finish(s, sys, false);
     }
+    let mut rel = [0u8; PATH];
+    let Some(rl) = vol_rel(s, &v, &mut rel) else {
+        return finish(s, sys, false);
+    };
+    let rel = rel.get(..rl).unwrap_or(&[]);
+    let mut abs = [0u8; PATH];
+    let Some(al) = abs_of(s, rel, &[], &mut abs) else {
+        return finish(s, sys, false);
+    };
+    let abs = abs.get(..al).unwrap_or(&[]);
     let ckey = fnv(fnv(0xcbf2_9ce4_8422_2325, v.uid), v.vol);
-    if v.kind == b'd' {
-        let mut text = [0u8; 1024];
-        let Some(tn) = argv_decode(v.items, &mut text) else {
-            return finish(s, sys, None);
-        };
-        let mut fp = [0u8; PATH];
-        let Some(fl) = target(s, &v, &mut fp) else {
-            return finish(s, sys, None);
-        };
-        s.digest = fnv(0xcbf2_9ce4_8422_2325, text.get(..tn).unwrap_or(&[]));
-        if cached(s, ckey, s.digest) {
-            return finish(s, sys, Some(fl));
+    match v.kind {
+        b'e' => {
+            s.digest = fnv(0x0e, spec.get(..sl).unwrap_or(&[]));
+            if set_bind(s, abs).is_none() {
+                return finish(s, sys, false);
+            }
+            if cached(s, ckey, s.digest) {
+                return finish(s, sys, true);
+            }
+            if !mkdirs(sys, abs) {
+                return;
+            }
+            if v.group.is_some() {
+                // The fsGroup's: group-owned, setgid, group-writable — what
+                // every container of the Pod (each holding the fsGroup) may
+                // write, as upstream's ownership management leaves it.
+                if group_tree(s, &v, rel).is_none() {
+                    finish(s, sys, false);
+                }
+                return;
+            }
+            // An emptyDir any user may write (mode 0777): the one mode no
+            // platform op sets, so through the process executor.
+            if !spawn_chmod(s, sys, b"777", abs) {
+                finish(s, sys, false);
+            }
         }
-        match write_file(
-            sys,
-            fp.get(..fl).unwrap_or(&[]),
-            text.get(..tn).unwrap_or(&[]),
-        ) {
-            Some(true) => {}
-            Some(false) => return,
-            None => return finish(s, sys, None),
+        b'd' => {
+            let mut text = [0u8; 1024];
+            let Some(tn) = argv_decode(v.items, &mut text) else {
+                return finish(s, sys, false);
+            };
+            let text = text.get(..tn).unwrap_or(&[]);
+            let mut fp = [0u8; PATH];
+            let Some(fl) = abs_of(s, rel, b"resolv.conf", &mut fp) else {
+                return finish(s, sys, false);
+            };
+            if set_bind(s, fp.get(..fl).unwrap_or(&[])).is_none() {
+                return finish(s, sys, false);
+            }
+            s.digest = fnv(0xcbf2_9ce4_8422_2325, text);
+            if cached(s, ckey, s.digest) {
+                return finish(s, sys, true);
+            }
+            let Some(mut p) = project_head(&mut s.hm, rel, hm::NO_GROUP, 0, 1) else {
+                return finish(s, sys, false);
+            };
+            match project_entry(&mut s.hm, p, b"resolv.conf", 0o644, text) {
+                Some(e) => p = e,
+                None => return finish(s, sys, false),
+            }
+            hm_begin(s, hm::PROJECT, p);
         }
-        s.files = 0;
-        s.next_mode = 0;
-        if !spawn_chmod(s, sys, b"644", fp.get(..fl).unwrap_or(&[])) {
-            return finish(s, sys, None);
-        }
-        s.job = J_CHMOD;
-        return;
+        b'g' => claim(s, sys, &v, spec.get(..sl).unwrap_or(&[]), ckey),
+        b'w' | b'p' => projected(s, sys, &v, spec.get(..sl).unwrap_or(&[]), rel, abs, ckey),
+        _ => source(s, sys, &v, spec.get(..sl).unwrap_or(&[]), rel, abs, ckey),
     }
-    if v.kind == b'e' {
-        s.digest = 0x0e;
-        if cached(s, ckey, s.digest) {
-            return finish(s, sys, Some(dl));
+}
+
+/// A claim the fsGroup owns (`@g`): its directory (the `path` its
+/// `/volumes/<ns>/<claim>` record names once bound), given the group before
+/// it is bound. A directory outside the mount root (a PersistentVolume's
+/// own host directory) is bound as it is, as upstream leaves a hostPath:
+/// the platform changes nothing outside its root.
+unsafe fn claim(s: &mut State, sys: &SyscallTable, v: &Vol, spec: &[u8], ckey: u64) {
+    let st = Store::plain(sys, &s.nag);
+    let mut key = [0u8; MAX_KEY];
+    let mut kl = 0usize;
+    for &c in b"/volumes/"
+        .iter()
+        .chain(v.ns.iter())
+        .chain(b"/".iter())
+        .chain(v.name.iter())
+    {
+        if let Some(d) = key.get_mut(kl) {
+            *d = c;
+            kl += 1;
         }
-        // An emptyDir any user may write.
-        s.files = 0;
-        s.next_mode = 0;
-        if !spawn_chmod(s, sys, b"777", dir.get(..dl).unwrap_or(&[])) {
-            return finish(s, sys, None);
-        }
-        s.job = J_CHMOD;
-        return;
     }
-    // A ConfigMap or Secret.
+    let n = match get_value(&st, key.get(..kl).unwrap_or(&[]), &mut s.obj) {
+        Some(n) => n,
+        None if st.waiting() => return,
+        // Unbound (or refused): nothing to bind yet; the claim's record
+        // changing asks again.
+        None => return finish(s, sys, false),
+    };
+    let mut path = [0u8; PATH];
+    let pl = {
+        let p = flat_field(s.obj.get(..n).unwrap_or(&[]), b"path");
+        if p.first() != Some(&b'/') || p.len() > PATH {
+            return finish(s, sys, false);
+        }
+        for (d, &c) in path.iter_mut().zip(p) {
+            *d = c;
+        }
+        p.len()
+    };
+    let path = path.get(..pl).unwrap_or(&[]);
+    if set_bind(s, path).is_none() {
+        return finish(s, sys, false);
+    }
+    s.digest = fnv(fnv(0x67, path), spec);
+    if cached(s, ckey, s.digest) {
+        return finish(s, sys, true);
+    }
+    let ml = s.mroot_len as usize;
+    let under =
+        path.len() > ml + 1 && path.get(..ml) == s.mroot.get(..ml) && path.get(ml) == Some(&b'/');
+    if !under {
+        if !s.said_outside {
+            s.said_outside = true;
+            let m = b"[volume_files] a claim outside the mount root keeps its ownership (fsGroup not applied)";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+        }
+        remember(s, ckey, s.digest);
+        return finish(s, sys, true);
+    }
+    let mut rel = [0u8; PATH];
+    let rl = path.len() - ml - 1;
+    for (d, &c) in rel.iter_mut().zip(path.get(ml + 1..).unwrap_or(&[])) {
+        *d = c;
+    }
+    if group_tree(s, v, rel.get(..rl).unwrap_or(&[])).is_none() {
+        finish(s, sys, false);
+    }
+}
+
+/// A ConfigMap or Secret (`@c`, `@s`): every file it projects, written by
+/// the platform as one projection (`PROJECT`, upstream's AtomicWriter
+/// layout) — each file at its mode (`defaultMode`, an item's `mode`), the
+/// fsGroup's group with group read (and, read-only as these volumes are,
+/// `0440` added, as upstream's ownership management does), a Secret on a
+/// memory filesystem — swapped in whole for a reader.
+unsafe fn source(
+    s: &mut State,
+    sys: &SyscallTable,
+    v: &Vol,
+    spec: &[u8],
+    rel: &[u8],
+    abs: &[u8],
+    ckey: u64,
+) {
     let st = Store::plain(sys, &s.nag);
     let mut key = [0u8; MAX_KEY];
     let mut kl = 0usize;
@@ -630,140 +962,327 @@ unsafe fn run(s: &mut State, sys: &SyscallTable) {
     s.obj_len = match get_value(&st, key.get(..kl).unwrap_or(&[]), &mut s.obj) {
         Some(n) => n,
         None if st.waiting() => return,
+        // Refused for good (said by the read): neither absent nor empty, so
+        // nothing is written, and the volume fails.
+        None if st.refusal().is_some() => return finish(s, sys, false),
         None if v.optional => 0,
-        None => return finish(s, sys, None),
+        None => return finish(s, sys, false),
     };
-    // What the directory should hold: written only when it changed.
-    let mut digest = fnv(0xcbf2_9ce4_8422_2325, s.obj.get(..s.obj_len).unwrap_or(&[]));
-    digest = fnv(digest, spec.get(..sl).unwrap_or(&[]));
+    if set_bind(s, abs).is_none() {
+        return finish(s, sys, false);
+    }
+    // What the directory should hold: projected only when it changed.
+    let digest = fnv(
+        fnv(0xcbf2_9ce4_8422_2325, s.obj.get(..s.obj_len).unwrap_or(&[])),
+        spec,
+    );
     s.digest = digest;
     if cached(s, ckey, digest) {
-        return finish(s, sys, Some(dl));
+        return finish(s, sys, true);
     }
+    let group = v.group.unwrap_or(hm::NO_GROUP);
+    let mut flags = 0u8;
+    if v.group.is_some() {
+        flags |= hm::P_READ_ONLY;
+    }
+    if v.kind == b's' {
+        if s.privs & hm::PRIV_SYS_ADMIN != 0 {
+            flags |= hm::P_MEMORY;
+        } else if !s.said_memory {
+            s.said_memory = true;
+            let m =
+                b"[volume_files] no CAP_SYS_ADMIN: Secret volumes are written to disk, not memory";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+    }
+    // The count is written once every file is in.
+    let Some(head) = project_head(&mut s.hm, rel, group, flags, 0) else {
+        return finish(s, sys, false);
+    };
+    let mut p = head;
     let mut i = 0usize;
     loop {
-        let mut rel = [0u8; PATH];
-        let (rl, n, _) = match file_at(s, &v, i, &mut rel) {
+        let mut path = [0u8; PATH];
+        let (pl, n, mode) = match file_at(s, v, i, &mut path) {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(()) => return finish(s, sys, None),
+            Err(()) => return finish(s, sys, false),
         };
-        let mut path = [0u8; PATH];
-        let Some(pl) = vol_path(s, &v, rel.get(..rl).unwrap_or(&[]), &mut path) else {
-            return finish(s, sys, None);
-        };
-        // An item's own subdirectories.
-        if let Some(last) = path
-            .get(..pl)
-            .and_then(|p| p.iter().rposition(|&c| c == b'/'))
-        {
-            if last > dl && !mkdirs(sys, path.get(..last).unwrap_or(&[])) {
-                return;
-            }
-        }
-        match write_file(
-            sys,
+        let entry = project_entry(
+            &mut s.hm,
+            p,
             path.get(..pl).unwrap_or(&[]),
+            mode_of(&mode),
             s.file.get(..n).unwrap_or(&[]),
-        ) {
-            Some(true) => {}
-            Some(false) => return,
-            None => return finish(s, sys, None),
+        );
+        match entry {
+            Some(e) => p = e,
+            None => return finish(s, sys, false),
         }
         i += 1;
     }
-    s.files = i;
-    s.next_mode = 0;
-    s.job = J_CHMOD;
-    chmod_next(s, sys);
+    let Ok(count) = u16::try_from(i) else {
+        return finish(s, sys, false);
+    };
+    if put_at(&mut s.hm, head - 2, &count.to_le_bytes()).is_none() {
+        return finish(s, sys, false);
+    }
+    hm_begin(s, hm::PROJECT, p);
 }
 
-/// `bytes` as the whole of the file at `path`. `Some(false)` when the
-/// provider has not answered yet (asked again from the start next step:
-/// every write here is idempotent), `None` when it refused.
-unsafe fn write_file(sys: &SyscallTable, path: &[u8], bytes: &[u8]) -> Option<bool> {
-    let mut p = [0u8; PATH];
-    for (d, &c) in p.iter_mut().zip(path) {
+/// A downwardAPI (`@w`) or projected (`@p`) volume: each item's file —
+/// a downward-API value pod_resolve rendered (`t~<text>`), or a ConfigMap's
+/// or Secret's key (`c~<name>~<key>~<optional>`, `s~…`; no key: every key at
+/// its own name), read here — at the item's mode (else the volume's
+/// `defaultMode`), written as one projection as [`source`] writes one. A
+/// projected volume is on a memory filesystem, as upstream backs it (it may
+/// hold a Secret).
+unsafe fn projected(
+    s: &mut State,
+    sys: &SyscallTable,
+    v: &Vol,
+    spec: &[u8],
+    rel: &[u8],
+    abs: &[u8],
+    ckey: u64,
+) {
+    if set_bind(s, abs).is_none() {
+        return finish(s, sys, false);
+    }
+    let group = v.group.unwrap_or(hm::NO_GROUP);
+    let mut flags = 0u8;
+    if v.group.is_some() {
+        flags |= hm::P_READ_ONLY;
+    }
+    if v.kind == b'p' {
+        if s.privs & hm::PRIV_SYS_ADMIN != 0 {
+            flags |= hm::P_MEMORY;
+        } else if !s.said_memory {
+            s.said_memory = true;
+            let m = b"[volume_files] no CAP_SYS_ADMIN: projected volumes are written to disk, not memory";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+    }
+    let Some(head) = project_head(&mut s.hm, rel, group, flags, 0) else {
+        return finish(s, sys, false);
+    };
+    let mut p = head;
+    let mut count = 0usize;
+    let mut digest = fnv(0xcbf2_9ce4_8422_2325, spec);
+    // The object in `s.obj` (its key's hash): read once for its items.
+    let mut loaded = 0u64;
+    let st = Store::plain(sys, &s.nag);
+    let mut dm = [0u8; 3];
+    for (d, &c) in dm.iter_mut().zip(v.mode) {
         *d = c;
     }
-    let rc = (sys.provider_call)(-1, FS_UNLINK, p.as_mut_ptr(), path.len());
-    if later(rc) {
-        return Some(false);
-    }
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, p.as_mut_ptr(), path.len());
-    if later(fd) {
-        return Some(false);
-    }
-    if fd < 0 {
-        return None;
-    }
-    let mut off = 0usize;
-    let mut ok = Some(true);
-    while off < bytes.len() {
-        let rest = bytes.get(off..).unwrap_or(&[]);
-        let w = (sys.provider_call)(fd, FS_WRITE, rest.as_ptr() as *mut u8, rest.len());
-        if w > 0 {
-            off += w as usize;
-        } else if later(w) {
-            ok = Some(false);
-            break;
+    for item in v.items.split(|&c| c == b'|') {
+        let mut parts = item.splitn(3, |&c| c == b'=');
+        let (path, mode, src) = (
+            parts.next().unwrap_or(&[]),
+            parts.next().unwrap_or(&[]),
+            parts.next().unwrap_or(&[]),
+        );
+        let mut m = dm;
+        if mode.len() == 3 && mode.iter().all(|c| (b'0'..=b'7').contains(c)) {
+            for (d, &c) in m.iter_mut().zip(mode) {
+                *d = c;
+            }
+        } else if !mode.is_empty() {
+            return finish(s, sys, false);
+        }
+        if let Some(text) = src.strip_prefix(b"t~") {
+            let Some(n) = argv_decode(text, &mut s.file) else {
+                return finish(s, sys, false);
+            };
+            match project_entry(
+                &mut s.hm,
+                p,
+                path,
+                mode_of(&m),
+                s.file.get(..n).unwrap_or(&[]),
+            ) {
+                Some(e) => p = e,
+                None => return finish(s, sys, false),
+            }
+            count += 1;
+            continue;
+        }
+        // `c~<name>~<key>~<optional>` / `s~…`.
+        let mut f = src.split(|&c| c == b'~');
+        let (kind, name, key, opt) = (
+            f.next().unwrap_or(&[]),
+            f.next().unwrap_or(&[]),
+            f.next().unwrap_or(&[]),
+            f.next().unwrap_or(&[]),
+        );
+        let kind = match kind {
+            b"c" => b'c',
+            b"s" => b's',
+            _ => return finish(s, sys, false),
+        };
+        if !name_ok(name) || (key.is_empty() != path.is_empty()) {
+            return finish(s, sys, false);
+        }
+        let mut okey = [0u8; MAX_KEY];
+        let mut kl = 0usize;
+        let coll: &[u8] = if kind == b's' {
+            b"/secrets/"
         } else {
-            ok = None;
-            break;
+            b"/configmaps/"
+        };
+        for &c in coll.iter().chain(v.ns).chain(b"/").chain(name) {
+            if let Some(d) = okey.get_mut(kl) {
+                *d = c;
+                kl += 1;
+            }
+        }
+        let okey = okey.get(..kl).unwrap_or(&[]);
+        let h = fnv(0xcbf2_9ce4_8422_2325, okey);
+        if h != loaded {
+            s.obj_len = match get_value(&st, okey, &mut s.obj) {
+                Some(n) => n,
+                None if st.waiting() => return,
+                None if st.refusal().is_some() => return finish(s, sys, false),
+                None if opt == b"1" => 0,
+                None => return finish(s, sys, false),
+            };
+            loaded = h;
+            digest = fnv(fnv(digest, okey), s.obj.get(..s.obj_len).unwrap_or(&[]));
+        }
+        // This source's files, as a ConfigMap or Secret volume of one item
+        // (or of every key) lays them out.
+        let mut one = [0u8; PATH + 64];
+        let mut ol = 0usize;
+        if !key.is_empty() {
+            for &c in key.iter().chain(b"=").chain(path) {
+                match one.get_mut(ol) {
+                    Some(d) => {
+                        *d = c;
+                        ol += 1;
+                    }
+                    None => return finish(s, sys, false),
+                }
+            }
+        }
+        let tv = Vol {
+            kind,
+            vol: v.vol,
+            ns: v.ns,
+            name,
+            mode: &m,
+            optional: opt == b"1",
+            items: one.get(..ol).unwrap_or(&[]),
+            uid: v.uid,
+            group: v.group,
+            on_mismatch: false,
+        };
+        let mut i = 0usize;
+        loop {
+            let mut fpath = [0u8; PATH];
+            let (pl, n, fm) = match file_at(s, &tv, i, &mut fpath) {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(()) => return finish(s, sys, false),
+            };
+            let entry = project_entry(
+                &mut s.hm,
+                p,
+                fpath.get(..pl).unwrap_or(&[]),
+                mode_of(&fm),
+                s.file.get(..n).unwrap_or(&[]),
+            );
+            match entry {
+                Some(e) => p = e,
+                None => return finish(s, sys, false),
+            }
+            count += 1;
+            i += 1;
         }
     }
-    let mut z = [0u8; 4];
-    (sys.provider_call)(fd, FS_CLOSE, z.as_mut_ptr(), 0);
-    ok
+    s.digest = digest;
+    if cached(s, ckey, digest) {
+        return finish(s, sys, true);
+    }
+    let Ok(count) = u16::try_from(count) else {
+        return finish(s, sys, false);
+    };
+    if put_at(&mut s.hm, head - 2, &count.to_le_bytes()).is_none() {
+        return finish(s, sys, false);
+    }
+    hm_begin(s, hm::PROJECT, p);
 }
 
-/// Set the next file's mode (one `chmod` each), then finish.
-unsafe fn chmod_next(s: &mut State, sys: &SyscallTable) {
-    let n = n_of(s);
-    let mut spec = [0u8; 512];
-    let mut id = [0u8; 160];
-    let (sl, il) = {
-        let rec = s.rec.get(..n).unwrap_or(&[]);
-        let a = frame_bytes(rec, 3);
-        let b = frame_bytes(rec, 17);
-        for (d, &c) in spec.iter_mut().zip(a) {
-            *d = c;
+/// `PROJECT`'s head at `b[0..]`: `[dir_len:u16][dir][group:u32]
+/// [flags:u8][count:u16]`; the end.
+fn project_head(b: &mut [u8], rel: &[u8], group: u32, flags: u8, count: u16) -> Option<usize> {
+    let dl = u16::try_from(rel.len()).ok()?;
+    let mut p = put_at(b, 0, &dl.to_le_bytes())?;
+    p = put_at(b, p, rel)?;
+    p = put_at(b, p, &group.to_le_bytes())?;
+    p = put_at(b, p, &[flags])?;
+    put_at(b, p, &count.to_le_bytes())
+}
+
+/// One entry `[path_len:u16][path][mode:u16][data_len:u32][data]` at `at`;
+/// the end.
+fn project_entry(b: &mut [u8], at: usize, path: &[u8], mode: u16, data: &[u8]) -> Option<usize> {
+    let pl = u16::try_from(path.len()).ok()?;
+    let dl = u32::try_from(data.len()).ok()?;
+    let mut p = put_at(b, at, &pl.to_le_bytes())?;
+    p = put_at(b, p, path)?;
+    p = put_at(b, p, &mode.to_le_bytes())?;
+    p = put_at(b, p, &dl.to_le_bytes())?;
+    put_at(b, p, data)
+}
+
+/// A platform op answered: the PREPARE it served finished (its content
+/// remembered when it succeeded), or the sweep's removal counted.
+unsafe fn hm_done(s: &mut State, sys: &SyscallTable, rc: i32) {
+    if rc != 0 && !s.said_rc {
+        s.said_rc = true;
+        let mut m = [0u8; 96];
+        let mut n = 0usize;
+        let mut d = [0u8; 20];
+        let k = pm_dec(u64::from(rc.unsigned_abs()), &mut d);
+        let mut o = [0u8; 20];
+        let ok = pm_dec(u64::from(s.hm_op), &mut o);
+        for &c in b"[volume_files] host_mount op "
+            .iter()
+            .chain(o.get(..ok).unwrap_or(&[]))
+            .chain(b" refused: -")
+            .chain(d.get(..k).unwrap_or(&[]))
+        {
+            if let Some(o) = m.get_mut(n) {
+                *o = c;
+                n += 1;
+            }
         }
-        for (d, &c) in id.iter_mut().zip(b) {
-            *d = c;
+        dev_log(sys, 1, m.as_ptr(), n);
+    }
+    if s.job == J_SWEEP {
+        s.job = J_IDLE;
+        if rc == 0 {
+            s.removed = s.removed.wrapping_add(1);
         }
-        (a.len().min(512), b.len().min(160))
-    };
-    let Some(v) = parse_vol(spec.get(..sl).unwrap_or(&[]), id.get(..il).unwrap_or(&[])) else {
-        return finish(s, sys, None);
-    };
-    let mut dir = [0u8; PATH];
-    let Some(dl) = vol_path(s, &v, &[], &mut dir) else {
-        return finish(s, sys, None);
-    };
-    if (v.kind == b'd' || v.kind == b'e' || s.next_mode > 0) && !s.proc_ok {
-        return finish(s, sys, None);
+        return;
     }
-    if s.next_mode >= s.files {
-        let ckey = fnv(fnv(0xcbf2_9ce4_8422_2325, v.uid), v.vol);
-        remember(s, ckey, s.digest);
-        let mut t = [0u8; PATH];
-        let tl = target(s, &v, &mut t).unwrap_or(dl);
-        return finish(s, sys, Some(tl));
+    prepared(s, sys, rc == 0);
+}
+
+/// The held PREPARE's last op ended: on success its content is remembered
+/// and its bind offered.
+unsafe fn prepared(s: &mut State, sys: &SyscallTable, ok: bool) {
+    if ok {
+        let mut spec = [0u8; SPEC];
+        let mut id = [0u8; 160];
+        let (sl, il) = held(s, &mut spec, &mut id);
+        if let Some(v) = parse_vol(spec.get(..sl).unwrap_or(&[]), id.get(..il).unwrap_or(&[])) {
+            let ckey = fnv(fnv(0xcbf2_9ce4_8422_2325, v.uid), v.vol);
+            remember(s, ckey, s.digest);
+        }
     }
-    let mut rel = [0u8; PATH];
-    let (rl, _, mode) = match file_at(s, &v, s.next_mode, &mut rel) {
-        Ok(Some(f)) => f,
-        _ => return finish(s, sys, None),
-    };
-    let mut path = [0u8; PATH];
-    let Some(pl) = vol_path(s, &v, rel.get(..rl).unwrap_or(&[]), &mut path) else {
-        return finish(s, sys, None);
-    };
-    s.next_mode += 1;
-    if !spawn_chmod(s, sys, &mode, path.get(..pl).unwrap_or(&[])) {
-        finish(s, sys, None);
-    }
+    finish(s, sys, ok);
 }
 
 /// `chmod <mode> <path>` through the process executor.
@@ -784,21 +1303,18 @@ unsafe fn spawn_chmod(s: &mut State, sys: &SyscallTable, mode: &[u8], path: &[u8
             None => return false,
         }
     }
-    spawn(s, sys, &mut cmd, n)
-}
-
-unsafe fn spawn(s: &mut State, sys: &SyscallTable, cmd: &mut [u8; CMD], n: usize) -> bool {
     let h = (sys.provider_call)(-1, hp::PROC_SPAWN, cmd.as_mut_ptr(), n);
     if h < 0 {
         if !s.said_proc {
             s.said_proc = true;
-            let m = b"[volume_files] the process executor refused chmod/rm - add them to SECTOR_PROC_ALLOW";
+            let m = b"[volume_files] the process executor refused chmod - add it to SECTOR_PROC_ALLOW (an emptyDir without fsGroup)";
             dev_log(sys, 1, m.as_ptr(), m.len());
         }
         return false;
     }
     s.proc_h = h;
     s.proc_ok = false;
+    s.job = J_CHMOD;
     true
 }
 
@@ -814,9 +1330,6 @@ unsafe fn poll_proc(s: &mut State, sys: &SyscallTable) -> bool {
     let _ = (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
     s.proc_h = -1;
     s.proc_ok = running == 0 && i32::from_le_bytes(code) == 0;
-    if !s.proc_ok && s.job == J_CHMOD {
-        s.next_mode = usize::MAX;
-    }
     true
 }
 
@@ -836,37 +1349,22 @@ fn remember(s: &mut State, key: u64, digest: u64) {
 }
 
 /// The held request on to the store connector: a PREPARE as a NOOP carrying
-/// its directory (`dir_len` of `root/…`), or nothing when it could not be
+/// its bind (`s.bind`, when `ok`), or nothing when it could not be
 /// prepared.
-unsafe fn finish(s: &mut State, sys: &SyscallTable, dir_len: Option<usize>) {
-    let n = n_of(s);
+unsafe fn finish(s: &mut State, sys: &SyscallTable, ok: bool) {
     let mut dir = [0u8; PATH];
     let mut dl = 0usize;
-    if let Some(l) = dir_len {
-        let rec = s.rec.get(..n).unwrap_or(&[]);
-        let mut spec = [0u8; 512];
-        let mut id = [0u8; 160];
-        let a = frame_bytes(rec, 3);
-        let b = frame_bytes(rec, 17);
-        for (d, &c) in spec.iter_mut().zip(a) {
+    if ok && s.bind_len > 0 {
+        dl = s.bind_len.min(PATH);
+        for (d, &c) in dir.iter_mut().zip(s.bind.iter().take(dl)) {
             *d = c;
-        }
-        for (d, &c) in id.iter_mut().zip(b) {
-            *d = c;
-        }
-        if let Some(v) = parse_vol(
-            spec.get(..a.len().min(512)).unwrap_or(&[]),
-            id.get(..b.len().min(160)).unwrap_or(&[]),
-        ) {
-            if target(s, &v, &mut dir) == Some(l) {
-                dl = l;
-            }
         }
         s.prepared = s.prepared.wrapping_add(1);
     } else {
         s.failed = s.failed.wrapping_add(1);
     }
     s.job = J_IDLE;
+    s.bind_len = 0;
     forward(
         s,
         if dl > 0 {
@@ -941,43 +1439,60 @@ fn forward(s: &mut State, dir: Option<&[u8]>) {
 }
 
 /// Every `gc_ms`: the root's Pod directories whose Pod record is gone, and
-/// one of them removed a step. True while a removal is under way.
+/// one of them removed at a time (`REMOVE_TREE`: what the Pod's volumes
+/// held, a Secret's memory filesystem unmounted first; a directory still
+/// holding a mounted volume is left whole and asked again next sweep).
+/// True while a removal is under way.
 unsafe fn sweep(s: &mut State, sys: &SyscallTable) -> bool {
     if s.gone_n > 0 {
         s.gone_n -= 1;
         let i = s.gone_n;
         let name_len = s.gone_len.get(i).copied().unwrap_or(0) as usize;
-        let mut cmd = [0u8; CMD];
-        let mut n = 0usize;
         let name = s.gone.get(i).copied().unwrap_or([0; 64]);
+        let rl = s.root_len as usize;
         let root = s.root;
-        for &c in b"rm -rf "
+        let mut p = 0usize;
+        for &c in root
+            .get(..rl)
+            .unwrap_or(&[])
             .iter()
-            .chain(root.get(..s.root_len as usize).unwrap_or(&[]).iter())
             .chain(b"/".iter())
             .chain(name.get(..name_len).unwrap_or(&[]).iter())
         {
-            if let Some(d) = cmd.get_mut(n) {
-                *d = c;
-                n += 1;
+            match s.hm.get_mut(p) {
+                Some(d) => {
+                    *d = c;
+                    p += 1;
+                }
+                None => return false,
             }
         }
-        if name_len > 0 && spawn(s, sys, &mut cmd, n) {
-            s.removed = s.removed.wrapping_add(1);
-            return true;
+        if name_len == 0 {
+            return false;
         }
-        return false;
+        s.hm_op = hm::REMOVE_TREE;
+        s.hm_len = p;
+        s.job = J_SWEEP;
+        return true;
     }
     let now = dev_millis(sys);
     if now.wrapping_sub(s.last_gc_ms) < u64::from(s.gc_ms.max(1000)) {
         return false;
     }
     s.last_gc_ms = now;
-    let mut root = [0u8; PATH];
-    let rl = s.root_len as usize;
-    for (d, &c) in root.iter_mut().zip(s.root.iter().take(rl)) {
-        *d = c;
+    if !platform(s, sys) {
+        return false;
     }
+    let mut root = [0u8; PATH];
+    let r = s.root;
+    let Some(rl) = abs_of(
+        s,
+        r.get(..s.root_len as usize).unwrap_or(&[]),
+        &[],
+        &mut root,
+    ) else {
+        return false;
+    };
     let dh = (sys.provider_call)(-1, FS_OPENDIR, root.as_mut_ptr(), rl);
     if dh < 0 {
         return false;
@@ -1008,7 +1523,7 @@ unsafe fn sweep(s: &mut State, sys: &SyscallTable) -> bool {
                     kl += 1;
                 }
             }
-            if exists(&st, key.get(..kl).unwrap_or(&[])) || st.waiting() {
+            if exists(&st, key.get(..kl).unwrap_or(&[])) || st.stopped() {
                 continue;
             }
             if let (Some(g), Some(l)) = (s.gone.get_mut(s.gone_n), s.gone_len.get_mut(s.gone_n)) {
@@ -1022,8 +1537,9 @@ unsafe fn sweep(s: &mut State, sys: &SyscallTable) -> bool {
     }
     let mut z = [0u8; 4];
     (sys.provider_call)(dh, FS_CLOSE, z.as_mut_ptr(), 0);
-    // A sweep whose reads were not all answered is taken again next time.
-    if st.waiting() {
+    // A sweep whose reads were not all answered (or were refused) removes
+    // nothing: it is taken again next time.
+    if st.stopped() {
         s.gone_n = 0;
     }
     false

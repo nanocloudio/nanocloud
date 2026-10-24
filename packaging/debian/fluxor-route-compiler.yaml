@@ -27,7 +27,6 @@
 target: linux
 tick_us: 1000
 
-# Every self-edge below is a source's change sink — a deliberate 1-node cycle.
 scheduler:
   accept_cycles: true
 
@@ -92,19 +91,11 @@ modules:
     key_prefix: "/dataplane/edge/"
 
 wiring:
-  - from: rt_routes.status
-    to: rt_routes.changes
   - from: rt_routes.record_out
     to: rt_be.request_in
-  - from: rt_pairs.status
-    to: rt_pairs.changes
   - from: rt_pairs.record_out
     to: rt_edgebe.request_in
-  - from: rt_fold.status
-    to: rt_fold.changes
   - from: rt_fold.record_out
     to: rt_edge.request_in
-  - from: rt_rows.status
-    to: rt_rows.changes
   - from: rt_rows.record_out
     to: rt_drop.request_in

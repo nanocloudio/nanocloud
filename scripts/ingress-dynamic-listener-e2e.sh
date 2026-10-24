@@ -123,10 +123,6 @@ wiring:
   - from: http.net_out
     to: linux_net.net_in
     buffer_bytes: 32768
-  - from: http.routes_sink
-    to: http.routes_changes
-  - from: http.listeners_sink
-    to: http.listeners_changes
 YAML
 
 echo "== 3. seed the Route → /dataplane/edge/ and the desired listener =="

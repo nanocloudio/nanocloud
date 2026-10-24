@@ -24,6 +24,16 @@
 // Services commit by PATCHing spec.clusterIP (the Service is its own lease).
 // Pods commit by CREATING /ipam-lease/<id> — create-only, so a lease is never
 // reassigned, and a request is "waiting" while it has none (`unless`).
+//
+// A Pod's address comes from its NODE's Pod CIDR: the request names it
+// (`/ipam-request/<uid>` = `node=…;cidr=<the node's podCIDR>;pod=…`,
+// pod_resolve's), and the candidate is taken from that CIDR. A request
+// naming none (a sandbox's own, the runner's) takes the pool's, /ipam-pool.
+// Either way the CIDR's first host address is never leased: it is the
+// gateway the node holds on that segment (node_net), so candidates start at
+// the second — net + 2 + (n mod span), span the hosts less the gateway.
+// The cursor's `n` is the cluster's one next-fit counter; claims are
+// cluster-wide (/ipam/pod/<u32>), so two nodes' CIDRs never share one.
 module nanocloud.ipam_pod {
 
   // The context each chain here carries across its effects: ONE nested
@@ -36,6 +46,8 @@ module nanocloud.ipam_pod {
     n: int = 31;
     ip: int = 32;
     st: int = 34;
+    rnet: int = 35;        // the request's CIDR (its node's), as a number
+    rspan: int = 36;       //   its hosts less the gateway (0: none named)
   }
   // carried by: BackfillCall, BackfillReply, ReadyCall, PoolReply
   message Ctx2 {
@@ -57,6 +69,8 @@ module nanocloud.ipam_pod {
     seq: int = 1;
     key: string = 3;
     idx: int = 20;
+    net: int = 50;         // its request's cidr, as a number (flat ints cidr!ip4)
+    pfx: int = 51;         //   and its prefix length (cidr!prefix; 0: none)
   }
   message CurGet {
     cid: int = 1;
@@ -157,17 +171,32 @@ module nanocloud.ipam_pod {
     ctx: Ctx2 = 254;
   }
   decision pod_cur(w: Waiting) -> CurGet {
-    when w.idx == 0 -> CurGet { cid: w.seq, op: GET, key: "pod", ctx: Ctx { key: w.key } };
-    default -> CurGet { cid: w.seq, op: NOOP, key: "", ctx: Ctx { key: w.key } };
+    // A request naming its node's CIDR: its hosts less the gateway, 2^(32-p)
+    // - 3 (network, gateway, broadcast) — worked out once, here, so the
+    // claim's arithmetic is the pool's.
+    when w.idx == 0 && w.pfx > 0 && w.pfx <= 30 ->
+      CurGet { cid: w.seq, op: GET, key: "pod",
+               ctx: Ctx { key: w.key, rnet: w.net, rspan: math.bitShiftLeft(1, 32 - w.pfx) - 3 } };
+    when w.idx == 0 -> CurGet { cid: w.seq, op: GET, key: "pod", ctx: Ctx { key: w.key, rnet: 0, rspan: 0 } };
+    default -> CurGet { cid: w.seq, op: NOOP, key: "", ctx: Ctx { key: w.key, rnet: 0, rspan: 0 } };
   }
-  // The pod pool's span comes from its cursor (net and size of the pool CIDR,
-  // written by the backfill). A zero span would divide by zero; refuse it.
+  // A request naming its node's CIDR takes the candidate from it, from its
+  // second host on (pod_cur worked out its span). One naming none takes the
+  // pool's, whose span (hosts less network and broadcast) comes from its
+  // cursor, written by the backfill — less the gateway too. A span that
+  // would be zero would divide by zero; refuse it.
   decision pod_claim(c: Cur) -> ClaimCall {
-    when c.status == 200 && c.span > 0 ->
+    when c.status == 200 && c.ctx.rspan > 0 ->
       ClaimCall { cid: c.cid, op: CREATE,
-                  key: c.net + 1 + (c.n - (c.n / c.span) * c.span),
+                  key: c.ctx.rnet + 2 + (c.n - (c.n / c.ctx.rspan) * c.ctx.rspan),
                   v1: "owner=", v2: c.ctx.key, v3: ";ip=",
-                  v4: c.net + 1 + (c.n - (c.n / c.span) * c.span), ctx: Ctx { key: c.ctx.key, n: c.n, ip: c.net + 1 + (c.n - (c.n / c.span) * c.span) } };
+                  v4: c.ctx.rnet + 2 + (c.n - (c.n / c.ctx.rspan) * c.ctx.rspan),
+                  ctx: Ctx { key: c.ctx.key, n: c.n, ip: c.ctx.rnet + 2 + (c.n - (c.n / c.ctx.rspan) * c.ctx.rspan) } };
+    when c.status == 200 && c.span > 1 ->
+      ClaimCall { cid: c.cid, op: CREATE,
+                  key: c.net + 2 + (c.n - (c.n / (c.span - 1)) * (c.span - 1)),
+                  v1: "owner=", v2: c.ctx.key, v3: ";ip=",
+                  v4: c.net + 2 + (c.n - (c.n / (c.span - 1)) * (c.span - 1)), ctx: Ctx { key: c.ctx.key, n: c.n, ip: c.net + 2 + (c.n - (c.n / (c.span - 1)) * (c.span - 1)) } };
     default ->
       ClaimCall { cid: c.cid, op: NOOP, key: 0, v1: "", v2: "", v3: "", v4: 0, ctx: Ctx { key: c.ctx.key, n: c.n, ip: 0 } };
   }
@@ -233,9 +262,9 @@ module nanocloud.ipam_pod {
   }
 
   // ---- stage wrappers ----
-  transformation pw(w: Waiting) -> Waiting { Waiting { seq: w.seq, key: w.key, idx: w.idx } }
+  transformation pw(w: Waiting) -> Waiting { Waiting { seq: w.seq, key: w.key, idx: w.idx, net: w.net, pfx: w.pfx } }
   transformation pc(c: Cur) -> Cur {
-    Cur { cid: c.cid, status: c.status, n: c.n, net: c.net, span: c.span, ctx: Ctx { key: c.ctx.key } }
+    Cur { cid: c.cid, status: c.status, n: c.n, net: c.net, span: c.span, ctx: Ctx { key: c.ctx.key, rnet: c.ctx.rnet, rspan: c.ctx.rspan } }
   }
   transformation pcl(c: Claimed) -> Claimed {
     Claimed { cid: c.cid, status: c.status, ctx: Ctx { key: c.ctx.key, n: c.ctx.n, ip: c.ctx.ip } }

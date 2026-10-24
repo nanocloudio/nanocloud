@@ -16,7 +16,8 @@ hardware_targets = ["bcm2712", "linux"]
 # realizes it — nftables on Linux, the packet filter on bare metal, a recorded
 # no-op on wasm — and this module never names which.
 #
-# Rows: one flat `k=v;…` record per key under `prefix`:
+# Rows: one flat `k=v;…` record per key under `prefix` (a `,`-separated list
+# of at most two prefixes, walked in order into the one table):
 #   kind=allow|drop  dir=in|out  subj=<ip>[/<n>]
 #                    peers=<cidr>,…   ("" = any peer; `-` = one it cannot name,
 #                                      and that entry allows nothing)
@@ -33,26 +34,49 @@ hardware_targets = ["bcm2712", "linux"]
 #        `nports=<p>,…` (aligned, `-` for none): the same backend at this
 #        node's `node_address` and each node port (NodePort);
 #        `lbip=<ip>`: the same backend at that address and each port
-#        (LoadBalancer)
+#        (LoadBalancer).
+#        `node=<name>`: the node the backend's Pod runs on, matched against
+#        `node_name`; `itp=Local` (internalTrafficPolicy) keeps the
+#        Service's own address to backends on this node, `etp=Local`
+#        (externalTrafficPolicy) its node ports and load-balancer address.
+#        A backend elsewhere then adds its address with NO backend, so an
+#        address none of whose backends is here rejects.
+#        translate_source: the ClusterIP `hairpin` (a client that is its own
+#        backend comes back through the node); node ports and the
+#        load-balancer address `always` under `Cluster` (the reply returns
+#        through this node, wherever the backend is), `never` under `Local`
+#        (the client's address kept)
+#   kind=hostport    hports=<p|->,…  tports=<p>,…  protos=<P>,…  hostips=<ip|->,…
+#                    backend=<ip>  node=<name>
+#     -> on the node `node_name` names only: one DNAT per port with a
+#        hostPort, this node's `node_address` (or the port's hostIP) at the
+#        hostPort to the Pod's address at the containerPort, `hairpin`
 #   anything else is skipped and counted.
+#
+# Where the provider translates only traffic originated on the node (CAPS
+# `DNAT_LOCAL` without `DNAT`: bare metal), every record is `scope = local`
+# and a table with inbound records (node ports, load-balancer addresses, host
+# ports) says `inbound=unsupported` in its status; where it does not realize
+# source translation (no `SOURCE_TRANSLATE`) records translate nothing and
+# the status says `translate=unsupported`.
 # A row set that does not fit the table is NOT applied: the previous table
 # stands, and the status says why. Half a policy is a policy nobody wrote.
 #
 # Status, written put-if-changed to `status_key` after every apply:
-#   enforced=1|0;rules=<n>;generation=<g>        — applied
+#   enforced=1|pending|0;rules=<n>;generation=<g>[;inbound=unsupported]
+#                    [;translate=unsupported]    — applied
 #   error=<errno>;rules=<n>                        — refused (old table stands)
 #   error=table-full;rules=<n>                     — not applied
-# `enforced=0` is the platform saying it records the table and enforces
-# nothing (wasm; bare metal with no filter attached). A NetworkPolicy that
+# `enforced=` is the table's own state, read back (net.policy READ): 1 when
+# its enforcer has applied exactly this generation, `pending` while an
+# enforcer is bound (or the provider can enforce) and has not — read again
+# every 100 steps until it has — and 0 when the platform records the table
+# and enforces nothing (wasm; a dry run; bare metal with no filter attached).
+# A REPLACE answered EAGAIN is asked again the next step. A NetworkPolicy that
 # exists and is not enforced is a gap the cluster must be able to see.
 timer_class = "agnostic"
 # REPLACE rewrites the host's packet policy: privileged, as spawning is.
 permissions = ["platform_raw"]
-
-[[ports]]
-name = "changes"
-direction = "input"
-content_type = "OctetStream"
 
 [[ports]]
 name = "status"
@@ -71,5 +95,17 @@ access = "read"
 requires_contract = "storage.object"
 access = "write"
 
+# Every subscription rings the module's one kernel event: the store writes
+# no channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
 [observability]
 metrics = ["np_applied", "np_refused", "np_skipped_rows"]
+
+# Store subscriptions an instance opens: one per prefix it lists (two at
+# most), counted from its `prefix` param (tag 1), all on one kernel event.
+[capacities]
+demand_from_params = { pool = "store_subs", tags = [1] }
+store_subscribers = 1

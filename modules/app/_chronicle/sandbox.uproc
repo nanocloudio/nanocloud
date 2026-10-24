@@ -5,7 +5,10 @@
 //   spec   /sandboxes/<id> (phase, cmd, rootfs, iso, net, tasks; the process:
 //          env, host, wd, iwd, user; the limits: cpu, mem, eph) against its
 //          /sandbox-status/: CREATE when it has no workload under this boot
-//          (an own-network sandbox waits for its /ipam-lease/; a sandbox
+//          (an own-network sandbox waits for its /ipam-lease/ and for the
+//          node to say what segment it joins, /sandbox-net — node_net's;
+//          one on segment s >= 1 holds its lease as a single address there,
+//          one on 0 the pool's prefix in a domain of its own; a sandbox
 //          naming volumes waits until each is bound, /volume-binds/), START a
 //          created one whose phase is start, DESTROY one whose phase is delete
 //   exec   /sandbox-exec/<id>/<req> with no result -> EXEC in sandbox <id>
@@ -13,7 +16,9 @@
 //   kill   /sandbox-kill/<id> sig=term|kill -> SIGNAL
 //   pause  /sandbox-pause/<id> pause|resume -> PAUSE / RESUME
 //   tty    /tty/<id>/<sid>/ctl open|close -> the pty session; /in -> its input
-//   ev     what the connector reports -> /sandbox-status/<id> (state, code)
+//   ev     what the connector reports -> /sandbox-status/<id> (state, code,
+//          and — for a workload START started — `started`, the moment its
+//          process started, on every status of that run, its exit included)
 //          and the boot it holds under (/sandbox-boot-of/<id>), /sandbox-logs/<id> and /tty/…/out (bounded tails;
 //          /sandbox-log-n/<id> every log byte ever written, the connector's
 //          `append_tally`),
@@ -86,6 +91,7 @@ module nanocloud.sandbox {
     cpu: string = 15;      // limits: millicores
     mem: string = 16;      //         bytes
     eph: string = 17;      //         ephemeral-storage bytes
+    dns: string = 18;      // its resolver context: `<server> <search>…`
     bound: int = 22;       // /volume-binds/<id>-* present
     binds: string = 56;    // their values
     st: string = 70;       // /sandbox-status/ state
@@ -95,6 +101,7 @@ module nanocloud.sandbox {
     boot: string = 100;    // /sandbox-boot: this runtime's
     nvol: int = 110;       // /pod-specs/<id> volumes, counted
     desired: string = 111; // /pod-specs/<id> desired: `deleted` once its Pod is
+    seg: string = 130;     // /sandbox-net seg: the node's segment (0: none)
   }
   message Op {
     cid: int = 1;
@@ -114,6 +121,9 @@ module nanocloud.sandbox {
     a19: string = 19;      // cpu
     a20: string = 20;      // mem
     a21: string = 21;      // eph
+    // CREATE: the network identity's segment, and the resolver context.
+    a22: string = 22;      // segment (with a8 the address, a9 its prefix)
+    a23: string = 23;      // `<server> <search>…`
     ctx: Ctx = 254;
   }
   // A graph-backed sandbox (/metal-sandboxes/): the workload is the FLXA the
@@ -134,10 +144,50 @@ module nanocloud.sandbox {
     boot: string = 80;     // /sandbox-boot: this runtime's
     sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
     desired: string = 100; // /pod-specs/<id> desired: `deleted` once its Pod is
+    pod: string = 101;     // /pod-specs/<id> pod: `<ns>/<name>`
+    lease: string = 110;   // /ipam-lease/<id>: its own address
+    seg: string = 120;     // /sandbox-net: the node's segment (0: none)
+    gnet: string = 121;    //   and `1` when its module workloads join it
+    cdns: string = 130;    // /cluster-dns: the cluster's name service
   }
+  // On a node whose module workloads join its segment (`gnet=1`, bare metal)
+  // a graph-backed sandbox holds an address of its own there: its lease,
+  // which node_net asks for and its CREATE waits for. Elsewhere it shares
+  // the node's network. Its resolver context is the cluster's name service
+  // and its namespace's search path (ClusterFirst), so a workload the
+  // runtime resolves for reaches cluster names.
   decision mspec(s: MSpec) -> Op {
     when s.phase == "delete" && s.st != "" && s.st != "destroyed" ->
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0"
+         && has(s.lease) && s.lease != "" && has(s.cdns) && s.cdns != "" && has(s.pod) && s.pod != "" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
+           a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a19: s.cpu, a20: s.mem, a21: s.eph, a22: s.seg,
+           a23: s.cdns + " " + s.pod.substring(0, s.pod.indexOf("/")) + ".svc.cluster.local svc.cluster.local cluster.local",
+           ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0"
+         && has(s.lease) && s.lease != "" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
+           a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a19: s.cpu, a20: s.mem, a21: s.eph, a22: s.seg, ctx: Ctx { tag: "" } };
+    // Not yet created under this boot: wait for the lease and the name
+    // service. A created one falls through to START.
+    when s.phase != "delete" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" ->
+      Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && has(s.cdns) && s.cdns != "" && has(s.pod) && s.pod != "" ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
+           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a19: s.cpu, a20: s.mem, a21: s.eph,
+           a23: s.cdns + " " + s.pod.substring(0, s.pod.indexOf("/")) + ".svc.cluster.local svc.cluster.local cluster.local",
+           ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != ""
          && (!has(s.desired) || s.desired != "deleted") ->
@@ -152,20 +202,34 @@ module nanocloud.sandbox {
   decision spec(s: Spec) -> Op {
     when s.phase == "delete" && s.st != "" && s.st != "destroyed" ->
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
+    // An own-network sandbox: its lease as its address, on the node's
+    // segment (a single address there, the gateway its route out) — or, on
+    // a node with none (segment 0), the pool's prefix in a domain of its own.
+    // It waits for /sandbox-net: the node states its segment before any
+    // workload is created on it.
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != ""
+         && has(s.seg) && s.seg != "" && s.seg != "0"
+         && (!has(s.desired) || s.desired != "deleted") ->
+      Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
+           a8: s.lease, a9: "32", a10: s.binds, rev: 0, a12: "",
+           a14: s.env, a15: s.host, a16: s.wd, a17: s.iwd, a18: s.user,
+           a19: s.cpu, a20: s.mem, a21: s.eph, a22: s.seg, a23: s.dns, ctx: Ctx { tag: "" } };
+    when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
+         && s.boot != "" && s.bound >= s.nvol && s.net == "own" && s.lease != ""
+         && has(s.seg) && s.seg == "0"
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
            a8: s.lease, a9: s.pfx, a10: s.binds, rev: 0, a12: "",
            a14: s.env, a15: s.host, a16: s.wd, a17: s.iwd, a18: s.user,
-           a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
+           a19: s.cpu, a20: s.mem, a21: s.eph, a22: "0", a23: s.dns, ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.cmd != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && s.bound >= s.nvol && s.net != "own"
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: s.cmd, a5: s.rootfs, a6: s.iso, a7: s.tasks,
            a8: "", a9: "", a10: s.binds, rev: 0, a12: "",
            a14: s.env, a15: s.host, a16: s.wd, a17: s.iwd, a18: s.user,
-           a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
+           a19: s.cpu, a20: s.mem, a21: s.eph, a23: s.dns, ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
       Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     default ->
@@ -248,6 +312,7 @@ module nanocloud.sandbox {
     bytes: string = 6;
     boot: string = 7;
     code: string = 8;
+    started: string = 9;   // a status: the run's start moment ("" before START)
 // an exec request's name / a pty input key
     ctx: Ctx2 = 254;
   }
@@ -262,6 +327,12 @@ module nanocloud.sandbox {
     ctx: Ctx2 = 254;
   }
   decision ev(e: Ev) -> W {
+    // A run's every status carries its start; a workload not started (created,
+    // refused, destroyed) has none to say.
+    when e.kind == 1 && e.started != "" ->
+      W { cid: e.cid, op: PUT, key: "/sandbox-status/", k2: e.id, k3: "",
+          v1: "state=", v2: e.label, v3: ";code=", v4: e.code, v5: ";started=", v6: e.started,
+          rev: 0, ctx: Ctx2 { out: "", tag: "", id: e.id, boot: e.boot, bad: e.bytes, code: e.code } };
     when e.kind == 1 ->
       W { cid: e.cid, op: PUT, key: "/sandbox-status/", k2: e.id, k3: "",
           v1: "state=", v2: e.label, v3: ";code=", v4: e.code, v5: "", v6: "",
@@ -308,7 +379,7 @@ module nanocloud.sandbox {
     when d.ctx.tag != "" && d.ctx.out != "" ->
       W2 { cid: d.cid, op: PUT, key: "/sandbox-exec-output/", k2: d.ctx.tag, v1: d.ctx.out, ctx: d.ctx };
     // The boot a status was recorded under, beside it (the status itself stays
-    // `state=;code=` for every reader of it).
+    // `state=;code=[;started=]` for every reader of it).
     when d.ctx.id != "" && d.ctx.boot != "" ->
       W2 { cid: d.cid, op: PUT, key: "/sandbox-boot-of/", k2: d.ctx.id, v1: d.ctx.boot, ctx: d.ctx };
     default -> W2 { cid: d.cid, op: NOOP, key: "", k2: "", v1: "", ctx: d.ctx };
@@ -317,14 +388,15 @@ module nanocloud.sandbox {
   transformation t_spec(s: Spec) -> Spec {
     Spec { seq: s.seq, key: s.key, phase: s.phase, cmd: s.cmd, rootfs: s.rootfs, iso: s.iso,
            net: s.net, tasks: s.tasks, env: s.env, host: s.host, wd: s.wd, iwd: s.iwd,
-           user: s.user, cpu: s.cpu, mem: s.mem, eph: s.eph,
+           user: s.user, cpu: s.cpu, mem: s.mem, eph: s.eph, dns: s.dns,
            bound: s.bound, binds: s.binds, st: s.st, sboot: s.sboot,
-           lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol, desired: s.desired }
+           lease: s.lease, pfx: s.pfx, boot: s.boot, nvol: s.nvol, desired: s.desired, seg: s.seg }
   }
   transformation t_mspec(s: MSpec) -> MSpec {
     MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph, pack: s.pack,
             cpu: s.cpu, mem: s.mem, eph: s.eph,
-            st: s.st, sboot: s.sboot, boot: s.boot, desired: s.desired }
+            st: s.st, sboot: s.sboot, boot: s.boot, desired: s.desired, pod: s.pod,
+            lease: s.lease, seg: s.seg, gnet: s.gnet, cdns: s.cdns }
   }
   transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }
   transformation t_tty(t: Tty) -> Tty {
@@ -333,7 +405,7 @@ module nanocloud.sandbox {
   }
   transformation t_ev(e: Ev) -> Ev {
     Ev { cid: e.cid, kind: e.kind, id: e.id, label: e.label, bytes: e.bytes, boot: e.boot,
-         code: e.code, ctx: e.ctx }
+         code: e.code, started: e.started, ctx: e.ctx }
   }
   transformation t_done(d: Done) -> Done {
     Done { cid: d.cid, status: d.status, ctx: d.ctx }

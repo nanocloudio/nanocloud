@@ -19,12 +19,13 @@
 #      (81 -> the name `http`). The Pod's Endpoints, then:
 #        - web.default.svc.cluster.local resolves, through the node's DNS,
 #          to web's ClusterIP, and `curl http://web.default.svc.cluster.local/`
-#          is answered by the Pod — DNAT in the kernel (nft table nc_proxy);
+#          is answered by the Pod — DNAT in the kernel (nft table
+#          fx_<instance>_proxy, the runtime's instance tag FLUXOR_INSTANCE);
 #        - web-named's ClusterIP:81 is answered too: the name resolved against
 #          the Pod's own ports;
 #        - `kubectl logs` of the Pod reads what it wrote, from the node's own
 #          records
-#   5. a NetworkPolicy isolating the Pod is enforced (nc_netpolicy drops what
+#   5. a NetworkPolicy isolating the Pod is enforced (fx_<instance>_netpolicy drops what
 #      is addressed to it), then one allowing 10.0.0.0/8 to its port opens
 #      that and only that; removing both lifts the isolation. The rules are
 #      read back from the kernel, and the node's /np-status/ says enforced=1.
@@ -65,6 +66,10 @@ mkdir -p "$STORE" "$D/etc/fluxor" "$D/lib" "$D/owners"
 nc_lattice_prepare "$STORE"
 . "$ROOT/scripts/support/workload-node.sh"
 NS="nc-dp-$$"
+# The runtime's instance: its nftables tables are fx_<tag>_<table>.
+TAG="ncdp$$"
+PXT="fx_${TAG}_proxy"
+NPT="fx_${TAG}_netpolicy"
 NSX="sudo -n ip netns exec $NS"
 RUNTIME_PID=""
 RPORT=6380
@@ -123,15 +128,16 @@ render() { # render <role> <out>: nanocloud-graph.sh on the installed tree, as t
 has() { grep -qx "  - name: $2" "$1"; }
 
 echo "== 2. the renders: the Service plane on the control plane, its enforcement on every node =="
-# As installed: NetworkPolicy off (its chain does not fit beside the image
-# pull in the runtime's config arena), the rest on.
+# As installed: everything on, NetworkPolicy too (no NANOCLOUD_NETPOLICY);
+# the operator's opt-out leaves it out.
 NP="" render plane "$D/default.rendered" 2>/dev/null || fail "the plane did not render"
-for m in ep_pairs cluster_dns px_src px_apply; do has "$D/default.rendered" "$m" || fail "$m is not in the default render"; done
-grep -q '^  - name: np_' "$D/default.rendered" && fail "NetworkPolicy is rendered by default"
-# The operator's opt-in (cluster.env NANOCLOUD_NETPOLICY=1), from here on.
-NP=1
+for m in ep_pairs cluster_dns px_src px_apply np_selsrc np_apply; do has "$D/default.rendered" "$m" || fail "$m is not in the default render"; done
+NP=0 render plane "$D/optout.rendered" 2>/dev/null || fail "the plane did not render with NetworkPolicy off"
+grep -q '^  - name: np_' "$D/optout.rendered" && fail "NANOCLOUD_NETPOLICY=0 still renders NetworkPolicy"
+NP=""
 render node "$D/worker.yaml" 2>/dev/null || fail "the worker did not render"
 for m in px_apply np_apply; do has "$D/worker.yaml" "$m" || fail "$m is not in the worker's graph"; done
+grep -q '^    node_name: "' "$D/worker.yaml" || fail "the worker's proxy does not know its own name"
 for m in ep_pairs cluster_dns px_src np_selsrc; do
   has "$D/worker.yaml" "$m" && fail "the worker runs the cluster's $m"
 done
@@ -176,7 +182,7 @@ sudo -n mkdir -p "/etc/netns/$NS"
 printf 'nameserver %s\nsearch default.svc.cluster.local svc.cluster.local cluster.local\n' "$NODE_IP" \
   | sudo -n tee "/etc/netns/$NS/resolv.conf" >/dev/null
 WN_NO_NODE=1 wn_seed_identity
-$NSX env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_VAULT_DIR="$STORE/vault" RUST_LOG=info \
+$NSX env -C "$STORE" FLUXOR_INSTANCE="$TAG" FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_VAULT_DIR="$STORE/vault" RUST_LOG=info \
   "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 api() { # api <method> <path> [json-body] -> "<status>|<body>", inside the namespace
@@ -275,17 +281,23 @@ echo "   dig web.default.svc.cluster.local -> $R"
 enforced() { case "$(sget "/~node/node-a/np-status/$1")" in enforced=1\;*) return 0 ;; *) return 1 ;; esac; }
 wait_for 30 "the proxy table was never enforced: '$(sget /~node/node-a/np-status/proxy)'" enforced proxy
 answered() { case "$($NSX curl -s --max-time 3 "$1" 2>/dev/null)" in "hello from the web Pod") return 0 ;; *) return 1 ;; esac; }
-wait_for 30 "http://web.default.svc.cluster.local/ was never answered by $POD ($($NSX nft list table ip nc_proxy 2>&1 | grep dnat))" \
+wait_for 30 "http://web.default.svc.cluster.local/ was never answered by $POD ($($NSX nft list table ip $PXT 2>&1 | grep dnat))" \
   answered http://web.default.svc.cluster.local/
 answered "http://web/" || fail "the search path's short name was not answered"
 echo "   curl http://web.default.svc.cluster.local/ (and http://web/) -> $POD's page"
 wait_for 30 "web-named's ClusterIP:81 was never answered" answered "http://$CIP2:81/"
-$NSX nft list table ip nc_proxy | grep -q "ip daddr $CIP2 tcp dport 81 dnat to $NODE_IP:8080" \
-  || fail "web-named's rule does not lead to the Pod's port named http: $($NSX nft list table ip nc_proxy)"
+$NSX nft list table ip $PXT | grep -q "ip daddr $CIP2 tcp dport 81 dnat to $NODE_IP:8080" \
+  || fail "web-named's rule does not lead to the Pod's port named http: $($NSX nft list table ip $PXT)"
 echo "   curl http://$CIP2:81/ -> $POD's page (targetPort http = the Pod's 8080); /np-status/proxy: $(sget /~node/node-a/np-status/proxy)"
 
-[ "$(sget /cluster-dns)" = "$NODE_IP" ] || fail "/cluster-dns = '$(sget /cluster-dns)': the Pods' nameserver is not the node's DNS"
-echo "   /cluster-dns = $NODE_IP (the nameserver a Pod's resolv.conf names)"
+DNS_CIP=10.96.0.10
+dnsname() { [ "$(sget /cluster-dns)" = "$DNS_CIP" ]; }
+wait_for 30 "/cluster-dns = '$(sget /cluster-dns)': the Pods' nameserver is not the kube-dns ClusterIP" dnsname
+[ "$(api GET /api/v1/namespaces/kube-system/services/kube-dns | jget spec.clusterIP)" = "$DNS_CIP" ] \
+  || fail "no kube-system/kube-dns Service at $DNS_CIP"
+R="$($NSX dig +short +time=2 +tries=2 "@$DNS_CIP" web.default.svc.cluster.local A)"
+[ "$R" = "$CIP" ] || fail "through the kube-dns ClusterIP, web.default.svc.cluster.local -> '$R', want $CIP"
+echo "   /cluster-dns = $DNS_CIP (kube-system/kube-dns); dig @$DNS_CIP web.default.svc.cluster.local -> $R"
 
 echo "== 5b. NodePort and LoadBalancer: allocated, then answered at the node's port and the pool's address =="
 svct() { # svct <name> <type> <port>
@@ -330,14 +342,14 @@ policy() { # policy <name> <spec-json>
   api POST /apis/networking.k8s.io/v1/namespaces/default/networkpolicies \
     "{\"apiVersion\":\"networking.k8s.io/v1\",\"kind\":\"NetworkPolicy\",\"metadata\":{\"name\":\"$1\",\"namespace\":\"default\"},\"spec\":$2}"
 }
-nptable() { $NSX nft list table ip nc_netpolicy 2>/dev/null || true; }
+nptable() { $NSX nft list table ip $NPT 2>/dev/null || true; }
 r="$(policy deny-web '{"podSelector":{"matchLabels":{"app":"web"}},"policyTypes":["Ingress"]}')"
 case "$r" in 20[01]\|*) ;; *) fail "POST deny-web: ${r:0:200}" ;; esac
 drops() { nptable | grep -q "ip daddr $NODE_IP drop"; }
 wait_for 60 "the isolation never reached the kernel: $(sget /~node/node-a/np-status/netpolicy)" drops
 nptable | grep -q "dport.*accept" && fail "an isolated Pod with no allowing policy has an accept rule: $(nptable)"
 enforced netpolicy || fail "the node does not say it enforces the policy: $(sget /~node/node-a/np-status/netpolicy)"
-echo "   deny-web: nc_netpolicy drops what is addressed to $NODE_IP; $(sget /~node/node-a/np-status/netpolicy)"
+echo "   deny-web: $NPT drops what is addressed to $NODE_IP; $(sget /~node/node-a/np-status/netpolicy)"
 r="$(policy allow-web '{"podSelector":{"matchLabels":{"app":"web"}},"policyTypes":["Ingress"],"ingress":[{"from":[{"ipBlock":{"cidr":"10.0.0.0/8"}}],"ports":[{"port":8080,"protocol":"TCP"}]}]}')"
 case "$r" in 20[01]\|*) ;; *) fail "POST allow-web: ${r:0:200}" ;; esac
 allows() { nptable | grep -q "ip daddr $NODE_IP ip saddr 10.0.0.0/8 tcp dport 8080 accept"; }

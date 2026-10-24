@@ -24,8 +24,6 @@ const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_DELETE: u32 = 0x1424;
 const OBJ_CLOSE: u32 = 0x1425;
 const NS_LIST: u32 = 0x1302;
-const NS_SUBSCRIBE: u32 = 0x1305;
-const EVENT_HEADER_SIZE: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 4096;
 
@@ -54,8 +52,10 @@ const OUTQ: usize = 3 * REQ;
 const OP_PUT: i64 = 3;
 const OP_DELETE: i64 = 4;
 const OP_CREATE: i64 = 8;
-/// Pods kept to resolve again, and how often.
-const RETRY: usize = 16;
+/// Pods kept to resolve again, and how often: a Pod waiting on what it
+/// names, and every Pod waiting for its address (a Deployment's replicas at
+/// once).
+const RETRY: usize = 64;
 const RETRY_REC: usize = 400;
 const RETRY_MS: u64 = 3000;
 /// Containers of one list a Pod may have, past which none is resolved.
@@ -119,6 +119,8 @@ struct State {
     finished: u32,
     refused: u32,
     waited: u32,
+    /// Pods whose address was asked for.
+    leased: u32,
     last_hb_ms: u64,
     last_hb_sum: u32,
     nag: ReadNag,
@@ -155,7 +157,9 @@ impl PrWorld for StoreWorld<'_> {
         // SAFETY: the pass's store over the live syscall table.
         match unsafe { get_value(self.st, key.get(..n).unwrap_or(&[]), out) } {
             Some(v) => PrLook::Found(v),
-            None if self.st.waiting() => PrLook::Pending,
+            // Not answered yet — or refused for good, which is not absence
+            // either: the transcription stops, and `resolve` fails it.
+            None if self.st.stopped() => PrLook::Pending,
             None => PrLook::Absent,
         }
     }
@@ -164,7 +168,9 @@ impl PrWorld for StoreWorld<'_> {
         // SAFETY: the pass's store over the live syscall table.
         match unsafe { get_value(self.st, key, out) } {
             Some(v) => PrLook::Found(v),
-            None if self.st.waiting() => PrLook::Pending,
+            // Not answered yet — or refused for good, which is not absence
+            // either: the transcription stops, and `resolve` fails it.
+            None if self.st.stopped() => PrLook::Pending,
             None => PrLook::Absent,
         }
     }
@@ -192,7 +198,7 @@ impl PrWorld for StoreWorld<'_> {
                 }
             }
         }
-        if walk.pending || self.st.waiting() {
+        if walk.pending || self.st.stopped() {
             PrLook::Pending
         } else {
             PrLook::Found(0)
@@ -250,6 +256,7 @@ pub unsafe extern "C" fn module_new(
     };
     s.cid = 0;
     s.finished = 0;
+    s.leased = 0;
     let _ = (params, params_len);
     0
 }
@@ -347,6 +354,7 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
     let pkl = cat(&mut pk, &[b"/pods/", key]);
     let pod_len = match get_value(&st, pk.get(..pkl).unwrap_or(&[]), &mut s.pod) {
         Some(n) => n,
+        None if st.refusal().is_some() => return resolve_failed(s, key),
         None if st.waiting() => return false,
         None => {
             retry_keep(s, key, false);
@@ -386,7 +394,32 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
         };
         let mut world = StoreWorld { st: &st };
         let n = match pr_spec(&mut world, &mut s.x, &ask, &mut s.spec) {
+            PrRes::Pending if st.refusal().is_some() => return resolve_failed(s, key),
             PrRes::Pending => return false,
+            // Its address of its own, asked of its node's Pod CIDR
+            // (ipam_pod): created once (a request already there answers
+            // 409), and the Pod resolved again until it is leased.
+            PrRes::NeedLease => {
+                let mut rk = [0u8; MAX_KEY];
+                let rkl = cat(&mut rk, &[b"ipam-request/", uid]);
+                let cidr = s.x.net_cidr.get(..s.x.net_cidr_len).unwrap_or(&[]);
+                let mut v = [0u8; 400];
+                let vl = cat(&mut v, &[b"node=", node, b";cidr=", cidr, b";pod=", key]);
+                for (d, &c) in s.spec.iter_mut().zip(v.iter().take(vl)) {
+                    *d = c;
+                }
+                s.cid = s.cid.wrapping_add(1);
+                s.outq_len = 0;
+                s.outq_at = 0;
+                queue(s, OP_CREATE, rk.get(..rkl).unwrap_or(&[]), Src::Spec(vl));
+                if !flush(s, sys) {
+                    return false;
+                }
+                s.leased = s.leased.wrapping_add(1);
+                retry_keep(s, key, true);
+                s.rec_len = 0;
+                return true;
+            }
             PrRes::NoContainer => {
                 if init {
                     s.cur = Cursor {
@@ -487,6 +520,9 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
         };
         if !held {
             let Some(live) = pl_live(&st, node, uid) else {
+                if st.refusal().is_some() {
+                    return resolve_failed(s, key);
+                }
                 return false;
             };
             let past = match (until, mo_trusted_ms(sys)) {
@@ -514,6 +550,16 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
     }
     s.resolved = s.resolved.wrapping_add(1);
     retry_keep(s, key, s.err || keep);
+    s.rec_len = 0;
+    true
+}
+
+/// The held Pod's resolve FAILED: the store refused a read for good (said
+/// by the read), so asking it again next step answers the same. Nothing is
+/// written on what it read; the Pod is let go, and looked at again every
+/// RETRY_MS, as a Pod waiting on what it names is.
+fn resolve_failed(s: &mut State, key: &[u8]) -> bool {
+    retry_keep(s, key, true);
     s.rec_len = 0;
     true
 }

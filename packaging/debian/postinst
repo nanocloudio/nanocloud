@@ -109,9 +109,9 @@ NANOCLOUD_PEERS="0=127.0.0.1:7450"
 #NANOCLOUD_REGISTRY=registry.nanocloud.io:5000
 #NANOCLOUD_REGISTRY_ADDR=registry.nanocloud.io:5000
 #NANOCLOUD_REGISTRY_CA=/etc/nanocloud.io/certs/ca.der
-# NetworkPolicy computed and enforced (nftables). Off by default: with the
-# image pull above, a single node's graph overflows the runtime's config.
-#NANOCLOUD_NETPOLICY=1
+# NetworkPolicy computed and enforced (nftables); on by default, 0 leaves
+# it out.
+#NANOCLOUD_NETPOLICY=0
 EOF
     fi
 }

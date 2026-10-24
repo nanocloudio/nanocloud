@@ -1,11 +1,11 @@
-# Loam's admin plane for an E2E, as its operators run it: the loam-admin
-# template from a Loam checkout (packaging/mtls/loam-admin), rendered with
-# its values and run under `fluxor run`, and the mesh capabilities its gate
-# admits sessions under.
+# Loam's admin plane for an E2E, as its operators run it: loam's published
+# `loam-admin` service bundle, run by name under `fluxor run` with its values
+# as params, and the mesh capabilities its gate admits sessions under. The
+# bundle is a reference of this project's (`fluxor.toml` `[uses]`), so
+# `fluxor update` pins it from loam's published index.
 #
 # Source after setting nothing; the caller gets:
-#   LOAM_ROOT              the checkout ($LOAM_ROOT, default ../loam)
-#   nc_loam_present        true when the checkout has the template
+#   nc_loam_present        true when this project pins the bundle
 #   nc_loam_mesh <dir>     a mesh root's seed at <dir>/root.seed; echoes its key
 #   nc_loam_mint <seed> <--scope s|--object hex> <perms> [<not-before> <not-after>]
 #                          one chain, by default valid from a minute ago for a day
@@ -18,11 +18,11 @@
 #                          `fluxor run`; returns once the gate listens
 # The server's key is DER (`openssl ec -outform DER`).
 
-LOAM_ROOT="${LOAM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/../loam}"
+NC_LOAM_PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOAM_PID=""
 
 nc_loam_present() {
-  [ -f "$LOAM_ROOT/packaging/mtls/loam-admin/linux.yaml" ] && [ -f "$LOAM_ROOT/tools/e2e/render_service.py" ]
+  grep -q '^name = "loam-admin"' "$NC_LOAM_PROJECT/fluxor.lock" 2>/dev/null
 }
 
 nc_loam_mesh() {
@@ -50,10 +50,10 @@ nc_loam_node_cap() {
 nc_loam_start() {
   local dir="$1" port="$2" mesh="$3" ca="$4" cert="$5" key="$6" log="$7"
   mkdir -p "$dir/bodies"
-  python3 -B "$LOAM_ROOT/tools/e2e/render_service.py" "$LOAM_ROOT/packaging/mtls/loam-admin/linux.yaml" \
-    "$dir/loam.yaml" port="$port" mesh_roots="$mesh" ns_wal="$dir/ns.wal" obj_wal="$dir/obj.wal" \
-    body_dir="$dir/bodies" gc_interval=0 ca="$ca" cert="$cert" key="$key" || return 1
-  env -C "$LOAM_ROOT" fluxor run "$dir/loam.yaml" > "$log" 2>&1 < /dev/null &
+  env -C "$NC_LOAM_PROJECT" fluxor run loam-admin --param port="$port" --param mesh_roots="$mesh" \
+    --param ns_wal="$dir/ns.wal" --param obj_wal="$dir/obj.wal" --param body_dir="$dir/bodies" \
+    --param gc_interval=0 --param ca="$ca" --param cert="$cert" --param key="$key" \
+    > "$log" 2>&1 < /dev/null &
   LOAM_PID=$!
   local _
   for _ in $(seq 1 300); do

@@ -7,7 +7,9 @@
 //            artifact fields are the spec's; the `phase=` field is the
 //            lifecycle chain's, and MERGE is why the two can own one record
 //            without either restating the other's half.
-//   prune    a /pod-runtime/ whose /pod-specs/ is gone
+//   prune    a /pod-runtime/ whose /pod-specs/ is gone — or a
+//            /pod-lifecycle-status/ whose spec is gone, the status a
+//            lifecycle record still in flight wrote back after the rest went
 module nanocloud.podproject {
 
   // The context each chain here carries across its effects: ONE nested
@@ -54,6 +56,7 @@ module nanocloud.podproject {
     nonroot: string = 82;     // runAsNonRoot: "1"
     cfgerr: string = 83;      // why Kubernetes would not create it
     gate: int = 84;           // the init containers that must have completed
+    dns: string = 85;         // its resolver context (`<server> <search>…`)
     done: int = 90;           // /pod-init/<pod uid> done: those that have
     st: string = 100;         // /sandbox-status/ state
   }
@@ -69,6 +72,7 @@ module nanocloud.podproject {
     p18: string = 84; p19: string = 85; p20: string = 86; p21: string = 87;
     p22: string = 88; p23: string = 89; p24: string = 90; p25: string = 91;
     p26: string = 92; p27: string = 93; p28: string = 94;
+    p29: string = 95; p30: string = 96; p31: string = 97; p32: string = 98;
     ctx: Ctx = 254;
   }
   message pp.Made {
@@ -116,7 +120,9 @@ module nanocloud.podproject {
   // of it runs on the node's own root — then the image's rootfs, the argv
   // composed by the Kubernetes rules (pod_image), isolated (`iso=1`: the
   // image's root is the process's root only in a mount namespace of its
-  // own). Its environment is the image's Env then the container's, a later
+  // own). Its network (`net=own`: an address of its own, pod_resolve's) and
+  // its resolver context (`dns=`) go with it. Its environment is the image's
+  // Env then the container's, a later
   // entry overriding an earlier of its name (`env=`, joined; workload_effect
   // composes it); `host=` the Pod's name (HOSTNAME); `wd=` the container's
   // workingDir and `iwd=` the image's, the first that is set winning; `user=`
@@ -168,7 +174,8 @@ module nanocloud.podproject {
                p11: ";wd=", p12: s.workdir, p13: ";iwd=", p14: s.res_wd,
                p15: ";user=", p16: s.res_user, p17: "/", p18: s.ruid, p19: "/", p20: s.rgid,
                p21: ";cpu=", p22: s.cpu, p23: ";mem=", p24: s.mem, p25: ";eph=", p26: s.eph,
-               p27: ";tasks=", p28: s.tasks, ctx: Ctx { key: s.key } };
+               p27: ";tasks=", p28: s.tasks, p29: ";net=", p30: s.net, p31: ";dns=", p32: s.dns,
+               ctx: Ctx { key: s.key } };
     when s.image != "" && s.rootfs == "" ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     when s.cmd != "" && has(s.nonroot) && s.nonroot == "1" && (!has(s.ruid) || s.ruid == "" || s.ruid == "0")
@@ -184,7 +191,8 @@ module nanocloud.podproject {
                p11: ";host=", p12: s.pod.substring(s.pod.indexOf("/") + 1),
                p13: ";wd=", p14: s.workdir, p15: ";iwd=;user=/", p16: s.ruid, p17: "/", p18: s.rgid,
                p19: ";cpu=", p20: s.cpu, p21: ";mem=", p22: s.mem, p23: ";eph=", p24: s.eph,
-               p25: ";tasks=", p26: s.tasks, ctx: Ctx { key: s.key } };
+               p25: ";tasks=", p26: s.tasks, p27: ";net=", p28: s.net, p29: ";dns=", p30: s.dns,
+               ctx: Ctx { key: s.key } };
     when s.cmd != "" ->
       pp.Art { cid: s.seq, op: MERGE, key: "sandboxes/" + s.key,
                p1: "cmd=", p2: s.cmd, p3: ";rootfs=", p4: s.rootfs,
@@ -192,7 +200,8 @@ module nanocloud.podproject {
                p9: ";host=", p10: s.pod.substring(s.pod.indexOf("/") + 1),
                p11: ";wd=", p12: s.workdir, p13: ";iwd=;user=/", p14: s.ruid, p15: "/", p16: s.rgid,
                p17: ";cpu=", p18: s.cpu, p19: ";mem=", p20: s.mem, p21: ";eph=", p22: s.eph,
-               p23: ";tasks=", p24: s.tasks, ctx: Ctx { key: s.key } };
+               p23: ";tasks=", p24: s.tasks, p25: ";net=", p26: s.net, p27: ";dns=", p28: s.dns,
+               ctx: Ctx { key: s.key } };
     default ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }
@@ -254,7 +263,7 @@ module nanocloud.podproject {
               eph: s.eph, pod: s.pod, res_rootfs: s.res_rootfs, res_cmd: s.res_cmd,
               res_env: s.res_env, res_wd: s.res_wd, res_user: s.res_user, res_uid: s.res_uid,
               ruid: s.ruid, rgid: s.rgid, nonroot: s.nonroot, cfgerr: s.cfgerr, gate: s.gate,
-              done: s.done, st: s.st }
+              dns: s.dns, done: s.done, st: s.st }
   }
   transformation pass_made(m: pp.Made) -> pp.Made {
     pp.Made { cid: m.cid, status: m.status, value: m.value, ctx: m.ctx }

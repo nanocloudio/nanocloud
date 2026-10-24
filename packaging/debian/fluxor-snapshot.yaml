@@ -1,6 +1,6 @@
 # snapshot graph the snapshot_reconciler fmod — the
 # VolumeSnapshot controller. Watches VolumeSnapshots and provisions a bound,
-# ready VolumeSnapshotContent for each. The self-edge allocates the change-sink.
+# ready VolumeSnapshotContent for each.
 target: linux
 tick_us: 1000
 
@@ -27,8 +27,6 @@ modules:
     key_prefix: "/volumesnapshots.snapshot.storage.k8s.io/"
 
 wiring:
-  - from: sn_source.status
-    to: sn_source.changes
   - from: sn_source.record_out
     to: sn_contents.request_in
   - from: sn_contents.response_out

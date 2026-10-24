@@ -141,16 +141,12 @@ modules:
     decision: {hex: "${DEC_GONE}"}
     key_prefix: "/~node/"
 wiring:
-  - from: ps_pods.status
-    to: ps_pods.changes
   - from: ps_pods.record_out
     to: ps_resolve.request_in
   - from: ps_resolve.forward_out
     to: ps_spec.request_in
   - from: ps_resolve.request_out
     to: ps_rput.request_in
-  - from: ps_tombs.status
-    to: ps_tombs.changes
   - from: ps_tombs.record_out
     to: ps_gone.request_in
 YAML

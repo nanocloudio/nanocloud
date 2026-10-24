@@ -495,9 +495,17 @@ unsafe fn parse_credentials(s: &mut State, params: *const u8, params_len: usize)
     let data = core::slice::from_raw_parts(params, params_len);
     let mut pos = 0usize;
     if data[0] == 0xFE && data[1] == 0x01 {
-        let basic_end = 4 + (((data[3] as usize) << 8) | data[2] as usize);
-        if basic_end <= params_len {
-            pos = basic_end;
+        // Walked to the `0xFF` terminator, not taken from the header's u16
+        // payload length, which saturates for params past 64 KiB. The scan
+        // starts just past the terminator's tag; the `0x00` the composer
+        // writes after it matches no extended tag and is stepped over.
+        let mut p = 4usize;
+        while let (Some(&tag), Some(&n)) = (data.get(p), data.get(p + 1)) {
+            if tag == 0xFF {
+                pos = p + 1;
+                break;
+            }
+            p += 2 + n as usize;
         }
     }
     while pos + 4 <= params_len {

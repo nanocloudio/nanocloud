@@ -16,9 +16,22 @@
 //          load-balancer address (`status.loadBalancer.ingress[0].ip`) ride
 //          along as nports=…;lbip=…: each node DNATs its own address at each
 //          node port, and the load-balancer address at each port, to the
-//          same backends (svc_alloc allocates both).
+//          same backends (svc_alloc allocates both). The traffic policies
+//          (`spec.externalTrafficPolicy`, `spec.internalTrafficPolicy`) and
+//          the backend Pod's node (`spec.nodeName`) ride along as
+//          etp=…;itp=…;node=…: each node keeps a `Local` policy's addresses
+//          to the backends on it (net_apply).
 //   prune  a row whose Service's ClusterIP is no longer its vip, or whose
 //          slice no longer holds its backend, is deleted.
+//   hostport  /pods/, one record per container (`expand`): a container with
+//          a port naming a hostPort, on a node, with an address, gets a row at
+//          /np-rows/hostport/<ns>/<pod>/<i> = "kind=hostport;hports=…;
+//          tports=…;protos=…;hostips=…;backend=<podIP>;node=<nodeName>", the
+//          ports aligned (`-` where a port names no hostPort); the node it
+//          names DNATs its own address (or the port's hostIP) at each
+//          hostPort to the Pod (net_apply).
+//   hp_prune  a hostport row whose Pod is gone, or holds another address now,
+//          is deleted.
 // `net_apply` turns the rows into the `proxy` net.policy table; the platform
 // merges one VIP's rows into one balanced service.
 module nanocloud.proxy {
@@ -39,6 +52,8 @@ module nanocloud.proxy {
     ip: string = 36;
     nports: string = 37;
     lbip: string = 38;
+    etp: string = 39;
+    itp: string = 40;
   }
   message Pair {
     seq: int = 1;
@@ -49,6 +64,8 @@ module nanocloud.proxy {
     protos: string = 7;    // spec.ports[].protocol
     nports: string = 8;    // spec.ports[].nodePort
     lbip: string = 9;      // status.loadBalancer.ingress.0.ip
+    etp: string = 10;      // spec.externalTrafficPolicy
+    itp: string = 11;      // spec.internalTrafficPolicy
     pod: string = 21;      // the slice's pod
     ns: string = 28;       // the Service's namespace
     ip: string = 60;       // the slice: the backend address
@@ -66,6 +83,7 @@ module nanocloud.proxy {
     status: int = 2;
     pnames: string = 40;   // store_effect `paths`: spec.containers.0.ports[].name
     pnums: string = 41;    //                       spec.containers.0.ports[].containerPort
+    node: string = 42;     //                       spec.nodeName
     ctx: Ctx = 254;
   }
   message RowPut {
@@ -78,6 +96,8 @@ module nanocloud.proxy {
     v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
     v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80;
     v15: string = 81; v16: string = 82; v17: string = 83; v18: string = 84;
+    v19: string = 85; v20: string = 86; v21: string = 87; v22: string = 88;
+    v23: string = 89; v24: string = 90;
   }
   message Row {
     seq: int = 1;
@@ -102,11 +122,12 @@ module nanocloud.proxy {
     when p.vip == "" || p.vip == "None" || p.ip == "" || p.ports == "" ->
       PodGet { cid: p.seq, op: NOOP, key: "", sep: "", name: "",
                ctx: Ctx { key: "", pod: "", vip: "", ports: "", tports: "", protos: "", ip: "",
-                          nports: "", lbip: "" } };
+                          nports: "", lbip: "", etp: "", itp: "" } };
     default ->
       PodGet { cid: p.seq, op: GET, key: p.ns, sep: "/", name: p.pod,
                ctx: Ctx { key: p.key, pod: p.pod, vip: p.vip, ports: p.ports, tports: p.tports,
-                          protos: p.protos, ip: p.ip, nports: p.nports, lbip: p.lbip } };
+                          protos: p.protos, ip: p.ip, nports: p.nports, lbip: p.lbip,
+                          etp: p.etp, itp: p.itp } };
   }
   // The Pod gone (404): no named port of it resolves, and the numbered ones
   // still lead to its address until its slice is pruned.
@@ -114,14 +135,56 @@ module nanocloud.proxy {
     when g.ctx.vip == "" ->
       RowPut { cid: g.cid, op: NOOP, key: "", sep: "", pod: "",
                v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
-               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "", v17: "", v18: "" };
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "", v17: "", v18: "",
+               v19: "", v20: "", v21: "", v22: "", v23: "", v24: "" };
     default ->
       RowPut { cid: g.cid, op: PUT, key: g.ctx.key, sep: "/", pod: g.ctx.pod,
                v1: "kind=dnat;vip=", v2: g.ctx.vip, v3: ";vports=", v4: g.ctx.ports,
                v5: ";tports=", v6: g.ctx.tports, v7: ";protos=", v8: g.ctx.protos,
                v9: ";backend=", v10: g.ctx.ip,
                v11: ";pnames=", v12: g.pnames, v13: ";pnums=", v14: g.pnums,
-               v15: ";nports=", v16: g.ctx.nports, v17: ";lbip=", v18: g.ctx.lbip };
+               v15: ";nports=", v16: g.ctx.nports, v17: ";lbip=", v18: g.ctx.lbip,
+               v19: ";node=", v20: g.node, v21: ";etp=", v22: g.ctx.etp,
+               v23: ";itp=", v24: g.ctx.itp };
+  }
+  message HpPod {
+    seq: int = 1;
+    key: string = 3;       // <ns>/<pod>
+    ip: string = 4;        // status.podIP
+    node: string = 5;      // spec.nodeName
+    hports: string = 6;    // spec.containers.#.ports[].hostPort
+    tports: string = 7;    //                          .containerPort
+    protos: string = 8;    //                          .protocol
+    hips: string = 9;      //                          .hostIP
+    idx: string = 21;      // the container's index, as digits
+  }
+  message HpRow {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;       // <ns>/<pod>/<i>
+    backend: string = 4;
+    pip: string = 70;      // the Pod's address now (related ^1)
+  }
+  // No hostPort on any of its ports (each `-`), or not yet placed and
+  // addressed: no row (a row once written goes with its Pod, `hp_prune`).
+  decision hp_row(h: HpPod) -> RowPut {
+    when h.ip == "" || h.node == "" || h.hports.replace("-", "").replace(",", "") == "" ->
+      RowPut { cid: h.seq, op: NOOP, key: "", sep: "", pod: "",
+               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "", v17: "", v18: "",
+               v19: "", v20: "", v21: "", v22: "", v23: "", v24: "" };
+    default ->
+      RowPut { cid: h.seq, op: PUT, key: h.key, sep: "/", pod: h.idx,
+               v1: "kind=hostport;hports=", v2: h.hports, v3: ";tports=", v4: h.tports,
+               v5: ";protos=", v6: h.protos, v7: ";hostips=", v8: h.hips,
+               v9: ";backend=", v10: h.ip, v11: ";node=", v12: h.node,
+               v13: "", v14: "", v15: "", v16: "", v17: "", v18: "",
+               v19: "", v20: "", v21: "", v22: "", v23: "", v24: "" };
+  }
+  decision hp_prune(r: HpRow) -> RowDel {
+    when r.pip != r.backend ->
+      RowDel { cid: r.seq, op: DELETE, key: r.key, rev: r.rev };
+    default -> RowDel { cid: r.seq, op: NOOP, key: "", rev: 0 };
   }
   decision prune(r: Row) -> RowDel {
     when r.svip != r.vip || r.sip != r.backend ->
@@ -130,22 +193,35 @@ module nanocloud.proxy {
   }
   transformation pp(p: Pair) -> Pair {
     Pair { seq: p.seq, key: p.key, vip: p.vip, ports: p.ports, tports: p.tports,
-           protos: p.protos, nports: p.nports, lbip: p.lbip, pod: p.pod, ns: p.ns, ip: p.ip }
+           protos: p.protos, nports: p.nports, lbip: p.lbip, etp: p.etp, itp: p.itp,
+           pod: p.pod, ns: p.ns, ip: p.ip }
   }
   transformation pg(g: PodPorts) -> PodPorts {
-    PodPorts { cid: g.cid, status: g.status, pnames: g.pnames, pnums: g.pnums,
+    PodPorts { cid: g.cid, status: g.status, pnames: g.pnames, pnums: g.pnums, node: g.node,
                ctx: Ctx { key: g.ctx.key, pod: g.ctx.pod, vip: g.ctx.vip, ports: g.ctx.ports,
                           tports: g.ctx.tports, protos: g.ctx.protos, ip: g.ctx.ip,
-                          nports: g.ctx.nports, lbip: g.ctx.lbip } }
+                          nports: g.ctx.nports, lbip: g.ctx.lbip, etp: g.ctx.etp,
+                          itp: g.ctx.itp } }
   }
   transformation pr(r: Row) -> Row {
     Row { seq: r.seq, rev: r.rev, key: r.key, vip: r.vip, backend: r.backend, svip: r.svip, sip: r.sip }
   }
+  transformation ph(h: HpPod) -> HpPod {
+    HpPod { seq: h.seq, key: h.key, ip: h.ip, node: h.node, hports: h.hports, tports: h.tports,
+            protos: h.protos, hips: h.hips, idx: h.idx }
+  }
+  transformation phr(r: HpRow) -> HpRow {
+    HpRow { seq: r.seq, rev: r.rev, key: r.key, backend: r.backend, pip: r.pip }
+  }
+  pipeline px_hostport(h: HpPod) -> RowPut { call x = ph(h); call y = hp_row(x); return y; }
+  pipeline px_hp_prune(r: HpRow) -> RowDel { call x = phr(r); call y = hp_prune(x); return y; }
   pipeline px_ask(p: Pair) -> PodGet { call x = pp(p); call y = ask(x); return y; }
   pipeline px_row(g: PodPorts) -> RowPut { call x = pg(g); call y = row(x); return y; }
   pipeline px_prune(r: Row) -> RowDel { call x = pr(r); call y = prune(x); return y; }
   entry px_ask = px_ask;
   entry px_row = px_row;
   entry px_prune = px_prune;
+  entry px_hostport = px_hostport;
+  entry px_hp_prune = px_hp_prune;
   provenance revision "proxy-rows" toolchain "chronicle-authoring";
 }

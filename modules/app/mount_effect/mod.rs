@@ -250,7 +250,9 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
         return;
     }
     // Nothing runs without the privilege, and the answer says so.
-    if (sys.provider_call)(-1, hm::PRIV, core::ptr::null_mut(), 0) != 1 {
+    // `PRIV` is a bit set: a root runtime answers SYS_ADMIN | CHOWN.
+    let held = (sys.provider_call)(-1, hm::PRIV, core::ptr::null_mut(), 0);
+    if held < 0 || held & hm::PRIV_SYS_ADMIN == 0 {
         answer(s, sys, 0, -1, 0);
         return;
     }

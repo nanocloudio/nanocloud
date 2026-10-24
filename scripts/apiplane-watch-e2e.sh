@@ -283,12 +283,16 @@ for label, w in (("app=web", sel), ("app in (api,web)", sin), ("metadata.name=we
         fail("selector %s: %r" % (label, names(evs)))
 print("   labelSelector app=web, app in (api,web), fieldSelector metadata.name=web-9: web-9 only")
 
-# --- resume strictly after a revision: the create is behind it
+# --- resume strictly after a revision: the create is behind it. A resumed
+# watch reads the window as the store's CHANGES answers it: one event per key
+# at its latest state (versions collapse; a delete is never omitted), so
+# web-9's MODIFIED folds into its DELETED (with its last state) — the live
+# watchers above, rung between changes, saw every step.
 w = Watch("&resourceVersion=%d" % R_added)
-evs = w.events(lambda e: len(e) >= 3, 6)
-if names(evs) != full[1:]:
+evs = w.events(lambda e: len(e) >= 2, 6)
+if names(evs) != [("ADDED", "db-1"), ("DELETED", "web-9")]:
     fail("resume after %d: %r" % (R_added, names(evs)))
-print("   resume from web-9's ADDED revision: %r" % names(evs))
+print("   resume from web-9's ADDED revision: %r (collapsed)" % names(evs))
 
 # --- no revision: the current objects as ADDED
 w = Watch("")
