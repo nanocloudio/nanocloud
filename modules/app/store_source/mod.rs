@@ -536,6 +536,35 @@ struct State {
     st_phase: u8,
     _st_pad: [u8; 3],
     st_slow: u32,
+    /// CHANGES calls this step and their time (the events phase's reads).
+    st_chg_us: u32,
+    st_chgs: u16,
+    /// A TAKE_RUNG that failed after the event was polled: its rung bits are
+    /// still set, so the store will not signal again for them — asked again
+    /// each step until it answers.
+    take_owed: u8,
+    /// Since boot: store calls by kind and their time, rings, scans — the
+    /// heartbeat ([`hb_line`]) a board run reads a source's cost from.
+    c_lists: u32,
+    c_gets: u32,
+    c_chgs: u32,
+    c_list_us: u64,
+    c_get_us: u64,
+    c_chg_us: u64,
+    hb_at: i64,
+    hb_work: u32,
+    /// The emit walk's current LIST page, held until the walk leaves it: a
+    /// step that stops mid-page (a read not answered yet, downstream full)
+    /// resumes in it rather than LISTing it again — on a store whose calls
+    /// cost milliseconds, a re-LIST per stop multiplies the scan.
+    pg_buf: [u8; LIST_BUF],
+    pg_n: u16,
+    pg_next: [u8; MAX_CURSOR],
+    pg_nlen: u8,
+    pg_valid: u8,
+    /// `step_budget_us` (0: none), and the steps a walk stopped for it.
+    step_budget_us: u32,
+    c_budget: u32,
     watchers: [Watcher; MAX_WATCHERS],
     /// The watcher a pass is serving (`EV_IDLE` between passes), and its
     /// page of changes: `ev_buf[ev_at..ev_end]` still to emit (`ev_len` the
@@ -937,6 +966,13 @@ mod params_def {
 
         53, sched_noexec, u32, 0
             => |s, d, len| { s.sched_noexec = super::p_u32(d, len, 0, 0); };
+
+        // The time a step's walk may spend before it stops between objects
+        // and resumes at the next one on the next step (0: no bound). Set
+        // from the module's declared step deadline, where a store call
+        // costs milliseconds; the object in hand always completes.
+        56, step_budget_us, u32, 0
+            => |s, d, len| { s.step_budget_us = super::p_u32(d, len, 0, 0); };
     }
 }
 
@@ -1208,16 +1244,89 @@ unsafe fn since_us(sys: &SyscallTable, t0: u64) -> u32 {
 }
 
 unsafe fn st_list(s: &mut State, sys: &SyscallTable, t0: u64) {
-    s.st_list_us = s.st_list_us.saturating_add(since_us(sys, t0));
+    let us = since_us(sys, t0);
+    s.st_list_us = s.st_list_us.saturating_add(us);
     s.st_lists = s.st_lists.saturating_add(1);
+    s.c_lists = s.c_lists.wrapping_add(1);
+    s.c_list_us = s.c_list_us.wrapping_add(u64::from(us));
+}
+
+unsafe fn st_chg(s: &mut State, sys: &SyscallTable, t0: u64) {
+    let us = since_us(sys, t0);
+    s.st_chg_us = s.st_chg_us.saturating_add(us);
+    s.st_chgs = s.st_chgs.saturating_add(1);
+    s.c_chgs = s.c_chgs.wrapping_add(1);
+    s.c_chg_us = s.c_chg_us.wrapping_add(u64::from(us));
 }
 
 unsafe fn st_get(s: &mut State, sys: &SyscallTable, t0: u64) {
-    s.st_get_us = s.st_get_us.saturating_add(since_us(sys, t0));
+    let us = since_us(sys, t0);
+    s.st_get_us = s.st_get_us.saturating_add(us);
     s.st_gets = s.st_gets.saturating_add(1);
+    s.c_gets = s.c_gets.wrapping_add(1);
+    s.c_get_us = s.c_get_us.wrapping_add(u64::from(us));
 }
 
-/// `[store_source] slow <prefix> us= ph= list=<n>/<us> get=<n>/<us> nth=`:
+/// How often a source that did work says what it cost.
+const HB_MS: i64 = 60_000;
+
+/// `[store_source] hb <prefix> rings= scans= list=<n>/<us> get=<n>/<us>
+/// chg=<n>/<us> waits= budget= emitted=`: since boot (`waits`: steps that
+/// stopped on a read the store had not answered yet; `budget`: steps that
+/// stopped for `step_budget_us`), once a minute when the source did
+/// any work — what a board run reads each source's share of the store from.
+unsafe fn hb_line(s: &State) {
+    let mut b = [0u8; 220];
+    let mut n = 0usize;
+    let mut put = |part: &[u8]| {
+        let k = part.len().min(b.len() - n);
+        if let (Some(dst), Some(src)) = (b.get_mut(n..n + k), part.get(..k)) {
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = c;
+            }
+        }
+        n += k;
+    };
+    let mut d = [0u8; 20];
+    put(b"[store_source] hb ");
+    put(s.prefix.get(..s.prefix_len as usize).unwrap_or(&[]));
+    put(b" rings=");
+    let k = dec_into(u64::from(s.t_wakes), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" scans=");
+    let k = dec_into(u64::from(s.t_scans), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" list=");
+    let k = dec_into(u64::from(s.c_lists), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b"/");
+    let k = dec_into(s.c_list_us, &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" get=");
+    let k = dec_into(u64::from(s.c_gets), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b"/");
+    let k = dec_into(s.c_get_us, &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" chg=");
+    let k = dec_into(u64::from(s.c_chgs), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b"/");
+    let k = dec_into(s.c_chg_us, &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" waits=");
+    let k = dec_into(u64::from(s.t_waits), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" budget=");
+    let k = dec_into(u64::from(s.c_budget), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    put(b" emitted=");
+    let k = dec_into(u64::from(s.emitted), &mut d);
+    put(d.get(..k).unwrap_or(&[]));
+    dev_log(&*s.syscalls, 2, b.as_ptr(), n);
+}
+
+/// `[store_source] slow <prefix> us= ph= list=<n>/<us> get=<n>/<us> chg=<n>/<us> nth=`:
 /// one step past `SLOW_STEP_US`. `ph` as `st_phase`; what the step spent
 /// outside the scan's LIST and GET calls is `us` less the two.
 unsafe fn slow_line(s: &State, us: u64) {
@@ -1248,6 +1357,12 @@ unsafe fn slow_line(s: &State, us: u64) {
     put(&d[..k]);
     put(b"/");
     let k = dec_into(u64::from(s.st_get_us), &mut d);
+    put(&d[..k]);
+    put(b" chg=");
+    let k = dec_into(u64::from(s.st_chgs), &mut d);
+    put(&d[..k]);
+    put(b"/");
+    let k = dec_into(u64::from(s.st_chg_us), &mut d);
     put(&d[..k]);
     put(b" nth=");
     let k = dec_into(u64::from(s.st_slow), &mut d);
@@ -1319,14 +1434,25 @@ const TAKE_BATCH: usize = 16;
 /// per subscription and signals only when it was clear, so a burst of
 /// changes is one ring — and a pass dropped on a failure is never rung
 /// again for them.
-unsafe fn store_take(sys: &SyscallTable, event: i32) -> u32 {
+unsafe fn store_take(sys: &SyscallTable, event: i32, owed: &mut u8) -> u32 {
     if event < 0 {
         return 0;
     }
-    let fired = (sys.provider_call)(event, abi::kernel_abi::event::POLL, core::ptr::null_mut(), 0);
-    if fired <= 0 {
-        return 0;
+    if *owed == 0 {
+        let fired = (sys.provider_call)(
+            event,
+            abi::kernel_abi::event::POLL,
+            core::ptr::null_mut(),
+            0,
+        );
+        if fired <= 0 {
+            return 0;
+        }
     }
+    // Polled (or owed from a take that failed): the take is asked until it
+    // answers — its rung bits stay set until then, so the store will not
+    // signal again for them.
+    *owed = 1;
     let mut named = 0u32;
     // A take whose handles did not fit says `more`: taken again here, a few
     // times; past that the store signals the event again for the next step.
@@ -1343,13 +1469,16 @@ unsafe fn store_take(sys: &SyscallTable, event: i32) -> u32 {
         };
         let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
         if n < 0 {
-            break;
+            // Still owed: asked again next step. A pass is owed too — the
+            // ring happened — so the caller scans.
+            return named.max(1);
         }
         let Some((more, handles)) = ns::take::decode(out.get(..n as usize).unwrap_or(&[])) else {
-            break;
+            return named.max(1);
         };
         named += handles.count() as u32;
         if !more {
+            *owed = 0;
             break;
         }
     }
@@ -3489,6 +3618,7 @@ unsafe fn join_count(s: &State, sys: &SyscallTable, tail: &[u8]) -> i64 {
 /// is emitted; only `total` advances. Returns true when the listing is done.
 unsafe fn count_page(s: &mut State) -> bool {
     let sys = &*s.syscalls;
+    let t_step = dev_micros(sys);
     let plen = s.prefix_len as usize;
     let mut pfx = [0u8; MAX_PREFIX];
     pfx[..plen].copy_from_slice(&s.prefix[..plen]);
@@ -3497,21 +3627,58 @@ unsafe fn count_page(s: &mut State) -> bool {
     cur[..clen].copy_from_slice(&s.cursor[..clen]);
     let mut lout = [0u8; LIST_BUF];
     let mut next = [0u8; MAX_CURSOR];
-    let tl = dev_micros(sys);
-    let (n, nlen) = list_page(
-        sys,
-        &pfx[..plen],
-        &cur[..clen],
-        s.page_bytes as usize,
-        &mut lout,
-        &mut next,
-        &s.waited,
-    );
-    st_list(s, sys, tl);
-    let total0 = s.total;
+    let (n, nlen) = if s.pg_valid != 0 {
+        // Resumed in the page this walk already holds, as the emit walk is.
+        let n = (s.pg_n as usize).min(LIST_BUF);
+        let nl = (s.pg_nlen as usize).min(MAX_CURSOR);
+        ptr_copy(lout.as_mut_ptr(), s.pg_buf.as_ptr(), n);
+        ptr_copy(next.as_mut_ptr(), s.pg_next.as_ptr(), nl);
+        (n, nl)
+    } else {
+        let tl = dev_micros(sys);
+        let (n, nlen) = list_page(
+            sys,
+            &pfx[..plen],
+            &cur[..clen],
+            s.page_bytes as usize,
+            &mut lout,
+            &mut next,
+            &s.waited,
+        );
+        st_list(s, sys, tl);
+        if s.waited.get() {
+            // The page was not answered yet: asked again next step, from the
+            // same cursor.
+            s.t_waits = s.t_waits.wrapping_add(1);
+            return false;
+        }
+        let n = n.min(LIST_BUF);
+        let nl = nlen.min(MAX_CURSOR);
+        ptr_copy(s.pg_buf.as_mut_ptr(), lout.as_ptr(), n);
+        ptr_copy(s.pg_next.as_mut_ptr(), next.as_ptr(), nl);
+        s.pg_n = n as u16;
+        s.pg_nlen = nl as u8;
+        s.pg_valid = 1;
+        (n, nl)
+    };
+    let mut began = false;
     let mut rp = 0usize;
     while let Some((name, q)) = raw_entry(&lout[..n], rp) {
         rp = q;
+        // Skip what a previous step already counted from this page: keys
+        // ascend, so everything below the resume key was counted.
+        if s.page_off != 0 {
+            let r = &s.resume_key[..s.resume_len as usize];
+            if name < r {
+                continue;
+            }
+            s.page_off = 0;
+        }
+        if began && spent(s, sys, t_step) {
+            budget_hold(s, name);
+            return false;
+        }
+        began = true;
         if s.unless_len > 0 {
             let pl = s.prefix_len as usize;
             let tail = if name.len() > pl {
@@ -3519,7 +3686,11 @@ unsafe fn count_page(s: &mut State) -> bool {
             } else {
                 &name[..0]
             };
-            if !unless_ok(s, sys, tail) {
+            let ok = unless_ok(s, sys, tail);
+            if s.waited.get() {
+                return count_hold(s, name);
+            }
+            if !ok {
                 continue;
             }
         }
@@ -3532,6 +3703,9 @@ unsafe fn count_page(s: &mut State) -> bool {
             // where there is one): an object it emits is one it counts.
             let got = read_value(sys, name, &mut v, &s.waited);
             st_get(s, sys, tg);
+            if s.waited.get() {
+                return count_hold(s, name);
+            }
             let _held = HeapDoc::of(sys, &got);
             let doc: &[u8] = match got {
                 Val::Stack(n) => v.get(..n).unwrap_or(&[]),
@@ -3552,7 +3726,7 @@ unsafe fn count_page(s: &mut State) -> bool {
                 let mut o = SchOut::new();
                 let fit = sched_pick(s, sys, tail, pod, &mut node, &mut o, false).is_some();
                 if s.waited.get() {
-                    continue;
+                    return count_hold(s, name);
                 }
                 if fit {
                     s.sch_fit_max = s.sch_fit_max.max(prio);
@@ -3563,19 +3737,41 @@ unsafe fn count_page(s: &mut State) -> bool {
         }
         s.total += 1;
     }
-    if s.waited.get() {
-        // A page or a value not answered yet: this page is counted again
-        // next step, from the same cursor.
-        s.total = total0;
-        s.t_waits = s.t_waits.wrapping_add(1);
-        return false;
-    }
+    s.pg_valid = 0;
     if nlen == 0 {
         s.clen = 0;
         return true;
     }
     s.cursor[..nlen].copy_from_slice(&next[..nlen]);
     s.clen = nlen as u16;
+    false
+}
+
+/// Whether this step's walk has used its `step_budget_us`.
+unsafe fn spent(s: &State, sys: &SyscallTable, t_step: u64) -> bool {
+    s.step_budget_us != 0 && since_us(sys, t_step) >= s.step_budget_us
+}
+
+/// Stop the walk before `key` for the step's budget: the next step resumes
+/// in the held page at `key`, its expansion from the start.
+unsafe fn budget_hold(s: &mut State, key: &[u8]) {
+    s.c_budget = s.c_budget.wrapping_add(1);
+    s.page_off = 1;
+    let k = key.len().min(MAX_KEY);
+    ptr_copy(s.resume_key.as_mut_ptr(), key.as_ptr(), k);
+    s.resume_len = k as u16;
+    s.exp_off = 0;
+}
+
+/// Stop the count walk at `key`, whose read was not answered yet: what it
+/// counted before `key` stands, and the next step resumes in the held page
+/// at `key`, so neither the page nor the reads before it are asked again.
+unsafe fn count_hold(s: &mut State, key: &[u8]) -> bool {
+    s.t_waits = s.t_waits.wrapping_add(1);
+    s.page_off = 1;
+    let k = key.len().min(MAX_KEY);
+    ptr_copy(s.resume_key.as_mut_ptr(), key.as_ptr(), k);
+    s.resume_len = k as u16;
     false
 }
 
@@ -3645,6 +3841,7 @@ unsafe fn flush(s: &mut State) -> bool {
 
 unsafe fn emit_page(s: &mut State) -> u32 {
     let sys = &*s.syscalls;
+    let t_step = dev_micros(sys);
     let plen = s.prefix_len as usize;
     let mut pfx = [0u8; MAX_PREFIX];
     pfx[..plen].copy_from_slice(&s.prefix[..plen]);
@@ -3655,25 +3852,43 @@ unsafe fn emit_page(s: &mut State) -> u32 {
 
     let mut lout = [0u8; LIST_BUF];
     let mut next = [0u8; MAX_CURSOR];
-    let tl = dev_micros(sys);
-    let (n, nlen) = list_page(
-        sys,
-        &pfx[..plen],
-        &cur[..clen],
-        s.page_bytes as usize,
-        &mut lout,
-        &mut next,
-        &s.waited,
-    );
-    st_list(s, sys, tl);
-    if s.waited.get() {
-        // The page was not answered yet: asked again next step, from the
-        // same cursor — never taken as the end of the listing.
-        s.t_waits = s.t_waits.wrapping_add(1);
-        return 0;
-    }
+    let (n, nlen) = if s.pg_valid != 0 {
+        // Resumed in the page this walk already holds.
+        let n = (s.pg_n as usize).min(LIST_BUF);
+        let nl = (s.pg_nlen as usize).min(MAX_CURSOR);
+        ptr_copy(lout.as_mut_ptr(), s.pg_buf.as_ptr(), n);
+        ptr_copy(next.as_mut_ptr(), s.pg_next.as_ptr(), nl);
+        (n, nl)
+    } else {
+        let tl = dev_micros(sys);
+        let (n, nlen) = list_page(
+            sys,
+            &pfx[..plen],
+            &cur[..clen],
+            s.page_bytes as usize,
+            &mut lout,
+            &mut next,
+            &s.waited,
+        );
+        st_list(s, sys, tl);
+        if s.waited.get() {
+            // The page was not answered yet: asked again next step, from the
+            // same cursor — never taken as the end of the listing.
+            s.t_waits = s.t_waits.wrapping_add(1);
+            return 0;
+        }
+        let n = n.min(LIST_BUF);
+        let nl = nlen.min(MAX_CURSOR);
+        ptr_copy(s.pg_buf.as_mut_ptr(), lout.as_ptr(), n);
+        ptr_copy(s.pg_next.as_mut_ptr(), next.as_ptr(), nl);
+        s.pg_n = n as u16;
+        s.pg_nlen = nl as u8;
+        s.pg_valid = 1;
+        (n, nl)
+    };
 
     let mut wrote = 0u32;
+    let mut began = false;
     let mut rp = 0usize;
     while let Some((name, q)) = raw_entry(&lout[..n], rp) {
         rp = q;
@@ -3695,6 +3910,14 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             }
             s.page_off = 0;
         }
+        // The step's time is spent: stop before this object, which the
+        // next step starts with.
+        if began && spent(s, sys, t_step) {
+            budget_hold(s, name);
+            s.emitted = s.emitted.wrapping_add(wrote);
+            return wrote;
+        }
+        began = true;
         // LIST yields whole keys — the reconcilers pass them straight to GET.
         let mut key = [0u8; MAX_KEY];
         key[..klen].copy_from_slice(name);
@@ -4085,6 +4308,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
             // Not answered yet: the (empty) prefix is listed again.
             s.t_waits = s.t_waits.wrapping_add(1);
             s.clen = 0;
+            s.pg_valid = 0;
             return wrote;
         }
         if flen > 0 {
@@ -4094,11 +4318,14 @@ unsafe fn emit_page(s: &mut State) -> u32 {
                 // the (empty) prefix and tries again.
                 s.deferred = s.deferred.wrapping_add(1);
                 s.clen = 0;
+                s.pg_valid = 0;
                 return wrote;
             }
             wrote += 1;
         }
     }
+    // The walk leaves this page: the next is LISTed.
+    s.pg_valid = 0;
     if nlen == 0 {
         s.paging = 0; // listing complete
         s.clen = 0;
@@ -4232,8 +4459,22 @@ pub unsafe extern "C" fn module_new(
         s.st_get_us = 0;
         s.st_lists = 0;
         s.st_gets = 0;
+        s.st_chg_us = 0;
+        s.st_chgs = 0;
         s.st_phase = 0;
         s.st_slow = 0;
+        s.take_owed = 0;
+        s.c_lists = 0;
+        s.c_gets = 0;
+        s.c_chgs = 0;
+        s.c_list_us = 0;
+        s.c_get_us = 0;
+        s.c_chg_us = 0;
+        s.hb_at = 0;
+        s.hb_work = 0;
+        s.pg_valid = 0;
+        s.step_budget_us = 0;
+        s.c_budget = 0;
         s.deferred = 0;
         s.truncated = 0;
         s.events = 0;
@@ -4323,6 +4564,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.st_get_us = 0;
         s.st_lists = 0;
         s.st_gets = 0;
+        s.st_chg_us = 0;
+        s.st_chgs = 0;
         s.st_phase = 0;
         let rc = step_body(s);
         let us = dev_micros(sys).saturating_sub(t0);
@@ -4363,7 +4606,8 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 // One kernel event for every subscription of this source.
                 s.event = store_event(sys);
                 if s.event < 0 {
-                    let m = b"[store_source] ERROR no kernel event - changes will NOT wake this source";
+                    let m =
+                        b"[store_source] ERROR no kernel event - changes will NOT wake this source";
                     dev_log(sys, 1, m.as_ptr(), m.len());
                 }
             }
@@ -4420,9 +4664,28 @@ unsafe fn step_body(s: &mut State) -> i32 {
             s.dirty = 1; // cold start: emit the current set once
         }
 
-        if store_take(sys, s.event) > 0 {
+        let mut owed = s.take_owed;
+        if store_take(sys, s.event, &mut owed) > 0 {
             s.dirty = 1;
             s.t_wakes = s.t_wakes.wrapping_add(1);
+            s.hb_work = s.hb_work.wrapping_add(1);
+        }
+        s.take_owed = owed;
+        let now_ms = dev_millis(sys) as i64;
+        if s.hb_at == 0 {
+            // Spread over the minute by the prefix, so a node's hundred
+            // sources do not all say it in one tick (a board's log ring
+            // drops a burst).
+            let mut h: u32 = 2_166_136_261;
+            for &c in s.prefix.iter().take(s.prefix_len as usize) {
+                h = (h ^ u32::from(c)).wrapping_mul(16_777_619);
+            }
+            s.hb_at = now_ms - i64::from(h % HB_MS as u32);
+        }
+        if s.hb_work != 0 && now_ms - s.hb_at >= HB_MS {
+            s.hb_at = now_ms;
+            s.hb_work = 0;
+            hb_line(s);
         }
         if s.trace != 0 {
             s.t_steps = s.t_steps.wrapping_add(1);
@@ -4460,6 +4723,7 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 s.t_scans = s.t_scans.wrapping_add(1);
                 s.paging = 1;
                 s.clen = 0;
+                s.pg_valid = 0;
                 s.page_off = 0;
                 s.exp_off = 0;
                 s.list_idx = 0;
@@ -4481,6 +4745,8 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 if count_page(s) {
                     s.counting = 0;
                     s.clen = 0;
+                    s.pg_valid = 0;
+                    s.page_off = 0;
                 }
             } else if s.paging == 1 {
                 s.st_phase = 5;
@@ -4504,6 +4770,7 @@ unsafe fn scan_failed(s: &mut State, rc: i32) {
     s.paging = 0;
     s.counting = 0;
     s.clen = 0;
+    s.pg_valid = 0;
     s.page_off = 0;
     s.exp_off = 0;
     s.list_idx = 0;
@@ -4538,7 +4805,8 @@ unsafe fn retry_later(s: &mut State) {
     if s.timer_fd < 0 {
         s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0);
         if s.timer_fd < 0 {
-            let m = b"[store_source] no timer fd - a refused pass is run again only on the next change";
+            let m =
+                b"[store_source] no timer fd - a refused pass is run again only on the next change";
             dev_log(sys, 1, m.as_ptr(), m.len());
             return;
         }
@@ -5725,7 +5993,9 @@ unsafe fn changes_on_heap(
             s.evh_cap = cap;
         }
         let dst = core::slice::from_raw_parts_mut(s.evh, s.evh_cap);
+        let tc = dev_micros(sys);
         let n = store_changes(sys, prefix, sub, token, dst, fence, &s.waited);
+        st_chg(s, sys, tc);
         if n != ERR_ENOMEM || cap >= EVH_MAX {
             if n >= 0 {
                 s.ev_heap = 1;
@@ -6502,7 +6772,17 @@ unsafe fn watcher_step(s: &mut State, wi: usize, now: i64) -> bool {
         let mut fence = 0u64;
         s.ev_heap = 0;
         let pfx = &w.prefix[..w.prefix_len as usize];
-        let mut n = store_changes(sys, pfx, s.sub, &tok[..tl], &mut s.ev_buf, &mut fence, &s.waited);
+        let tc = dev_micros(sys);
+        let mut n = store_changes(
+            sys,
+            pfx,
+            s.sub,
+            &tok[..tl],
+            &mut s.ev_buf,
+            &mut fence,
+            &s.waited,
+        );
+        st_chg(s, sys, tc);
         // A page whose first record is past `ev_buf` (a large object):
         // again, on the heap.
         if n == ERR_ENOMEM {

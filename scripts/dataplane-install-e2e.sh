@@ -286,7 +286,7 @@ wait_for 30 "http://web.default.svc.cluster.local/ was never answered by $POD ($
 answered "http://web/" || fail "the search path's short name was not answered"
 echo "   curl http://web.default.svc.cluster.local/ (and http://web/) -> $POD's page"
 wait_for 30 "web-named's ClusterIP:81 was never answered" answered "http://$CIP2:81/"
-$NSX nft list table ip $PXT | grep -q "ip daddr $CIP2 tcp dport 81 dnat to $NODE_IP:8080" \
+$NSX nft list table ip $PXT | grep "ip daddr $CIP2 tcp dport 81 dnat to $NODE_IP:8080" >/dev/null \
   || fail "web-named's rule does not lead to the Pod's port named http: $($NSX nft list table ip $PXT)"
 echo "   curl http://$CIP2:81/ -> $POD's page (targetPort http = the Pod's 8080); /np-status/proxy: $(sget /~node/node-a/np-status/proxy)"
 
@@ -345,14 +345,14 @@ policy() { # policy <name> <spec-json>
 nptable() { $NSX nft list table ip $NPT 2>/dev/null || true; }
 r="$(policy deny-web '{"podSelector":{"matchLabels":{"app":"web"}},"policyTypes":["Ingress"]}')"
 case "$r" in 20[01]\|*) ;; *) fail "POST deny-web: ${r:0:200}" ;; esac
-drops() { nptable | grep -q "ip daddr $NODE_IP drop"; }
+drops() { nptable | grep "ip daddr $NODE_IP drop" >/dev/null; }
 wait_for 60 "the isolation never reached the kernel: $(sget /~node/node-a/np-status/netpolicy)" drops
 nptable | grep -q "dport.*accept" && fail "an isolated Pod with no allowing policy has an accept rule: $(nptable)"
 enforced netpolicy || fail "the node does not say it enforces the policy: $(sget /~node/node-a/np-status/netpolicy)"
 echo "   deny-web: $NPT drops what is addressed to $NODE_IP; $(sget /~node/node-a/np-status/netpolicy)"
 r="$(policy allow-web '{"podSelector":{"matchLabels":{"app":"web"}},"policyTypes":["Ingress"],"ingress":[{"from":[{"ipBlock":{"cidr":"10.0.0.0/8"}}],"ports":[{"port":8080,"protocol":"TCP"}]}]}')"
 case "$r" in 20[01]\|*) ;; *) fail "POST allow-web: ${r:0:200}" ;; esac
-allows() { nptable | grep -q "ip daddr $NODE_IP ip saddr 10.0.0.0/8 tcp dport 8080 accept"; }
+allows() { nptable | grep "ip daddr $NODE_IP ip saddr 10.0.0.0/8 tcp dport 8080 accept" >/dev/null; }
 wait_for 60 "the allow never reached the kernel: $(nptable)" allows
 drops || fail "the allow lifted the isolation of everything else"
 echo "   allow-web: 10.0.0.0/8 -> :8080 accepted ahead of the drop"
@@ -360,7 +360,7 @@ for p in deny-web allow-web; do
   r="$(api DELETE "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies/$p")"
   case "$r" in 200\|*|202\|*) ;; *) fail "DELETE $p: ${r:0:200}" ;; esac
 done
-lifted() { ! nptable | grep -q "ip daddr $NODE_IP"; }
+lifted() { ! nptable | grep "ip daddr $NODE_IP" >/dev/null; }
 wait_for 60 "removing the policies never lifted the isolation: $(nptable)" lifted
 answered "http://$CIP/" || fail "the Service stopped answering"
 echo "   both removed: no rule addresses the Pod; the Service still answers"

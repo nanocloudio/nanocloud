@@ -57,10 +57,9 @@ hardware_targets = ["bcm2712", "linux"]
 # not written again.
 #
 # Modes, groups and removal are the platform's (`host_mount` PROJECT,
-# GROUP_TREE, REMOVE_TREE, each asked again until it answers): no tool is
-# spawned for them. The one exception is an emptyDir without fsGroup, whose
-# mode 0777 no platform op sets: `chmod` through the process executor (the
-# node's grant must allow it, `SECTOR_PROC_ALLOW`). A volume that could not
+# GROUP_TREE, MKDIR_MODE, REMOVE_TREE, each asked again until it answers):
+# no tool is spawned. An emptyDir without fsGroup is MKDIR_MODE 0777, the
+# mode set exactly, as upstream's kubelet leaves it. A volume that could not
 # be given its mode or group is not offered (its container waits). Every
 # `gc_ms` the root is swept for Pods whose record (`/pod-specs/<uid>`) is
 # gone, and each one's directory removed (REMOVE_TREE: a Secret's memory
@@ -102,11 +101,6 @@ access = "write"
 # Projections, group ownership and removal under the mount root.
 [[resources]]
 requires_contract = "host_mount"
-access = "write"
-
-# An emptyDir's mode 0777 (`chmod`).
-[[resources]]
-requires_contract = "proc"
 access = "write"
 
 [observability]

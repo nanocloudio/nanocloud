@@ -66,6 +66,7 @@ const CAPS_OP_LOOKUP: u16 = 1 << 5;
 /// asked again this many times before it is reported failed.
 const CREATE_EEXIST_RETRIES: u8 = 8;
 const POSTURE_SHARED: u8 = 0;
+const POSTURE_ISOLATED: u8 = 1;
 /// A workload that is a module subgraph (an FLXA blob), realised by the
 /// kernel's fmod-graph backend from the node's own modules. A bare-metal
 /// node runs these and packs (`SOURCE_FMOD_PACK`), never a host process.
@@ -658,8 +659,13 @@ fn find_tty(s: &State, tail: &[u8]) -> Option<usize> {
 /// else the image's (the backend's `/` when neither is set).
 ///
 /// The identity (field 18, [`split_ident`]): the user [`compose_user`]
-/// makes, the supplementary groups and their policy, and whether the root
-/// is read-only. What the host cannot realize (`caps`, the host's CAPS) is
+/// makes, the supplementary groups and their policy, whether the root is
+/// read-only, the seccompProfile (unstated or RuntimeDefault: the runtime's
+/// filter; Unconfined: none) and the capabilities added and dropped. A drop
+/// the runtime cannot realize — of a default capability from a process
+/// running as root — is refused `EOPNOTSUPP`, as is what the host cannot
+/// realize (`caps`, the host's CAPS): RuntimeDefault asked for by name on a
+/// host that installs no filter, an addition on one that cannot grant it. It is
 /// refused `EOPNOTSUPP` rather than run without it, as a read-only root
 /// without isolation is `EINVAL`: a container is never run with less than
 /// its securityContext asks.
@@ -667,20 +673,37 @@ fn spawn_src(buf: &mut [u8], req: &[u8], caps: u32) -> Result<usize, i64> {
     let mut ub = [0u8; MAX_IDENT];
     let ul = decode_text(frame_bytes(req, 18), &mut ub).ok_or(-22i64)?;
     let (user, groups, flags) = split_ident(ub.get(..ul).ok_or(-22i64)?).ok_or(-22i64)?;
-    // `s` before `r`, each at most once (split_ident).
-    let strict = flags.first() == Some(&b's');
-    let ro_root = flags.last() == Some(&b'r');
+    let f = parse_flags(flags).ok_or(-22i64)?;
     let iso = frame_bytes(req, 6) == b"1";
-    if ro_root && !iso {
+    if f.ro_root && !iso {
         return Err(-22);
     }
-    let need = if ro_root { hp::caps::ROOT_READ_ONLY } else { 0 }
-        | if groups.is_empty() {
-            0
+    // A drop takes from the runtime's defaults; an addition stands whatever
+    // is dropped (`ALL` included), as container runtimes apply them. A
+    // process not running as root holds only what is added, so its drop is
+    // already met; one running as root holds the defaults, which this
+    // runtime cannot take from it.
+    let mut ub2 = [0u8; MAX_IDENT];
+    let un = compose_user(user, &mut ub2).ok_or(-22i64)?;
+    let cap_add = f.cap_add;
+    if runs_as_root(ub2.get(..un).unwrap_or(&[])) && f.cap_drop & DEFAULT_CAPS & !cap_add != 0 {
+        return Err(-95);
+    }
+    let need = if f.ro_root {
+        hp::caps::ROOT_READ_ONLY
+    } else {
+        0
+    } | if groups.is_empty() {
+        0
+    } else {
+        hp::caps::GROUPS
+    } | if f.strict { hp::caps::GROUPS_STRICT } else { 0 }
+        | if cap_add != 0 { hp::caps::CAP_ADD } else { 0 }
+        | if f.filtered {
+            hp::caps::SYSCALL_FILTER
         } else {
-            hp::caps::GROUPS
-        }
-        | if strict { hp::caps::GROUPS_STRICT } else { 0 };
+            0
+        };
     if caps & need != need {
         return Err(-95);
     }
@@ -688,10 +711,22 @@ fn spawn_src(buf: &mut [u8], req: &[u8], caps: u32) -> Result<usize, i64> {
     if iso {
         b0 |= hp::SRC_ISOLATED;
     }
-    if ro_root {
+    if f.ro_root {
         b0 |= hp::SRC_ROOT_READ_ONLY;
     }
-    spawn_parts(buf, req, b0, user, groups, strict).ok_or(-22)
+    if f.unconfined {
+        b0 |= hp::SRC_NO_SYSCALL_FILTER;
+    }
+    if cap_add != 0 {
+        b0 |= hp::SRC_CAP_ADD;
+    }
+    let p = spawn_parts(buf, req, b0, user, groups, f.strict).ok_or(-22)?;
+    if cap_add == 0 {
+        return Ok(p);
+    }
+    // The cap_add part, after the groups part.
+    let p = copy_into(buf, p, &8u16.to_le_bytes()).ok_or(-22)?;
+    copy_into(buf, p, &cap_add.to_le_bytes()).ok_or(-22)
 }
 
 /// The decoded identity of field 18 can carry this much: a user and up to
@@ -760,6 +795,122 @@ fn spawn_parts(
     end_part(buf, at, p)
 }
 
+/// Say why a CREATE was refused: `what` (the process spec or the volume
+/// binds, which this module could not state; the runtime, which answered
+/// `rc`), so a CreateContainerError's errno has its cause beside it.
+unsafe fn say_create_refused(sys: &SyscallTable, what: &[u8], rc: i64) {
+    let mut m = [0u8; 96];
+    let mut n = 0usize;
+    let mut d = [0u8; 20];
+    let mut v = rc.unsigned_abs();
+    let mut k = 0usize;
+    loop {
+        if let Some(c) = d.get_mut(k) {
+            *c = b'0' + (v % 10) as u8;
+        }
+        k += 1;
+        v /= 10;
+        if v == 0 || k >= d.len() {
+            break;
+        }
+    }
+    let digits = d.get(..k).unwrap_or(&[]);
+    for &c in b"[workload_effect] CREATE refused by "
+        .iter()
+        .chain(what.iter())
+        .chain(b": -".iter())
+        .chain(digits.iter().rev())
+    {
+        if let Some(o) = m.get_mut(n) {
+            *o = c;
+            n += 1;
+        }
+    }
+    dev_log(sys, 1, m.as_ptr(), n);
+}
+
+/// The identity's flags ([`split_ident`]).
+#[derive(Default)]
+struct IdentFlags {
+    strict: bool,
+    ro_root: bool,
+    /// seccompProfile: Unconfined.
+    unconfined: bool,
+    /// seccompProfile: RuntimeDefault, asked for by name.
+    filtered: bool,
+    cap_drop: u64,
+    cap_add: u64,
+}
+
+/// `[s][r][u|f][d<hex16>][c<hex16>]`, or None.
+fn parse_flags(f: &[u8]) -> Option<IdentFlags> {
+    let mut x = IdentFlags::default();
+    let mut f = f;
+    if let Some(r) = f.strip_prefix(b"s") {
+        x.strict = true;
+        f = r;
+    }
+    if let Some(r) = f.strip_prefix(b"r") {
+        x.ro_root = true;
+        f = r;
+    }
+    if let Some(r) = f.strip_prefix(b"u") {
+        x.unconfined = true;
+        f = r;
+    } else if let Some(r) = f.strip_prefix(b"f") {
+        x.filtered = true;
+        f = r;
+    }
+    if let Some(r) = f.strip_prefix(b"d") {
+        x.cap_drop = parse_hex16(r.get(..16)?)?;
+        f = r.get(16..)?;
+    }
+    if let Some(r) = f.strip_prefix(b"c") {
+        x.cap_add = parse_hex16(r.get(..16)?)?;
+        f = r.get(16..)?;
+    }
+    f.is_empty().then_some(x)
+}
+
+fn parse_hex16(h: &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for &c in h {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | u64::from(d);
+    }
+    Some(v)
+}
+
+/// The capabilities a process running as root holds without any addition:
+/// the runtime's defaults (the OCI set — CHOWN, DAC_OVERRIDE, FOWNER,
+/// FSETID, KILL, SETGID, SETUID, SETPCAP, NET_BIND_SERVICE, NET_RAW,
+/// SYS_CHROOT, MKNOD, AUDIT_WRITE, SETFCAP).
+const DEFAULT_CAPS: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 10)
+    | (1 << 13)
+    | (1 << 18)
+    | (1 << 27)
+    | (1 << 29)
+    | (1 << 31);
+
+/// Whether the user [`compose_user`] made runs as root: uid 0, the name
+/// `root`, or no user at all (the runtime's own identity, root on a node).
+fn runs_as_root(user: &[u8]) -> bool {
+    let name = user.split(|&c| c == b':').next().unwrap_or(&[]);
+    matches!(name, b"" | b"0" | b"root")
+}
+
 /// A numeric group id, as Kubernetes allows one (0..=2147483647).
 fn parse_gid(g: &[u8]) -> Option<u32> {
     if g.is_empty() || g.len() > 10 {
@@ -779,7 +930,10 @@ fn parse_gid(g: &[u8]) -> Option<u32> {
 /// `<image's User>/<runAsUser>/<runAsGroup>`, or a user alone), then — when
 /// pod_resolve states any — `/<gid>,<gid>…/<flags>`: the supplementary groups
 /// (fsGroup and supplementalGroups, numeric) and `s` (supplementalGroupsPolicy
-/// Strict) then `r` (readOnlyRootFilesystem). None when it is not that shape.
+/// Strict), `r` (readOnlyRootFilesystem), `u` or `f` (seccompProfile
+/// Unconfined or RuntimeDefault), `d<hex16>` (capabilities.drop) and
+/// `c<hex16>` (capabilities.add), each at most once and in that order. None
+/// when it is not that shape.
 fn split_ident(raw: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let mut slashes = raw
         .iter()
@@ -794,9 +948,7 @@ fn split_ident(raw: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
         return None;
     }
     let flags = raw.get(fourth + 1..)?;
-    if !matches!(flags, b"" | b"s" | b"r" | b"sr") {
-        return None;
-    }
+    parse_flags(flags)?;
     Some((raw.get(..third)?, raw.get(third + 1..fourth)?, flags))
 }
 
@@ -1143,7 +1295,14 @@ unsafe fn create_header(
     // refuses it.
     let digest = sha256(id);
     arg[..16].copy_from_slice(&digest[..16]);
-    arg[16] = POSTURE_SHARED;
+    // A process in namespaces of its own (field 6) is the ISOLATED
+    // posture: the runtime requires the source's SRC_ISOLATED and the
+    // posture to agree.
+    arg[16] = if kind == SOURCE_HOST_PROCESS && frame_bytes(req, 6) == b"1" {
+        POSTURE_ISOLATED
+    } else {
+        POSTURE_SHARED
+    };
     arg[17] = kind;
     arg[32..36].copy_from_slice(&tasks.to_le_bytes());
     arg[40..42].copy_from_slice(&(src_len as u16).to_le_bytes());
@@ -1641,6 +1800,7 @@ unsafe fn create_step(s: &mut State) {
     s.creating.active = false;
     let pack = core::mem::replace(&mut s.asm.pending, false);
     if handle < 0 {
+        say_create_refused(sys, b"the runtime", handle as i64);
         // The kernel refused a module that is not its pinned digest: the
         // bytes changed after they were verified here, so none is trusted.
         let bl = if pack && handle as i64 == WL_EACCES as i64 {
@@ -1728,11 +1888,13 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
         let sl = match spawn_src(&mut src, req, s.hp_caps) {
             Ok(n) => n,
             Err(code) => {
+                say_create_refused(sys, b"the process spec", code);
                 emit(s, cid, EV_STATUS, id, b"failed", code, &[], Some(req));
                 return;
             }
         };
         let Some(ol) = bind_options(frame_bytes(req, 10), &mut opts) else {
+            say_create_refused(sys, b"the volume binds", -22);
             emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
             return;
         };

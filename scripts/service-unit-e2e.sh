@@ -24,7 +24,7 @@ D="$(mktemp -d /tmp/nc-unit-XXXXXX)"
 RUNTIME_PID=""
 cleanup() {
   if [ -n "$RUNTIME_PID" ]; then kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; fi
-  if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else rm -rf "$D"; fi
+  if [ -n "${KEEP:-}" ]; then echo "kept: $D"; else sudo -n rm -rf "$D" 2>/dev/null || rm -rf "$D"; fi
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -30 "$D/run.log" 2>/dev/null || true; exit 1; }
@@ -157,6 +157,12 @@ rc=0; out="$(reclaim 2>&1)" || rc=$?
 [ "$rc" = 1 ] || fail "an unprivileged reclaim after stop exited $rc, not 1 (pending): $out"
 echo "   stopped, unprivileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
 if sudo -n true 2>/dev/null; then
+  # On a node the runtime and its reclaim are both root, so the host
+  # registry is root's; this test's runtime ran as its user. Hand the
+  # registry to root, as a node holds it: a privileged reclaim refuses one
+  # another user owns.
+  sudo -n chown -R root:root "$D/run"
+  sudo -n chmod 0755 "$D/run"
   rc=0; out="$(reclaim privileged 2>&1)" || rc=$?
   [ "$rc" = 0 ] || fail "a privileged reclaim after stop exited $rc, not 0: $out"
   case "$out" in *"reclaimed"*) ;; *) fail "reclaim after stop named no instance: $out" ;; esac

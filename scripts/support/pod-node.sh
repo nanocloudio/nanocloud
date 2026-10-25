@@ -275,7 +275,7 @@ PY
 # without fsGroup is the one mode no platform op sets.
 pn_run() {
   sudo -n mkdir -p "$CG" "$D/mnt"
-  sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef SECTOR_PROC_ALLOW="chmod" \
+  sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef \
     FLUXOR_MOUNT_ROOT="$D/mnt" \
     FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_HOST_CGROUP_ROOT="$CG" RUST_LOG=info "$FLUXOR_RUNTIME" \
     --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &

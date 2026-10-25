@@ -70,7 +70,7 @@ print(n)
 PY
 }
 
-for e in ak sl ex pr dc gn; do
+for e in ak dl sl ex pr dc gn; do
   v="$(nc_decision "$ROOT/modules/app/_chronicle/endpoints.uproc" $e)"
   [ -n "$v" ] || { echo "FAIL: endpoints.uproc $e did not compile"; exit 1; }
   eval "DEC_$(echo $e | tr a-z A-Z)=\"$v\""
@@ -89,13 +89,19 @@ modules:
     join_scoped: 2
     join_match: "metadata.labels:spec.selector"
     join_paths: "status.conditions[type=Ready].status,status.podIP,metadata.uid"
-    watch: "/pods/,/probe-status/"
+    watch: "/pods/,/probe-status/,/pod-probes/"
   - name: probe
     type: store_effect
     decision: {hex: "${DEC_AK}"}
     key_prefix: "/probe-status/"
     flat: 1
     paths: "ready"
+  - name: declared
+    type: store_effect
+    decision: {hex: "${DEC_DL}"}
+    key_prefix: "/pod-probes/"
+    flat: 1
+    paths: "rp_cmd"
   - name: slices
     type: store_effect
     decision: {hex: "${DEC_SL}"}
@@ -138,6 +144,8 @@ wiring:
   - from: pairs.record_out
     to: probe.request_in
   - from: probe.response_out
+    to: declared.request_in
+  - from: declared.response_out
     to: slices.request_in
   - from: sl_source.record_out
     to: podexists.request_in

@@ -57,7 +57,10 @@ for c in nft ip dig curl; do command -v "$c" >/dev/null || skip "$c not found"; 
 D="$(mktemp -d "${TMPDIR:-/tmp}/nc-dprt-XXXXXX")"
 chmod 755 "$D"
 DA="$D/a"; DB="$D/b"
-mkdir -p "$DA" "$DB" "$D/run"
+mkdir -p "$DA" "$DB"
+# The nodes' host registry (FLUXOR_RUN_DIR): the runtimes run as root, and
+# the registry refuses a directory another user owns or may write.
+sudo -n install -d -m 0755 "$D/run"
 P="ncrt$$"
 LAN="${P}l"; NA="${P}a"; NB="${P}b"; NC="${P}c"
 # Instance tags: distinct in their first six characters (a tag's stem names
@@ -123,7 +126,9 @@ head = "target: linux\ntick_us: 1000\n\nplatform:\n  net: {}\n\nscheduler:\n  ac
 def write(path, mods, edges, net):
     h = head if net else head.replace("platform:\n  net: {}\n\n", "")
     w = "".join(f"  - from: {f}\n    to: {t}\n" for f, t in edges)
-    open(path, "w").write(h + "\n".join(mods) + "\n\nwiring:\n" + w)
+    # A graph with no edges (B: two enforcers, each its own watcher) says
+    # so: an empty `wiring:` is not a list.
+    open(path, "w").write(h + "\n".join(mods) + ("\n\nwiring:\n" + w if w else "\n\nwiring: []\n"))
 write(out_a, A, EA, True)
 write(out_b, B, EB, False)
 print("   A: %d modules; B: %d (%s)" % (len(A), len(B), ", ".join(name(b) for b in B)))
@@ -147,30 +152,25 @@ lan_port "$NC" 192.168.77.100
 for n in "$NA" "$NB"; do in_ns "$n" sysctl -qw net.ipv4.ip_forward=1; done
 in_ns "$NA" ip route add 10.244.2.0/24 via 192.168.77.2
 in_ns "$NB" ip route add 10.244.1.0/24 via 192.168.77.1
-# A's routes to its Pods name the node's own address as their source: the
-# cluster DNS on A answers from an unbound UDP socket (fluxor's linux_net
-# datagram surface binds 0.0.0.0 and replies with plain sendto, no
-# IP_PKTINFO), so the reply to a Pod on A leaves from whatever the route
-# prefers — the Pod gateway, an address the query never went to, which the
-# Pod's resolver (and conntrack, past the kube-dns DNAT) refuses. With the
-# node address preferred the reply is the one asked for. (A fluxor gap,
-# reported; a Pod on another node is routed through the uplink and needs no
-# such help.)
-pod_net() { # pod_net <pod> <node ns> <addr> <gateway> [route src]
+# A Pod's route is plain: the cluster DNS on A answers each query from the
+# address it was sent to (fluxor's linux_net replies with the query's own
+# destination as its source), so a Pod on A resolves through its gateway's
+# route as one on B does through the uplink.
+pod_net() { # pod_net <pod> <node ns> <addr> <gateway>
   local ns="${P}$1"
   sudo -n ip netns add "$ns"
   in_ns "$ns" ip link set lo up
   sudo -n ip link add "v$1" netns "$2" type veth peer name eth0 netns "$ns"
   in_ns "$2" ip addr add "$4/32" dev "v$1"
   in_ns "$2" ip link set "v$1" up
-  in_ns "$2" ip route add "$3/32" dev "v$1" ${5:+src "$5"}
+  in_ns "$2" ip route add "$3/32" dev "v$1"
   in_ns "$ns" ip addr add "$3/32" dev eth0
   in_ns "$ns" ip link set eth0 up
   in_ns "$ns" ip route add "$4" dev eth0
   in_ns "$ns" ip route add default via "$4"
 }
-pod_net a1 "$NA" 10.244.1.2 10.244.1.1 192.168.77.1
-pod_net a2 "$NA" 10.244.1.3 10.244.1.1 192.168.77.1
+pod_net a1 "$NA" 10.244.1.2 10.244.1.1
+pod_net a2 "$NA" 10.244.1.3 10.244.1.1
 pod_net b1 "$NB" 10.244.2.2 10.244.2.1
 pod_net b2 "$NB" 10.244.2.3 10.244.2.1
 cat >"$D/serve.py" <<'PY'
@@ -234,7 +234,10 @@ wait_for() { # wait_for <seconds> <what> <cmd...>
 enforced() { # enforced <dir> <table>
   case "$(on "$1" np_last "/np-status/$2")" in enforced=1\;*) return 0 ;; *) return 1 ;; esac
 }
-rule() { in_ns "$1" nft list table ip "fx_${2}_proxy" 2>/dev/null | grep -qF "$3"; }
+# grep reads nft's listing whole (no -q): under pipefail a grep that quits at
+# its first match leaves nft writing into a closed pipe, and the SIGPIPE fails
+# the check once the table outgrows the pipe's buffer.
+rule() { in_ns "$1" nft list table ip "fx_${2}_proxy" 2>/dev/null | grep -F "$3" >/dev/null; }
 
 start "$DA" "$NA" "$TAGA"
 wait_for 60 "A's proxy table was never enforced: '$(on "$DA" np_last /np-status/proxy)'" enforced "$DA" proxy
@@ -309,7 +312,7 @@ wait_for 60 "A never computed b1's isolation: $(on "$DA" np_keys /np-rows/netpol
 sleep 2
 replicate
 wait_for 60 "B's netpolicy table was never enforced: '$(on "$DB" np_last /np-status/netpolicy)'" enforced "$DB" netpolicy
-in_ns "$NB" nft list table ip "fx_${TAGB}_netpolicy" | grep -qF "ip daddr 10.244.2.2 drop" || fail "B's kernel holds no isolation for b1"
+in_ns "$NB" nft list table ip "fx_${TAGB}_netpolicy" | grep -F "ip daddr 10.244.2.2 drop" >/dev/null || fail "B's kernel holds no isolation for b1"
 R="$(get "${P}b2" http://10.244.2.2:8080/)"
 [ -z "$R" ] || fail "b2 -> b1 answered under deny-b1: '$R'"
 R="$(get "${P}b1" http://10.244.2.3:8080/)"

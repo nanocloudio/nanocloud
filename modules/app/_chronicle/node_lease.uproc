@@ -58,7 +58,10 @@ module nanocloud.nodelease {
   // (the node restarted, its clock with it). A node whose render knows its
   // facts (arch, os, the fluxor ABI) carries them as its labels — what a
   // Pod's nodeSelector is matched against — and renews at once when the
-  // stored labels are not them (a node upgraded to another ABI).
+  // stored labels are not them (a node upgraded to another ABI). The labels
+  // are compared as views (`{`, the facts, `}`), never by building
+  // "{" + facts + "}": every arm's condition is evaluated up to the one that
+  // matches, and a concatenation per arm overflows the decision's scratch.
   //
   // A node whose render knows its address advertises it, as a kubelet does:
   // status.addresses InternalIP (then its Hostname) — the hostIP of every
@@ -74,15 +77,19 @@ module nanocloud.nodelease {
   // The record is the Node whole, so its spec is restated: its Pod CIDR
   // (spec.podCIDR and spec.podCIDRs, which svc_alloc carved from the
   // cluster CIDR at the node's first registration) as the source read it,
-  // or no spec when it has none yet. A renewal that read the record before
+  // or no spec when it has none yet — each renewal twice, with the CIDR
+  // and without it, as a rule never reads a field the record lacks (the
+  // first registration has none). A renewal that read the record before
   // the CIDR was written leaves it out, and svc_alloc writes it back from
   // its claim.
   decision renew(n: nl.Self) -> nl.Put {
     when n.label == "" ->
       nl.Put { cid: n.seq, op: NOOP, key: "" };
-    when has(n.facts) && n.facts != "" && has(n.addr) && n.addr != "" && !n.addr.startsWith("_")
+    when has(n.cidr) && n.cidr != "" && (has(n.facts) && n.facts != "" && has(n.addr) && n.addr != "" && !n.addr.startsWith("_")
          && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000
-             || !has(n.labels) || n.labels != "{" + n.facts + "}") ->
+             || !has(n.labels) || size(n.labels) != size(n.facts) + 2
+             || !n.labels.startsWith("{") || !n.labels.endsWith("}")
+             || n.labels.substring(math.least(1, size(n.labels)), math.least(size(n.facts) + 1, size(n.labels))) != n.facts)) ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
                v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
                v3: "\",\"labels\":{", v4: n.facts,
@@ -95,15 +102,30 @@ module nanocloud.nodelease {
                v7: ",\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + n.addr + "\"},{\"type\":\"Hostname\",\"address\":\"",
                v8: n.label,
                v9: "\"}],\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
-               s1: ",\"spec\":{\"podCIDR\":\"".substring(0, 20 * math.least(1, size(n.cidr))),
-               s2: n.cidr,
-               s3: "\",\"podCIDRs\":[\"".substring(0, 15 * math.least(1, size(n.cidr))),
-               s4: n.cidr,
-               s5: "\"]}".substring(0, 3 * math.least(1, size(n.cidr))),
-               s6: "}" };
-    when has(n.facts) && n.facts != ""
+               s1: ",\"spec\":{\"podCIDR\":\"", s2: n.cidr, s3: "\",\"podCIDRs\":[\"", s4: n.cidr, s5: "\"]}", s6: "}" };
+    when has(n.facts) && n.facts != "" && has(n.addr) && n.addr != "" && !n.addr.startsWith("_")
          && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000
-             || !has(n.labels) || n.labels != "{" + n.facts + "}") ->
+             || !has(n.labels) || size(n.labels) != size(n.facts) + 2
+             || !n.labels.startsWith("{") || !n.labels.endsWith("}")
+             || n.labels.substring(math.least(1, size(n.labels)), math.least(size(n.facts) + 1, size(n.labels))) != n.facts) ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
+               v3: "\",\"labels\":{", v4: n.facts,
+               v5: "}},\"status\":{\"ready\":true,\"heartbeat\":", v6: n.now,
+               c1: ",\"capacity\":{".substring(0, 13 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c2: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c3: "},\"allocatable\":{".substring(0, 17 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
+               v7: ",\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + n.addr + "\"},{\"type\":\"Hostname\",\"address\":\"",
+               v8: n.label,
+               v9: "\"}],\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
+               s1: "", s2: "", s3: "", s4: "", s5: "", s6: "}" };
+    when has(n.cidr) && n.cidr != "" && (has(n.facts) && n.facts != ""
+         && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000
+             || !has(n.labels) || size(n.labels) != size(n.facts) + 2
+             || !n.labels.startsWith("{") || !n.labels.endsWith("}")
+             || n.labels.substring(math.least(1, size(n.labels)), math.least(size(n.facts) + 1, size(n.labels))) != n.facts)) ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
                v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
                v3: "\",\"labels\":{", v4: n.facts,
@@ -114,14 +136,39 @@ module nanocloud.nodelease {
                c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
                c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
                v7: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
-               s1: ",\"spec\":{\"podCIDR\":\"".substring(0, 20 * math.least(1, size(n.cidr))),
-               s2: n.cidr,
-               s3: "\",\"podCIDRs\":[\"".substring(0, 15 * math.least(1, size(n.cidr))),
-               s4: n.cidr,
-               s5: "\"]}".substring(0, 3 * math.least(1, size(n.cidr))),
-               s6: "}" };
+               s1: ",\"spec\":{\"podCIDR\":\"", s2: n.cidr, s3: "\",\"podCIDRs\":[\"", s4: n.cidr, s5: "\"]}", s6: "}" };
+    when has(n.facts) && n.facts != ""
+         && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000
+             || !has(n.labels) || size(n.labels) != size(n.facts) + 2
+             || !n.labels.startsWith("{") || !n.labels.endsWith("}")
+             || n.labels.substring(math.least(1, size(n.labels)), math.least(size(n.facts) + 1, size(n.labels))) != n.facts) ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
+               v3: "\",\"labels\":{", v4: n.facts,
+               v5: "}},\"status\":{\"ready\":true,\"heartbeat\":", v6: n.now,
+               c1: ",\"capacity\":{".substring(0, 13 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c2: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c3: "},\"allocatable\":{".substring(0, 17 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
+               v7: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
+               s1: "", s2: "", s3: "", s4: "", s5: "", s6: "}" };
     when has(n.facts) && n.facts != "" ->
       nl.Put { cid: n.seq, op: NOOP, key: "" };
+    when has(n.cidr) && n.cidr != "" && (has(n.addr) && n.addr != "" && !n.addr.startsWith("_")
+         && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000)) ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
+               v5: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v6: n.now,
+               c1: ",\"capacity\":{".substring(0, 13 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c2: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c3: "},\"allocatable\":{".substring(0, 17 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
+               v7: ",\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + n.addr + "\"},{\"type\":\"Hostname\",\"address\":\"",
+               v8: n.label,
+               v9: "\"}],\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
+               s1: ",\"spec\":{\"podCIDR\":\"", s2: n.cidr, s3: "\",\"podCIDRs\":[\"", s4: n.cidr, s5: "\"]}", s6: "}" };
     when has(n.addr) && n.addr != "" && !n.addr.startsWith("_")
          && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000) ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
@@ -135,12 +182,18 @@ module nanocloud.nodelease {
                v7: ",\"addresses\":[{\"type\":\"InternalIP\",\"address\":\"" + n.addr + "\"},{\"type\":\"Hostname\",\"address\":\"",
                v8: n.label,
                v9: "\"}],\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
-               s1: ",\"spec\":{\"podCIDR\":\"".substring(0, 20 * math.least(1, size(n.cidr))),
-               s2: n.cidr,
-               s3: "\",\"podCIDRs\":[\"".substring(0, 15 * math.least(1, size(n.cidr))),
-               s4: n.cidr,
-               s5: "\"]}".substring(0, 3 * math.least(1, size(n.cidr))),
-               s6: "}" };
+               s1: "", s2: "", s3: "", s4: "", s5: "", s6: "}" };
+    when has(n.cidr) && n.cidr != "" && (n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000) ->
+      nl.Put { cid: n.seq, op: PUT, key: n.label,
+               v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
+               v5: "\"},\"status\":{\"ready\":true,\"heartbeat\":", v6: n.now,
+               c1: ",\"capacity\":{".substring(0, 13 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c2: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c3: "},\"allocatable\":{".substring(0, 17 * math.least(1, n.cap.indexOf("\"") + 1)),
+               c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
+               c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
+               v7: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
+               s1: ",\"spec\":{\"podCIDR\":\"", s2: n.cidr, s3: "\",\"podCIDRs\":[\"", s4: n.cidr, s5: "\"]}", s6: "}" };
     when n.total == 0 || n.ready != "true" || n.hb == 0 || n.now < n.hb || n.now >= n.hb + 10000 ->
       nl.Put { cid: n.seq, op: PUT, key: n.label,
                v1: "{\"apiVersion\":\"v1\",\"kind\":\"Node\",\"metadata\":{\"name\":\"", v2: n.label,
@@ -151,12 +204,7 @@ module nanocloud.nodelease {
                c4: n.cap.substring(0, size(n.cap) * math.least(1, n.cap.indexOf("\"") + 1)),
                c5: "}".substring(0, math.least(1, n.cap.indexOf("\"") + 1)),
                v7: ",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"reason\":\"KubeletReady\"}]}",
-               s1: ",\"spec\":{\"podCIDR\":\"".substring(0, 20 * math.least(1, size(n.cidr))),
-               s2: n.cidr,
-               s3: "\",\"podCIDRs\":[\"".substring(0, 15 * math.least(1, size(n.cidr))),
-               s4: n.cidr,
-               s5: "\"]}".substring(0, 3 * math.least(1, size(n.cidr))),
-               s6: "}" };
+               s1: "", s2: "", s3: "", s4: "", s5: "", s6: "}" };
     default ->
       nl.Put { cid: n.seq, op: NOOP, key: "" };
   }

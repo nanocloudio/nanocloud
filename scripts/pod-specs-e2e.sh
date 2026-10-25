@@ -196,6 +196,7 @@ store_put "/pods/default/dflt" '{"metadata":{"name":"dflt","namespace":"default"
 store_put "/pods/default/job-0" '{"metadata":{"name":"job-0","namespace":"default","uid":"uid-job","ownerReferences":[{"kind":"Job","name":"job"}]},"spec":{"nodeName":"node-a","restartPolicy":"Never","containers":[{"name":"c","image":"busybox:1.36","command":["true"]}]}}'
 # A graph-backed Pod defaults the same way and carries its limits.
 store_put "/pods/default/g" '{"metadata":{"name":"g","namespace":"default","uid":"uid-g"},"spec":{"nodeName":"node-a","runtimeClassName":"fluxor","containers":[{"name":"g","image":"probe","resources":{"limits":{"cpu":"100m","memory":"64Mi"}}}]}}'
+store_put "/pods/default/hnet" '{"metadata":{"name":"hnet","namespace":"default","uid":"uid-hnet"},"spec":{"nodeName":"node-a","hostNetwork":true,"runtimeClassName":"fluxor","containers":[{"name":"k","image":"nanocloud/kv:1"}]}}'
 store_put "/pods/default/wimg" '{"metadata":{"name":"wimg","namespace":"default","uid":"uid-wimg"},"spec":{"nodeName":"node-a","restartPolicy":"Never","runtimeClassName":"fluxor","containers":[{"name":"w","image":"nanocloud/probe:1","resources":{"limits":{"ephemeral-storage":"10Mi"}}}]}}'
 # An exec readinessProbe rides along for the node's probe chain; a
 # graph-backed Pod has no exec seam and carries none.
@@ -235,8 +236,11 @@ is /~node/node-a/pod-specs/uid-dflt "node=node-a;image=nanocloud/app:1;pull=;res
 echo "   dflt: no restartPolicy -> always (a ReplicaSet's Pod), no grace -> 30; args with no command"
 is /~node/node-a/pod-specs/uid-job "node=node-a;image=busybox:1.36;pull=;restart=never;grace=30;desired=running;cmd=true;args=;env=;workdir=;cpu=;mem=;eph=;tasks=4194304;pod=default/job-0;rp_cmd=;ruid=;rgid=;nonroot=;volumes=/etc/resolv.conf:/etc/resolv.conf:ro;gate=0;ord=;ctr=c;paused=;cfgerr="
 echo "   job-0: a Job's Never kept"
-is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;restart=always;grace=0;desired=running;cmd=;cpu=100;mem=67108864;eph=;pod=default/g;paused="
-is /~node/node-a/pod-specs/uid-wimg "node=node-a;graph=nanocloud/probe:1;image=nanocloud/probe:1;restart=never;grace=0;desired=running;cmd=;cpu=;mem=;eph=10485760;pod=default/wimg;paused="
+is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;restart=always;grace=0;desired=running;cmd=;cpu=100;mem=67108864;eph=;pod=default/g;paused=;hostnet="
+is /~node/node-a/pod-specs/uid-wimg "node=node-a;graph=nanocloud/probe:1;image=nanocloud/probe:1;restart=never;grace=0;desired=running;cmd=;cpu=;mem=;eph=10485760;pod=default/wimg;paused=;hostnet="
+# hostNetwork: the node's network, no address of its own (node_net and the
+# metal sandbox read hostnet=true).
+is /~node/node-a/pod-specs/uid-hnet "node=node-a;graph=nanocloud/kv:1;image=nanocloud/kv:1;restart=always;grace=0;desired=running;cmd=;cpu=;mem=;eph=;pod=default/hnet;paused=;hostnet=true"
 echo "   g, wimg: graph-backed Pods defaulted alike, their limits carried"
 
 echo "== 2. a pass with nothing changed spends no revision =="

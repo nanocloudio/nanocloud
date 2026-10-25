@@ -1060,7 +1060,11 @@ unsafe fn store_event(sys: &SyscallTable) -> i32 {
 unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32, flags: u8) -> i32 {
     use abi::contracts::storage::namespace as ns;
     let mut arg = [0u8; MAX_KEY + 16];
-    let req = ns::subscribe::Request { prefix, event, flags };
+    let req = ns::subscribe::Request {
+        prefix,
+        event,
+        flags,
+    };
     let Some(len) = ns::subscribe::encode(&mut arg, &req) else {
         return abi::kernel_abi::errno::EINVAL;
     };
@@ -1130,7 +1134,12 @@ unsafe fn store_take(sys: &SyscallTable, event: i32, mut rung: impl FnMut(i32)) 
     if event < 0 {
         return 0;
     }
-    let fired = (sys.provider_call)(event, abi::kernel_abi::event::POLL, core::ptr::null_mut(), 0);
+    let fired = (sys.provider_call)(
+        event,
+        abi::kernel_abi::event::POLL,
+        core::ptr::null_mut(),
+        0,
+    );
     if fired <= 0 {
         return 0;
     }

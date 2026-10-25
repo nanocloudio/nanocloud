@@ -43,11 +43,19 @@ trap 'rm -rf "$W"' EXIT
 fail() { echo "rig-join: $*" >&2; exit 1; }
 
 # ── 1. the presented authority, checked against the announced digest
-openssl s_client -connect "$HOST:$PORT" -servername "$NAME" -showcerts </dev/null \
-  >"$W/hello" 2>/dev/null || true
-awk '/-----BEGIN CERTIFICATE-----/{n++; in_c=1} in_c{print > (dir "/c" n ".pem")} /-----END CERTIFICATE-----/{in_c=0}' \
-  dir="$W" "$W/hello"
-N="$(ls "$W"/c*.pem 2>/dev/null | wc -l)"
+# The API may answer after the node announces its secret: its chain is
+# asked for until it is presented (two minutes).
+N=0
+for _ in $(seq 60); do
+  openssl s_client -connect "$HOST:$PORT" -servername "$NAME" -showcerts </dev/null \
+    >"$W/hello" 2>/dev/null || true
+  rm -f "$W"/c*.pem
+  awk '/-----BEGIN CERTIFICATE-----/{n++; in_c=1} in_c{print > (dir "/c" n ".pem")} /-----END CERTIFICATE-----/{in_c=0}' \
+    dir="$W" "$W/hello"
+  N="$(find "$W" -maxdepth 1 -name 'c*.pem' | wc -l)"
+  [ "$N" -ge 2 ] && break
+  sleep 2
+done
 [ "$N" -ge 2 ] || fail "the API at $HOST:$PORT presented no chain (got $N certificate(s))"
 cp "$W/c$N.pem" "$W/ca.pem"
 cp "$W/c1.pem" "$W/leaf.pem"
@@ -60,16 +68,28 @@ openssl verify -CAfile "$W/ca.pem" -verify_hostname "$NAME" "$W/leaf.pem" >/dev/
 
 # ── 3. the secret, spent. A 503 is a store that has not decided yet (the
 # node just booted and its store is recovering): the secret is not spent,
-# so it is presented again; only a 401 says the node does not know it.
+# so it is presented again; only a 401 says the node does not know it. An
+# answer that does not come in time (curl 28) is asked again too: a board
+# just booted can take longer than one request to decide.
+TIMED_OUT=0
 for _ in $(seq 30); do
   ANS="$(curl -sS --max-time 20 --cacert "$W/ca.pem" --resolve "$NAME:$PORT:$HOST" \
     -X POST --data '' -H "Authorization: Bearer $SECRET" \
-    -w '\n%{http_code}' "https://$NAME:$PORT/apis/nanocloud.io/v1/join")" || fail "the join request failed"
+    -w '\n%{http_code}' "https://$NAME:$PORT/apis/nanocloud.io/v1/join")" && RC=0 || RC=$?
+  if [ "$RC" = 28 ]; then
+    TIMED_OUT=1
+    continue
+  fi
+  [ "$RC" = 0 ] || fail "the join request failed (curl $RC)"
   CODE="${ANS##*$'\n'}"
   BODY="${ANS%$'\n'*}"
   [ "$CODE" = "503" ] || break
   sleep 2
 done
+[ -n "${CODE:-}" ] || fail "the join request was never answered (30 tries, 20 s each)"
+if [ "$CODE" = "401" ] && [ "$TIMED_OUT" = 1 ]; then
+  fail "the node refused the secret (401) after a request timed out: an earlier ask may have spent it"
+fi
 [ "$CODE" = "200" ] || fail "the node refused the secret ($CODE): $BODY"
 
 # ── 4. the kubeconfig

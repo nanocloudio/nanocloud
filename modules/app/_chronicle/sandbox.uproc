@@ -145,6 +145,7 @@ module nanocloud.sandbox {
     sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
     desired: string = 100; // /pod-specs/<id> desired: `deleted` once its Pod is
     pod: string = 101;     // /pod-specs/<id> pod: `<ns>/<name>`
+    hnet: string = 102;    // /pod-specs/<id> hostnet: `true` shares the node's network
     lease: string = 110;   // /ipam-lease/<id>: its own address
     seg: string = 120;     // /sandbox-net: the node's segment (0: none)
     gnet: string = 121;    //   and `1` when its module workloads join it
@@ -152,8 +153,8 @@ module nanocloud.sandbox {
   }
   // On a node whose module workloads join its segment (`gnet=1`, bare metal)
   // a graph-backed sandbox holds an address of its own there: its lease,
-  // which node_net asks for and its CREATE waits for. Elsewhere it shares
-  // the node's network. Its resolver context is the cluster's name service
+  // which node_net asks for and its CREATE waits for. Elsewhere, and for a
+  // hostNetwork Pod (hostnet=true), it shares the node's network. Its resolver context is the cluster's name service
   // and its namespace's search path (ClusterFirst), so a workload the
   // runtime resolves for reaches cluster names.
   decision mspec(s: MSpec) -> Op {
@@ -161,7 +162,7 @@ module nanocloud.sandbox {
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
-         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0"
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true")
          && has(s.lease) && s.lease != "" && has(s.cdns) && s.cdns != "" && has(s.pod) && s.pod != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
            a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
@@ -170,7 +171,7 @@ module nanocloud.sandbox {
            ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
-         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0"
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true")
          && has(s.lease) && s.lease != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
            a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
@@ -178,7 +179,7 @@ module nanocloud.sandbox {
     // Not yet created under this boot: wait for the lease and the name
     // service. A created one falls through to START.
     when s.phase != "delete" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" ->
+         && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true") ->
       Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
          && s.boot != "" && (!has(s.desired) || s.desired != "deleted")

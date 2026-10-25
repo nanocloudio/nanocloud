@@ -54,7 +54,8 @@ join() {
   LAST_JOIN="$line"
   secret="$(sed 's/.*secret=\([0-9a-f]*\).*/\1/' <<<"$line")"
   ca="$(sed 's/.*ca-sha256=\([0-9a-f]*\).*/\1/' <<<"$line")"
-  bash "$ROOT/scripts/rig-join.sh" "$secret" "$ca" "$IP:6443" "$KC" >/dev/null || fail "join"
+  local out
+  out="$(bash "$ROOT/scripts/rig-join.sh" "$secret" "$ca" "$IP:6443" "$KC" 2>&1)" || fail "join: $(printf '%s\n' "$out" | tail -5)"
   echo "   joined: authority ${ca:0:16}…, kubeconfig $KC"
 }
 
@@ -87,7 +88,26 @@ if [ -n "${NANOCLOUD_JOIN:-}" ]; then
   printf '[join] %s\n' "$NANOCLOUD_JOIN" >"$TLOG"   # "secret=… ca-sha256=…"
   join "$TLOG"
 else
-  join "$(ls -td "$RUNS"/*/ | head -1)telemetry.monitor_udp.log"
+  # The run's teardown powers the board off once it passes, which can be
+  # long before these steps finish. So the driver waits for the run's
+  # verdict and, if the board was switched off, powers it back on itself and
+  # joins from its own capture. The kernel stays staged, and the board comes
+  # back on its disk. A run that did not pass holds the board (--hold), and
+  # its own capture has the announcement.
+  run="$(ls -td "$RUNS"/*/ | head -1)"
+  for i in $(seq 450); do
+    [ -n "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("finished_at") or "")' "${run}manifest.json" 2>/dev/null)" ] && break
+    sleep 2
+  done
+  off="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); p=(m.get("teardown") or {}).get("power") or {}; print(1 if p.get("verb")=="off" and p.get("outcome")=="ok" else 0)' "${run}manifest.json" 2>/dev/null)"
+  if [ "${off:-0}" = "1" ]; then
+    echo "   the run's teardown powered $RIG off: powering it on"
+    listen
+    fluxor rig power on --rig "$RIG" >/dev/null || fail "fluxor rig power on"
+    join "$TLOG"
+  else
+    join "${run}telemetry.monitor_udp.log"
+  fi
 fi
 
 echo "== 0b. the API answers (TLS, verified against the node's authority)"
@@ -301,6 +321,10 @@ spec:
       labels: {app: $app}
     spec:
       runtimeClassName: fluxor
+      # Served on the board's own address, which the operator reaches: a Pod
+      # without it gets an address of its own from the node's Pod CIDR,
+      # which this host has no route to.
+      hostNetwork: true
       containers:
       - name: $app
         image: nanocloud/$app:1

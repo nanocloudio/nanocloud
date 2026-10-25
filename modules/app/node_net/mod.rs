@@ -903,6 +903,10 @@ unsafe fn request_pass(s: &mut State, store: &Store) -> Pass {
         if field(spec, b"desired=") == Some(b"deleted") {
             continue;
         }
+        // A hostNetwork Pod shares the node's network: no address of its own.
+        if field(spec, b"hostnet=") == Some(b"true") {
+            continue;
+        }
         let mut v = [0u8; 512];
         let mut c = [0u8; 24];
         let cl = put_cidr(&mut c, 0, s.seg_cidr).unwrap_or(0);

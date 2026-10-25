@@ -124,8 +124,13 @@ if g.count('    identity_label: "nanocloud.api"\n') != 1 or "  - name: node_pki\
 sub_re(r"^(\s+- from: |\s+to: )linux_net\.", r"\1ip.", count=g.count("linux_net."))
 
 # The store and the log on the board's disk, at the FAT32 root.
-deadline = ("    step_deadline_us: 12000\n    step_deadline_burst_us: 16000\n"
+DEADLINE_US = 12000
+deadline = (f"    step_deadline_us: {DEADLINE_US}\n    step_deadline_burst_us: 16000\n"
             "    fault_policy: tolerate\n")
+# A store source's walk stops between objects once it has spent half its
+# step's deadline (store_source `step_budget_us`, set below): an object's
+# reads cost milliseconds on the board, and the object in hand always
+# completes, so the other half is that object's.
 sub("  - name: kv_state_worker_store\n    params:\n      state_store: 1\n"
     "      store_dir: lattice\n      import_log: store.log\n",
     "  - name: kv_state_worker_store\n" + deadline +
@@ -392,9 +397,15 @@ mods = mods.rstrip("\n") + "\n" + "".join(extra)
 def with_deadline(m):
     name, rest = m.group(1), m.group(0)
     t = re.search(r"^    type: (\S+)$", rest, re.M)
-    if (t.group(1) if t else name) not in consumers or "step_deadline_us:" in rest:
-        return rest
     head = f"  - name: {name}\n"
+    own = re.search(r"^    step_deadline_us: (\d+)$", rest, re.M)
+    if t and t.group(1) in ("store_source", "store_scan", "store_watch") \
+            and "step_budget_us:" not in rest:
+        # Half of the deadline the source steps under, its own or the store's.
+        us = int(own.group(1)) if own else DEADLINE_US
+        rest = head + f"    step_budget_us: {us // 2}\n" + rest[len(head):]
+    if (t.group(1) if t else name) not in consumers or own:
+        return rest
     return head + deadline + rest[len(head):]
 mods = re.sub(r"^  - name: (\S+)\n(?:(?!  - name: ).*\n)*", with_deadline, mods, flags=re.M)
 

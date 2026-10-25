@@ -35,6 +35,13 @@ Environment=FLUXOR_VAULT_DIR=/var/lib/nanocloud.io/control-plane/store/vault
 # Each Pod's own storage (its files and its store), rooted by its identity:
 # kept across restarts, removed only when its workload is destroyed.
 Environment=FLUXOR_OWNER_ROOT=/var/lib/nanocloud.io/owners
+# Each Pod's volumes (emptyDir, Secret, ConfigMap, projected, downward API),
+# one directory per Pod under the platform's mount root, bound into its
+# containers by the runtime and removed once the Pod is gone. Under the
+# node's own state, not the platform's default. Its modes are set by
+# `host_mount` (an emptyDir without fsGroup is 0777 exactly); no tool is
+# spawned, so the node grants no process allow-list.
+Environment=FLUXOR_MOUNT_ROOT=/var/lib/nanocloud.io/mounts
 # The store holds Secrets, minted tokens and (under vault/) the sealed keys,
 # and the store writes its files 0644: the DIRECTORY is what keeps them from
 # every other local user, so it is 0700 on every start — an upgrade from a
@@ -44,6 +51,7 @@ ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/sto
 ExecStartPre=/bin/chmod 0700 /var/lib/nanocloud.io/control-plane/store
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/control-plane/store/lattice
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/owners
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/nanocloud.io/mounts
 RuntimeDirectory=nanocloud
 RuntimeDirectoryMode=0700
 # The runtime's instance state (FLUXOR_STATE_DIR): it holds the instance lock

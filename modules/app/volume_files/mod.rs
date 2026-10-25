@@ -12,7 +12,6 @@ use core::ffi::c_void;
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::platform::linux::host_mount as hm;
-use abi::platform::linux::host_process as hp;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
@@ -38,6 +37,7 @@ const FS_CLOSE: u32 = 0x0903;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
 const FS_MKDIR: u32 = 0x090B;
+const FS_READLINK: u32 = 0x0914;
 const EAGAIN: i32 = -11;
 const EINPROGRESS: i32 = -36;
 const ENOENT: i32 = -2;
@@ -53,7 +53,6 @@ const FILE: usize = 64 * 1024;
 /// A projection as one `PROJECT` argument: every file of the volume.
 const HM_ARG: usize = 72 * 1024;
 const PATH: usize = 256;
-const CMD: usize = 512;
 /// A PREPARE's volume spec (field 3).
 const SPEC: usize = 2048;
 const OP_NOOP: i64 = 0;
@@ -69,12 +68,14 @@ const SWEEP: usize = 16;
 const J_IDLE: u8 = 0;
 /// Reading what the volume holds, and asking the platform for it.
 const J_RUN: u8 = 1;
-/// An emptyDir's mode, through the process executor.
-const J_CHMOD: u8 = 2;
 /// A `host_mount` op of the PREPARE in flight, asked again byte-identical.
 const J_HM: u8 = 3;
 /// A gone Pod's directory being removed (`REMOVE_TREE`).
 const J_SWEEP: u8 = 4;
+/// The PREPARE's file binds where its projection holds it now: `..data`
+/// read (`fs` READLINK) so the bind names the file through no link — the
+/// runtime binds nothing a link is on the way to.
+const J_LINK: u8 = 5;
 
 #[repr(C)]
 struct State {
@@ -102,11 +103,21 @@ struct State {
     /// What the held PREPARE binds once its op succeeds.
     bind: [u8; PATH],
     bind_len: usize,
-    proc_h: i32,
-    proc_ok: bool,
     /// The `host_mount` op in flight and its argument.
     hm_op: u32,
     hm_len: usize,
+    /// The op that follows the one in flight once it succeeds (0: none):
+    /// a memory-backed emptyDir's mode or group, after its mount.
+    then_op: u32,
+    then_arg: [u8; PATH + 16],
+    then_len: usize,
+    /// A projection's `..data` and the file under it the PREPARE binds
+    /// ([`J_LINK`], after the projection when [`State::link_after`]).
+    ldir: [u8; PATH],
+    ldir_len: usize,
+    lfile: [u8; 64],
+    lfile_len: usize,
+    link_after: bool,
     obj: [u8; OBJ],
     obj_len: usize,
     file: [u8; FILE],
@@ -124,12 +135,10 @@ struct State {
     removed: u32,
     last_hb_ms: u64,
     last_hb_sum: u32,
-    said_proc: bool,
     said_root: bool,
     said_memory: bool,
     said_outside: bool,
     said_rc: bool,
-    drain: [u8; 256],
     nag: ReadNag,
 }
 
@@ -196,7 +205,8 @@ pub unsafe extern "C" fn module_new(
     s.rec_len = 0;
     s.out_len = 0;
     s.job = J_IDLE;
-    s.proc_h = -1;
+    s.then_op = 0;
+    s.link_after = false;
     s.gone_n = 0;
     s.cache_next = 0;
     s.mroot_len = 0;
@@ -245,14 +255,8 @@ unsafe fn step(s: &mut State, sys: &SyscallTable) {
         }
         s.out_len = 0;
     }
-    if s.proc_h >= 0 {
-        if !poll_proc(s, sys) {
-            return;
-        }
-        if s.job == J_CHMOD {
-            let ok = s.proc_ok;
-            return prepared(s, sys, ok);
-        }
+    if s.job == J_LINK {
+        return link_step(s, sys);
     }
     if s.job == J_HM || s.job == J_SWEEP {
         let rc = (sys.provider_call)(-1, s.hm_op, s.hm.as_mut_ptr(), s.hm_len);
@@ -299,6 +303,9 @@ struct Vol<'a> {
     group: Option<u32>,
     /// fsGroupChangePolicy OnRootMismatch (`r`), else Always.
     on_mismatch: bool,
+    /// A memory-backed emptyDir's bound in bytes (`@m`); 0 the runtime's
+    /// default.
+    size: u64,
 }
 
 fn seg(s: &[u8], n: usize) -> &[u8] {
@@ -312,6 +319,21 @@ fn name_ok(n: &[u8]) -> bool {
             .all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
         && n != b"."
         && n != b".."
+}
+
+/// A byte count as pod_resolve writes one (decimal).
+fn dec_of(d: &[u8]) -> Option<u64> {
+    if d.is_empty() || d.len() > 19 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in d {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+    }
+    Some(v)
 }
 
 /// A group ID as pod_resolve writes one (decimal, 0..=2147483647).
@@ -366,8 +388,20 @@ fn parse_vol<'a>(spec: &'a [u8], id: &'a [u8]) -> Option<Vol<'a>> {
         uid,
         group: None,
         on_mismatch: false,
+        size: 0,
     };
     match kind {
+        // A memory-backed emptyDir: `@m/<vol>/<bytes>[/<gid>/<a|r>]`.
+        b'm' => {
+            let size = dec_of(seg(spec, 2))?;
+            let (group, on_mismatch) = fs_group(spec, 3)?;
+            Some(Vol {
+                group,
+                on_mismatch,
+                size,
+                ..bare
+            })
+        }
         b'e' => {
             let (group, on_mismatch) = fs_group(spec, 2)?;
             Some(Vol {
@@ -570,17 +604,105 @@ fn put_at(buf: &mut [u8], at: usize, bytes: &[u8]) -> Option<usize> {
 
 /// The `host_mount` op `op` over `s.hm[..len]`, asked from the next step
 /// until it answers; what the PREPARE binds once it does is `s.bind`.
+/// Hold `dir` (a projection, absolute) and `file` under it for [`J_LINK`].
+fn link_target(s: &mut State, dir: &[u8], file: &[u8]) -> bool {
+    if dir.len() > s.ldir.len() || file.len() > s.lfile.len() {
+        return false;
+    }
+    for (d, &c) in s.ldir.iter_mut().zip(dir) {
+        *d = c;
+    }
+    s.ldir_len = dir.len();
+    for (d, &c) in s.lfile.iter_mut().zip(file) {
+        *d = c;
+    }
+    s.lfile_len = file.len();
+    true
+}
+
+/// [`J_LINK`]: `<dir>/..data` read, and the bind set to
+/// `<dir>/<its target>/<file>` — the projection's current directory, a
+/// real one. A target that is not a timestamp directory of the projection
+/// (a name of its own, no `/`) is refused.
+unsafe fn link_step(s: &mut State, sys: &SyscallTable) {
+    let mut arg = [0u8; PATH + 2];
+    let path_len = s.ldir_len + b"/..data".len();
+    let Ok(pl) = u16::try_from(path_len) else {
+        return prepared(s, sys, false);
+    };
+    let mut p = put_at(&mut arg, 0, &pl.to_le_bytes()).unwrap_or(0);
+    p = put_at(&mut arg, p, s.ldir.get(..s.ldir_len).unwrap_or(&[])).unwrap_or(0);
+    if put_at(&mut arg, p, b"/..data").is_none() {
+        return prepared(s, sys, false);
+    }
+    let rc = (sys.provider_call)(-1, FS_READLINK, arg.as_mut_ptr(), arg.len());
+    if later(rc) {
+        return;
+    }
+    let target = if rc > 0 {
+        arg.get(..rc as usize).unwrap_or(&[])
+    } else {
+        &[]
+    };
+    // A name of its own: one component, nothing split off at a `/`.
+    if !target.starts_with(b"..")
+        || target.len() < 3
+        || target.split(|&c| c == b'/').nth(1).is_some()
+    {
+        return prepared(s, sys, false);
+    }
+    let mut file = [0u8; 64];
+    let fl = s.lfile_len.min(file.len());
+    for (d, &c) in file.iter_mut().zip(s.lfile.iter().take(fl)) {
+        *d = c;
+    }
+    let mut bind = [0u8; PATH];
+    let mut n = put_at(&mut bind, 0, s.ldir.get(..s.ldir_len).unwrap_or(&[])).unwrap_or(0);
+    for part in [&b"/"[..], target, b"/", file.get(..fl).unwrap_or(&[])] {
+        match put_at(&mut bind, n, part) {
+            Some(e) => n = e,
+            None => return prepared(s, sys, false),
+        }
+    }
+    if set_bind(s, bind.get(..n).unwrap_or(&[])).is_none() {
+        return prepared(s, sys, false);
+    }
+    prepared(s, sys, true);
+}
+
 fn hm_begin(s: &mut State, op: u32, len: usize) {
     s.hm_op = op;
     s.hm_len = len;
     s.job = J_HM;
 }
 
+/// `MKDIR_MODE` of `rel` (relative to the mount root): the directory, created
+/// when absent, given exactly `mode`.
+fn mkdir_mode(s: &mut State, rel: &[u8], mode: u16) -> Option<()> {
+    let p = mkdir_mode_arg(&mut s.hm, rel, mode)?;
+    hm_begin(s, hm::MKDIR_MODE, p);
+    Some(())
+}
+
+/// `MKDIR_MODE`'s argument into `b`: its length.
+fn mkdir_mode_arg(b: &mut [u8], rel: &[u8], mode: u16) -> Option<usize> {
+    let dl = u16::try_from(rel.len()).ok()?;
+    let p = put_at(b, 0, &dl.to_le_bytes())?;
+    let p = put_at(b, p, rel)?;
+    put_at(b, p, &mode.to_le_bytes())
+}
+
 /// `GROUP_TREE` of `rel` (relative to the mount root) to the volume's group.
 fn group_tree(s: &mut State, v: &Vol, rel: &[u8]) -> Option<()> {
+    let p = group_tree_arg(&mut s.hm, v, rel)?;
+    hm_begin(s, hm::GROUP_TREE, p);
+    Some(())
+}
+
+/// `GROUP_TREE`'s argument into `b`: its length.
+fn group_tree_arg(b: &mut [u8], v: &Vol, rel: &[u8]) -> Option<usize> {
     let group = v.group?;
     let dl = u16::try_from(rel.len()).ok()?;
-    let b = &mut s.hm;
     let mut p = put_at(b, 0, &dl.to_le_bytes())?;
     p = put_at(b, p, rel)?;
     p = put_at(b, p, &group.to_le_bytes())?;
@@ -589,9 +711,7 @@ fn group_tree(s: &mut State, v: &Vol, rel: &[u8]) -> Option<()> {
     } else {
         hm::GT_ALWAYS
     };
-    p = put_at(b, p, &[pol])?;
-    hm_begin(s, hm::GROUP_TREE, p);
-    Some(())
+    put_at(b, p, &[pol])
 }
 
 /// The held PREPARE's bind: `path`.
@@ -819,11 +939,54 @@ unsafe fn run(s: &mut State, sys: &SyscallTable) {
                 }
                 return;
             }
-            // An emptyDir any user may write (mode 0777): the one mode no
-            // platform op sets, so through the process executor.
-            if !spawn_chmod(s, sys, b"777", abs) {
+            // An emptyDir any user may write: mode 0777, set exactly (the
+            // runtime's umask does not apply).
+            if mkdir_mode(s, rel, 0o777).is_none() {
                 finish(s, sys, false);
             }
+        }
+        b'm' => {
+            s.digest = fnv(0x6d, spec.get(..sl).unwrap_or(&[]));
+            if set_bind(s, abs).is_none() {
+                return finish(s, sys, false);
+            }
+            if cached(s, ckey, s.digest) {
+                return finish(s, sys, true);
+            }
+            if s.privs & hm::PRIV_SYS_ADMIN == 0 {
+                if !s.said_memory {
+                    s.said_memory = true;
+                    let m = b"[volume_files] no CAP_SYS_ADMIN: a memory-backed emptyDir cannot be mounted";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                }
+                return finish(s, sys, false);
+            }
+            // Its mode or group once the memory filesystem is in place: the
+            // one the Pod's fsGroup gives it, else 0777.
+            let (op, n) = if v.group.is_some() {
+                let Some(n) = group_tree_arg(&mut s.then_arg, &v, rel) else {
+                    return finish(s, sys, false);
+                };
+                (hm::GROUP_TREE, n)
+            } else {
+                let Some(n) = mkdir_mode_arg(&mut s.then_arg, rel, 0o777) else {
+                    return finish(s, sys, false);
+                };
+                (hm::MKDIR_MODE, n)
+            };
+            let flags = hm::P_MEMORY | if v.size != 0 { hm::P_SIZE } else { 0 };
+            let Some(mut p) = project_head(&mut s.hm, rel, hm::NO_GROUP, flags, 0) else {
+                return finish(s, sys, false);
+            };
+            if v.size != 0 {
+                match put_at(&mut s.hm, p, &v.size.to_le_bytes()) {
+                    Some(e) => p = e,
+                    None => return finish(s, sys, false),
+                }
+            }
+            s.then_op = op;
+            s.then_len = n;
+            hm_begin(s, hm::PROJECT, p);
         }
         b'd' => {
             let mut text = [0u8; 1024];
@@ -839,8 +1002,12 @@ unsafe fn run(s: &mut State, sys: &SyscallTable) {
                 return finish(s, sys, false);
             }
             s.digest = fnv(0xcbf2_9ce4_8422_2325, text);
+            if !link_target(s, abs, b"resolv.conf") {
+                return finish(s, sys, false);
+            }
             if cached(s, ckey, s.digest) {
-                return finish(s, sys, true);
+                s.job = J_LINK;
+                return;
             }
             let Some(mut p) = project_head(&mut s.hm, rel, hm::NO_GROUP, 0, 1) else {
                 return finish(s, sys, false);
@@ -849,6 +1016,7 @@ unsafe fn run(s: &mut State, sys: &SyscallTable) {
                 Some(e) => p = e,
                 None => return finish(s, sys, false),
             }
+            s.link_after = true;
             hm_begin(s, hm::PROJECT, p);
         }
         b'g' => claim(s, sys, &v, spec.get(..sl).unwrap_or(&[]), ckey),
@@ -1176,6 +1344,7 @@ unsafe fn projected(
             uid: v.uid,
             group: v.group,
             on_mismatch: false,
+            size: 0,
         };
         let mut i = 0usize;
         loop {
@@ -1260,6 +1429,25 @@ unsafe fn hm_done(s: &mut State, sys: &SyscallTable, rc: i32) {
         }
         dev_log(sys, 1, m.as_ptr(), n);
     }
+    if s.link_after {
+        s.link_after = false;
+        if rc == 0 {
+            s.job = J_LINK;
+            return;
+        }
+    }
+    if s.then_op != 0 {
+        let op = s.then_op;
+        s.then_op = 0;
+        if rc == 0 {
+            let n = s.then_len;
+            for (d, &c) in s.hm.iter_mut().zip(s.then_arg.iter().take(n)) {
+                *d = c;
+            }
+            hm_begin(s, op, n);
+            return;
+        }
+    }
     if s.job == J_SWEEP {
         s.job = J_IDLE;
         if rc == 0 {
@@ -1283,54 +1471,6 @@ unsafe fn prepared(s: &mut State, sys: &SyscallTable, ok: bool) {
         }
     }
     finish(s, sys, ok);
-}
-
-/// `chmod <mode> <path>` through the process executor.
-unsafe fn spawn_chmod(s: &mut State, sys: &SyscallTable, mode: &[u8], path: &[u8]) -> bool {
-    let mut cmd = [0u8; CMD];
-    let mut n = 0usize;
-    for &c in b"chmod "
-        .iter()
-        .chain(mode.iter())
-        .chain(b" ".iter())
-        .chain(path.iter())
-    {
-        match cmd.get_mut(n) {
-            Some(d) => {
-                *d = c;
-                n += 1;
-            }
-            None => return false,
-        }
-    }
-    let h = (sys.provider_call)(-1, hp::PROC_SPAWN, cmd.as_mut_ptr(), n);
-    if h < 0 {
-        if !s.said_proc {
-            s.said_proc = true;
-            let m = b"[volume_files] the process executor refused chmod - add it to SECTOR_PROC_ALLOW (an emptyDir without fsGroup)";
-            dev_log(sys, 1, m.as_ptr(), m.len());
-        }
-        return false;
-    }
-    s.proc_h = h;
-    s.proc_ok = false;
-    s.job = J_CHMOD;
-    true
-}
-
-/// The running tool, polled. True once it has finished (`proc_ok` its
-/// success).
-unsafe fn poll_proc(s: &mut State, sys: &SyscallTable) -> bool {
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_READ, s.drain.as_mut_ptr(), s.drain.len());
-    let mut code = [0u8; 4];
-    let running = (sys.provider_call)(s.proc_h, hp::PROC_STATUS, code.as_mut_ptr(), 4);
-    if running == 1 {
-        return false;
-    }
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
-    s.proc_h = -1;
-    s.proc_ok = running == 0 && i32::from_le_bytes(code) == 0;
-    true
 }
 
 fn cached(s: &State, key: u64, digest: u64) -> bool {

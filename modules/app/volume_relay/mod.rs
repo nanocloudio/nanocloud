@@ -274,7 +274,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.event < 0 {
                 s.event = store_event(sys);
                 if s.event < 0 {
-                    let m = b"[volume_relay] ERROR no kernel event - only the sweep wakes this relay";
+                    let m =
+                        b"[volume_relay] ERROR no kernel event - only the sweep wakes this relay";
                     dev_log(sys, 1, m.as_ptr(), m.len());
                 }
             }

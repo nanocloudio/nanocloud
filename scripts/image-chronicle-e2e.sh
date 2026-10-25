@@ -81,7 +81,7 @@ python3 - "$ROOT/packaging/debian/fluxor-podlifecycle.yaml" "$D/graph.yaml" <<'P
 import re, sys
 s = open(sys.argv[1]).read()
 mods = re.search(r'(  # ── image:.*?)\n  # ── lifecycle', s, re.S).group(1)
-wire = re.search(r'(  - from: pi_source\.status.*?  - from: pi_resolved\.response_out\n    to: \S+)\n', s, re.S).group(1)
+wire = re.search(r'(  - from: pi_source\.record_out.*?  - from: pi_resolved\.response_out\n    to: \S+)\n', s, re.S).group(1)
 open(sys.argv[2], "w").write(
     "target: linux\ntick_us: 1000\nscheduler:\n  accept_cycles: true\nmodules:\n"
     + mods + "\nwiring:\n" + wire + "\n")

@@ -39,7 +39,9 @@
 //             `@g/<vol>/<ns>/<claim>/<fsGroup>/<a|r>` when the Pod's fsGroup
 //             owns it (not read-only; fsGroupChangePolicy Always or
 //             OnRootMismatch) — a hostPath `<path>`, an emptyDir
-//             `@e/<vol>[/<fsGroup>/<a|r>]`, a ConfigMap
+//             `@e/<vol>[/<fsGroup>/<a|r>]` (medium Memory:
+//             `@m/<vol>/<bytes>[/<fsGroup>/<a|r>]`, 0 bytes the runtime's
+//             default bound), a ConfigMap
 //             `@c/<vol>/<ns>/<name>/<mode>/<optional>/<fsGroup>[/<key>=<path>|…]`,
 //             a Secret `@s/…` the same way — each `:<mountPath>[:ro]`
 //   restart   the Pod's policy (`always` unless stated); an init container's
@@ -426,6 +428,95 @@ fn pr_flat<'a>(rec: &'a [u8], k: &[u8]) -> &'a [u8] {
         }
     }
     &[]
+}
+
+/// The capabilities a `capabilities.add` / `.drop` list names, bit n =
+/// capability n (capabilities(7)); `ALL` is every one this node knows. A
+/// name it does not know is the container's config error.
+fn pr_cap_mask(list: &[u8], err: &mut PrErr, cname: &[u8]) -> u64 {
+    let mut mask = 0u64;
+    let mut k = 0usize;
+    while let Some(c) = pr_at(list, k) {
+        k += 1;
+        let name = pr_s(Some(c));
+        let name = name.strip_prefix(b"CAP_").unwrap_or(name);
+        if name == b"ALL" {
+            mask |= (1u64 << (PR_CAP_LAST + 1)) - 1;
+            continue;
+        }
+        match pr_cap_number(name) {
+            Some(n) => mask |= 1u64 << n,
+            None => err.set(&[
+                b"container \"",
+                cname,
+                b"\": unknown capability \"",
+                name,
+                b"\"",
+            ]),
+        }
+    }
+    mask
+}
+
+/// The highest capability number this node maps (CHECKPOINT_RESTORE).
+const PR_CAP_LAST: u32 = 40;
+
+/// A capability's number by its name without the `CAP_` prefix.
+fn pr_cap_number(name: &[u8]) -> Option<u32> {
+    Some(match name {
+        b"CHOWN" => 0,
+        b"DAC_OVERRIDE" => 1,
+        b"DAC_READ_SEARCH" => 2,
+        b"FOWNER" => 3,
+        b"FSETID" => 4,
+        b"KILL" => 5,
+        b"SETGID" => 6,
+        b"SETUID" => 7,
+        b"SETPCAP" => 8,
+        b"LINUX_IMMUTABLE" => 9,
+        b"NET_BIND_SERVICE" => 10,
+        b"NET_BROADCAST" => 11,
+        b"NET_ADMIN" => 12,
+        b"NET_RAW" => 13,
+        b"IPC_LOCK" => 14,
+        b"IPC_OWNER" => 15,
+        b"SYS_MODULE" => 16,
+        b"SYS_RAWIO" => 17,
+        b"SYS_CHROOT" => 18,
+        b"SYS_PTRACE" => 19,
+        b"SYS_PACCT" => 20,
+        b"SYS_ADMIN" => 21,
+        b"SYS_BOOT" => 22,
+        b"SYS_NICE" => 23,
+        b"SYS_RESOURCE" => 24,
+        b"SYS_TIME" => 25,
+        b"SYS_TTY_CONFIG" => 26,
+        b"MKNOD" => 27,
+        b"LEASE" => 28,
+        b"AUDIT_WRITE" => 29,
+        b"AUDIT_CONTROL" => 30,
+        b"SETFCAP" => 31,
+        b"MAC_OVERRIDE" => 32,
+        b"MAC_ADMIN" => 33,
+        b"SYSLOG" => 34,
+        b"WAKE_ALARM" => 35,
+        b"BLOCK_SUSPEND" => 36,
+        b"AUDIT_READ" => 37,
+        b"PERFMON" => 38,
+        b"BPF" => 39,
+        b"CHECKPOINT_RESTORE" => 40,
+        _ => return None,
+    })
+}
+
+/// `v` as 16 lowercase hex digits.
+fn pr_hex16(o: &mut PrOut, v: u64) {
+    let mut i = 16u32;
+    while i > 0 {
+        i -= 1;
+        let d = ((v >> (i * 4)) & 0xF) as u8;
+        o.byte(if d < 10 { b'0' + d } else { b'a' + d - 10 });
+    }
 }
 
 fn pr_true(b: &[u8], k: &[u8]) -> bool {
@@ -1027,6 +1118,28 @@ fn pr_gid(g: &[u8]) -> u32 {
 }
 
 /// `/<gid>/<policy>` of an emptyDir or a claim the fsGroup owns.
+/// The largest memory-backed volume the runtime mounts (`host_mount`
+/// PROJECT's bound).
+const PR_MEMORY_VOLUME_MAX: u64 = 1 << 30;
+
+/// The Pod's memory limit, as upstream bounds a memory-backed emptyDir by
+/// it: defined only when every container states one (0 otherwise).
+fn pr_pod_mem_limit(pod: &[u8]) -> u64 {
+    let cs = pr_m(pr_m(pod, b"spec").unwrap_or(b"{}"), b"containers").unwrap_or(b"[]");
+    let mut i = 0usize;
+    while let Some(c) = pr_at(cs, i) {
+        i += 1;
+        let lim = pr_m(pr_m(c, b"resources").unwrap_or(b"{}"), b"limits").unwrap_or(b"{}");
+        if pr_ms(lim, b"memory").is_empty() {
+            return 0;
+        }
+    }
+    if i == 0 {
+        return 0;
+    }
+    pm_pod_res(pod, b"limits", b"memory", 0)
+}
+
 fn pr_fsg_tail(x: &PrScratch, out: &mut PrOut) {
     out.byte(b'/');
     out.dec(u64::from(x.fsg));
@@ -1487,9 +1600,58 @@ fn pr_volume<W: PrWorld>(
             PrLook::Absent => {}
         }
         out.lit(path);
-    } else if pr_m(vol, b"emptyDir").is_some() {
-        out.lit(b"@e/");
-        out.lit(vname);
+    } else if let Some(ed) = pr_m(vol, b"emptyDir") {
+        match pr_ms(ed, b"medium") {
+            b"" => {
+                out.lit(b"@e/");
+                out.lit(vname);
+            }
+            // A memory filesystem, bounded by its sizeLimit, else by the
+            // Pod's memory limit when every container states one, else by
+            // the runtime's default (what it holds, at least 64 MiB).
+            b"Memory" => {
+                let limit = pr_ms(ed, b"sizeLimit");
+                let size = if limit.is_empty() {
+                    pr_pod_mem_limit(pod)
+                } else {
+                    match pm_quantity(limit, 0) {
+                        Some(v) => v,
+                        None => {
+                            err.set(&[
+                                b"volume \"",
+                                vname,
+                                b"\": sizeLimit \"",
+                                limit,
+                                b"\" is not a quantity",
+                            ]);
+                            return Some(());
+                        }
+                    }
+                };
+                if size > PR_MEMORY_VOLUME_MAX {
+                    err.set(&[
+                        b"volume \"",
+                        vname,
+                        b"\": a memory-backed emptyDir is bounded at 1Gi on this node",
+                    ]);
+                    return Some(());
+                }
+                out.lit(b"@m/");
+                out.lit(vname);
+                out.byte(b'/');
+                out.dec(size);
+            }
+            medium => {
+                err.set(&[
+                    b"volume \"",
+                    vname,
+                    b"\": emptyDir medium \"",
+                    medium,
+                    b"\" is not supported by this node",
+                ]);
+                return Some(());
+            }
+        }
         if x.fsg_set {
             pr_fsg_tail(x, out);
         }
@@ -2206,6 +2368,12 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             cname,
             b"\": runAsUser/runAsGroup is not a number",
         ]);
+    } else if (!ruid.is_empty() && !pr_gid_ok(ruid)) || (!rgid.is_empty() && !pr_gid_ok(rgid)) {
+        err.set(&[
+            b"container \"",
+            cname,
+            b"\": runAsUser/runAsGroup must be between 0 and 2147483647, inclusive",
+        ]);
     }
     if nonroot && ruid == b"0" {
         err.set(&[
@@ -2217,6 +2385,55 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
         ]);
     }
     let ro_root = pr_true(csc, b"readOnlyRootFilesystem");
+    // seccompProfile, the container's over the Pod's. Unstated, the node's
+    // default: the runtime's filter (RuntimeDefault), wherever the host
+    // installs one.
+    let sec = {
+        let c = pr_m(csc, b"seccompProfile")
+            .map(|m| pr_ms(m, b"type"))
+            .unwrap_or(&[]);
+        if c.is_empty() {
+            pr_m(psc, b"seccompProfile")
+                .map(|m| pr_ms(m, b"type"))
+                .unwrap_or(&[])
+        } else {
+            c
+        }
+    };
+    let sec_flag = match sec {
+        b"" => 0u8,
+        b"RuntimeDefault" => b'f',
+        b"Unconfined" => b'u',
+        b"Localhost" => {
+            err.set(&[
+                b"container \"",
+                pr_ms(ctr, b"name"),
+                b"\": Localhost seccomp profiles are not supported by this node's runtime",
+            ]);
+            0
+        }
+        _ => {
+            err.set(&[
+                b"seccompProfile type \"",
+                sec,
+                b"\" is not RuntimeDefault, Unconfined or Localhost",
+            ]);
+            0
+        }
+    };
+    // capabilities: what is added beyond the runtime's defaults, and what is
+    // dropped (the node checks a drop against the user it runs as).
+    let capsj = pr_m(csc, b"capabilities").unwrap_or(b"{}");
+    let cap_add = pr_cap_mask(
+        pr_m(capsj, b"add").unwrap_or(b"[]"),
+        &mut err,
+        pr_ms(ctr, b"name"),
+    );
+    let cap_drop = pr_cap_mask(
+        pr_m(capsj, b"drop").unwrap_or(b"[]"),
+        &mut err,
+        pr_ms(ctr, b"name"),
+    );
     if pr_true(csc, b"privileged") {
         err.set(&[
             b"container \"",
@@ -2274,7 +2491,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     o.lit(rgid);
     // The identity's tail the node composes with the user (workload_effect):
     // `/<groups>/<flags>`, only when there is one.
-    if ng > 0 || strict || ro_root {
+    if ng > 0 || strict || ro_root || sec_flag != 0 || cap_add != 0 || cap_drop != 0 {
         o.byte(b'/');
         o.lit(gtext);
         o.byte(b'/');
@@ -2283,6 +2500,17 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
         }
         if ro_root {
             o.byte(b'r');
+        }
+        if sec_flag != 0 {
+            o.byte(sec_flag);
+        }
+        if cap_drop != 0 {
+            o.byte(b'd');
+            pr_hex16(&mut o, cap_drop);
+        }
+        if cap_add != 0 {
+            o.byte(b'c');
+            pr_hex16(&mut o, cap_add);
         }
     }
     o.lit(b";nonroot=");

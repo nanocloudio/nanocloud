@@ -3,7 +3,9 @@
 //
 //   spec    /pods/<ns>/<name> bound to a node, graph-backed
 //           (runtimeClassName: fluxor) -> /pod-specs/<uid>
-//           node graph image restart grace desired cpu mem eph pod paused;
+//           node graph image restart grace desired cpu mem eph pod paused
+//           hostnet (spec.hostNetwork: a Pod that shares its node's network
+//           gets no address of its own, so it serves on the node's);
 //           desired=deleted once the Pod carries a deletionTimestamp. A
 //           CONTAINER Pod's records — one per container — are pod_resolve's
 //           (_shared/podres.rs): its environment, command, user and volumes
@@ -46,6 +48,7 @@ module nanocloud.podspecs {
     mem: string = 11;      // …limits.memory!bytes
     eph: string = 12;      // …limits.ephemeral-storage!bytes
     paused: string = 13;   // metadata.annotations!pick=nanocloud.io/paused
+    hnet: string = 14;     // spec.hostNetwork: "true" shares the node's network
   }
   // Value parts are joined into the record (store_effect: 4..16, then
   // 80..99); the node reads it as flat `k=v;` fields, in any order.
@@ -58,7 +61,7 @@ module nanocloud.podspecs {
     p9: string = 12;  p10: string = 13; p11: string = 14; p12: string = 15;
     p13: string = 16;
     p14: string = 80; p15: string = 81; p16: string = 82; p17: string = 83;
-    p18: string = 84;
+    p18: string = 84; p19: string = 85; p20: string = 86;
   }
   // The defaults upstream's API server applies to a Pod it admits, applied
   // where the spec is read: an unstated restartPolicy is Always. A
@@ -82,23 +85,25 @@ module nanocloud.podspecs {
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";image=", p6: p.image,
                  p7: ";restart=", p8: "always", p9: ";grace=0;desired=running;cmd=;cpu=",
                  p10: p.cpu, p11: ";mem=", p12: p.mem, p13: ";eph=", p14: p.eph, p15: ";pod=",
-                 p16: p.key, p17: ";paused=", p18: p.paused };
+                 p16: p.key, p17: ";paused=", p18: p.paused, p19: ";hostnet=", p20: p.hnet };
     when p.image.indexOf("/") >= 0 || p.image.indexOf(":") >= 0 ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";image=", p6: p.image,
                  p7: ";restart=", p8: p.restart, p9: ";grace=0;desired=running;cmd=;cpu=",
                  p10: p.cpu, p11: ";mem=", p12: p.mem, p13: ";eph=", p14: p.eph, p15: ";pod=",
-                 p16: p.key, p17: ";paused=", p18: p.paused };
+                 p16: p.key, p17: ";paused=", p18: p.paused, p19: ";hostnet=", p20: p.hnet };
     when p.restart == "" ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";restart=", p6: "always",
                  p7: ";grace=0;desired=running;cmd=;cpu=", p8: p.cpu, p9: ";mem=", p10: p.mem,
-                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused };
+                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused,
+                 p17: ";hostnet=", p18: p.hnet };
     default ->
       ps.Spec { cid: p.seq, op: PUT, key: p.node + "/pod-specs/" + p.uid, p1: "node=",
                  p2: p.node, p3: ";graph=", p4: p.image, p5: ";restart=", p6: p.restart,
                  p7: ";grace=0;desired=running;cmd=;cpu=", p8: p.cpu, p9: ";mem=", p10: p.mem,
-                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused };
+                 p11: ";eph=", p12: p.eph, p13: ";pod=", p14: p.key, p15: ";paused=", p16: p.paused,
+                 p17: ";hostnet=", p18: p.hnet };
   }
 
   message ps.Tomb {

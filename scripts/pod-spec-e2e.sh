@@ -21,7 +21,10 @@
 #              supplementalGroups in the process's groups, with the image's
 #              /etc/group memberships (Merge) or without them (Strict);
 #              readOnlyRootFilesystem: a write to / refused, a volume still
-#              written
+#              written; seccompProfile (the runtime's filter unless
+#              Unconfined; Localhost refused); capabilities.add given to a
+#              non-root process, a drop from a root one refused
+#   memory     an emptyDir with medium Memory: a memory filesystem, 0777
 #   fsGroup    an emptyDir group-owned by it (setgid, group-writable); a
 #              ConfigMap's and a Secret's files at their modes, group-owned
 #              by it with 0440 added (a 0400 Secret readable through it); a
@@ -240,6 +243,40 @@ refused nonroot-name "image has non-numeric user (app)"
 refused nonroot-root "image will run as root"
 make_pod badpol '"restartPolicy":"Never","securityContext":{"supplementalGroupsPolicy":"Loose"},"containers":[{"name":"c","image":"nanocloud/probe:1"}]'
 refused badpol "supplementalGroupsPolicy"
+
+echo "== 6b. seccomp, capabilities, a memory-backed emptyDir =="
+# /proc/self/status, one field: the probe prints a file with `|` for newlines,
+# and a container's log is a bounded tail, which may begin inside it.
+status_of() { pn_logs "${U[$1]}" | tr '|' '\n' | sed -n "s/^$2:[[:space:]]*//p" | head -1; }
+make_pod sec-default '"restartPolicy":"Never","containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","cat","/proc/self/status"]}]'
+make_pod sec-unconfined '"restartPolicy":"Never","securityContext":{"seccompProfile":{"type":"Unconfined"}},"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","cat","/proc/self/status"]}]'
+make_pod cap-add '"restartPolicy":"Never","containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","cat","/proc/self/status"],"securityContext":{"capabilities":{"add":["NET_ADMIN"],"drop":["ALL"]}}}]'
+make_pod memvol '"restartPolicy":"Never","volumes":[{"name":"m","emptyDir":{"medium":"Memory","sizeLimit":"8Mi"}}],"containers":[{"name":"c","image":"nanocloud/probe:1","command":["/bin/probe","fstype","/m","mode","/m","write","/m/x","y","cat","/m/x"],"volumeMounts":[{"name":"m","mountPath":"/m"}]}]'
+for p in sec-default sec-unconfined cap-add memvol; do pn_wait_phase "${U[$p]}" Succeeded; done
+expect "sec-default: the runtime's filter (RuntimeDefault, the node's default)" "$(status_of sec-default Seccomp)" "2"
+expect "sec-unconfined: no filter" "$(status_of sec-unconfined Seccomp)" "0"
+expect "sec-default: a non-root process holds no capability" "$(status_of sec-default CapEff)" "0000000000000000"
+expect "cap-add: NET_ADMIN added, everything else dropped" "$(status_of cap-add CapEff)" "0000000000001000"
+expect "memvol: a memory filesystem" "$(pn_logs "${U[memvol]}" | sed -n 's|^fstype /m=||p')" "1021994"
+expect "memvol: any user may write it" "$(pn_logs "${U[memvol]}" | sed -n 's|^mode /m=||p')/$(pn_logs "${U[memvol]}" | sed -n 's|^cat /m/x=||p')" "777/y"
+# A drop of a default capability from a process running as root: this
+# runtime cannot take it, so the container is refused rather than run with it.
+# (restartPolicy Always: a refused CREATE is a waiting CreateContainerError
+# while the Pod would run.)
+make_pod drop-root '"containers":[{"name":"c","image":"nanocloud/rootprobe:1","command":["/bin/probe","id"],"securityContext":{"capabilities":{"drop":["ALL"]}}}]'
+w=""
+for _ in $(seq 60); do
+  w="$(pn_pod_json default drop-root | python3 -c 'import json,sys
+d=json.load(sys.stdin); cs=d.get("status",{}).get("containerStatuses") or [{}]
+w=cs[0].get("state",{}).get("waiting",{}); print(w.get("reason",""), "|", w.get("message",""))' 2>/dev/null || true)"
+  case "$w" in "CreateContainerError | "*"-95"*) break ;; esac
+  sleep 1
+done
+case "$w" in "CreateContainerError | "*"-95"*) echo "   drop-root: $w" ;; *) fail "drop-root not refused: '$w'" ;; esac
+[ -z "$(pn_logs "${U[drop-root]}")" ] || fail "drop-root ran: $(pn_logs "${U[drop-root]}")"
+make_pod sec-local '"restartPolicy":"Never","containers":[{"name":"c","image":"nanocloud/probe:1","securityContext":{"seccompProfile":{"type":"Localhost","localhostProfile":"p.json"}}}]'
+refused sec-local "Localhost seccomp profiles"
+echo "   seccomp default/unconfined, NET_ADMIN added to a non-root process, a 0777 memory emptyDir; a root drop and a Localhost profile refused"
 
 echo "== 7. volumes and containers: init containers in order, two app containers, an emptyDir, a ConfigMap, a Secret, a hostPath =="
 echo "from-the-host" >"$D/host/note"

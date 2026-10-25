@@ -961,7 +961,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.event < 0 && s.subscribed == 0 {
                 s.event = store_event(sys);
                 if s.event < 0 {
-                    let m = b"[net_apply] ERROR no kernel event - changes will NOT wake this module";
+                    let m =
+                        b"[net_apply] ERROR no kernel event - changes will NOT wake this module";
                     dev_log(sys, 1, m.as_ptr(), m.len());
                 }
             }
