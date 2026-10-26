@@ -1,5 +1,5 @@
 # Decoding `http_chain`'s request envelope into the API plane's record — the
-# byte half of what kube_decode does; kube.uproc `route` is the other half (the
+# byte half of what kube_decode does; kube.plan `route` is the other half (the
 # path's shape: resource, namespace, name, key).
 #
 #   [cid u32][method u8][flags u8][target_len u16][hdr_len u16]

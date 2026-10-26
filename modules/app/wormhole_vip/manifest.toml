@@ -1,0 +1,76 @@
+name = "wormhole_vip"
+version = "0.1.0"
+description = "A Service's load-balancer address → the VIP move or release Wormhole's failover coordinator runs for it, from a ledger so a restart re-sends the same request"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The Wormhole projection's VIP half (rfc_lb_vip §6.1, §11.1): svc_alloc's
+# `/lb-addr/<ns>/<svc>` = `ip=<a>` asks Wormhole's VIP authority for the
+# address (docs/architecture/wormhole-projection.md, "The VIP requests").
+#
+#   new allocation   one `VipMove` of (service_id, <a>/32), no previous
+#                    owner and no fence, to the node whose own hold claims
+#                    the address (`/net-hold/<u32>`, so its controller
+#                    adopts it in place) or, with no ready claimant, the
+#                    first ready node (`/nodes/`); not sent while Wormhole's
+#                    published binding (`/wh/<t>/<s>/vip/4`) is owned
+#   allocation gone  one `VipRelease` (graceful) from the node whose
+#                    controller holds the address (`/net-vip/<u32>`); none
+#                    when nothing holds it
+#
+# Each request's whole intent is written first at `/wh-vip-op/<ns>/<svc>` =
+# `op=<move|release>;ip=<u32>;rev=<r>;epoch=<e>;node=<n>` and sent from it,
+# so a restarted module re-sends byte-identical requests, which the
+# coordinator answers from the record it already keeps. Operation ids are
+# H("nc-vip-move"|"nc-vip-release", service_id, address, the allocation's
+# revision): a restart repeats them; a Service created again with the same
+# address is a new operation.
+#
+# An owned binding is never moved from here: moving an address off an
+# unresponsive node is an external-fence move, which needs an admitted fence
+# provider the coordinator would refuse it without.
+#
+# Only the Services of `namespace` are asked for: a node's vip_controller
+# publishes every binding under one tenant (H("nc-tenant", namespace)), so a
+# Service of another namespace keeps node_net's own hold and an empty
+# load-balancer status, as without a controller.
+#
+# Parameters:
+# | Tag | Name      | Type | Default   | Description |
+# |-----|-----------|------|-----------|-------------|
+# | 1   | namespace | str  | default   | the namespace whose Services are asked for (NANOCLOUD_VIP_NAMESPACE) |
+# | 2   | node_name | str  | (required) | this node: a move names it (as the own-hold claimant, or with no claim while it is ready) and a release is sent only when its controller holds the address — the coordinator beside it reaches only this node's controller |
+#
+# Reads the clock to look again every 2 s (claims, marks, nodes and
+# bindings are not subscribed).
+timer_class = "wall_clock"
+
+# `failover_request` (vip_control.v1 kind 0x7A), enveloped, to
+# failover_coordinator.request_in.
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "event"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one request per allocation change, observed through `/wh-vip-op/` and the coordinator's results"
+
+# Store subscriptions an instance opens: /lb-addr/ only.
+[capacities]
+store_subscriptions = 1
+store_subscribers = 1

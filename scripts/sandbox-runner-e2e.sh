@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live E2E for nanocloud's container runtime — sandbox.uproc and volume.uproc
+# Live E2E for nanocloud's container runtime — sandbox.plan and volume.plan
 # over the workload_effect connector (packaging/debian/fluxor-sandbox.yaml) —
 # the store -> workload seam over the ONE shared multi-process store.
 #

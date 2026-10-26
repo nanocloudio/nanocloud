@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: a multi-arch image pulls the node's own platform
-# (packaging/debian/fluxor-imagepull.yaml, image.uproc `fq`).
+# (packaging/debian/fluxor-imagepull.yaml, image.plan `fq`).
 #
 # A tag names an image INDEX with a real amd64 image and a real arm64/v8
 # image (an arm/v7 decoy first, so "the first arm-ish entry" would be wrong).

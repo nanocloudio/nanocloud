@@ -4,7 +4,7 @@
     sandbox-block.py mods|wire        print the modules / wiring block
     sandbox-block.py sync <graph>...  rewrite each graph's embedded copy
 
-The runtime (sandbox.uproc and volume.uproc over workload_effect) is stated
+The runtime (sandbox.plan and volume.plan over workload_effect) is stated
 once, in that graph, between `# ── sandbox` markers. A graph that runs
 sandboxes carries the same block between the same markers; `sync` makes each
 copy the source's again after it changes (then re-bake the params).

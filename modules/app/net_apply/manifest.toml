@@ -10,7 +10,7 @@ hardware_targets = ["bcm2712", "linux"]
 # chains, as `store_effect` is the effect half of a reconciler.
 #
 # The chains decide WHICH traffic is allowed and where a virtual address leads,
-# as rows in the store (params, `proxy.uproc` / `netpolicy.uproc`). This module
+# as rows in the store (params, `proxy.plan` / `netpolicy.plan`). This module
 # does the one thing the VM cannot: encode those rows as `net.policy` rule
 # records and REPLACE the table, whole and atomically. The platform then
 # realizes it — nftables on Linux, the packet filter on bare metal, a recorded

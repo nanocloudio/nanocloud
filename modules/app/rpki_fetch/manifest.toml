@@ -1,0 +1,55 @@
+name = "rpki_fetch"
+version = "0.1.0"
+description = "RPKI fetching: a repository's ROAs over RRDP, validated against the trust anchor, into the store as validated ROA payloads"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The RPKI relying party's fetcher (rfc_lb_vip §11.15, §22 "Nanocloud: an
+# RPKI relying party feeding VRPs"). Every `poll_ms` it GETs the RRDP
+# notification file (RFC 8182) at `notify` (`http://a.b.c.d[:port]/path`)
+# over the net pair, one connection at a time, `Connection: close`. When the
+# session or serial moved it GETs the snapshot the notification names,
+# refuses it unless its bytes hash to the notification's hash and it names
+# the same session and serial (`_shared/rrdp.rs`), and validates every
+# published `.roa` against the trust anchor held at
+#   /wh-rpki/anchor    the anchor certificate, base64 DER
+# with `_shared/rpki.rs` (signature, validity, RFC 3779 resources, the CMS
+# signer, every prefix and max length). The validated payloads replace
+#   /wh-rpki/vrps      one line per payload: <prefix>/<len> <max> AS<asn>
+# whole — a snapshot is taken all or nothing — and
+#   /wh-rpki/status    session=…;serial=…;roas=…;refused=…;vrps=…
+# says what was taken. A failed fetch, a refused snapshot or a store that
+# does not take the rows leaves both as they were and is tried again after
+# `poll_ms`. Wormhole's address lifecycle runs RFC 6811 origin validation
+# over these payloads (`address_core.rs` `origin_validate`).
+#
+# Not done (stated limits, not omissions): rsync, RRDP deltas (a snapshot
+# each time the serial moves), CRLs and manifests, intermediate CAs, HTTPS
+# to the repository (the transport is plain HTTP; the snapshot's hash comes
+# from the notification and every object is signed under the anchor).
+#
+# Params: `notify` (required), `poll_ms` (default 5000).
+timer_class = "wall_clock"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = 8192
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = 8192
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane fetcher — one snapshot per moved serial, observed through `/wh-rpki/status` and its log"

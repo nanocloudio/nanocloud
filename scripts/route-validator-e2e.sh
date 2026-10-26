@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live E2E for route validation — a validation reconciler over the control-plane
 # store, run by the production graph (packaging/debian/fluxor-route.yaml) as a
-# Chronicle decision compiled from modules/app/_chronicle/route_validator.uproc.
+# Chronicle decision compiled from modules/app/_chronicle/route_validator.plan.
 #
 # The store is consumed through the standard storage contracts (storage.object
 # 0x14 + storage.namespace 0x13); it lives inside the runtime and is seeded

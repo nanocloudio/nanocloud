@@ -101,7 +101,7 @@ const BUF: usize = 8192;
 /// The largest reply record the next stage reads: `se_act`, Chronicle's
 /// `decision`, whose in and out record buffers are both 4096 bytes. An
 /// object as stored that would carry the reply past it is sent with an
-/// EMPTY value instead, which `se_ans` (`apiplane_watch.uproc ans`) reads
+/// EMPTY value instead, which `se_ans` (`apiplane_watch.plan ans`) reads
 /// as "too large for a record" and answers with a GET registration the
 /// watch chain serves. A reply past the bound is dropped by the reader, so
 /// the client would wait out its timeout on a write that landed.
@@ -124,7 +124,7 @@ const ANSWER_MS: u32 = 30_000;
 const SLOW_ANSWER_MS: u64 = 2_000;
 /// How long a deleted object's last state stays for a watch to carry.
 /// How long a deleted object's tomb stays (`tomb_ms`): a watch's DELETED
-/// event reads it, and a Pod's node spec lives as long (tomb.uproc).
+/// event reads it, and a Pod's node spec lives as long (tomb.plan).
 const TOMB_MS: u32 = 300_000;
 
 const PHASE_IDLE: u8 = 0;
@@ -639,7 +639,7 @@ impl State {
         // the request's DeleteOptions', else the Pod's own; 0 (`--force
         // --grace-period=0`), or a Pod nothing of which runs, is deleted at
         // once — its tomb stating the grace, which its node's specs carry
-        // (pod_specs.uproc `gone`).
+        // (pod_specs.plan `gone`).
         let mut mark = [0u8; 160];
         let mut mark_len = 0usize;
         let pod_delete = op == OP_DELETE

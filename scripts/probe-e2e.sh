@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live E2E for probes as Chronicle params (probe.uproc, probe_collect.uproc;
+# Live E2E for probes as Chronicle params (probe.plan, probe_collect.plan;
 # the pb_ nodes of fluxor-podlifecycle.yaml): exec probes run through
 # the sandbox runtime's /sandbox-exec/ seam, each probe's state lives at
 # /probe-rt-<l|r>/<uid> (its due/deadline arm the kernel timer), verdicts land

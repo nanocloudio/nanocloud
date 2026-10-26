@@ -8,17 +8,17 @@
 #   curl -> linux_net -> http (wave)      terminates HTTP, HANDLER_APP fan-out
 #        -> http_chain                    the exchange -> one request envelope
 #        -> kube_decode                   envelope -> Request record + credential
-#        -> admit      (decision)         apiplane_auth.uproc `admit`, as params
+#        -> admit      (decision)         apiplane_auth.plan `admit`, as params
 #        -> kagi_verify                   the kagi seam: credential out, identity back
 #             <-> token_verify (KAGI)     the signature check, kagi's module
-#        -> decide     (decision)         apiplane_auth.uproc `decide`, as params
+#        -> decide     (decision)         apiplane_auth.plan `decide`, as params
 #        -> enc_http   (pipeline)         the READ PATH'S ser program, byte-identical
 #        -> http_chain -> http -> curl
 #
 # The stage under test is the FILTER: one that calls out of the graph and
 # correlates back. The only nanocloud code in it is `kagi_verify`, which decides
 # nothing — the 200/401/503 ladder is in
-# modules/app/_chronicle/apiplane_auth.uproc, and the response encoder is the
+# modules/app/_chronicle/apiplane_auth.plan, and the response encoder is the
 # read path's, because a response is data too.
 set -euo pipefail
 
@@ -117,15 +117,15 @@ store_put "/authn-keys/sa" "$(cat "$D/keyframe.hex")"
 echo "   /authn-keys/sa seeded with the kagi key frame"
 
 echo "== 2. write the graph — engines + params, ONE new nanocloud provider =="
-DEC_ADMIT="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.uproc" admit)"
-DEC_DECIDE="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.uproc" decide)"
-[ -n "$DEC_ADMIT" ]  || { echo "FAIL: could not compile apiplane_auth.uproc admit"; exit 1; }
-[ -n "$DEC_DECIDE" ] || { echo "FAIL: could not compile apiplane_auth.uproc decide"; exit 1; }
-# The request decoder, as the apiplane graph carries it (kube.rd, kube.uproc).
+DEC_ADMIT="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.plan" admit)"
+DEC_DECIDE="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.plan" decide)"
+[ -n "$DEC_ADMIT" ]  || { echo "FAIL: could not compile apiplane_auth.plan admit"; exit 1; }
+[ -n "$DEC_DECIDE" ] || { echo "FAIL: could not compile apiplane_auth.plan decide"; exit 1; }
+# The request decoder, as the apiplane graph carries it (kube.rd, kube.plan).
 . "$ROOT/scripts/chronicle-params.sh"
 KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
-KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_pass)"
-KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.plan" kd_pass)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.plan" kd_route)"
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -155,7 +155,7 @@ modules:
   - name: admit
     type: decision
     params:
-      # apiplane_auth.uproc 'admit': credential to field 8, request to carry 30..35.
+      # apiplane_auth.plan 'admit': credential to field 8, request to carry 30..35.
       decision: {hex: "${DEC_ADMIT}"}
   - name: kagi_verify
     audience: "nanocloud"
@@ -165,7 +165,7 @@ modules:
   - name: decide
     type: decision
     params:
-      # apiplane_auth.uproc 'decide': verify_err -> HTTP status + body.
+      # apiplane_auth.plan 'decide': verify_err -> HTTP status + body.
       decision: {hex: "${DEC_DECIDE}"}
   - name: enc_http
     type: pipeline

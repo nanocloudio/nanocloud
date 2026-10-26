@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live E2E: imagePullSecrets (image_auth.uproc, http_fetch's `pull_auth`).
+# Live E2E: imagePullSecrets (image_auth.plan, http_fetch's `pull_auth`).
 #
 # A private repository on a registry that wants Basic credentials, and the
 # same image on ANOTHER registry (a reference naming it is asked of it, by

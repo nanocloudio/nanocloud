@@ -76,10 +76,10 @@ store_put "/authn-req/r3" "peer=spiffe://cluster/ns/default/sa/ghost"  # unbound
 store_put "/authn-req/r6" "peer="                                      # none    -> anonymous
 
 echo "== 2. write the graph — source, decision, effect, decision, writer =="
-DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/authn_peer.uproc" ask)"
-[ -n "$DEC_ASK" ] || { echo "FAIL: could not compile authn_peer.uproc ask"; exit 1; }
-DEC_VERDICT="$(nc_decision "$ROOT/modules/app/_chronicle/authn_peer.uproc" verdict)"
-[ -n "$DEC_VERDICT" ] || { echo "FAIL: could not compile authn_peer.uproc verdict"; exit 1; }
+DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/authn_peer.plan" ask)"
+[ -n "$DEC_ASK" ] || { echo "FAIL: could not compile authn_peer.plan ask"; exit 1; }
+DEC_VERDICT="$(nc_decision "$ROOT/modules/app/_chronicle/authn_peer.plan" verdict)"
+[ -n "$DEC_VERDICT" ] || { echo "FAIL: could not compile authn_peer.plan verdict"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000

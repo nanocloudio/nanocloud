@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: an image assembly that fails is not the last word
-# (image_asm.uproc over the sandbox seam, packaging/debian/assemble-image.sh).
+# (image_asm.plan over the sandbox seam, packaging/debian/assemble-image.sh).
 #
 #   1. the node cannot write its rootfs directory (a FILE stands where the
 #      directory goes): the assembly fails, the Pod is told — ErrImagePull
@@ -11,7 +11,7 @@
 #      the next attempt assembles the image and the Pod runs to Succeeded
 #   3. a cached layer is not its digest (bit rot under the cache): the
 #      assembly finds it before extracting anything (exit 65), the image's
-#      layers are dropped and fetched again (image_heal.uproc), and the Pod
+#      layers are dropped and fetched again (image_heal.plan), and the Pod
 #      runs from the re-fetched, verified layer
 #
 # Needs passwordless sudo: the runtime runs as root, as the node does.

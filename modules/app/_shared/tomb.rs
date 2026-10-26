@@ -196,7 +196,7 @@ unsafe fn drop_family(sys: &Store, base: &[u8]) -> bool {
 /// StatefulSet's `db-0`): the replaced tomb's end is ended now, as its
 /// deadline would have ended it — its node specs
 /// `/~node/<node>/pod-specs/<uid>` and every `<uid>~…` of its other
-/// containers deleted (tomb.uproc `spec`), so the node drops every record
+/// containers deleted (tomb.plan `spec`), so the node drops every record
 /// of those (a live sandbox stopped first). The index names one uid; once
 /// overwritten, nothing else would ever remove the old one's records.
 /// `false` while a read is asked again or the delete is undecided: the
@@ -232,7 +232,7 @@ unsafe fn end_replaced_pod(sys: &Store, at_key: &[u8], key: &[u8], obj: &[u8]) -
     }
     sl = append(&mut sk, sl, uid);
     let spec = sk.get(..sl).unwrap_or(&[]);
-    // Delete-if-present, as tomb.uproc's end does: a spec already gone (or
+    // Delete-if-present, as tomb.plan's end does: a spec already gone (or
     // never written: a Pod no node ran) is the end reached. A read asked
     // again holds the serve (the tomb's own writes after it wait with it).
     drop_family(sys, spec);

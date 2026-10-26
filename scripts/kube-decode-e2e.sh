@@ -39,14 +39,14 @@ cleanup() { [ -n "$RUNTIME_PID" ] && kill "$RUNTIME_PID" 2>/dev/null || true; if
 trap cleanup EXIT
 fail() { echo "FAIL: $1"; tail -25 "$D/run.log" 2>/dev/null || true; exit 1; }
 
-echo "== 1. write the decode graph (kube.rd + kube.uproc, as the apiplane graph carries them) =="
+echo "== 1. write the decode graph (kube.rd + kube.plan, as the apiplane graph carries them) =="
 . "$ROOT/scripts/chronicle-params.sh"
 KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
 # kd_facts: the stage program the apiplane graph runs before its router
 # (the PATCH type folded into the method, a write's marks after the key).
-KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_facts)"
-KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
-[ -n "$KD_DECODE" ] && [ -n "$KD_PASS" ] && [ -n "$KD_ROUTE" ] || { echo "FAIL: kube.rd / kube.uproc did not build"; exit 1; }
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.plan" kd_facts)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.plan" kd_route)"
+[ -n "$KD_DECODE" ] && [ -n "$KD_PASS" ] && [ -n "$KD_ROUTE" ] || { echo "FAIL: kube.rd / kube.plan did not build"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000

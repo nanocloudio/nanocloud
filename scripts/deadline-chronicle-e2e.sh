@@ -75,8 +75,8 @@ print(n)
 PY
 }
 
-DEC_EX="$(nc_decision "$ROOT/modules/app/_chronicle/ttl.uproc" ex)"
-[ -n "$DEC_EX" ] || { echo "FAIL: ttl.uproc did not compile"; exit 1; }
+DEC_EX="$(nc_decision "$ROOT/modules/app/_chronicle/ttl.plan" ex)"
+[ -n "$DEC_EX" ] || { echo "FAIL: ttl.plan did not compile"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000

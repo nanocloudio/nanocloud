@@ -65,9 +65,9 @@ print(n)
 PY
 }
 
-DEC_CT="$(nc_decision "$ROOT/modules/app/_chronicle/snapshot.uproc" ct)"
-DEC_BD="$(nc_decision "$ROOT/modules/app/_chronicle/snapshot.uproc" bd)"
-[ -n "$DEC_CT" ] && [ -n "$DEC_BD" ] || { echo "FAIL: snapshot.uproc did not compile"; exit 1; }
+DEC_CT="$(nc_decision "$ROOT/modules/app/_chronicle/snapshot.plan" ct)"
+DEC_BD="$(nc_decision "$ROOT/modules/app/_chronicle/snapshot.plan" bd)"
+[ -n "$DEC_CT" ] && [ -n "$DEC_BD" ] || { echo "FAIL: snapshot.plan did not compile"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000

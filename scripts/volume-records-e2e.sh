@@ -2,7 +2,7 @@
 # The encrypted-volume pipelines' records chain against the control-plane
 # store, live.
 #
-# The chain's nodes (`vw_*`, volume_records.uproc) and their edges are taken
+# The chain's nodes (`vw_*`, volume_records.plan) and their edges are taken
 # from the shipped packaging/debian/fluxor-volumes.yaml, so the graph runs
 # what production runs, over a store directory seeded with a
 # PersistentVolumeClaim, a retained snapshot and a key record. A Python driver

@@ -80,7 +80,9 @@ __PEER_CLIENT_TRUST__
       listen_port: __PEER_PORT__
       __PEERS__
       __PEER_POLICY__
-      partitions: 1
+      # 2 where the graph also carries the VIP authority's group
+      # (fluxor-controlplane.yaml, partition 1).
+      partitions: __PARTITIONS__
   - name: gateway
     params:
       self_id: __REPLICA_ID__

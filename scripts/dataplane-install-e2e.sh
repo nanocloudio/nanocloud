@@ -309,9 +309,9 @@ r="$(svct web-lb LoadBalancer 83)"; case "$r" in 20[01]\|*) ;; *) fail "POST web
 nodeport() { api GET "/api/v1/namespaces/default/services/$1" | python3 -c 'import json,sys
 o = json.loads(sys.stdin.read().split("|", 1)[1])
 print((o.get("spec", {}).get("ports") or [{}])[0].get("nodePort", ""))'; }
-lbip() { api GET /api/v1/namespaces/default/services/web-lb | python3 -c 'import json,sys
-o = json.loads(sys.stdin.read().split("|", 1)[1])
-print(((o.get("status", {}).get("loadBalancer", {}) or {}).get("ingress") or [{}])[0].get("ip", ""))'; }
+# The address svc_alloc gave it (/lb-addr/): its status.loadBalancer is
+# Wormhole's VIP readiness to say, and no Wormhole VIP controller runs here.
+lbip() { v="$(sget /lb-addr/default/web-lb)"; printf '%s' "${v#ip=}"; }
 NPORT=""; LPORT=""; LBIP=""
 for _ in $(seq 30); do NPORT="$(nodeport web-np)"; LPORT="$(nodeport web-lb)"; LBIP="$(lbip)"
   [ -n "$NPORT" ] && [ -n "$LPORT" ] && [ -n "$LBIP" ] && break; sleep 1; done
@@ -321,7 +321,7 @@ for _ in $(seq 30); do NPORT="$(nodeport web-np)"; LPORT="$(nodeport web-lb)"; L
 wait_for 30 "web-np's nodePort $NPORT was never answered" answered "http://$NODE_IP:$NPORT/"
 wait_for 30 "web-lb's $LBIP:83 was never answered" answered "http://$LBIP:83/"
 answered "http://$NODE_IP:$LPORT/" || fail "web-lb's own nodePort $LPORT was not answered"
-echo "   web-np: $NODE_IP:$NPORT -> the Pod; web-lb: $LBIP:83 (status.loadBalancer.ingress) and $NODE_IP:$LPORT -> the Pod"
+echo "   web-np: $NODE_IP:$NPORT -> the Pod; web-lb: $LBIP:83 (/lb-addr/) and $NODE_IP:$LPORT -> the Pod"
 
 echo "== 5c. a Service deleted: its Endpoints and slices go with it =="
 [ -n "$(sget /endpoints/default/web-named)" ] || fail "web-named has no Endpoints before its delete"

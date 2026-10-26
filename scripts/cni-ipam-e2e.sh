@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live E2E for pod IP allocation as Chronicle params (ipam_pod.uproc,
-# ipam_pod_release.uproc; graph EXTRACTED from fluxor-controlplane.yaml into
+# Live E2E for pod IP allocation as Chronicle params (ipam_pod.plan,
+# ipam_pod_release.plan; graph EXTRACTED from fluxor-controlplane.yaml into
 # packaging/debian/fluxor-ipam.yaml) over the fluxor-native control-plane
 # store, seeded from its durable append-log ($D/store.log) at boot.
 #

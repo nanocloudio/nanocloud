@@ -6,7 +6,7 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
 
-# The volumes a Pod brings itself rather than claims (volume.uproc, from
+# The volumes a Pod brings itself rather than claims (volume.plan, from
 # pod_resolve's list): each is a directory of the Pod's own on this node,
 # `<mount root>/<root>/<pod uid>/volumes/<volume>` (the mount root is the
 # platform's, `host_mount` ROOT: `FLUXOR_MOUNT_ROOT`), bound into every

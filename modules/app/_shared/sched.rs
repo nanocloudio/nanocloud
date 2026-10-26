@@ -885,7 +885,7 @@ unsafe fn sched_pick(
         sel: (0, 0),
         nss: (0, 0),
     }; SCH_TERMS];
-    // A Pod whose class is not yet resolved to a priority (priority.uproc)
+    // A Pod whose class is not yet resolved to a priority (priority.plan)
     // waits, unplaced and unjudged: placed now, it would be placed at the
     // wrong priority.
     let named = sk_at(pod, b"spec.priorityClassName")

@@ -3,9 +3,9 @@
 # spec carrying `image=` drives pull → verify → assemble → run, all fmods:
 #
 #   the pod chain   image= → /image-requests/ (pull trigger) + Pending gate
-#   image.uproc      index → manifest → config + layers over http_fetch →
+#   image.plan      index → manifest → config + layers over http_fetch →
 #                    verified blob cache
-#   image_asm.uproc  every layer cached → assembly job → /image-rootfs/ ready
+#   image_asm.plan  every layer cached → assembly job → /image-rootfs/ ready
 #   sandbox chain    runs the assembly job, then the pod itself (pivot_root)
 #
 # The script plays the registry (docker-v2 stub) and authors a REAL runnable

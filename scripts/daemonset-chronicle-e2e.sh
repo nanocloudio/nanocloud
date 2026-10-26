@@ -78,7 +78,7 @@ PY
 }
 
 # The chain as production runs it: the ds_ nodes of fluxor-controlplane.yaml
-# and their baked params (checked against daemonset.uproc by
+# and their baked params (checked against daemonset.plan by
 # chronicle-param-drift-e2e.sh).
 python3 "$ROOT/scripts/extract-fixture.py" "$D/graph.yaml" - ds_ >/dev/null
 run() { # run <seconds>

@@ -1,0 +1,63 @@
+name = "wormhole_fd"
+version = "0.1.0"
+description = "Wormhole's failure-domain controller ⇄ the store: its preflight proofs and observations from the nodes and the projections, its placements merged into the zone's nodes"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# Nanocloud's side of Wormhole's `failure_domain_controller` (rfc_lb_vip
+# §14.5, §22 "Nanocloud: the preflight projection, acting on Placement"),
+# between its ports and the store, for the failure domain `zone` (the nodes'
+# `topology.kubernetes.io/zone`):
+#
+# - `status_in` takes the controller's `status_out` (`fd_ctl.v1`). A Status
+#   waiting for a PREFLIGHT (or RESTORE_PREFLIGHT) is answered on `ctl_out`
+#   (the controller's `ctl_in`) with the Preflight `_shared/whfd.rs`
+#   `fd_preflight` folds from the nodes under `/nodes/` (ready, cordoned,
+#   allocatable CPU, `nanocloud.io/store-voter`), the CPU requests of the
+#   Pods bound to them (`/pods/`, `spec.nodeName`) and the facts the
+#   projections wrote at
+#     /wh-fd/<zone>/facts  endpoints=…;rgen=…;returning=…;standbys=0|1;route=0|1;
+#                          keys=0|1;sovereignty=0|1;fence=0|1;conflicting=0|1;epochs=e,…
+# - a Status waiting for an OBSERVATION is answered with the FdObservation
+#   for the dial generation it names: the zone's demand (its Pods' requests)
+#   and readiness generation (the newest revision of its nodes' rows), each
+#   dial arm's spare room (`arms`: the zone of each arm, in the dial's order)
+#   from the same nodes, and the health the director's aggregation wrote at
+#     /wh-fd/<zone>/health  error_ppm=…;breaks=…;pinned=…;alarm=0|1
+# - a Placement (EVACUATE / RESTORE_WORKLOADS) is merged into every node of
+#   the zone (`fd_node_patch`: cordon and mark, or undo exactly that).
+#
+# Each is answered once per operation, generation and request; a missing or
+# unparsable source answers nothing (counted, logged once) — the
+# controller's own deadlines decide what silence means.
+#
+# Params: `zone` (required), `arms` (comma-separated zone names, the dial's
+# arm order).
+timer_class = "wall_clock"
+
+[[ports]]
+name = "status_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+[[ports]]
+name = "ctl_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 2048
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one answer per controller request, observed through the controller's status and the nodes' cordon"

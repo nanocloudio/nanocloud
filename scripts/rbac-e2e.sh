@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live E2E for Kubernetes RBAC as Chronicle params (rbac_rules.uproc,
-# rbac_grants.uproc, rbac_prune.uproc; graph EXTRACTED from
+# Live E2E for Kubernetes RBAC as Chronicle params (rbac_rules.plan,
+# rbac_grants.plan, rbac_prune.plan; graph EXTRACTED from
 # fluxor-controlplane.yaml into packaging/debian/fluxor-rbac.yaml).
 #
 # Real rbac.authorization.k8s.io/v1 objects go in; the grant index the API

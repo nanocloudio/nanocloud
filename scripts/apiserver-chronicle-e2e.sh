@@ -8,14 +8,14 @@
 #   curl -> linux_net -> http (wave)      terminates HTTP, HANDLER_APP fan-out
 #        -> http_chain                    the exchange -> one request envelope
 #        -> kube_decode                   envelope -> Request record + store key
-#        -> route      (decision)         apiserver.uproc's `to_store`, as params
+#        -> route      (decision)         apiserver.plan's `to_store`, as params
 #        -> store_effect                  GET, answering with the STORE's status
 #        -> enc_http   (pipeline)         ser bytecode: StoreReply -> reply envelope
 #        -> http_chain -> http -> curl
 #
 # Only `http_chain` and `store_effect` are nanocloud code, and both only
 # reshape bytes: the routing decision is a param compiled from
-# modules/app/_chronicle/apiserver.uproc, and the response framing is a `ser`
+# modules/app/_chronicle/apiserver.plan, and the response framing is a `ser`
 # program. Nothing about /api/v1 is baked into an .fmod.
 set -euo pipefail
 
@@ -61,15 +61,15 @@ POD='{"metadata":{"name":"web-0","namespace":"default"},"spec":{"containers":[{"
 store_put "/pods/default/web-0" "$POD"
 
 echo "== 2. write the graph — engines + params, two nanocloud providers =="
-DEC_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/apiserver.uproc" serve)"
-[ -n "$DEC_ROUTE" ] || { echo "FAIL: could not compile apiserver.uproc serve"; exit 1; }
-# The request decoder, as the apiplane graph carries it (kube.rd, kube.uproc).
+DEC_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/apiserver.plan" serve)"
+[ -n "$DEC_ROUTE" ] || { echo "FAIL: could not compile apiserver.plan serve"; exit 1; }
+# The request decoder, as the apiplane graph carries it (kube.rd, kube.plan).
 . "$ROOT/scripts/chronicle-params.sh"
 KD_DECODE="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/modules/app/_chronicle/kube.rd")"
 # kd_facts: the stage program the apiplane graph runs before its router
 # (the PATCH type folded into the method, a write's marks after the key).
-KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.uproc" kd_facts)"
-KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.uproc" kd_route)"
+KD_PASS="$(nc_stages "$ROOT/modules/app/_chronicle/kube.plan" kd_facts)"
+KD_ROUTE="$(nc_decision "$ROOT/modules/app/_chronicle/kube.plan" kd_route)"
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000
@@ -99,12 +99,12 @@ modules:
     params:
       decision: {hex: "${KD_ROUTE}"}
   - name: store_effect
-    # apiserver.uproc 'to_store': method -> store op, cid and key through.
+    # apiserver.plan 'to_store': method -> store op, cid and key through.
     decision: {hex: "${DEC_ROUTE}"}
   - name: enc_http
     type: pipeline
     params:
-      # apiserver.uproc 'pass_reply' — a codec-only node fails CLOSED.
+      # apiserver.plan 'pass_reply' — a codec-only node fails CLOSED.
       ir_stages: {hex: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"}
       # StoreReply -> http_chain's reply envelope. The cid is emitted as ONE
       # 4-byte LE int, so the reply reaches the exchange it answers.

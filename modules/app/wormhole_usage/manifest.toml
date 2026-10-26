@@ -1,0 +1,44 @@
+name = "wormhole_usage"
+version = "0.1.0"
+description = "Wormhole's usage_record.v1 stream → Wormhole's own usage ledger → one store row per tenant usage stream"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# Tenant usage ingest (rfc_lb_vip §19, §22 "Nanocloud: ingest
+# `usage_record.v1`"): the ONE writer of `/wh-usage/`.
+#
+# Wormhole's usage exporters send `usage_record.v1` (144 bytes each) on
+# `usage_in`. Every record is applied by Wormhole's own ledger
+# (`_shared/whusage.rs` `usage_ingest`: chained, in order, a gap recorded and
+# never skipped, a duplicate or a conflict told apart, a gap past the replay
+# ring closed from the running totals and marked so), and the stream it moved
+# is written as its row
+#   /wh-usage/<tenant hex>/<subject hex>/<exporter hex>
+#     = seq=…;chain=…;last=…;connections=…;bytes_in=…;bytes_out=…;refusals=…;gaps=…;from_totals=…
+# At start the streams are taken back from those rows (`usage_restore`), so a
+# record applied before a restart is a duplicate after it. A record is taken
+# off the port only once its stream's row is written: one write at a time, a
+# refused write asked again after `retry_ms`.
+#
+# Params: `retry_ms` (default 1000).
+timer_class = "wall_clock"
+
+[[ports]]
+name = "usage_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one store write per usage record, observed through `/wh-usage/`"

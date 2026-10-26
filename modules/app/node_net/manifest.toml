@@ -20,7 +20,8 @@ hardware_targets = ["bcm2712", "linux"]
 #   ROUTES    a peer route to every other node: its spec.podCIDR via its
 #             InternalIP (status.addresses).
 #   HOLD      the addresses of LoadBalancer Services
-#             (status.loadBalancer.ingress[0].ip, svc_alloc's pool), each
+#             (svc_alloc's pool, `/lb-addr/<ns>/<name>` = `ip=…` — not their
+#             status, which reports the VIP's readiness), each
 #             answered by ONE node: the node holding its claim
 #             `/net-hold/<address as u32>` (created under ABSENT, value
 #             `node=<name>`) arms it, every other node fences it. A node
@@ -29,11 +30,25 @@ hardware_targets = ["bcm2712", "linux"]
 #             an endpoint of the Service of its own (an address in its
 #             podCIDR, or its own address) — and gives the claim up when it
 #             may no longer. A claim whose node is not ready (the control
-#             plane's node lease, node_lease.uproc `stale`) is taken over:
+#             plane's node lease, node_lease.plan `stale`) is taken over:
 #             deleted conditional on the revision read, then claimed. Mode
 #             by the provider's CAPS: `announce` where HOLD_ANNOUNCE (Linux),
 #             else `deliver` where HOLD_DELIVER (bare metal: node-terminated
 #             only), else none and the address reads `unsupported`.
+#             With the VIP controller wired (`vip_ctl`/`vip_evt`), an
+#             address it drives is marked `/net-vip/<addr>` = `node=<name>`,
+#             and while a mark stands no node's own hold makes a NEW claim on
+#             it (a claim already held keeps answering). ADDR_ADD on the
+#             claim's own node adopts it in place (the row stays armed, the
+#             claim stays); elsewhere it installs the row fenced, and its
+#             ADDR_ARM waits until the claim is released, then claims under
+#             ABSENT and arms. ADDR_FENCE then ADDR_DEL is the handover: the
+#             claim is released, the mark kept for the destination. ADDR_DEL
+#             without a fence (a controller restart's clean slate, or one
+#             that let the address go uncut) hands the address back to the
+#             own hold with the claim it has. A mark whose node is not ready
+#             is removed: controller loss falls back to the own hold. The
+#             rules are `_shared/vip_hold.rs`'s.
 #
 # What took effect is the provider's to say (READ), polled every 2 s and
 # written put-if-changed:
@@ -45,13 +60,13 @@ hardware_targets = ["bcm2712", "linux"]
 #                     (what pod_resolve gives a Pod its own address on)
 #   /sandbox-net      seg=<1|0>: the node's own copy (scoped to it under
 #                     /~node/<node>), what the sandbox chain's CREATE puts in
-#                     the workload's network identity (sandbox.uproc)
+#                     the workload's network identity (sandbox.plan)
 #
 # With `graph_pods = 1` (a runtime that attaches its module workloads to the
 # segment: bare metal), its graph-backed Pods (/metal-sandboxes/) are given
 # addresses too: node_net asks for each (`/ipam-request/<uid>`, as
 # pod_resolve does for a container Pod), and /sandbox-net says `graph=1`, so
-# their CREATE waits for the lease (sandbox.uproc `mspec`).
+# their CREATE waits for the lease (sandbox.plan `mspec`).
 #
 # And the node's own Pod-IP requests (`/ipam-request/<uid>` naming
 # `node=<this node>`, pod_resolve's) are released here once their Pod is
@@ -80,6 +95,31 @@ name = "status"
 direction = "output"
 content_type = "OctetStream"
 
+# Wormhole's VIP controller on this node (optional, both wired or neither):
+# Fluxor's `addr_ctl` contract (contracts/net/identity.rs) — ADDR_ADD
+# (disarmed), ADDR_ARM and ADDR_FENCE under the install token node_net
+# mints, ADDR_DEL — realised over the HOLD table, answered on `addr_evt`
+# (MSG_ADDR_ADDED/ARMED/FENCED/REFUSED; a fence's cutoff is the hand-off to
+# the host provider). See HOLD below for how an address moves between the
+# node's own hold and the controller's. Unwired: the own hold, unchanged.
+#
+# Named `vip_ctl`/`vip_evt`, not `addr_ctl`/`addr_evt`: on a workload node
+# Fluxor keeps the network stack's `addr_ctl` to one writer (the kernel's
+# workload identities) and refuses any edge into a port of that name. This
+# is not that ring: node_net realises the controller's frames as net.route
+# HOLD rows itself, which is the path that rule asks for.
+[[ports]]
+name = "vip_ctl"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 4096
+
+[[ports]]
+name = "vip_evt"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 4096
+
 [[resources]]
 requires_contract = "net_route"
 access = "write"
@@ -101,9 +141,10 @@ access = "write"
 [observability]
 exempt = "node agent — one table replace or store action per change, not a data path"
 
-# Store subscriptions an instance opens: /nodes/, /services/ and /net-hold/
+# Store subscriptions an instance opens: /nodes/, /services/, /net-hold/,
+# /lb-addr/ and /net-vip/
 # (an endpoint, a request or a sandbox moving is picked up by its periodic
 # pass, every 5 s).
 [capacities]
-store_subscriptions = 3
+store_subscriptions = 5
 store_subscribers = 1

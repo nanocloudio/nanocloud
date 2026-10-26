@@ -8,7 +8,7 @@
 #   curl -> linux_net -> http (wave)     terminates HTTP, HANDLER_APP fan-out
 #        -> http_chain                   the exchange -> one request envelope
 #        -> kube_decode                  envelope -> Request record
-#        -> admit   (decision)           apiplane.uproc, as params
+#        -> admit   (decision)           apiplane.plan, as params
 #        -> kagi_verify <-> token_verify  KAGI: the signature check
 #        -> authz   (decision)           verify_err -> verdict; method -> VERB
 #        -> rbac (store_effect)          ONE probe of the RBAC grant index
@@ -120,7 +120,7 @@ echo "== 2. use the SHIPPED graph, unmodified =="
 # The graph under test is the one that ships, not a copy written here: a test
 # that builds its own topology proves the topology it invented, and the file in
 # packaging/ is then only as correct as the last person to read it. The baked
-# params are checked separately against their .uproc by
+# params are checked separately against their .plan by
 # chronicle-param-drift-e2e.sh.
 [ -f "$GRAPH" ] || { echo "FAIL: missing $GRAPH"; exit 1; }
 cp "$GRAPH" "$D/graph.yaml"

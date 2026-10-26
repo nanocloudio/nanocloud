@@ -15,7 +15,7 @@
 #
 # `kubectl create token` is a TokenRequest on serviceaccounts/<name>/token:
 # the ServiceAccount is read, the plane's one issuer signs (tk_api ->
-# tk_mint, apiplane_token.uproc), and the answer carries the token and its
+# tk_mint, apiplane_token.plan), and the answer carries the token and its
 # expiry. The token authenticates against this same API; a missing
 # ServiceAccount and a lifetime under 10 minutes are refused as upstream
 # refuses them.

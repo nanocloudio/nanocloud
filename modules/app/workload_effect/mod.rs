@@ -1558,7 +1558,7 @@ unsafe fn asm_end(s: &mut State, rc: i64) {
         idb[..il].copy_from_slice(&id[..il]);
         // A layer the cache does not hold, holds short, or holds as other
         // bytes than its digest: named, so the chain drops it from the cache
-        // and has it fetched again (image_heal.uproc).
+        // and has it fetched again (image_heal.plan).
         let cur = s.asm.cur as usize;
         let bl = if rc == -2 || rc == -5 || rc == -74 {
             bad_layers(s, cur, cur + 1)

@@ -1,0 +1,131 @@
+// The lifecycle chain's writes, downstream of `pod_lifecycle.plan`'s one
+// decision: the kill key, the sandbox phase, the pod phase, the event. (What
+// the Pod's status says to the plane is pod_report.plan's: it reads the
+// phase written here, /pod-lifecycle-status/, with everything else the node
+// knows of the Pod.) Each
+// reads only the carry the decision stamped — which is the point of stamping
+// it: a stage after an effect sees a status and its carry, nothing else.
+plan nanocloud.podeffect {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: pe.Step, pe.Act
+  message Ctx {
+    key: string = 30;
+    sb: string = 31;
+    pod: string = 32;
+    kill: string = 33;
+    rst: int = 34;
+    metal: string = 35;
+    podkey: string = 36;
+  }
+
+  message pe.Step {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    ctx: Ctx = 254;
+  }
+  message pe.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: int = 7;
+    ctx: Ctx = 254;
+  }
+  message pe.Evt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    uid: string = 17;   // key parts: "default/" + uid + ".<Reason>.0"
+    xk: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
+    v5: string = 8;
+  }
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+
+  // two-phase kill: ask, then escalate, then consume the key.
+  decision kill(s: pe.Step) -> pe.Act {
+    when s.ctx.kill == "term" ->
+      pe.Act { cid: s.cid, op: PUT, key: s.ctx.key, v1: "sig=term", ctx: s.ctx };
+    when s.ctx.kill == "kill" ->
+      pe.Act { cid: s.cid, op: PUT, key: s.ctx.key, v1: "sig=kill", ctx: s.ctx };
+    when s.ctx.kill == "clear" ->
+      pe.Act { cid: s.cid, op: DELETE, key: s.ctx.key, ctx: s.ctx };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "", ctx: s.ctx };
+  }
+  // The phase, merged into whichever sandbox plane this pod belongs to. The
+  // artifact fields are the project chain's; this stage owns `phase=` alone.
+  decision sandbox(s: pe.Step) -> pe.Act {
+    when s.ctx.sb != "" && s.ctx.metal == "" ->
+      pe.Act { cid: s.cid, op: MERGE, key: s.ctx.key, v1: "phase=", v2: s.ctx.sb, ctx: s.ctx };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "", ctx: s.ctx };
+  }
+  decision metal(s: pe.Step) -> pe.Act {
+    when s.ctx.sb != "" && s.ctx.metal != "" ->
+      pe.Act { cid: s.cid, op: MERGE, key: s.ctx.key, v1: "phase=", v2: s.ctx.sb, ctx: s.ctx };
+    default ->
+      pe.Act { cid: s.cid, op: NOOP, key: "", ctx: s.ctx };
+  }
+  // The public phase. `;restarts=<n>` is appended only when non-zero, so a
+  // settled pod keeps the exact value every consumer already parses.
+  decision status(s: pe.Step) -> pe.Act {
+    when s.ctx.rst > 0 ->
+      pe.Act { cid: s.cid, op: PUT, key: s.ctx.key,
+               v1: "phase=", v2: s.ctx.pod, v3: ";restarts=", v4: s.ctx.rst, ctx: s.ctx };
+    default ->
+      pe.Act { cid: s.cid, op: PUT, key: s.ctx.key,
+               v1: "phase=", v2: s.ctx.pod, ctx: s.ctx };
+  }
+  // The event, from the phase write's own reply (pl_status, put-if-changed):
+  // 200 means the phase CHANGED.
+  decision record(s: pe.Step) -> pe.Evt {
+    when s.status == 200 && s.ctx.pod == "Running" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.ctx.key, xk: ".Started.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.ctx.key,
+               v3: ".Started.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.ctx.key,
+               v5: "\"},\"reason\":\"Started\",\"message\":\"Started pod sandbox\",\"type\":\"Normal\",\"count\":1}" };
+    when s.status == 200 && s.ctx.pod == "Failed" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.ctx.key, xk: ".Failed.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.ctx.key,
+               v3: ".Failed.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.ctx.key,
+               v5: "\"},\"reason\":\"Failed\",\"message\":\"Pod sandbox terminated with an error\",\"type\":\"Warning\",\"count\":1}" };
+    when s.status == 200 && s.ctx.pod == "Succeeded" ->
+      pe.Evt { cid: s.cid, op: PUT, key: "default/", uid: s.ctx.key, xk: ".Completed.0",
+               v1: "{\"metadata\":{\"name\":\"", v2: s.ctx.key,
+               v3: ".Completed.0\",\"namespace\":\"default\"},\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"default\",\"name\":\"",
+               v4: s.ctx.key,
+               v5: "\"},\"reason\":\"Completed\",\"message\":\"Pod sandbox completed\",\"type\":\"Normal\",\"count\":1}" };
+    default ->
+      pe.Evt { cid: s.cid, op: NOOP, key: "", uid: "", xk: "",
+               v1: "", v2: "", v3: "", v4: "", v5: "" };
+  }
+
+  transformation pass(s: pe.Step) -> pe.Step {
+    pe.Step { cid: s.cid, status: s.status, value: s.value, ctx: s.ctx }
+  }
+  pipeline kl(s: pe.Step) -> pe.Act { call x = pass(s); call y = kill(x); return y; }
+  pipeline sb(s: pe.Step) -> pe.Act { call x = pass(s); call y = sandbox(x); return y; }
+  pipeline mt(s: pe.Step) -> pe.Act { call x = pass(s); call y = metal(x); return y; }
+  pipeline st(s: pe.Step) -> pe.Act { call x = pass(s); call y = status(x); return y; }
+  pipeline ev(s: pe.Step) -> pe.Evt { call x = pass(s); call y = record(x); return y; }
+  entry kl = kl;
+  entry sb = sb;
+  entry mt = mt;
+  entry st = st;
+  entry ev = ev;
+  provenance revision "podeffect-writes" toolchain "chronicle-authoring";
+}

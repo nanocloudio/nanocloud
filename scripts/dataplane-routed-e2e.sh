@@ -201,18 +201,21 @@ pod() { # pod <name> <node> <ip> [ports-json]
 svc() { # svc <name> <clusterIP> <extra spec members>
   np_put "/services/default/$1" "{\"metadata\":{\"name\":\"$1\",\"namespace\":\"default\"},\"spec\":{\"clusterIP\":\"$2\"$3}}"
 }
+slice() { # slice <svc> <pod> <ip> <node>: a ready EndpointSlice, as endpoints.plan writes it
+  np_put "/endpointslices/default/$1/$2" "ip=$3;state=ready;zone=;node=$4;gen=1;af=4;uid=$2;grace=30000"
+}
 seed() {
   pod a1 node-a 10.244.1.2
   pod a2 node-a 10.244.1.3 '[{"containerPort":8080,"hostPort":18080}]'
   pod b1 node-b 10.244.2.2
   pod b2 node-b 10.244.2.3
   svc self 10.96.0.20 ',"ports":[{"port":80,"targetPort":8080}]'
-  np_put /endpointslices/default/self/a1 10.244.1.2
+  slice self a1 10.244.1.2 node-a
   svc rem 10.96.0.30 ',"type":"NodePort","ports":[{"port":80,"targetPort":8080,"nodePort":31001}]'
-  np_put /endpointslices/default/rem/b1 10.244.2.2
+  slice rem b1 10.244.2.2 node-b
   svc loc 10.96.0.40 ',"type":"NodePort","externalTrafficPolicy":"Local","ports":[{"port":80,"targetPort":8080,"nodePort":31002}]'
-  np_put /endpointslices/default/loc/a1 10.244.1.2
-  np_put /endpointslices/default/loc/b1 10.244.2.2
+  slice loc a1 10.244.1.2 node-a
+  slice loc b1 10.244.2.2 node-b
 }
 on "$DA" seed
 

@@ -4,7 +4,7 @@
 # clamped to [min, max] — folded by an aggregation (sliding window, max per
 # target) and applied as a PATCH of spec.replicas on the target Deployment.
 #
-# Driven by a SYNTHETIC metric (scripts/support/hpa_synth.uproc) inside the
+# Driven by a SYNTHETIC metric (scripts/support/hpa_synth.plan) inside the
 # graph: a sample every 200 ms, 90% CPU until SW ms, 20% after. One run,
 # polled live. Proven: the scale-up reaches the ceiling at once; the scale-down
 # is HELD for the window (without stabilisation it would follow the first low
@@ -77,14 +77,14 @@ PY
 WIN=3000
 STEP=500
 SW=6000
-# hpa.uproc with the test's step (apply acts on the window ending within a step).
-sed "s/enum STEP = [0-9]*;/enum STEP = $STEP;/; s/enum WIN = [0-9]*;/enum WIN = $WIN;/" "$ROOT/modules/app/_chronicle/hpa.uproc" >"$D/hpa.uproc"
-DEC_RD="$(nc_decision "$D/hpa.uproc" rd)"
-DEC_MT="$(nc_decision "$D/hpa.uproc" mt)"
-DEC_RC="$(nc_decision "$D/hpa.uproc" rc)"
-DEC_AP="$(nc_decision "$D/hpa.uproc" ap)"
-DEC_SP="$(nc_decision "$ROOT/scripts/support/hpa_synth.uproc" sy_put)"
-DEC_SA="$(nc_decision "$ROOT/scripts/support/hpa_synth.uproc" sy_adv)"
+# hpa.plan with the test's step (apply acts on the window ending within a step).
+sed "s/enum STEP = [0-9]*;/enum STEP = $STEP;/; s/enum WIN = [0-9]*;/enum WIN = $WIN;/" "$ROOT/modules/app/_chronicle/hpa.plan" >"$D/hpa.plan"
+DEC_RD="$(nc_decision "$D/hpa.plan" rd)"
+DEC_MT="$(nc_decision "$D/hpa.plan" mt)"
+DEC_RC="$(nc_decision "$D/hpa.plan" rc)"
+DEC_AP="$(nc_decision "$D/hpa.plan" ap)"
+DEC_SP="$(nc_decision "$ROOT/scripts/support/hpa_synth.plan" sy_put)"
+DEC_SA="$(nc_decision "$ROOT/scripts/support/hpa_synth.plan" sy_adv)"
 AGG="$(bash "$ROOT/scripts/hpa-agg.sh" "$WIN" "$STEP")"
 for v in "$DEC_RD" "$DEC_MT" "$DEC_RC" "$DEC_AP" "$DEC_SP" "$DEC_SA" "$AGG"; do
   [ -n "$v" ] || { echo "FAIL: a param did not compile"; exit 1; }

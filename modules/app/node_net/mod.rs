@@ -25,6 +25,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 include!("../_shared/field.rs");
+include!("../_shared/vip_hold.rs");
 
 use abi::contracts::net::route as wire;
 
@@ -66,6 +67,11 @@ const NODES: &[u8] = b"/nodes/";
 const SERVICES: &[u8] = b"/services/";
 const SLICES: &[u8] = b"/endpointslices/";
 const HOLDS: &[u8] = b"/net-hold/";
+/// The VIP controller's marks: an address a controller drives, which no
+/// node's own hold claims while the mark stands (`_shared/vip_hold.rs`).
+const MARKS: &[u8] = b"/net-vip/";
+/// svc_alloc's load-balancer addresses, by Service.
+const LB_ADDRS: &[u8] = b"/lb-addr/";
 const REQUESTS: &[u8] = b"/ipam-request/";
 const LEASES: &[u8] = b"/ipam-lease/";
 const SANDBOXES: &[u8] = b"/sandboxes/";
@@ -190,6 +196,13 @@ struct State {
     released: u32,
     replaced: u32,
     refused: u32,
+
+    /// Wormhole's VIP controller on this node: `addr_ctl` frames in (in[1]),
+    /// `addr_evt` events out (out[1]), and the addresses it drives here.
+    addr_ctl_in: i32,
+    addr_evt_out: i32,
+    ctl_buf: [u8; 64],
+    vh: VipHold,
 }
 
 /// The prefixes a change under which runs the pass again: the nodes (their
@@ -197,8 +210,16 @@ struct State {
 /// addresses) and the claims on those. An endpoint moving, a request or a
 /// sandbox going, is picked up by the periodic pass (`PASS_MS`): the store
 /// holds a bounded number of subscriptions for the whole node.
-const SUBS: usize = 3;
-name_table!(SUB_PREFIXES = [b"/nodes/", b"/services/", b"/net-hold/"]);
+const SUBS: usize = 5;
+name_table!(
+    SUB_PREFIXES = [
+        b"/nodes/",
+        b"/services/",
+        b"/net-hold/",
+        b"/lb-addr/",
+        b"/net-vip/"
+    ]
+);
 
 mod params_def {
     use super::ptr_copy;
@@ -609,11 +630,18 @@ unsafe fn local_endpoints(s: &State, store: &Store, svc: &[u8]) -> (bool, bool) 
         for (d, &c) in k.iter_mut().zip(key.iter().take(kl)) {
             *d = c;
         }
-        let mut v = [0u8; 64];
+        // A slice is `ip=<ip>;state=<ready|serving|terminating>;…`
+        // (endpoints.plan): only a ready one is an endpoint traffic may be
+        // brought to, and its address is its `ip=`.
+        let mut v = [0u8; 512];
         let Some(vl) = get_value(store, k.get(..kl).unwrap_or(&[]), &mut v) else {
             continue;
         };
-        let Some(a) = parse_ip4(v.get(..vl).unwrap_or(&[])) else {
+        let slice = v.get(..vl).unwrap_or(&[]);
+        if field(slice, b"state=") != Some(&b"ready"[..]) {
+            continue;
+        }
+        let Some(a) = field(slice, b"ip=").and_then(parse_ip4) else {
             continue;
         };
         if a != 0 && a == s.own_addr {
@@ -634,8 +662,47 @@ unsafe fn node_ready(s: &mut State, store: &Store, name: &[u8]) -> bool {
     }
 }
 
+/// Who a `node=<name>` record names, for `vip_hold::decide`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    None,
+    Me,
+    /// Another node, and whether it is ready.
+    Other(bool),
+}
+
+/// Read `key` (`node=<name>`) and its revision; `None` when the store said
+/// to stop (a read that waits, or was refused).
+unsafe fn read_holder(
+    s: &mut State,
+    store: &Store,
+    key: &[u8],
+    me: &[u8],
+) -> Option<(Holder, u64)> {
+    let mut cv = [0u8; 128];
+    let got = get_value_rev(store, key, &mut cv);
+    if store.stopped() {
+        return None;
+    }
+    let Some((cl, rev)) = got else {
+        return Some((Holder::None, 0));
+    };
+    let holder = field(cv.get(..cl).unwrap_or(&[]), b"node=").unwrap_or(&[]);
+    if holder == me {
+        return Some((Holder::Me, rev));
+    }
+    let mut hb = [0u8; MAX_PARAM];
+    let hl = cat(&mut hb, &[holder]);
+    let ready = node_ready(s, store, hb.get(..hl).unwrap_or(&[]));
+    if store.stopped() {
+        return None;
+    }
+    Some((Holder::Other(ready), rev))
+}
+
 /// The load-balancer addresses: each claimed, given up or taken over as the
-/// manifest says, one write a pass. Fills `want_*`.
+/// manifest says — and, where Wormhole's VIP controller drives one here, as
+/// it does (`_shared/vip_hold.rs`) — one write a pass. Fills `want_*`.
 unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
     s.want_n = 0;
     s.want_over = false;
@@ -655,19 +722,27 @@ unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
         let Some(dl) = get_value(store, k.get(..kl).unwrap_or(&[]), &mut s.doc) else {
             continue;
         };
-        let (addr, local) = {
+        let local = {
             let doc = s.doc.get(..dl).unwrap_or(&[]);
             if j_get2(doc, b"spec", b"type") != Some(&b"LoadBalancer"[..]) {
                 continue;
             }
-            let addr = j_sub2(doc, b"status", b"loadBalancer")
-                .and_then(|l| j_sub1(l, b"ingress"))
-                .and_then(|i| j_idx(i, 0))
-                .and_then(|e| j_get1(e, b"ip"))
+            j_get2(doc, b"spec", b"externalTrafficPolicy") == Some(&b"Local"[..])
+        };
+        // The address svc_alloc gave it (`/lb-addr/<ns>/<name>` = `ip=…`),
+        // not its status: the status is the VIP's readiness to say, and
+        // waits for the address to be held.
+        let mut ak = [0u8; MAX_KEY];
+        let akl = cat(
+            &mut ak,
+            &[LB_ADDRS, k.get(SERVICES.len()..kl).unwrap_or(&[])],
+        );
+        let mut av = [0u8; 64];
+        let addr = match get_value(store, ak.get(..akl).unwrap_or(&[]), &mut av) {
+            Some(n) => field(av.get(..n).unwrap_or(&[]), b"ip=")
                 .and_then(parse_ip4)
-                .unwrap_or(0);
-            let local = j_get2(doc, b"spec", b"externalTrafficPolicy") == Some(&b"Local"[..]);
-            (addr, local)
+                .unwrap_or(0),
+            None => 0,
         };
         if addr == 0 {
             continue;
@@ -703,51 +778,70 @@ unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
         if store.stopped() {
             break;
         }
+        // The address's own-hold claim and the controller's mark, with
+        // their writers' readiness: what `vip_hold::decide` rules on.
         let mut ck = [0u8; MAX_KEY];
         let ckl = put(&mut ck, 0, HOLDS)
             .and_then(|p| put_dec(&mut ck, p, addr as u64))
             .unwrap_or(0);
         let ck = ck.get(..ckl).unwrap_or(&[]);
-        let mut cv = [0u8; 128];
-        let got = get_value_rev(store, ck, &mut cv);
-        if store.stopped() {
+        let mut mk = [0u8; MAX_KEY];
+        let mkl = put(&mut mk, 0, MARKS)
+            .and_then(|p| put_dec(&mut mk, p, addr as u64))
+            .unwrap_or(0);
+        let mk = mk.get(..mkl).unwrap_or(&[]);
+        let Some((claim, claim_rev)) = read_holder(s, store, ck, me) else {
             break;
-        }
-        let armed = match got {
-            None => {
-                if eligible {
-                    let mut v = [0u8; MAX_PARAM + 8];
-                    let vl = cat(&mut v, &[b"node=", me]);
-                    act(s, ck, Some(v.get(..vl).unwrap_or(&[])), PRE_ABSENT, 0);
-                    s.claimed = s.claimed.wrapping_add(1);
-                    return Pass::Again;
-                }
-                false
+        };
+        let Some((mark, mark_rev)) = read_holder(s, store, mk, me) else {
+            break;
+        };
+        let vh_claim = match claim {
+            Holder::None => VhClaim::Free,
+            Holder::Me => VhClaim::Ours,
+            Holder::Other(ready) => VhClaim::Other { ready },
+        };
+        let vh_mark = match mark {
+            Holder::None => VhMark::None,
+            Holder::Me => VhMark::Ours,
+            Holder::Other(ready) => VhMark::Other { ready },
+        };
+        let d = s.vh.decide(addr, eligible, vh_claim, vh_mark);
+        let mut v = [0u8; MAX_PARAM + 8];
+        let vl = cat(&mut v, &[b"node=", me]);
+        let mine = v.get(..vl).unwrap_or(&[]);
+        let wrote = match d.write {
+            VhWrite::None => false,
+            VhWrite::Claim => {
+                act(s, ck, Some(mine), PRE_ABSENT, 0);
+                s.claimed = s.claimed.wrapping_add(1);
+                true
             }
-            Some((cl, rev)) => {
-                let holder = field(cv.get(..cl).unwrap_or(&[]), b"node=").unwrap_or(&[]);
-                if holder == me {
-                    if !eligible {
-                        act(s, ck, None, PRE_ETAG, rev);
-                        s.released = s.released.wrapping_add(1);
-                        return Pass::Again;
-                    }
-                    true
+            VhWrite::Unclaim => {
+                // Ours, or a not-ready node's: on the revision judged.
+                act(s, ck, None, PRE_ETAG, claim_rev);
+                s.released = s.released.wrapping_add(1);
+                true
+            }
+            VhWrite::Mark => {
+                if mark == Holder::None {
+                    act(s, mk, Some(mine), PRE_ABSENT, 0);
                 } else {
-                    let mut hb = [0u8; MAX_PARAM];
-                    let hl = cat(&mut hb, &[holder]);
-                    let holder = hb.get(..hl).unwrap_or(&[]);
-                    if eligible && !node_ready(s, store, holder) && !store.stopped() {
-                        // Its node is out of service: the claim is taken
-                        // over, conditional on the revision judged.
-                        act(s, ck, None, PRE_ETAG, rev);
-                        s.released = s.released.wrapping_add(1);
-                        return Pass::Again;
-                    }
-                    false
+                    // A not-ready node's mark, taken over on its revision.
+                    act(s, mk, Some(mine), PRE_ETAG, mark_rev);
                 }
+                true
+            }
+            VhWrite::Unmark => {
+                act(s, mk, None, PRE_ETAG, mark_rev);
+                true
             }
         };
+        if wrote {
+            s.vh.settle(addr, d.write);
+            return Pass::Again;
+        }
+        let armed = d.row == Some(true);
         let i = s.want_n as usize;
         if let (Some(a), Some(m)) = (s.want_addr.get_mut(i), s.want_armed.get_mut(i)) {
             *a = addr;
@@ -762,16 +856,19 @@ unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
     if store.waiting() {
         return Pass::Again;
     }
-    // A claim on an address no Service has any more goes (any node's: its
-    // holder may be gone with it).
-    if !s.want_over {
-        let mut walk = ListWalk::new(HOLDS);
+    // A claim or a mark on an address no Service has any more goes (any
+    // node's: its holder may be gone with it).
+    for pfx in [HOLDS, MARKS] {
+        if s.want_over {
+            break;
+        }
+        let mut walk = ListWalk::new(pfx);
         while let Some(key) = walk.next(store) {
             let kl = key.len().min(MAX_KEY);
             for (d, &c) in k.iter_mut().zip(key.iter().take(kl)) {
                 *d = c;
             }
-            let Some(a) = k.get(HOLDS.len()..kl).and_then(parse_num) else {
+            let Some(a) = k.get(pfx.len()..kl).and_then(parse_num) else {
                 continue;
             };
             let live = s.want_addr.iter().take(s.want_n as usize).any(|&w| w == a);
@@ -858,7 +955,7 @@ unsafe fn apply_held(s: &mut State, sys: &SyscallTable) {
 /// Pod CIDR as pod_resolve asks for a container Pod's: a metal sandbox with
 /// neither lease nor request gets a request (`node=;cidr=;pod=`, the Pod's
 /// name from its /pod-specs/). Its CREATE waits for the lease
-/// (sandbox.uproc `mspec`). One write a pass.
+/// (sandbox.plan `mspec`). One write a pass.
 unsafe fn request_pass(s: &mut State, store: &Store) -> Pass {
     if !s.graph_pods || !s.seg_up || s.seg_cidr.1 == 0 {
         return Pass::Idle;
@@ -1441,6 +1538,10 @@ pub unsafe extern "C" fn module_new(
         s.write_rc = 0;
         s.hb_ms = 0;
         s.hb_sum = 0;
+        core::ptr::write(&mut s.vh, VipHold::new());
+        let sys0 = &*s.syscalls;
+        s.addr_ctl_in = dev_channel_port(sys0, 0, 0);
+        s.addr_evt_out = dev_channel_port(sys0, 1, 1);
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         let sys = &*s.syscalls;
@@ -1484,6 +1585,83 @@ pub unsafe extern "C" fn module_new(
     }
 }
 
+/// The VIP controller's `addr_ctl` frames, one at a time while events have
+/// room, then the events it is owed. True when a frame moved an address.
+unsafe fn vip_ctl(s: &mut State, sys: &SyscallTable) -> bool {
+    let mut moved = false;
+    while let Some(e) = s.vh.event() {
+        if s.addr_evt_out < 0 {
+            s.vh.event_written();
+            continue;
+        }
+        if (sys.channel_write)(s.addr_evt_out, e.as_ptr(), e.len()) != e.len() as i32 {
+            return moved;
+        }
+        s.vh.event_written();
+    }
+    if s.addr_ctl_in < 0 {
+        return moved;
+    }
+    for _ in 0..4 {
+        if !s.vh.ev_room() {
+            break;
+        }
+        let n = (sys.channel_peek)(s.addr_ctl_in, s.ctl_buf.as_mut_ptr(), 3);
+        if n < 3 {
+            break;
+        }
+        let total = 3 + u16::from_le_bytes([s.ctl_buf[1], s.ctl_buf[2]]) as usize;
+        if total > s.ctl_buf.len() {
+            (sys.channel_discard)(s.addr_ctl_in, total);
+            continue;
+        }
+        if (sys.channel_peek)(s.addr_ctl_in, s.ctl_buf.as_mut_ptr(), total) < total as i32 {
+            break;
+        }
+        (sys.channel_discard)(s.addr_ctl_in, total);
+        let addr = s.ctl_buf.get(3..19).and_then(vh_addr).unwrap_or(0);
+        // The claim as the last pass found it decides adoption.
+        let ours = s
+            .want_addr
+            .iter()
+            .zip(s.want_armed.iter())
+            .take(s.want_n as usize)
+            .any(|(&a, &m)| a == addr && m == 1);
+        let claim = if ours { VhClaim::Ours } else { VhClaim::Free };
+        let mut token = [0u8; 16];
+        if dev_csprng_fill(sys, token.as_mut_ptr(), token.len()) != 0 {
+            // No entropy: an install would carry a predictable token.
+            token = [0; 16];
+        }
+        let f = s.ctl_buf;
+        if token == [0; 16] && f[0] == VH_ADDR_ADD {
+            let mut p = [0u8; 18];
+            p[..16].copy_from_slice(&f[3..19]);
+            p[16] = VH_ADDR_ADD;
+            p[17] = 4; // refusal::NO_ENTROPY
+            let mut ev = [0u8; 21];
+            ev[0] = VH_MSG_REFUSED;
+            ev[1] = 18;
+            ev[3..].copy_from_slice(&p);
+            if s.addr_evt_out >= 0 {
+                let _ = (sys.channel_write)(s.addr_evt_out, ev.as_ptr(), ev.len());
+            }
+            continue;
+        }
+        s.vh.on_frame(&f[..total], claim, token);
+        moved = true;
+    }
+    while let Some(e) = s.vh.event() {
+        if s.addr_evt_out >= 0
+            && (sys.channel_write)(s.addr_evt_out, e.as_ptr(), e.len()) != e.len() as i32
+        {
+            break;
+        }
+        s.vh.event_written();
+    }
+    moved
+}
+
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -1518,6 +1696,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.subscribed += 1;
         }
         if store_take(sys, s.event, |_| {}) > 0 {
+            s.dirty = 1;
+        }
+        if vip_ctl(s, sys) {
             s.dirty = 1;
         }
         if s.owed != 0 {

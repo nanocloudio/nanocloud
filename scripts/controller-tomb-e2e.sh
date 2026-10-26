@@ -4,7 +4,7 @@
 #
 # A watch's DELETED event carries the tomb (`/~tomb/<collection>/<ns>/<name>`,
 # the object's last state), and a Pod's node learns of the delete from the
-# tomb's index (`/~tomb-at/pods/…`, pod_specs.uproc `gone` ->
+# tomb's index (`/~tomb-at/pods/…`, pod_specs.plan `gone` ->
 # desired=deleted). A controller's delete that left none was seen by a
 # watcher (kubectl get -w, an informer) as identity only — or, for a Pod,
 # not at all by its node, which ran it on. Every Pod and Job here is past a

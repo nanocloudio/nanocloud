@@ -1,8 +1,8 @@
-# Compile a .uproc entry to its decision param, at TEST TIME.
+# Compile a .plan entry to its decision param, at TEST TIME.
 # Sourced, not run.
 #
 # Compiling here rather than carrying the hex inline in each E2E is what keeps
-# the two from drifting: an edit to the .uproc would leave a baked param stale,
+# the two from drifting: an edit to the .plan would leave a baked param stale,
 # and a stale decision does not error — it decides something else. Two key
 # parts moving between fields is enough to leave a sweep probing
 # `/replicasets.apps/default` instead of `/replicasets.apps/default/web`, so
@@ -14,7 +14,7 @@
 # does not compile. The whole document is read before it is searched: a reader
 # that stopped at the first match would leave the compiler writing to a closed
 # pipe, which under `pipefail` fails the caller however the match went.
-_nc_graph_field() { # _nc_graph_field <uproc-path> <entry> <field>
+_nc_graph_field() { # _nc_graph_field <plan-path> <entry> <field>
   local hex out
   hex="$(python3 -c "import sys;print(open(sys.argv[1],'rb').read().hex())" "$1")"
   out="$(fluxor exec chronicle -- graph "$hex" "$2" linux 2>/dev/null)" || true
@@ -22,7 +22,7 @@ _nc_graph_field() { # _nc_graph_field <uproc-path> <entry> <field>
   return 0
 }
 
-nc_decision() { # nc_decision <uproc-path> <entry>
+nc_decision() { # nc_decision <plan-path> <entry>
   _nc_graph_field "$1" "$2" decision
 }
 
@@ -31,7 +31,7 @@ nc_decision() { # nc_decision <uproc-path> <entry>
 # encoder. Baking these by hand is how a record grows a field the encoder never
 # sees: the stage program copies a FIXED list, and the symptom is an envelope
 # byte that silently stays zero.
-nc_stages() { # nc_stages <uproc-path> <entry>
+nc_stages() { # nc_stages <plan-path> <entry>
   _nc_graph_field "$1" "$2" ir_stages
 }
 
@@ -40,6 +40,6 @@ nc_stages() { # nc_stages <uproc-path> <entry>
 # carries map stages is wrong without them — the container would run each
 # map's header as bytecode — so they are baked beside `ir_stages`, from the
 # same compile.
-nc_stage_kinds() { # nc_stage_kinds <uproc-path> <entry>
+nc_stage_kinds() { # nc_stage_kinds <plan-path> <entry>
   _nc_graph_field "$1" "$2" stage_kinds
 }

@@ -6,7 +6,7 @@
 # index entry under /~tomb-at/pods/) into desired=deleted. Each lands in its node's scope,
 # /~node/<node>/pod-specs/<uid> (a worker's store names it /pod-specs/<uid>).
 # A container Pod's records are pod_resolve's (_shared/podres.rs), a
-# graph-backed Pod's and every tomb's modules/app/_chronicle/pod_specs.uproc.
+# graph-backed Pod's and every tomb's modules/app/_chronicle/pod_specs.plan.
 #
 #   spec   /pods/ (scheduled) -> /pod-specs/<uid>[~<container>]
 #          node image pull restart grace desired cmd args env workdir cpu mem
@@ -89,10 +89,10 @@ print(n)
 PY
 }
 
-DEC_SPEC="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.uproc" spec_p)"
-DEC_GONE="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.uproc" gone_p)"
+DEC_SPEC="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.plan" spec_p)"
+DEC_GONE="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.plan" gone_p)"
 for v in "$DEC_SPEC" "$DEC_GONE"; do
-  [ -n "$v" ] || { echo "FAIL: a pod_specs.uproc entry did not compile"; exit 1; }
+  [ -n "$v" ] || { echo "FAIL: a pod_specs.plan entry did not compile"; exit 1; }
 done
 # The projection the control plane ships, not a copy of it.
 PS_PATHS="$(python3 - "$ROOT/packaging/debian/fluxor-controlplane.yaml" <<'PY'

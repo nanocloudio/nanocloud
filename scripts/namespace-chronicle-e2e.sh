@@ -69,9 +69,9 @@ print(n)
 PY
 }
 
-DEC_SW="$(nc_decision "$ROOT/modules/app/_chronicle/namespace.uproc" sw)"
-DEC_FIN="$(nc_decision "$ROOT/modules/app/_chronicle/namespace.uproc" fin)"
-[ -n "$DEC_SW" ] && [ -n "$DEC_FIN" ] || { echo "FAIL: namespace.uproc did not compile"; exit 1; }
+DEC_SW="$(nc_decision "$ROOT/modules/app/_chronicle/namespace.plan" sw)"
+DEC_FIN="$(nc_decision "$ROOT/modules/app/_chronicle/namespace.plan" fin)"
+[ -n "$DEC_SW" ] && [ -n "$DEC_FIN" ] || { echo "FAIL: namespace.plan did not compile"; exit 1; }
 PREFIXES="/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
 cat >"$D/graph.yaml" <<YAML
 target: linux

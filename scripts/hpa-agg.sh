@@ -2,10 +2,10 @@
 # The HPA's stabilisation window as an aggregation `ir_def` (hex on stdout):
 #   hpa-agg.sh <window_ms> <step_ms>
 #
-# Over hpa.uproc's recommendations (hp.Rec {1 key, 2 t, 3 desired}): one lane
+# Over hpa.plan's recommendations (hp.Rec {1 key, 2 t, 3 desired}): one lane
 # per <ns>/<target>, event time `t`, a sliding window, operators
 # max(desired) and max(t), a Continuous trigger (every recommendation emits the
-# windows it touched), and the emit hpa.uproc's `apply` reads (hp.Stab {1 key,
+# windows it touched), and the emit hpa.plan's `apply` reads (hp.Stab {1 key,
 # 2 desired, 3 tmax, 4 wend}). Compiled from source on every run, like the
 # decision params (chronicle-params.sh), so it never drifts from them.
 set -euo pipefail

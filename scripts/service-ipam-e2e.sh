@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for Service ClusterIP allocation as Chronicle params
-# (modules/app/_chronicle/ipam_svc.uproc; graph EXTRACTED from
+# (modules/app/_chronicle/ipam_svc.plan; graph EXTRACTED from
 # fluxor-controlplane.yaml into packaging/debian/fluxor-service-ipam.yaml) over
 # the fluxor-native control-plane store, seeded from its durable append-log.
 #

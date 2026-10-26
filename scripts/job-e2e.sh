@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: Jobs as Kubernetes runs them, driven with kubectl against the
-# packaged control plane (job.uproc, job_launch.uproc, job_status.uproc).
+# packaged control plane (job.plan, job_launch.plan, job_status.plan).
 #
 #   1. completions=2, parallelism=2: two Pods, labelled job-name; both
 #      succeed -> `kubectl wait --for=condition=complete` returns; status

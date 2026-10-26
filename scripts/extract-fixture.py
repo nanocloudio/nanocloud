@@ -6,7 +6,7 @@
 Keeps every node whose name starts with one of the prefixes, and every wiring
 edge whose BOTH ends do, verbatim — so a component's E2E hosts the same nodes
 and baked params production runs, and cannot drift from them. The chains'
-params are checked against their .uproc by chronicle-param-drift-e2e.sh.
+params are checked against their .plan by chronicle-param-drift-e2e.sh.
 """
 import os
 import re

@@ -5,7 +5,7 @@
 # `!` projection modifiers on the connectors — transcription of the record's
 # own encoding, which the VM has no bytes arithmetic to do.
 #
-# The pull and the assembly (image.uproc / image_asm.uproc over http_fetch)
+# The pull and the assembly (image.plan / image_asm.plan over http_fetch)
 # are stubbed here by writing what they would: this proves the DECISION half,
 # on the same records they exchange.
 set -euo pipefail
@@ -73,8 +73,8 @@ PY
 }
 
 for e in rq ad ar ac rs; do
-  v="$(nc_decision "$ROOT/modules/app/_chronicle/pod_image.uproc" $e)"
-  [ -n "$v" ] || { echo "FAIL: pod_image.uproc $e did not compile"; exit 1; }
+  v="$(nc_decision "$ROOT/modules/app/_chronicle/pod_image.plan" $e)"
+  [ -n "$v" ] || { echo "FAIL: pod_image.plan $e did not compile"; exit 1; }
   eval "DEC_$(echo $e | tr a-z A-Z)=\"$v\""
 done
 python3 - "$ROOT/packaging/debian/fluxor-podlifecycle.yaml" "$D/graph.yaml" <<'PY2'
@@ -124,7 +124,7 @@ run 4
 echo "   state=pending: held"
 
 echo "== 3. ready + an OCI config: argv is Entrypoint ++ Cmd, every token's bounds kept; the digest recorded =="
-# What image.uproc writes (`!esc`): `,`-joined, with %25/%2C/%3B escaped.
+# What image.plan writes (`!esc`): `,`-joined, with %25/%2C/%3B escaped.
 store_put "/image-rootfs/$H1" "state=ready;path=/rootfs/$H1"
 store_put "/image-config/$H1" "entrypoint=/usr/sbin/nginx;cmd=-g,--pid%2Cfile"
 run 5
@@ -135,7 +135,7 @@ echo "   $R"
 echo "   (Entrypoint ++ Cmd, ',' tokens split; the comma inside one stays escaped until the spawn decodes it)"
 
 echo "== 3b. a ';' inside an argv token (nginx's CMD [\"nginx\",\"-g\",\"daemon off;\"]) keeps the record whole =="
-# image.uproc escapes the ';' (%3B) in the config list; !argv decodes it and
+# image.plan escapes the ';' (%3B) in the config list; !argv decodes it and
 # re-escapes it (with the space) for the argv grammar, so the resolved record
 # keeps its own ';' as the only separator and the spawn decodes the token.
 store_put "/pod-specs/pod-nginx" "image=library/nginx:1.27;desired=running"

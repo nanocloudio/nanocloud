@@ -110,12 +110,12 @@ for i in $(seq -f '%03g' 1 230); do
 done
 
 echo "== 2. write the graph =="
-DEC_PROBE="$(nc_decision "$ROOT/modules/app/_chronicle/gc.uproc" ask)"
-[ -n "$DEC_PROBE" ] || { echo "FAIL: could not compile gc.uproc ask"; exit 1; }
-DEC_SWEEP="$(nc_decision "$ROOT/modules/app/_chronicle/gc.uproc" act)"
-[ -n "$DEC_SWEEP" ] || { echo "FAIL: could not compile gc.uproc act"; exit 1; }
-DEC_CAP="$(nc_decision "$ROOT/modules/app/_chronicle/gc.uproc" evcap)"
-[ -n "$DEC_CAP" ] || { echo "FAIL: could not compile gc.uproc evcap"; exit 1; }
+DEC_PROBE="$(nc_decision "$ROOT/modules/app/_chronicle/gc.plan" ask)"
+[ -n "$DEC_PROBE" ] || { echo "FAIL: could not compile gc.plan ask"; exit 1; }
+DEC_SWEEP="$(nc_decision "$ROOT/modules/app/_chronicle/gc.plan" act)"
+[ -n "$DEC_SWEEP" ] || { echo "FAIL: could not compile gc.plan act"; exit 1; }
+DEC_CAP="$(nc_decision "$ROOT/modules/app/_chronicle/gc.plan" evcap)"
+[ -n "$DEC_CAP" ] || { echo "FAIL: could not compile gc.plan evcap"; exit 1; }
 cat >"$D/graph.yaml" <<YAML
 target: linux
 tick_us: 1000

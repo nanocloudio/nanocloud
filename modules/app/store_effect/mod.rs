@@ -289,7 +289,7 @@ struct State {
     tomb: [u8; 48],
     tomb_len: u8,
     /// `tomb_ms`: how long a tomb stays, ms (default `TOMB_MS`) — a Pod's
-    /// node specs live as long (tomb.uproc).
+    /// node specs live as long (tomb.plan).
     tomb_ms: u32,
     /// `blob = <prefix>`: a PUT/CREATE/REPLACE whose value is `sha256:<hex>`
     /// writes the STAGED body at `<prefix><hex>` instead (a request body the

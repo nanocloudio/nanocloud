@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Every baked Chronicle param must still match the .uproc it was compiled from.
+# Every baked Chronicle param must still match the .plan it was compiled from.
 #
 # A compiled decision carried in a graph has no link back to its source. Edit
-# the .uproc and the graph keeps the old bytes — and a stale decision does NOT
+# the .plan and the graph keeps the old bytes — and a stale decision does NOT
 # error, it decides something else. Moving two key parts between fields, say,
 # leaves a graph probing `/replicasets.apps/default` instead of
 # `.../default/web`: every owner looks absent and a live-owned pod is
@@ -10,7 +10,7 @@
 #
 # So every graph carrying a param declares its provenance:
 #
-#     # chronicle-source: <path-to-.uproc> <entry>
+#     # chronicle-source: <path-to-.plan> <entry>
 #     decision: {hex: "<hex>"}
 #
 # and this recompiles each one and compares. The param stays baked in the graph
@@ -48,35 +48,41 @@ for i, l in enumerate(lines):
     if not m:
         continue
     for j in range(i + 1, min(i + 12, len(lines))):
-        d = re.search(r'(decision|ir_stages|count_where):\s*\{hex:\s*"([0-9a-f]+)"\}', lines[j])
+        d = re.search(r'(decision|ir_stages|count_where):\s*\{hex:\s*"([0-9a-f]*)"\}', lines[j])
         if d:
-            print(m.group(1), m.group(2), d.group(1), d.group(2))
+            # An EMPTY param is one never baked (a graph landed from a tree
+            # whose compiler was behind the ABI): refused here, not skipped.
+            print(m.group(1), m.group(2), d.group(1), d.group(2) or "-unbaked-")
             if d.group(1) == "ir_stages":
                 k = re.search(r'stage_kinds:\s*\{hex:\s*"([0-9a-f]*)"\}', lines[j + 1] if j + 1 < len(lines) else "")
                 print(m.group(1), m.group(2), "stage_kinds", k.group(1) if k else "-")
             break
 PY
-  while read -r uproc entry kind baked; do
+  while read -r plan entry kind baked; do
     [ -n "$baked" ] || continue
     checked=$((checked + 1))
+    if [ "$baked" = "-unbaked-" ]; then
+      echo "   FAIL $graph: $plan $entry is NOT BAKED (an empty param) — run scripts/chronicle-rebake.sh $graph"
+      fails=$((fails + 1)); continue
+    fi
     if [ "$kind" = "decode" ]; then
-      fresh="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/$uproc")"
+      fresh="$(python3 "$ROOT/scripts/rdasm.py" "$ROOT/$plan")"
     elif [ "$kind" = "ir_stages" ]; then
-      fresh="$(nc_stages "$ROOT/$uproc" "$entry")"
+      fresh="$(nc_stages "$ROOT/$plan" "$entry")"
     elif [ "$kind" = "stage_kinds" ]; then
-      fresh="$(nc_stage_kinds "$ROOT/$uproc" "$entry")"; fresh="${fresh:--}"
+      fresh="$(nc_stage_kinds "$ROOT/$plan" "$entry")"; fresh="${fresh:--}"
     else
-      fresh="$(nc_decision "$ROOT/$uproc" "$entry")"
+      fresh="$(nc_decision "$ROOT/$plan" "$entry")"
     fi
     if [ -z "$fresh" ]; then
-      echo "   FAIL $graph: could not compile $uproc $entry"; fails=$((fails + 1)); continue
+      echo "   FAIL $graph: could not compile $plan $entry"; fails=$((fails + 1)); continue
     fi
     if [ "$fresh" != "$baked" ]; then
-      echo "   FAIL $graph: the baked param is STALE against $uproc $entry"
+      echo "   FAIL $graph: the baked param is STALE against $plan $entry"
       echo "        recompile and update the graph — a stale decision does not error, it decides something else"
       fails=$((fails + 1)); continue
     fi
-    echo "   ok   $(basename "$graph") <- $(basename "$uproc") $entry ($kind)"
+    echo "   ok   $(basename "$graph") <- $(basename "$plan") $entry ($kind)"
   done < /tmp/nc-drift-$$.txt
   rm -f /tmp/nc-drift-$$.txt
 done < <(

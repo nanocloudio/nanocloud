@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live E2E: image garbage collection (image_gc.uproc, image_gcd.uproc,
-# image_gcl.uproc; fs_effect for the rootfs; the blob dropped through
+# Live E2E: image garbage collection (image_gc.plan, image_gcd.plan,
+# image_gcl.plan; fs_effect for the rootfs; the blob dropped through
 # http_fetch).
 #
 #   1. two images pulled and run (app:v1 and app:v2, sharing a layer), and a

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: the scheduler to Kubernetes' semantics, driven with kubectl
-# against the packaged control plane (scheduler.uproc over store_source's
+# against the packaged control plane (scheduler.plan over store_source's
 # `sched` pick, _shared/sched.rs).
 #
 #   1. Nodes report capacity and allocatable; requests are fitted within

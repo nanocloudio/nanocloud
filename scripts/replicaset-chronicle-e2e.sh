@@ -76,12 +76,12 @@ PY
 }
 
 write_graph() { # write_graph
-DEC_PREV="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.uproc" prev)"
-DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.uproc" ask)"
-DEC_ACT="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.uproc" act)"
-DEC_REC="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.uproc" rec)"
+DEC_PREV="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.plan" prev)"
+DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.plan" ask)"
+DEC_ACT="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.plan" act)"
+DEC_REC="$(nc_decision "$ROOT/modules/app/_chronicle/replicaset.plan" rec)"
 for v in "$DEC_PREV" "$DEC_ASK" "$DEC_ACT" "$DEC_REC"; do
-  [ -n "$v" ] || { echo "FAIL: a replicaset.uproc entry did not compile"; exit 1; }
+  [ -n "$v" ] || { echo "FAIL: a replicaset.plan entry did not compile"; exit 1; }
 done
 cat >"$D/graph.yaml" <<YAML
 target: linux

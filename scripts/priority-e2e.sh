@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live E2E: PriorityClass, scheduling order and preemption, driven with
-# kubectl against the packaged control plane (priority.uproc; the scheduler's
-# pick, _shared/sched.rs; scheduler.uproc).
+# kubectl against the packaged control plane (priority.plan; the scheduler's
+# pick, _shared/sched.rs; scheduler.plan).
 #
 #   1. the system classes exist (system-node-critical, system-cluster-critical)
 #   2. a Pod's priorityClassName resolves to spec.priority (and its

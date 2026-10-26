@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ServiceAccount tokens as Chronicle params (sa_token.uproc) over kagi's
+# ServiceAccount tokens as Chronicle params (sa_token.plan) over kagi's
 # token_mint, through the kagi_mint connector (packaging/debian/fluxor-sa-token.yaml).
 #
 #   /token-req/<id>  = "ns=<ns>;sa=<sa>[;aud=<aud>]"

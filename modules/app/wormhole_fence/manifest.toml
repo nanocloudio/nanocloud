@@ -1,0 +1,47 @@
+name = "wormhole_fence"
+version = "0.1.0"
+description = "The regional fence provider: what the store holds of a region's transit links or power feeds → Wormhole's RegionFence confirmation, or nothing"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The regional fence provider (rfc_lb_vip §13.6, §15.1, §22 "Nanocloud: the
+# regional fence provider"), the decision half: `_shared/whfence.rs` over
+# what the store holds of the region `region`, on a `poll_ms` cadence:
+#   /wh-fence/<region>/custody          gen=<custody generation>
+#   /wh-fence/<region>/link/<name>      down=<0|1>;ack=<0|1>   (mechanism upstream)
+#   /wh-fence/<region>/feed/<name>      off=<0|1>;ack=<0|1>    (mechanism power)
+# written by the provider's observers of the region's transit sessions and
+# its power controllers. A confirmation is a positive fact: every link down
+# and its cut acknowledged by the upstream (or every feed off and
+# acknowledged), under the provider's custody of the region — then, once per
+# custody generation, the `region_ctl.v1` RegionFence record (0xB4) leaves on
+# `fence_out` for the region controller's `ctl_in`, and
+#   /wh-fence/<region>/confirmed        kind=<upstream|power>;gen=<g>;at=<ms>
+# is written. Anything less — no custody, no link or feed known, one still
+# up or unacknowledged, a row that does not parse — confirms nothing, and
+# the reason is logged once per change. The actuation itself (cutting
+# transit, removing power) needs hardware; this module only decides.
+#
+# Params: `region` (u32, required), `mechanism` (`upstream` | `power`),
+# `poll_ms` (default 500).
+timer_class = "wall_clock"
+
+[[ports]]
+name = "fence_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 1024
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one confirmation per custody generation, observed through `/wh-fence/<region>/confirmed` and its log"

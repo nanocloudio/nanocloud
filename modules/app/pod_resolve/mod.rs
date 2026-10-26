@@ -86,7 +86,7 @@ struct State {
     request_in: i32,
     request_out: i32,
     /// Every record as it came in, on to the graph-backed Pods' decision
-    /// (pod_specs.uproc), which shares this source.
+    /// (pod_specs.plan), which shares this source.
     forward_out: i32,
     /// The held record has been forwarded.
     forwarded: bool,

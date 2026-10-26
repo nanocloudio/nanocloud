@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: CronJobs as Kubernetes runs them, driven with kubectl against the
-# packaged control plane (cronjob.uproc, cronjob_status.uproc; the schedule
+# packaged control plane (cronjob.plan, cronjob_status.plan; the schedule
 # judged by store_source `cron` against the trusted wall clock). Real minutes
 # pass: about three.
 #

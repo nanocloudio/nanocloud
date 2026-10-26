@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E: PodDisruptionBudgets and the Eviction subresource, driven with
-# kubectl against the packaged control plane (pdb.uproc, admission_k8s.uproc).
+# kubectl against the packaged control plane (pdb.plan, admission_k8s.plan).
 #
 #   1. a budget's status as upstream's disruption controller states it:
 #      expectedPods, currentHealthy (Ready Pods), desiredHealthy (from

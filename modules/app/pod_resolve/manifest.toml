@@ -20,7 +20,7 @@ hardware_targets = ["bcm2712", "linux"]
 # `ps_pods`): 3 the key `<ns>/<name>`, 4 metadata.uid, 5 spec.nodeName,
 # 8 metadata.deletionTimestamp, 9 spec.runtimeClassName. A Pod not yet
 # scheduled, or graph-backed (`runtimeClassName: fluxor`, whose record
-# pod_specs.uproc writes), is not this module's. Every record is passed on
+# pod_specs.plan writes), is not this module's. Every record is passed on
 # unchanged at `forward_out` to that decision, which shares the source (one
 # store subscription for both).
 #

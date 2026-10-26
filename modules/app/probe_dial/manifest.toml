@@ -6,10 +6,10 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
 
-# The probe chain (probe.uproc, probe_collect.uproc) runs every probe through
+# The probe chain (probe.plan, probe_collect.plan) runs every probe through
 # the exec seam: it writes `/sandbox-exec/<id>/probe-<l|r|s>` and folds the
 # exit code that lands at `/sandbox-exec-result/<id>/probe-<…>`. An exec
-# probe is run in the sandbox (sandbox.uproc); an httpGet or tcpSocket probe
+# probe is run in the sandbox (sandbox.plan); an httpGet or tcpSocket probe
 # is an argv pod_resolve spelled for this module —
 #
 #   @tcp  <host> <port>                       passes when the connection is

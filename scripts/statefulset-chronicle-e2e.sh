@@ -55,11 +55,11 @@ PY
 }
 
 write_graph() {
-DEC_NB="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.uproc" nb)"
-DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.uproc" ask)"
-DEC_ACT="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.uproc" act)"
+DEC_NB="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.plan" nb)"
+DEC_ASK="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.plan" ask)"
+DEC_ACT="$(nc_decision "$ROOT/modules/app/_chronicle/statefulset.plan" act)"
 for v in "$DEC_NB" "$DEC_ASK" "$DEC_ACT"; do
-  [ -n "$v" ] || { echo "FAIL: a statefulset.uproc entry did not compile"; exit 1; }
+  [ -n "$v" ] || { echo "FAIL: a statefulset.plan entry did not compile"; exit 1; }
 done
 cat >"$D/graph.yaml" <<YAML
 target: linux

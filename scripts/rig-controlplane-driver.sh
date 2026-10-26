@@ -232,7 +232,7 @@ YAML
   done
   [ "${nn:-}" = "$NODE" ] || fail "pod probe was not scheduled on $NODE (nodeName='${nn:-}')"
   # The node stages the subgraph of its own image and reports: the phase
-  # its lifecycle chain decides reaches the Pod object (pod_status.uproc).
+  # its lifecycle chain decides reaches the Pod object (pod_status.plan).
   for i in $(seq 30); do
     ph="$(k get pod probe -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     [ "$ph" = "Running" ] && break

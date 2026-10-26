@@ -1,0 +1,12 @@
+# wormhole_ledger alone: the region controller's ledger stream on stdin.
+target: linux
+tick_us: 1000
+modules:
+  - name: ledger
+    type: wormhole_ledger
+    service: "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+    retry_ms: 100
+  - name: cli_in
+wiring:
+  - from: cli_in.stdin_out
+    to: ledger.ledger_in

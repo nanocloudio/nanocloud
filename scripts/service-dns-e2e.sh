@@ -136,7 +136,8 @@ echo "== 2. a Service, a headless Service with two ready backends, one with none
 np_put "/services/default/web" '{"metadata":{"name":"web","namespace":"default"},"spec":{"selector":{"app":"web"},"clusterIP":"10.96.0.10","ports":[{"name":"http","port":80,"targetPort":8080},{"name":"dns","port":53,"protocol":"UDP"}]}}'
 np_put "/services/default/db" '{"metadata":{"name":"db","namespace":"default"},"spec":{"selector":{"app":"db"},"clusterIP":"None","ports":[{"name":"pg","port":5432,"targetPort":5433}]}}'
 np_put "/services/default/ext" '{"metadata":{"name":"ext","namespace":"default"},"spec":{"type":"ExternalName","externalName":"db.example.com"}}'
-np_put "/endpoints/default/db" "db-0=10.244.0.5,db-1=10.244.0.6"
+# The document as endpoints_doc.plan folds it; db-2 is draining and answers nothing.
+np_put "/endpoints/default/db" "db-0=ip=10.244.0.5;state=ready;zone=;node=;gen=1;af=4;uid=,db-1=ip=10.244.0.6;state=ready;zone=;node=;gen=1;af=4;uid=,db-2=ip=10.244.0.7;state=terminating;zone=;node=;gen=1;af=4;uid=;at=1;grace=30000"
 np_put "/services/other/lonely" '{"metadata":{"name":"lonely","namespace":"other"},"spec":{"clusterIP":"None"}}'
 boot
 

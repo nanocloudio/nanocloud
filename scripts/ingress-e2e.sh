@@ -25,7 +25,7 @@
 #
 # net=own note: the ideal backend is a `net=own` workload (own netns + veth
 # carrying its leased Tier-1 address). The kernel realizes net=own on metal
-# too, but nanocloud's metal Pod path does not yet request it (sandbox.uproc's
+# too, but nanocloud's metal Pod path does not yet request it (sandbox.plan's
 # /metal-sandboxes/ CREATE carries no lease). On
 # Linux the relay reaches any routable backend
 # address; this script uses a host-reachable listener (host IP + a port), which

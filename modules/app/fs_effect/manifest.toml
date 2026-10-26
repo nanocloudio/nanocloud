@@ -6,7 +6,7 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
 
-# What image GC (image_gc.uproc) removes an assembled rootfs with: a
+# What image GC (image_gc.plan) removes an assembled rootfs with: a
 # directory's whole tree, walked and removed entry by entry through the fs
 # contract (OPENDIR / READDIR / UNLINK / RMDIR — the contract offers no
 # recursive removal, by design: the caller drives the walk and sees each

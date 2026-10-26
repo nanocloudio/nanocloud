@@ -1,7 +1,7 @@
 # route-validator workload graph.
 #
 # A Route is validated by a Chronicle decision compiled from
-# modules/app/_chronicle/route_validator.uproc; the three modules below only
+# modules/app/_chronicle/route_validator.plan; the three modules below only
 # move bytes. The rules — first-error, in spec order — live in the `decision`
 # param rather than in any .fmod, which is the point of the params form.
 #
@@ -24,7 +24,7 @@ modules:
 
   # The rules, as data.
   - name: store_effect
-    # chronicle-source: modules/app/_chronicle/route_validator.uproc check
+    # chronicle-source: modules/app/_chronicle/route_validator.plan check
     #
     # A baked param has no link to the source it came from, and a stale one
     # does not error -- it decides something else. That marker is the link:

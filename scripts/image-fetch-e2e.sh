@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live E2E for image pull as params (packaging/debian/fluxor-imagepull.yaml):
-# image.uproc over the http_fetch connector — request → manifest (through an
+# image.plan over the http_fetch connector — request → manifest (through an
 # index when the tag names one) → config → every layer a sha256-verified file
 # in the content-addressed cache, each marked in /image-blobs/ — everything
 # keyed by the manifest's digest, which the tag resolved to.

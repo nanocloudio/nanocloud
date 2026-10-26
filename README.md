@@ -20,7 +20,7 @@ node serves the Kubernetes API.
 - **The logic is rules, not code.** A Deployment becoming a ReplicaSet, an
   ownerRef cascade, a scheduler's placement, what `/api/v1` means and what a
   refusal answers: each is a chain of generic Chronicle engines carrying params
-  compiled from `modules/app/_chronicle/*.uproc`. No `.fmod` holds what a
+  compiled from `modules/app/_chronicle/*.plan`. No `.fmod` holds what a
   Deployment is, or what a Kubernetes path names.
 - **Kubernetes-shaped API.** `kubectl` talks to it directly: discovery for
   `core/v1`, `apps/v1`, `batch/v1`, `rbac.authorization.k8s.io/v1`,
@@ -72,7 +72,10 @@ admitted at the edge, written once, and every controller that cares wakes on
 the change and writes its own outputs back.
 [docs/architecture/modules.md](docs/architecture/modules.md) describes each
 chain, the keys it owns, the connectors it reaches them through, and the
-capability surfaces behind them.
+capability surfaces behind them;
+[docs/architecture/wormhole-projection.md](docs/architecture/wormhole-projection.md)
+how Services, their endpoints and load-balancer status are projected into
+Wormhole, nanocloud's load balancer.
 
 ## Install
 
@@ -256,7 +259,7 @@ chain one request envelope for it and turns the chain's replies into its
 response; a Chronicle decode program (`kube.rd`) projects the envelope into a
 record, and every decision after that — which resource a path names, whether the credential is good enough,
 what a refusal answers, which store operation the verb implies — is params
-compiled from `modules/app/_chronicle/apiplane.uproc`. Authorization is one
+compiled from `modules/app/_chronicle/apiplane.plan`. Authorization is one
 store probe of a grant index that the RBAC chains keep true from the real
 Role/ClusterRole/RoleBinding/ClusterRoleBinding objects. Admission is params
 too: a policy read and a live-object COUNT through `store_effect`, then a
@@ -264,7 +267,7 @@ decision. No node on the path holds Kubernetes meaning in compiled code.
 
 Discovery documents (`/api`, `/apis`, `/api/v1`, `/apis/<group>/<version>`),
 `/version` and `/openapi/v3` are literals in decisions — the API surface is
-data (`apiplane_admit.uproc`: `admit` answers discovery, and `oapi`, the node
+data (`apiplane_admit.plan`: `admit` answers discovery, and `oapi`, the node
 after it, the OpenAPI documents, because together they pass the 16 KiB one
 compiled decision holds).
 
@@ -276,7 +279,7 @@ transcoded to the JSON object it stands for at the ingress (`http_chain`,
 chain never sees protobuf. `kubectl create token` (a TokenRequest on
 `serviceaccounts/<name>/token`) is signed by the plane's one issuer — the same
 `token_mint` and vault key the store-driven tokens use — and answered with the
-token and its `expirationTimestamp` (`apiplane_token.uproc`).
+token and its `expirationTimestamp` (`apiplane_token.plan`).
 Namespaced paths (`/apis/<group>/<v>/namespaces/<ns>/<resource>[/<name>]`) and
 cluster-scoped paths resolve through the same rules; a grouped resource is keyed
 group-qualified (`deployments.apps`) so it never collides with a same-named
@@ -423,8 +426,16 @@ template; `resources.requests` (cpu shares).
 The control plane runs the Service plane; every node that runs Pods enforces
 it in its own kernel:
 
-- **Endpoints**: a Service's ready Pods (by selector, gated by readiness
-  probes) as its Endpoints; a deleted Service's Endpoints go with it.
+- **Endpoints**: a Service's Pods (by selector, gated by readiness probes)
+  as per-Pod EndpointSlice rows with upstream's conditions — `ready`,
+  `serving` (Ready while being deleted) and `terminating` — their zone (the
+  node's `topology.kubernetes.io/zone`), node, address family and a
+  generation that moves on whenever the endpoint is reused. Removal drains
+  first: a deleted, deselected or vanished Pod's endpoint is `terminating`
+  for its grace (`deletionGracePeriodSeconds`, else
+  `terminationGracePeriodSeconds`, else 30 s) and is removed only after it;
+  the DNS, the proxy and the edge take ready endpoints only. A deleted
+  Service's Endpoints go with it.
 - **ClusterIP**: allocated from 10.96.0.0/16; each node DNATs it to the ready
   backends, balanced (nftables on Linux, `/~node/<node>/np-status/proxy`
   saying whether it is enforced). A `targetPort` naming a port resolves
@@ -433,10 +444,24 @@ it in its own kernel:
   `nodePort` from 30000-32767 (`NANOCLOUD_NODE_PORTS`) unless it names one;
   each node DNATs its own address at that port.
 - **LoadBalancer**: with a pool (`NANOCLOUD_LB_POOL=<a.b.c.d>/<n>`), one
-  address of it, in `status.loadBalancer.ingress`, DNATed by every node.
-  Nothing announces the address (no ARP): the network must route it to a
-  node. Without a pool the Service stays pending, as upstream with no
+  address of it for each Service whose `loadBalancerClass` is unset or
+  `wormhole.nanocloud.io/lb` (another class is another controller's),
+  DNATed by every node and answered on the link by one node (node_net: the
+  node holding its claim, one with a local endpoint for `Local`, taken over
+  from a node out of service). `status.loadBalancer.ingress` names it only
+  once Wormhole reports the address's VIP ACTIVE (or DRAINING): the status
+  says the address is reachable, and that is the VIP's readiness to say, so
+  without a Wormhole VIP controller the address works and the status stays
+  empty. Without a pool the Service stays pending, as upstream with no
   load-balancer controller.
+- **Wormhole projection**: every such Service and its endpoints are declared
+  to Wormhole (nanocloud's load balancer, rfc_lb_vip) as Wormhole's own v1
+  records — one route per Service port and IP family (dual stack: linked
+  routes), its endpoints with their state, zone and generation, its traffic
+  policies, ClientIP session affinity and its timeout, and its
+  `loadBalancerSourceRanges` as early admission — published a sealed
+  generation at a time and activated by compare-and-swap
+  ([docs/architecture/wormhole-projection.md](docs/architecture/wormhole-projection.md)).
 - **DNS** on the control plane (port 53): `<svc>.<ns>.svc.cluster.local` is the
   Service's ClusterIP, a headless Service's ready Pod addresses, an
   ExternalName Service's CNAME, NXDOMAIN when there is no such Service;
@@ -457,21 +482,18 @@ it in its own kernel:
   no count of the bytes it has seen, so nothing can tell a follower which
   bytes are new once the tail is trimmed.
 
-Not implemented yet: a network namespace and address per Pod (a Pod shares
-its node's network, so its `podIP` is the node's, and a NetworkPolicy — as
-upstream for a `hostNetwork` Pod — does not constrain its traffic), a Pod's
-`dnsPolicy`/`dnsConfig` reaching its `/etc/resolv.conf` (`_shared/poddns.rs`
-computes the file by Kubernetes' rules; the Pod's volumes do not yet carry
-it, so its resolver is its image's or its node's), `sessionAffinity`,
-`externalTrafficPolicy`/`internalTrafficPolicy`, named ports in containers
-past the first, Pod DNS names (`<a-b-c-d>.<ns>.pod.cluster.local`).
+Not implemented yet: `sessionAffinity` at the nodes' DNAT (it is declared to
+Wormhole, which enforces it; the nftables path balances per connection),
+named ports in containers past the first, Pod DNS names
+(`<a-b-c-d>.<ns>.pod.cluster.local`), and a load-balancer status without
+Wormhole's VIP controller (see LoadBalancer above).
 
 ### Kubernetes compatibility: workloads, scheduling and policy
 
 The controllers and the scheduler are params (`modules/app/_chronicle/`),
 to Kubernetes' semantics:
 
-- **Jobs** (`job*.uproc`): `parallelism`, `completions` (NonIndexed Pods
+- **Jobs** (`job*.plan`): `parallelism`, `completions` (NonIndexed Pods
   `<job>-<i>`; Indexed `<job>-<index>-<attempt>`, the completion index their
   annotation and label), `backoffLimit` with a backoff of 10 s doubling to
   6 min, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`, `suspend`; and
@@ -481,7 +503,7 @@ to Kubernetes' semantics:
   SuccessCriteriaMet), Failed (with FailureTarget; BackoffLimitExceeded or
   DeadlineExceeded) and Suspended. A finished or suspended Job's active Pods
   are deleted; a deleted Job's Pods are collected.
-- **CronJobs** (`cronjob*.uproc`): `schedule` (the five standard fields,
+- **CronJobs** (`cronjob*.plan`): `schedule` (the five standard fields,
   names, steps, and @yearly … @hourly), `timeZone` (UTC and its aliases, or a
   fixed `Etc/GMT±N`), `concurrencyPolicy` (Allow, Forbid, Replace),
   `startingDeadlineSeconds`, `suspend`, `successfulJobsHistoryLimit` (3) and
@@ -505,7 +527,7 @@ to Kubernetes' semantics:
   object, whatever its size, and a Pod's node learns of the delete from it
   and stops the Pod. A deleted Node takes its DaemonSet Pods with it and is
   no longer scheduled to.
-- **Scheduler** (`scheduler.uproc` over the source's pick,
+- **Scheduler** (`scheduler.plan` over the source's pick,
   `_shared/sched.rs`): `kubectl cordon`/`uncordon` (`spec.unschedulable`),
   nodeSelector and node affinity (required and preferred), taints and
   tolerations (NoSchedule, PreferNoSchedule; NoExecute evicts an
@@ -520,18 +542,18 @@ to Kubernetes' semantics:
   Insufficient cpu.`) and a FailedScheduling event; one of higher priority
   preempts lower-priority Pods (Preempted events), sparing those a
   PodDisruptionBudget protects as far as it can.
-- **PriorityClass** (`priority.uproc`): `priorityClassName` (else the
+- **PriorityClass** (`priority.plan`): `priorityClassName` (else the
   `globalDefault` class) resolves to `spec.priority` and
   `spec.preemptionPolicy`; system-node-critical and system-cluster-critical
   exist.
-- **PodDisruptionBudget** (`pdb.uproc`): `minAvailable` or
+- **PodDisruptionBudget** (`pdb.plan`): `minAvailable` or
   `maxUnavailable` (a number or a percentage); status `expectedPods`,
   `currentHealthy`, `desiredHealthy`, `disruptionsAllowed`, the
   DisruptionAllowed condition. The Eviction subresource (`pods/eviction`,
   policy/v1) deletes a Pod only while its budget allows a disruption —
   spent atomically, so two evictions cannot spend the last — and answers 429
   otherwise: `kubectl drain` waits on it.
-- **ResourceQuota** (`quota.uproc`, `admission_k8s.uproc`): `pods`,
+- **ResourceQuota** (`quota.plan`, `admission_k8s.plan`): `pods`,
   `requests.cpu`/`cpu`, `requests.memory`/`memory`, `limits.cpu`,
   `limits.memory`, `services`, `configmaps`, `secrets`,
   `persistentvolumeclaims` and `count/<resource>`, with `status.hard` and
@@ -572,10 +594,10 @@ together.
   through `kagi_verify`. No credential is ever stored: a token is admitted
   because its signature verifies, not because a record exists.
 - **Deny-by-default authorization.** Kubernetes RBAC objects are expanded into a
-  grant index (`rbac_*.uproc`); a request is admitted only when a grant covers
+  grant index (`rbac_*.plan`); a request is admitted only when a grant covers
   its namespace, verb and resource, and a deleted binding's grants are pruned.
 - **Admission before the store.** Every mutating request crosses the
-  admission decisions (`admission.uproc`, `admission_k8s.uproc`), which
+  admission decisions (`admission.plan`, `admission_k8s.plan`), which
   validate required fields, apply defaults, enforce ResourceQuotas and judge
   evictions against PodDisruptionBudgets.
 - **Device certificates.** A Device names the public key it holds; the

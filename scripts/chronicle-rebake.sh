@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Recompile every `# chronicle-source: <uproc> <entry>` param in the given
+# Recompile every `# chronicle-source: <plan> <entry>` param in the given
 # graphs and rewrite the `decision: {hex: "…"}` line that follows it (a
 # program param is a `blob`, written as its inline hex entry). The inverse of
 # chronicle-param-drift-e2e.sh: that one refuses a stale param, this one
-# refreshes it. Run after editing a .uproc.
+# refreshes it. Run after editing a .plan.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/fluxor-env.sh"
@@ -29,7 +29,7 @@ for i, l in enumerate(lines):
                 break
         continue
     # `agg-source: <script> <args…>`: an aggregation `ir_def` built by a
-    # script (the window and its programs), not by one .uproc entry.
+    # script (the window and its programs), not by one .plan entry.
     a = re.search(r'agg-source:\s*(\S+)((?:\s+\S+)*)', l)
     if a:
         fresh = subprocess.run(["bash", "-c", f'. "{root}/scripts/fluxor-env.sh"; bash "{root}/{a.group(1)}" {a.group(2)}'],

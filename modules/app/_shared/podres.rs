@@ -35,7 +35,7 @@
 //             node cannot give, so a container asking for it is refused
 //             rather than run without it
 //   volumes   each volumeMount against the Pod's volumes, as the node's list
-//             (`volume.uproc`): a PersistentVolumeClaim `<ns>/<claim>` —
+//             (`volume.plan`): a PersistentVolumeClaim `<ns>/<claim>` —
 //             `@g/<vol>/<ns>/<claim>/<fsGroup>/<a|r>` when the Pod's fsGroup
 //             owns it (not read-only; fsGroupChangePolicy Always or
 //             OnRootMismatch) — a hostPath `<path>`, an emptyDir
@@ -875,7 +875,7 @@ fn pr_field<'a>(
         b"spec.serviceAccountName" => pr_ms(spec, b"serviceAccountName"),
         b"status.hostIP" | b"status.hostIPs" => host_ip,
         // A Pod shares its node's network unless it has an address of its
-        // own: then its lease, else its node's (pod_status.uproc).
+        // own: then its lease, else its node's (pod_status.plan).
         b"status.podIP" | b"status.podIPs" => pod_ip,
         _ => {
             let (coll, rest): (&[u8], &[u8]) =
@@ -1149,7 +1149,7 @@ fn pr_fsg_tail(x: &PrScratch, out: &mut PrOut) {
 
 /// The longest volume list entry a node record carries: one element of the
 /// node's `volumes[]` expansion, which the volume chain's decision splits
-/// in its 512-byte scratch (volume.uproc).
+/// in its 512-byte scratch (volume.plan).
 const PR_VOL_MAX: usize = 400;
 
 /// A projected file's text for a node record: every byte but the plainest
@@ -2303,7 +2303,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     o.lit(b";pod=");
     o.lit(key);
     // Its own network: the sandbox is created in a network domain of its
-    // own, holding its lease (sandbox.uproc).
+    // own, holding its lease (sandbox.plan).
     if own {
         o.lit(b";net=own");
     }

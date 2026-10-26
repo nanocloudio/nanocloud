@@ -34,7 +34,7 @@
 #     graph-backed Pods;
 #   - `sntp` anchors the wall clock, so token expiry and certificate validity
 #     are judged against trusted time;
-#   - this node registers itself and keeps its lease (node_lease.uproc `renew`,
+#   - this node registers itself and keeps its lease (node_lease.plan `renew`,
 #     as a worker does): a k3s-style single node is server and agent;
 #   - the node is its own PKI (node_pki): the API's TLS key is born in the
 #     board's vault (`identity_label`) and certified on the board by kagi's
@@ -157,8 +157,8 @@ podplane = (os.environ.get("NANOCLOUD_RIG_PODPLANE", "0") == "1"
 # Pods of workload images (`NANOCLOUD_RIG_IMAGES=1`, or `.images` beside the
 # render): the image plane runs on the board — http_fetch through a `tls`
 # client that authenticates the registry as registry.nanocloud.io by the
-# cluster's CA, image.uproc/image_asm.uproc, the pod plane's resolution
-# chain (pod_image.uproc) — and its blob cache is the FAT32's /blobs.
+# cluster's CA, image.plan/image_asm.plan, the pod plane's resolution
+# chain (pod_image.plan) — and its blob cache is the FAT32's /blobs.
 images = podplane and (os.environ.get("NANOCLOUD_RIG_IMAGES", "0") == "1"
                        or os.path.exists(os.path.join(work, ".images")))
 registry = os.environ.get("NANOCLOUD_RIG_REGISTRY", "192.168.1.10:5000")
@@ -268,7 +268,7 @@ extra = [
 for name, k, obj, hexval in seeds:
     v = f"      value_hex: \"{hexval}\"\n" if hexval else f"      value: {js(obj)}\n"
     extra.append(f"  - name: {name}\n    type: store_seed\n    params:\n      key: \"{k}\"\n{v}")
-extra.append("  # ── This node's lease (node_lease.uproc renew) ───────────────────────\n")
+extra.append("  # ── This node's lease (node_lease.plan renew) ───────────────────────\n")
 extra.append(lease)
 if volume:
     cap = open(os.path.join(volume_dir, "node.cap")).read()

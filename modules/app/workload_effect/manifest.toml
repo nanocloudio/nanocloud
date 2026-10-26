@@ -9,7 +9,7 @@ hardware_targets = ["bcm2712", "linux"]
 # The workload seam as a connector — what `store_effect` is to the store.
 #
 # WHEN to create, start, signal, pause, exec or tear a sandbox down is decided
-# by params (`sandbox.uproc`), from the desired specs and the observed status.
+# by params (`sandbox.plan`), from the desired specs and the observed status.
 # This module performs the op and reports what happened, and it owns only what
 # cannot live in the store: the table of live workload HANDLES, and the
 # continuous observation of them (WAIT for state changes, READ for output, the

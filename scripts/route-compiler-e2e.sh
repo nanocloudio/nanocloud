@@ -113,16 +113,16 @@ echo "== 2. project Routes + route-status + endpoints =="
 # A validated, multi-backend route.
 wal_put "/routes/default/web"        '{"spec":{"host":"api.example.com","to":{"name":"web"},"port":8080,"path":"/v1/"}}'
 wal_put "/route-status/default/web"  "ready=1;endpoint=web:8080"
-# One key per backend, which is what endpoints.uproc materialises on the way to
+# One key per backend, which is what endpoints.plan materialises on the way to
 # building the /endpoints/ document. The compiler joins these rather than
 # mapping over the folded list — the per-element work is already done.
-wal_put "/endpointslices/default/web/web-1" "10.0.0.1"
-wal_put "/endpointslices/default/web/web-2" "10.0.0.2"
+wal_put "/endpointslices/default/web/web-1" "ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid="
+wal_put "/endpointslices/default/web/web-2" "ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid="
 wal_put "/endpoints/default/web"     "web-1=10.0.0.1,web-2=10.0.0.2"
 # A route that failed validation (ready=0) — must NOT be compiled.
 wal_put "/routes/default/bad"        '{"spec":{"to":{"name":"nohost"},"port":9090,"path":"/"}}'
 wal_put "/route-status/default/bad"  "ready=0;msg=host must be set"
-wal_put "/endpointslices/default/nohost/n-1" "10.0.0.9"
+wal_put "/endpointslices/default/nohost/n-1" "ip=10.0.0.9;state=ready;zone=;node=;gen=1;af=4;uid="
 wal_put "/endpoints/default/nohost"  "n-1=10.0.0.9"
 
 echo "== 3. run the compiler; it PUBLISHES one key per validated route =="

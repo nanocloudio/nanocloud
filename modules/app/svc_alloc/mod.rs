@@ -47,6 +47,16 @@ const MAX_PORTS: usize = 16;
 const SERVICES: &[u8] = b"/services/";
 const NP_CLAIMS: &[u8] = b"/ipam/nodeport/";
 const LB_CLAIMS: &[u8] = b"/ipam/lb/";
+/// The address a LoadBalancer Service was given, by Service:
+/// `/lb-addr/<ns>/<name>` = `ip=<a.b.c.d>` — this module's, and what the
+/// proxy, node_net and the Wormhole projection read. NOT its status: a
+/// Service's `status.loadBalancer` says the address is reachable, which only
+/// the VIP's readiness can (wormhole.plan `wh_status`).
+const LB_ADDRS: &[u8] = b"/lb-addr/";
+/// The loadBalancerClass that names Wormhole (nanocloud's load balancer;
+/// unset is Wormhole too). Another class is another controller's: its
+/// Service is given node ports, never an address of this pool.
+const WH_CLASS: &[u8] = b"wormhole.nanocloud.io/lb";
 const NODES: &[u8] = b"/nodes/";
 /// A node's Pod CIDR is held by `/ipam/podcidr/<index>`: its position in the
 /// cluster CIDR, counted in node-sized blocks.
@@ -253,19 +263,27 @@ struct Svc {
     /// Its ports' nodePorts, 0 where none.
     ports: [u16; MAX_PORTS],
     nports: usize,
-    /// Its load-balancer address (0: none).
+    /// Its load-balancer address (0: none): its `/lb-addr/` record's, or
+    /// (adopted from a cluster that wrote it there) its status's.
     lb_ip: u32,
+    /// `status.loadBalancer.ingress[0].ip` as it stands.
+    status_ip: u32,
+    /// Its address is recorded at `/lb-addr/`.
+    recorded: bool,
 }
 
 fn read_svc(doc: &[u8]) -> Svc {
     let t = j_get2(doc, b"spec", b"type").unwrap_or(&[]);
-    let lb = t == b"LoadBalancer";
+    let class = j_get2(doc, b"spec", b"loadBalancerClass").unwrap_or(&[]);
+    let typed_lb = t == b"LoadBalancer";
     let mut s = Svc {
-        node: lb || t == b"NodePort",
-        lb,
+        node: typed_lb || t == b"NodePort",
+        lb: typed_lb && (class.is_empty() || class == WH_CLASS),
         ports: [0; MAX_PORTS],
         nports: 0,
         lb_ip: 0,
+        status_ip: 0,
+        recorded: false,
     };
     if let Some(ports) = j_sub2(doc, b"spec", b"ports") {
         while s.nports < MAX_PORTS {
@@ -280,12 +298,38 @@ fn read_svc(doc: &[u8]) -> Svc {
         }
     }
     if let Some(ing) = j_sub2(doc, b"status", b"loadBalancer").and_then(|l| j_sub1(l, b"ingress")) {
-        s.lb_ip = j_idx(ing, 0)
+        s.status_ip = j_idx(ing, 0)
             .and_then(|e| j_get1(e, b"ip"))
             .and_then(parse_ip4)
             .unwrap_or(0);
     }
     s
+}
+
+/// `/lb-addr/<owner>` into `k`; its length.
+fn addr_key(k: &mut [u8; MAX_KEY], owner: &[u8]) -> usize {
+    put(k, 0, LB_ADDRS)
+        .and_then(|p| put(k, p, owner))
+        .unwrap_or(0)
+}
+
+/// The Service's load-balancer address: its `/lb-addr/` record, else the
+/// address its status already names (a cluster that wrote it there, before
+/// the status was the VIP's to say), which is then recorded and claimed.
+unsafe fn resolve_lb(store: &Store, owner: &[u8], svc: &mut Svc) {
+    if !svc.lb {
+        return;
+    }
+    let mut k = [0u8; MAX_KEY];
+    let kl = addr_key(&mut k, owner);
+    let mut v = [0u8; 64];
+    match get_value(store, &k[..kl], &mut v) {
+        Some(n) => {
+            svc.lb_ip = v[..n].strip_prefix(b"ip=").and_then(parse_ip4).unwrap_or(0);
+            svc.recorded = true;
+        }
+        None => svc.lb_ip = svc.status_ip,
+    }
 }
 
 /// Ask (or ask again) the owed write.
@@ -355,6 +399,17 @@ unsafe fn claim_held(s: &mut State, store: &Store, owner: &[u8], svc: &Svc) -> b
             }
         }
     }
+    if svc.lb && svc.lb_ip != 0 && !svc.recorded {
+        // An address its status names and nothing recorded: recorded now,
+        // under ABSENT (claimed by the next pass, as an allocation is).
+        let kl = addr_key(&mut k, owner);
+        let Some(vl) = put(&mut s.out, 0, b"ip=").and_then(|e| put_ip(&mut s.out, e, svc.lb_ip))
+        else {
+            return false;
+        };
+        act(s, &k[..kl], vl, false, PRE_ABSENT, 0);
+        return true;
+    }
     if svc.lb && svc.lb_ip != 0 {
         let kl = claim_key(&mut k, LB_CLAIMS, svc.lb_ip as u64);
         if get_value(store, &k[..kl], &mut cur).is_none() && !store.stopped() {
@@ -390,13 +445,44 @@ unsafe fn release(s: &mut State, store: &Store, prefix: &[u8], lb: bool) -> bool
         };
         let holds = match get_value(store, &sk[..skl], &mut s.doc) {
             Some(dl) => {
-                let svc = read_svc(&s.doc[..dl]);
+                let mut svc = read_svc(&s.doc[..dl]);
+                resolve_lb(store, &owner[..ol], &mut svc);
                 if lb {
                     svc.lb && svc.lb_ip == n
                 } else {
                     svc.node && !svc.ports[..svc.nports].iter().all(|&p| p as u32 != n)
                 }
             }
+            None => false,
+        };
+        if store.stopped() {
+            return false;
+        }
+        if !holds {
+            act(s, &k[..kl], 0, true, PRE_ANY, 0);
+            s.released = s.released.wrapping_add(1);
+            return true;
+        }
+    }
+    false
+}
+
+/// Release one `/lb-addr/` record whose Service is gone, or no longer a
+/// LoadBalancer Service of this pool. True when it acted.
+unsafe fn release_addrs(s: &mut State, store: &Store) -> bool {
+    let mut walk = ListWalk::new(LB_ADDRS);
+    while let Some(key) = walk.next(store) {
+        let mut k = [0u8; MAX_KEY];
+        let kl = key.len().min(MAX_KEY);
+        k[..kl].copy_from_slice(&key[..kl]);
+        let mut sk = [0u8; MAX_KEY];
+        let Some(skl) =
+            put(&mut sk, 0, SERVICES).and_then(|p| put(&mut sk, p, &k[LB_ADDRS.len()..kl]))
+        else {
+            continue;
+        };
+        let holds = match get_value(store, &sk[..skl], &mut s.doc) {
+            Some(dl) => read_svc(&s.doc[..dl]).lb,
             None => false,
         };
         if store.stopped() {
@@ -450,7 +536,11 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
     let Some((dl, rev)) = get_value_rev(store, key, &mut s.doc) else {
         return store.waiting();
     };
-    let svc = read_svc(&s.doc[..dl]);
+    let mut svc = read_svc(&s.doc[..dl]);
+    let mut ob = [0u8; MAX_KEY];
+    let owner_len = key.len().saturating_sub(SERVICES.len()).min(MAX_KEY);
+    ob[..owner_len].copy_from_slice(&key[SERVICES.len()..SERVICES.len() + owner_len]);
+    resolve_lb(store, &ob[..owner_len], &mut svc);
     let mut budget = PROBES;
     // Node ports first: one per port that has none.
     let mut picks = [0u32; MAX_PORTS];
@@ -493,7 +583,10 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
         }
     }
     let mut lb_ip = 0u32;
-    if svc.lb && svc.lb_ip == 0 && s.pool_size > 0 {
+    // An address only once the ports are written: picked in the same pass,
+    // it would be passed over (the cursor past it) when the ports' write
+    // goes first.
+    if svc.lb && svc.lb_ip == 0 && s.pool_size > 0 && picks.iter().all(|&p| p == 0) {
         let mut cur = s.ip_cursor;
         let got = free_one(
             store,
@@ -513,7 +606,20 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
     if picks.iter().all(|&p| p == 0) && lb_ip == 0 {
         return false;
     }
-    // The object with each pick in its port, rewritten in place.
+    if picks.iter().all(|&p| p == 0) {
+        // The address alone: recorded by Service, never in its status (the
+        // VIP's to say), and claimed by the next pass.
+        let mut k = [0u8; MAX_KEY];
+        let kl = addr_key(&mut k, &ob[..owner_len]);
+        let Some(vl) = put(&mut s.out, 0, b"ip=").and_then(|e| put_ip(&mut s.out, e, lb_ip)) else {
+            return false;
+        };
+        act(s, &k[..kl], vl, false, PRE_ABSENT, 0);
+        s.allocated = s.allocated.wrapping_add(1);
+        return true;
+    }
+    // The object with each pick in its port, rewritten in place; an address
+    // owed too is the next pass's (one action a step).
     let doc = &s.doc[..dl];
     let mut ol = 0usize;
     let mut from = 0usize;
@@ -552,29 +658,6 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
         return false;
     };
     ol = e;
-    if lb_ip != 0 {
-        let mut v = [0u8; 64];
-        let Some(vl) = put(&mut v, 0, b"{\"ingress\":[{\"ip\":\"")
-            .and_then(|e| put_ip(&mut v, e, lb_ip))
-            .and_then(|e| put(&mut v, e, b"\"}]}"))
-        else {
-            return false;
-        };
-        let n = j_set2(
-            &s.out[..ol],
-            b"status",
-            b"loadBalancer",
-            &v[..vl],
-            &mut s.doc,
-        );
-        if n == 0 || n >= DOC {
-            return false;
-        }
-        let Some(e) = put(&mut s.out, 0, &s.doc[..n]) else {
-            return false;
-        };
-        ol = e;
-    }
     act(s, key, ol, false, PRE_ETAG, rev);
     s.allocated = s.allocated.wrapping_add(1);
     true
@@ -822,11 +905,12 @@ unsafe fn pass(s: &mut State) -> Pass {
         let Some(dl) = get_value(&store, &k[..kl], &mut s.doc) else {
             continue;
         };
-        let svc = read_svc(&s.doc[..dl]);
+        let mut svc = read_svc(&s.doc[..dl]);
         if !svc.node {
             continue;
         }
         let owner = &k[SERVICES.len()..kl];
+        resolve_lb(&store, owner, &mut svc);
         let mut ow = [0u8; MAX_KEY];
         ow[..owner.len()].copy_from_slice(owner);
         if claim_held(s, &store, &ow[..owner.len()], &svc) {
@@ -846,7 +930,10 @@ unsafe fn pass(s: &mut State) -> Pass {
         return Pass::Again;
     }
     // release
-    if release(s, &store, NP_CLAIMS, false) || release(s, &store, LB_CLAIMS, true) {
+    if release(s, &store, NP_CLAIMS, false)
+        || release(s, &store, LB_CLAIMS, true)
+        || release_addrs(s, &store)
+    {
         return Pass::Again;
     }
     if store.refusal().is_some() {

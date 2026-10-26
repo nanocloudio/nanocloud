@@ -1,4 +1,4 @@
-# Admission's decode: the record ad_cnt answers (admission.uproc Cnt, as a
+# Admission's decode: the record ad_cnt answers (admission.plan Cnt, as a
 # frame), with the policy APPLIED — upstream's order, mutate then validate:
 #
 #   defaults   each `path=raw` of the policy's list inserted where the object

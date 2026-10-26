@@ -143,7 +143,7 @@ blocks, pairs = parts(f"{root}/packaging/debian/fluxor-podlifecycle.yaml")
 kube_mods = "".join(b for b in blocks if kept(b.split()[2]))
 kube_mods = sub('    blobs: "/var/lib/nanocloud.io/image/blobs"\n', f'    blobs: "{blobs}"\n', kube_mods)
 edges = [(a, b) for a, b in pairs if kept(a.split(".")[0]) and kept(b.split(".")[0])]
-# The pull: http_fetch straight to linux_net, and image.uproc/image_asm.uproc.
+# The pull: http_fetch straight to linux_net, and image.plan/image_asm.plan.
 iblocks, ipairs = parts(f"{root}/packaging/debian/fluxor-imagepull.yaml")
 img_mods = "".join(iblocks)
 img_mods = sub('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"', img_mods)

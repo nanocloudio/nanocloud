@@ -41,7 +41,7 @@
 //           decodes to; anything but an object renders EMPTY
 //   !lower  ASCII lowercased — an upstream enum (`OnFailure`) in the
 //           spelling a flat record's reader compares against (`onfailure`)
-//   !argv   a `,`-separated escaped list (image.uproc's `!esc` config lists:
+//   !argv   a `,`-separated escaped list (image.plan's `!esc` config lists:
 //           `%25`/`%2C`/`%3B`) rendered as an argv ([`ArgvOut`]): tokens
 //           separated by a space, each escaped so it keeps its bounds
 //   !jargv  a JSON array of strings (a container's `command`) rendered as

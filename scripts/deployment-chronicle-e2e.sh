@@ -79,12 +79,12 @@ print(n)
 PY
 }
 
-DEC_RD="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.uproc" rd)"
-DEC_ARCH="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.uproc" arch)"
-DEC_WR="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.uproc" wr)"
-DEC_REC="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.uproc" rec)"
+DEC_RD="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.plan" rd)"
+DEC_ARCH="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.plan" arch)"
+DEC_WR="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.plan" wr)"
+DEC_REC="$(nc_decision "$ROOT/modules/app/_chronicle/deployment.plan" rec)"
 for v in "$DEC_RD" "$DEC_ARCH" "$DEC_WR" "$DEC_REC"; do
-  [ -n "$v" ] || { echo "FAIL: a deployment.uproc entry did not compile"; exit 1; }
+  [ -n "$v" ] || { echo "FAIL: a deployment.plan entry did not compile"; exit 1; }
 done
 cat >"$D/graph.yaml" <<YAML
 target: linux

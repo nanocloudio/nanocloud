@@ -1,0 +1,528 @@
+// Endpoints as params. Three chains here, and the document's fold in
+// endpoints_doc.plan (the compiler holds eight entries a plan).
+//   slice   /services/ JOIN /pods/ scoped to the namespace, with the label
+//           selector as the join predicate (65) and the pod's readiness (its
+//           Ready condition, `status.conditions[type=Ready].status`), IP,
+//           uid, node and deletionTimestamp projected (60..64); the probe
+//           runner's verdict, when it has one on this store, overrides
+//           readiness, and a readiness probe declared here (/pod-probes/<uid>
+//           rp_cmd) with no verdict yet is not ready, as upstream's kubelet
+//           holds a container until its readiness probe first succeeds.
+//           Then the Pod is read for its grace (`pd`), its node for its
+//           zone (`nd`), and the slice it has now for its generation and
+//           its drain moment (`pv`) ->
+//           /endpointslices/<ns>/<svc>/<pod> =
+//             ip=<ip>;state=<ready|serving|terminating>;zone=<z>;node=<n>;
+//             gen=<u32>;af=<4|6>;uid=<uid>[;at=<moment>];grace=<ms>
+//           (`grace` on every slice: the drain an endpoint is owed, known
+//           before it begins; `at` only while draining)
+//           the EndpointSlice conditions of upstream (rfc_lb_vip §6.1):
+//             ready        Ready (the probe's verdict, else the condition)
+//                          and not being deleted
+//             serving      Ready, but `metadata.deletionTimestamp` is set
+//             terminating  being deleted (or gone, or deselected), with
+//                          the moment the drain began (`at`, a recorded
+//                          moment: _shared/moment.rs) and its length
+//                          (`grace`, ms: deletionGracePeriodSeconds, else
+//                          terminationGracePeriodSeconds, else 30 s)
+//           `gen` changes whenever the endpoint is REUSED — another IP,
+//           another Pod uid under the same name, or a slice that was
+//           draining and is ready again (§9.2: a late result for an older
+//           generation cannot affect its replacement). `zone` is the node's
+//           `topology.kubernetes.io/zone` label (empty without one; the
+//           node name is beside it). The IP is status.podIP as the node
+//           reports it. A not-ready Pod that is not being deleted has no
+//           slice (health, not drain: removed at once, as before).
+//           A Service WITHOUT a selector is left alone, as upstream leaves
+//           it: its slices are whoever made them (the cluster DNS's own,
+//           kube-system/kube-dns), and an absent selector matching every
+//           Pod would make it a Service of the whole namespace
+//   prune   a slice whose pod is gone DRAINS first: it is written
+//           `terminating` with the moment and the grace it records (keeping
+//           the drain already begun, when the Pod was deleted gracefully), and
+//           the expiry chain (ttl.plan over `at!due+grace`) deletes it when
+//           the grace has run; one whose Service is gone (related ^1) is
+//           deleted at once — not one of a Service without a selector,
+//           which names no Pod
+//   expiry  ttl.plan, over each slice's `at` + `grace`
+// (endpoints_doc.plan: the /endpoints/ document folded from the slices, and
+// a gone Service's document deleted.)
+plan nanocloud.endpoints {
+
+  // The context each chain here carries across its effects: ONE nested
+  // message in the reserved carry field (254), echoed unchanged by every
+  // connector. Inner numbers are the old carry-through numbers, so every
+  // module that hands a context on agrees on it.
+  // carried by: ep.Ask, ep.Probe, ep.PodInfo, ep.NodeInfo, ep.Prev,
+  //             ep.Exists, ep.Known
+  message Ctx {
+    key: string = 30;
+    pod: string = 31;
+    ready: string = 32;
+    ip: string = 33;
+    hit: string = 34;
+    uid: string = 35;
+    pst: string = 36;     // "200" when the probe runner has a verdict
+    prd: string = 37;     // and that verdict's ready=
+    ns: string = 38;
+    node: string = 39;    // the Pod's spec.nodeName
+    del: string = 40;     // its metadata.deletionTimestamp ("" while not deleted)
+    ok: string = 41;      // "1" when it is ready by the rules above
+    grace: int = 42;      // its grace, ms
+    zone: string = 43;    // its node's zone label
+    // The prune chain's slice, carried whole to be rewritten draining.
+    state: string = 51;
+    gen: string = 52;
+    af: string = 53;
+    at: string = 54;
+    grc: string = 55;
+  }
+
+  message ep.Pair {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    selector: string = 4; // spec.selector ("" without one)
+    pod: string = 21;     // the pod's name
+    podkey: string = 24;  // its full key
+    ns: string = 28;      // the namespace (the key's first segment)
+    ready: string = 60;   // the Ready condition's status: True|False
+    ip: string = 61;      // status.podIP
+    uid: string = 62;     // metadata.uid
+    node: string = 63;    // spec.nodeName
+    del: string = 64;     // metadata.deletionTimestamp
+    hit: string = 65;     // "1" when labels ⊇ selector
+  }
+  message ep.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the uid, under /probe-status/ or /pod-probes/
+    ctx: Ctx = 254;
+  }
+  message ep.Probe {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    pready: string = 40;  // ready= from the probe record (/pod-probes/: rp_cmd)
+    ctx: Ctx = 254;
+  }
+  // The Pod, read for its grace (ints).
+  message ep.PodAsk {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // ns
+    sep: string = 17;     // "/"
+    pod: string = 18;
+    ctx: Ctx = 254;
+  }
+  message ep.PodInfo {
+    cid: int = 1;
+    status: int = 2;
+    tgrace: int = 50;     // spec.terminationGracePeriodSeconds
+    dgrace: int = 51;     // metadata.deletionGracePeriodSeconds
+    ctx: Ctx = 254;
+  }
+  // Its node, read for its zone label.
+  message ep.NodeAsk {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // the node name
+    ctx: Ctx = 254;
+  }
+  message ep.NodeInfo {
+    cid: int = 1;
+    status: int = 2;
+    zone: string = 40;    // metadata.labels."topology.kubernetes.io/zone"
+    ctx: Ctx = 254;
+  }
+  // The slice as it stands.
+  message ep.PrevAsk {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    sep: string = 17;     // "/"
+    pod: string = 18;
+    ctx: Ctx = 254;
+  }
+  message ep.Prev {
+    cid: int = 1;
+    status: int = 2;
+    pip: string = 40;
+    pstate: string = 41;
+    puid: string = 42;
+    pat: string = 43;
+    pgen: int = 50;
+    pgrace: int = 51;
+    moment: string = 62;  // store_effect `wall = 2`: the moment now
+    ctx: Ctx = 254;
+  }
+  // Value parts, joined by the connector in field order (4..16, then
+  // 80..): `gen` (v8) and `grace` (v16) are integers, rendered as decimal.
+  // A slice is never concatenated in the VM, whose scratch (512 bytes) a
+  // long zone or node name would overflow.
+  message ep.Slice {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+    sep: string = 17;     // "/"
+    pod: string = 18;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: int = 11; v9: string = 12; v10: string = 13;
+    v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80; v15: string = 81;
+    v16: int = 82;
+  }
+
+  message ep.Sl {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;      // "<ns>/<svc>/<pod>"
+    ip: string = 4;       // the slice's fields (flat)
+    state: string = 5;
+    zone: string = 6;
+    node: string = 7;
+    gen: string = 8;
+    af: string = 9;
+    uid: string = 10;
+    at: string = 11;
+    grace: string = 12;
+    ns: string = 28;
+    pod: string = 29;
+    svc: string = 70;     // its Service's metadata.name now (related ^1)
+    sel: string = 71;     // and its spec.selector ("" without one)
+  }
+  message ep.Exists {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // ns
+    sep: string = 17;
+    pod: string = 18;
+    ctx: Ctx = 254;
+  }
+  message ep.Known {
+    cid: int = 1;
+    status: int = 2;
+    value: string = 3;
+    moment: string = 62;  // store_effect `wall = 2`: the moment now
+    ctx: Ctx = 254;
+  }
+  message ep.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7; v5: string = 8;
+    v6: string = 9; v7: string = 10; v8: string = 11; v9: string = 12; v10: string = 13;
+    v11: string = 14; v12: string = 15; v13: string = 16; v14: string = 80; v15: string = 81;
+    v16: string = 82;
+  }
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // Ask the probe runner when the pod has a uid; otherwise the static
+  // readiness stands (a NOOP answers 204 and carries everything).
+  decision ask(p: ep.Pair) -> ep.Ask {
+    when p.selector == "" ->
+      ep.Ask { cid: p.seq, op: NOOP, key: "", ctx: Ctx { key: p.key, pod: p.pod, ready: "", ip: "", hit: "none" } };
+    when p.uid != "" ->
+      ep.Ask { cid: p.seq, op: GET, key: p.uid,
+               ctx: Ctx { key: p.key, pod: p.pod, ready: p.ready, ip: p.ip, hit: p.hit, uid: p.uid,
+                          ns: p.ns, node: p.node, del: p.del } };
+    default ->
+      ep.Ask { cid: p.seq, op: NOOP, key: "",
+               ctx: Ctx { key: p.key, pod: p.pod, ready: p.ready, ip: p.ip, hit: p.hit, uid: p.uid,
+                          ns: p.ns, node: p.node, del: p.del } };
+  }
+  // With no verdict, ask whether a readiness probe is declared here; a
+  // verdict is carried on (pst, prd) past the second lookup.
+  decision declared(a: ep.Probe) -> ep.Ask {
+    when a.ctx.hit == "none" ->
+      ep.Ask { cid: a.cid, op: NOOP, key: "", ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, ready: "", ip: "", hit: "none" } };
+    when a.status == 200 && has(a.pready) ->
+      ep.Ask { cid: a.cid, op: NOOP, key: "",
+               ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, ready: a.ctx.ready, ip: a.ctx.ip, hit: a.ctx.hit,
+                          pst: "200", prd: a.pready, uid: a.ctx.uid, ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del } };
+    when a.status == 200 ->
+      ep.Ask { cid: a.cid, op: NOOP, key: "",
+               ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, ready: a.ctx.ready, ip: a.ctx.ip, hit: a.ctx.hit,
+                          pst: "200", prd: "", uid: a.ctx.uid, ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del } };
+    when has(a.ctx.uid) && a.ctx.uid != "" ->
+      ep.Ask { cid: a.cid, op: GET, key: a.ctx.uid,
+               ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, ready: a.ctx.ready, ip: a.ctx.ip, hit: a.ctx.hit, uid: a.ctx.uid,
+                          ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del } };
+    default ->
+      ep.Ask { cid: a.cid, op: NOOP, key: "",
+               ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, ready: a.ctx.ready, ip: a.ctx.ip, hit: a.ctx.hit, uid: a.ctx.uid,
+                          ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del } };
+  }
+  // Readiness decided here, as `slice` decided it before: the probe's
+  // verdict when it has one; not ready while a readiness probe is declared
+  // without one; the Pod's Ready condition otherwise. Then the Pod is read
+  // for its grace. A pair of a selectorless Service, or one the selector
+  // does not match, reads nothing (the drain of a deselected Pod needs only
+  // the slice, `pv`).
+  decision pod(a: ep.Probe) -> ep.PodAsk {
+    when a.ctx.hit == "none" ->
+      ep.PodAsk { cid: a.cid, op: NOOP, key: "", sep: "", pod: "",
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: "none" } };
+    when a.ctx.hit != "1" ->
+      ep.PodAsk { cid: a.cid, op: NOOP, key: "", sep: "", pod: "",
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "0",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+    when has(a.ctx.pst) && a.ctx.pst == "200" && has(a.ctx.prd) && a.ctx.prd == "1" ->
+      ep.PodAsk { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", pod: a.ctx.pod,
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "1",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+    when has(a.ctx.pst) && a.ctx.pst == "200" ->
+      ep.PodAsk { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", pod: a.ctx.pod,
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "0",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+    when a.status == 200 && has(a.pready) && a.pready != "" ->
+      ep.PodAsk { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", pod: a.ctx.pod,
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "0",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+    when a.ctx.ready == "True" ->
+      ep.PodAsk { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", pod: a.ctx.pod,
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "1",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+    default ->
+      ep.PodAsk { cid: a.cid, op: GET, key: a.ctx.ns, sep: "/", pod: a.ctx.pod,
+                  ctx: Ctx { key: a.ctx.key, pod: a.ctx.pod, hit: a.ctx.hit, ip: a.ctx.ip, ok: "0",
+                             ns: a.ctx.ns, node: a.ctx.node, del: a.ctx.del, uid: a.ctx.uid } };
+  }
+  // The grace, in ms: deletionGracePeriodSeconds (set by the deleter), else
+  // terminationGracePeriodSeconds (the spec's), else upstream's 30 s. Then
+  // the node, for its zone (a Pod on none asks for no key: no zone). A pair
+  // the selector does not match read no Pod: its grace is the default.
+  decision node(i: ep.PodInfo) -> ep.NodeAsk {
+    when i.ctx.hit == "none" ->
+      ep.NodeAsk { cid: i.cid, op: NOOP, key: "", ctx: Ctx { key: i.ctx.key, pod: i.ctx.pod, hit: "none" } };
+    when i.ctx.hit != "1" ->
+      ep.NodeAsk { cid: i.cid, op: NOOP, key: "",
+                   ctx: Ctx { key: i.ctx.key, pod: i.ctx.pod, hit: i.ctx.hit, ip: i.ctx.ip, ok: "0",
+                              ns: i.ctx.ns, node: i.ctx.node, del: i.ctx.del, uid: i.ctx.uid, grace: 30000 } };
+    when i.dgrace > 0 ->
+      ep.NodeAsk { cid: i.cid, op: GET, key: i.ctx.node,
+                   ctx: Ctx { key: i.ctx.key, pod: i.ctx.pod, hit: i.ctx.hit, ip: i.ctx.ip, ok: i.ctx.ok,
+                              ns: i.ctx.ns, node: i.ctx.node, del: i.ctx.del, uid: i.ctx.uid, grace: i.dgrace * 1000 } };
+    when i.tgrace > 0 ->
+      ep.NodeAsk { cid: i.cid, op: GET, key: i.ctx.node,
+                   ctx: Ctx { key: i.ctx.key, pod: i.ctx.pod, hit: i.ctx.hit, ip: i.ctx.ip, ok: i.ctx.ok,
+                              ns: i.ctx.ns, node: i.ctx.node, del: i.ctx.del, uid: i.ctx.uid, grace: i.tgrace * 1000 } };
+    default ->
+      ep.NodeAsk { cid: i.cid, op: GET, key: i.ctx.node,
+                   ctx: Ctx { key: i.ctx.key, pod: i.ctx.pod, hit: i.ctx.hit, ip: i.ctx.ip, ok: i.ctx.ok,
+                              ns: i.ctx.ns, node: i.ctx.node, del: i.ctx.del, uid: i.ctx.uid, grace: 30000 } };
+  }
+  // The slice as it stands: its generation and the drain it may be in.
+  decision prev(n: ep.NodeInfo) -> ep.PrevAsk {
+    when n.ctx.hit == "none" ->
+      ep.PrevAsk { cid: n.cid, op: NOOP, key: "", sep: "", pod: "", ctx: Ctx { key: n.ctx.key, pod: n.ctx.pod, hit: "none" } };
+    when n.status == 200 && has(n.zone) ->
+      ep.PrevAsk { cid: n.cid, op: GET, key: n.ctx.key, sep: "/", pod: n.ctx.pod,
+                   ctx: Ctx { key: n.ctx.key, pod: n.ctx.pod, hit: n.ctx.hit, ip: n.ctx.ip, ok: n.ctx.ok,
+                              ns: n.ctx.ns, node: n.ctx.node, del: n.ctx.del, uid: n.ctx.uid,
+                              grace: n.ctx.grace, zone: n.zone } };
+    default ->
+      ep.PrevAsk { cid: n.cid, op: GET, key: n.ctx.key, sep: "/", pod: n.ctx.pod,
+                   ctx: Ctx { key: n.ctx.key, pod: n.ctx.pod, hit: n.ctx.hit, ip: n.ctx.ip, ok: n.ctx.ok,
+                              ns: n.ctx.ns, node: n.ctx.node, del: n.ctx.del, uid: n.ctx.uid,
+                              grace: n.ctx.grace, zone: "" } };
+  }
+  // The slice, decided from everything read (no slice reads ip "", gen 0).
+  // In order:
+  //   none         a selectorless Service: nothing
+  //   ready        matched, addressed, ready, not being deleted: PUT ready.
+  //                The generation moves on when the endpoint is REUSED —
+  //                another IP or uid, or a slice that was not ready (none,
+  //                or draining) — so a first slice is generation 1
+  //   serving      the same, being deleted: PUT serving with the drain's
+  //                moment (the one recorded, else now) and its grace (the
+  //                longer of the one recorded and the Pod's: an announced
+  //                drain is never shortened); the generation as for ready,
+  //                less the draining case
+  //   terminating  being deleted, not ready: the slice it has is rewritten
+  //                terminating, the same way (a dying Pod with no slice
+  //                gets none)
+  //   not ready    not being deleted: the slice is deleted (health, not drain)
+  //   deselected   a slice it still has (and not yet terminating) drains:
+  //                terminating, its recorded moment else now, its recorded
+  //                grace else 30 s
+  // `af` is 6 when the address has a `:`; the moment kept is chosen with
+  // substring arithmetic, as the VM has no conditional expression. A PUT of
+  // what is already there is 204 and spends no revision.
+  decision slice(a: ep.Prev) -> ep.Slice {
+    when a.ctx.hit == "none" ->
+      ep.Slice { cid: a.cid, op: NOOP, key: "", sep: "", pod: "",
+                 v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: 0, v9: "", v10: "",
+                 v11: "", v12: "", v13: "", v14: "", v15: "", v16: 0 };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "1" && a.ctx.del == ""
+         && (a.pip != a.ctx.ip || a.puid != a.ctx.uid || a.pstate != "ready") ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=ready;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen + 1, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: "", v14: "", v15: ";grace=", v16: a.ctx.grace };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "1" && a.ctx.del == "" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=ready;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: "", v14: "", v15: ";grace=", v16: a.ctx.grace };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "1" && (a.pip != a.ctx.ip || a.puid != a.ctx.uid) ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=serving;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen + 1, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: math.greatest(a.pgrace, a.ctx.grace) };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "1" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=serving;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: math.greatest(a.pgrace, a.ctx.grace) };
+    when a.ctx.hit == "1" && a.ctx.del != "" && a.status == 200 ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.pip, v3: ";state=terminating;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.pip.indexOf(":") + 1), math.least(1, a.pip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.puid,
+                 v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: math.greatest(a.pgrace, a.ctx.grace) };
+    when a.ctx.hit == "1" && a.ctx.del == "" && a.status == 200 ->
+      ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: 0, v9: "", v10: "",
+                 v11: "", v12: "", v13: "", v14: "", v15: "", v16: 0 };
+    when a.ctx.hit != "1" && a.status == 200 && a.pstate != "terminating" && a.pgrace > 0 ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.pip, v3: ";state=terminating;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.pip.indexOf(":") + 1), math.least(1, a.pip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.puid,
+                 v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: a.pgrace };
+    when a.ctx.hit != "1" && a.status == 200 && a.pstate != "terminating" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.pip, v3: ";state=terminating;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.pip.indexOf(":") + 1), math.least(1, a.pip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.puid,
+                 v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: 30000 };
+    default ->
+      ep.Slice { cid: a.cid, op: NOOP, key: "", sep: "", pod: "",
+                 v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: 0, v9: "", v10: "",
+                 v11: "", v12: "", v13: "", v14: "", v15: "", v16: 0 };
+  }
+
+  // No Service: ask nothing, and say so to the prune (`hit`), which deletes
+  // the slice as it does a vanished pod's.
+  decision exists(s: ep.Sl) -> ep.Exists {
+    when s.svc == "" ->
+      ep.Exists { cid: s.seq, op: NOOP, key: "", sep: "", pod: "", ctx: Ctx { key: s.key, hit: "gone" } };
+    when s.sel == "" ->
+      ep.Exists { cid: s.seq, op: NOOP, key: "", sep: "", pod: "", ctx: Ctx { key: s.key, hit: "" } };
+    default ->
+      ep.Exists { cid: s.seq, op: EXISTS, key: s.ns, sep: "/", pod: s.pod,
+                  ctx: Ctx { key: s.key, hit: "1", ip: s.ip, state: s.state, zone: s.zone, node: s.node,
+                             gen: s.gen, af: s.af, uid: s.uid, at: s.at, grc: s.grace } };
+  }
+  // A gone Service: the slice goes. A gone Pod: the slice drains — written
+  // terminating with the moment its drain began (recorded when it was
+  // deleted gracefully) else now, and the grace the slice records (the
+  // Pod's, written with every slice) else 30 s; one already terminating
+  // with a moment is left to the expiry chain.
+  decision prune(k: ep.Known) -> ep.Act {
+    when k.ctx.hit == "gone" ->
+      ep.Act { cid: k.cid, op: DELETE, key: k.ctx.key,
+               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
+    when k.status == 404 && k.ctx.hit == "1" && k.ctx.state == "terminating" && k.ctx.at != "" ->
+      ep.Act { cid: k.cid, op: NOOP, key: "",
+               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
+    when k.status == 404 && k.ctx.hit == "1" && k.ctx.at != "" ->
+      ep.Act { cid: k.cid, op: PUT, key: k.ctx.key,
+               v1: "ip=", v2: k.ctx.ip, v3: ";state=terminating;zone=", v4: k.ctx.zone, v5: ";node=", v6: k.ctx.node,
+               v7: ";gen=", v8: k.ctx.gen, v9: ";af=", v10: k.ctx.af, v11: ";uid=", v12: k.ctx.uid,
+               v13: ";at=", v14: k.ctx.at, v15: ";grace=", v16: k.ctx.grc };
+    when k.status == 404 && k.ctx.hit == "1" && k.ctx.grc != "" ->
+      ep.Act { cid: k.cid, op: PUT, key: k.ctx.key,
+               v1: "ip=", v2: k.ctx.ip, v3: ";state=terminating;zone=", v4: k.ctx.zone, v5: ";node=", v6: k.ctx.node,
+               v7: ";gen=", v8: k.ctx.gen, v9: ";af=", v10: k.ctx.af, v11: ";uid=", v12: k.ctx.uid,
+               v13: ";at=", v14: k.moment, v15: ";grace=", v16: k.ctx.grc };
+    when k.status == 404 && k.ctx.hit == "1" ->
+      ep.Act { cid: k.cid, op: PUT, key: k.ctx.key,
+               v1: "ip=", v2: k.ctx.ip, v3: ";state=terminating;zone=", v4: k.ctx.zone, v5: ";node=", v6: k.ctx.node,
+               v7: ";gen=", v8: k.ctx.gen, v9: ";af=", v10: k.ctx.af, v11: ";uid=", v12: k.ctx.uid,
+               v13: ";at=", v14: k.moment, v15: ";grace=", v16: "30000" };
+    default ->
+      ep.Act { cid: k.cid, op: NOOP, key: "",
+               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
+  }
+
+  transformation pass_pair(p: ep.Pair) -> ep.Pair {
+    ep.Pair { seq: p.seq, rev: p.rev, key: p.key, selector: p.selector, pod: p.pod, podkey: p.podkey,
+              ns: p.ns, ready: p.ready, ip: p.ip, uid: p.uid, node: p.node, del: p.del, hit: p.hit }
+  }
+  transformation pass_probe(a: ep.Probe) -> ep.Probe {
+    ep.Probe { cid: a.cid, status: a.status, value: a.value, pready: a.pready, ctx: a.ctx }
+  }
+  transformation pass_podinfo(i: ep.PodInfo) -> ep.PodInfo {
+    ep.PodInfo { cid: i.cid, status: i.status, tgrace: i.tgrace, dgrace: i.dgrace, ctx: i.ctx }
+  }
+  transformation pass_nodeinfo(n: ep.NodeInfo) -> ep.NodeInfo {
+    ep.NodeInfo { cid: n.cid, status: n.status, zone: n.zone, ctx: n.ctx }
+  }
+  transformation pass_prev(a: ep.Prev) -> ep.Prev {
+    ep.Prev { cid: a.cid, status: a.status, pip: a.pip, pstate: a.pstate, puid: a.puid, pat: a.pat,
+              pgen: a.pgen, pgrace: a.pgrace, moment: a.moment, ctx: a.ctx }
+  }
+  transformation pass_sl(s: ep.Sl) -> ep.Sl {
+    ep.Sl { seq: s.seq, rev: s.rev, key: s.key, ip: s.ip, state: s.state, zone: s.zone, node: s.node,
+            gen: s.gen, af: s.af, uid: s.uid, at: s.at, grace: s.grace,
+            ns: s.ns, pod: s.pod, svc: s.svc, sel: s.sel }
+  }
+  transformation pass_known(k: ep.Known) -> ep.Known {
+    ep.Known { cid: k.cid, status: k.status, value: k.value, moment: k.moment, ctx: k.ctx }
+  }
+  pipeline ak(p: ep.Pair) -> ep.Ask {
+    call x = pass_pair(p);
+    call y = ask(x);
+    return y;
+  }
+  pipeline dl(a: ep.Probe) -> ep.Ask {
+    call x = pass_probe(a);
+    call y = declared(x);
+    return y;
+  }
+  pipeline pd(a: ep.Probe) -> ep.PodAsk {
+    call x = pass_probe(a);
+    call y = pod(x);
+    return y;
+  }
+  pipeline nd(i: ep.PodInfo) -> ep.NodeAsk {
+    call x = pass_podinfo(i);
+    call y = node(x);
+    return y;
+  }
+  pipeline pv(n: ep.NodeInfo) -> ep.PrevAsk {
+    call x = pass_nodeinfo(n);
+    call y = prev(x);
+    return y;
+  }
+  pipeline sl(a: ep.Prev) -> ep.Slice {
+    call x = pass_prev(a);
+    call y = slice(x);
+    return y;
+  }
+  pipeline ex(s: ep.Sl) -> ep.Exists {
+    call x = pass_sl(s);
+    call y = exists(x);
+    return y;
+  }
+  pipeline pr(k: ep.Known) -> ep.Act {
+    call x = pass_known(k);
+    call y = prune(x);
+    return y;
+  }
+  entry ak = ak;
+  entry dl = dl;
+  entry pd = pd;
+  entry nd = nd;
+  entry pv = pv;
+  entry sl = sl;
+  entry ex = ex;
+  entry pr = pr;
+  provenance revision "endpoints-lifecycle" toolchain "chronicle-authoring";
+}

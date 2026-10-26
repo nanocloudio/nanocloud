@@ -233,7 +233,7 @@ with os.fdopen(fd, "r+b") as f:
 PY
 }
 # A svc whose slices are BARE ADDRESSES — no JSON, no `k=v`, nothing a path can
-# reach. This is the shape endpoints.uproc actually writes.
+# reach. This is the shape endpoints.plan actually writes.
 store_put2 "/svc/default/web" "x=1"
 store_put2 "/slices/default/web/pod-a" "10.0.0.1"
 store_put2 "/slices/default/web/pod-b" "10.0.0.2"

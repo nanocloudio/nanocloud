@@ -4,7 +4,7 @@
 #
 #   bind        a PersistentVolume pre-bound to its claim (claimRef), and a
 #               claim naming its volume (volumeName): each claim Bound, its
-#               volume's directory the claim's record (volume_static.uproc)
+#               volume's directory the claim's record (volume_static.plan)
 #   Deployment  a Pod mounting the claim writes to it; the Deployment is
 #               rolled (a new ReplicaSet, a Pod of a new UID) and the new Pod
 #               reads what the first wrote

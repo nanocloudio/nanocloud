@@ -1,0 +1,74 @@
+// The Endpoints document as params (endpoints.plan writes the slices).
+//   doc     /services/ with list_children over /endpointslices/ ->
+//           /endpoints/<ns>/<svc> = "<pod>=<slice value>,…" — the
+//           consumers' document (cluster_dns takes the ready ones, a slice
+//           being `ip=…;state=<ready|serving|terminating>;…`); a
+//           materialised view of the slices
+//   gone    an /endpoints/ document whose Service is gone is deleted,
+//           conditional on the revision judged
+plan nanocloud.endpoints_doc {
+  message ep.Svc {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    selector: string = 4;   // spec.selector; a Service without one has no endpoints
+    list: string = 56;      // "<pod>=<value>,…"
+  }
+
+  message ep.Doc {        // an /endpoints/ document and its Service now
+    seq: int = 1;
+    rev: int = 2;         // the document's revision (source `rev = 1`)
+    key: string = 3;      // "<ns>/<svc>"
+    svc: string = 70;     // the Service's metadata.name (related)
+  }
+  message ep.Del {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;
+  }
+  message ep.Act {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  decision doc(v: ep.Svc) -> ep.Act {
+    when v.selector == "" ->
+      ep.Act { cid: v.seq, op: NOOP, key: "", v1: "" };
+    when v.list == "" ->
+      ep.Act { cid: v.seq, op: DELETE, key: v.key, v1: "" };
+    default ->
+      ep.Act { cid: v.seq, op: PUT, key: v.key, v1: v.list };
+  }
+
+  decision gone(d: ep.Doc) -> ep.Del {
+    when d.svc == "" -> ep.Del { cid: d.seq, op: DELETE, key: d.key, rev: d.rev };
+    default -> ep.Del { cid: d.seq, op: NOOP, key: "", rev: 0 };
+  }
+
+  transformation pass_doc(d: ep.Doc) -> ep.Doc {
+    ep.Doc { seq: d.seq, rev: d.rev, key: d.key, svc: d.svc }
+  }
+  transformation pass_svc(v: ep.Svc) -> ep.Svc {
+    ep.Svc { seq: v.seq, rev: v.rev, key: v.key, selector: v.selector, list: v.list }
+  }
+  pipeline dc(v: ep.Svc) -> ep.Act {
+    call x = pass_svc(v);
+    call y = doc(x);
+    return y;
+  }
+  pipeline gn(d: ep.Doc) -> ep.Del {
+    call x = pass_doc(d);
+    call y = gone(x);
+    return y;
+  }
+  entry dc = dc;
+  entry gn = gn;
+  provenance revision "endpoints-doc" toolchain "chronicle-authoring";
+}

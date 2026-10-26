@@ -24,6 +24,7 @@
 //!   nanocloud bundle export|apply        # dump / restore every object as key+JSON
 //!   nanocloud ca                         # print the cluster CA certificate
 //!   nanocloud token <sa> [<ns>]          # mint a ServiceAccount token (JWT)
+//!   nanocloud explain failovers <svc>    # a service's failover ledger, chain-checked
 //!   nanocloud help                       # lists commands
 
 #![no_std]
@@ -43,6 +44,10 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
+// Wormhole's cores (its explain library among them) for `explain`.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+include!("../_shared/wormhole_portfolio.rs");
+include!("../_shared/whexplain.rs");
 
 const NS_LIST: u32 = 0x1302;
 const OBJ_PUT: u32 = 0x1420;
@@ -379,6 +384,60 @@ unsafe fn cmd_policy(sys: &Store, out: &mut [u8]) -> usize {
         }
         _ => append(out, p, b"(not applied yet)\n"),
     }
+}
+
+/// `explain failovers <service>` — the region controller's failover ledger
+/// for one service (`/wh-ledger/<service hex>/<seq>`), every entry checked
+/// against its predecessor with Wormhole's `LedgerCheck` and rendered by
+/// `_shared/whexplain.rs`; the first gap or fork ends the listing and is
+/// named, so nothing after it is vouched for.
+unsafe fn cmd_explain_failovers(sys: &Store, svc: &[u8], out: &mut [u8]) -> (usize, i32) {
+    let mut service = [0u8; 16];
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let mut ok = svc.len() == 32;
+    let mut i = 0;
+    while ok && i < 16 {
+        match (nib(svc[2 * i]), nib(svc[2 * i + 1])) {
+            (Some(h), Some(l)) => service[i] = (h << 4) | l,
+            _ => ok = false,
+        }
+        i += 1;
+    }
+    if !ok {
+        return (
+            append(out, 0, b"error: the service id is 32 hex digits\n"),
+            1,
+        );
+    }
+    let mut prefix = [0u8; 64];
+    let pn = ledger_prefix(&service, &mut prefix);
+    let mut walk = ListWalk::new(&prefix[..pn]);
+    let mut reader = LedgerReader::default();
+    let mut p = 0;
+    let mut key = [0u8; MAX_KEY];
+    let mut val = [0u8; 512];
+    let mut line = [0u8; 256];
+    while let Some(k) = walk.next(sys) {
+        let kn = k.len().min(MAX_KEY);
+        key[..kn].copy_from_slice(&k[..kn]);
+        let Some(n) = get_value(sys, &key[..kn], &mut val) else {
+            continue;
+        };
+        match reader.row(&val[..n], &mut line) {
+            LedgerRow::Entry(m) => p = append(out, p, &line[..m]),
+            LedgerRow::Malformed => {}
+            LedgerRow::Fault(_) => break,
+        }
+    }
+    let n = reader.verdict(&mut line);
+    p = append(out, p, &line[..n]);
+    let broken = reader.check.fault.is_some() || reader.malformed != 0;
+    (p, i32::from(broken))
 }
 
 /// `volume` — list PersistentVolumeClaims and bound volumes.
@@ -1624,6 +1683,7 @@ fn cmd_help(out: &mut [u8]) -> usize {
           \x20 diagnostics                     object counts across every resource\n\
           \x20 policy                          NetworkPolicies + compiled dataplane\n\
           \x20 volume                          PersistentVolumeClaims + bound volumes\n\
+          \x20 explain failovers <service>     a service's failover ledger, chain-checked\n\
           \x20 config                          the CLI's effective context\n\
           \x20 watch <resource>                stream a resource listing on change\n\
           \x20 bundle export                   dump every object (key\\tjson lines)\n\
@@ -1879,6 +1939,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else {
                     (
                         append(&mut out, 0, b"error: delete needs <resource> <ns/name>\n"),
+                        1,
+                    )
+                }
+            } else if sub == b"explain" {
+                if argc >= 3 && &arec[argv[1].0..argv[1].1] == b"failovers" {
+                    let (s2, e2) = argv[2];
+                    cmd_explain_failovers(st, &arec[s2..e2], &mut out)
+                } else {
+                    (
+                        append(
+                            &mut out,
+                            0,
+                            b"usage: explain failovers <service id, 32 hex>\n",
+                        ),
                         1,
                     )
                 }

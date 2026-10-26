@@ -177,7 +177,7 @@ fn rl_with_cid(rec: &[u8], cid: i64, out: &mut [u8]) -> Option<usize> {
     Some(w)
 }
 
-/// The carry's field holding the node an effect names (`volume_effect.uproc`
+/// The carry's field holding the node an effect names (`volume_effect.plan`
 /// `Ctx.device`).
 const RL_CARRY_DEVICE: u8 = 36;
 const RL_CARRY: u8 = 254;

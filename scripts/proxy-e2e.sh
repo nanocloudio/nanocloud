@@ -7,8 +7,10 @@
 # dry run must.
 #
 #   /services/<ns>/<svc>             = Service JSON (clusterIP, ports[])
-#   /endpointslices/<ns>/<svc>/<pod> = <ready backend address>
+#   /endpointslices/<ns>/<svc>/<pod> = ip=<addr>;state=<ready|serving|terminating>;…
+#                                      (endpoints.plan; only a ready slice is a backend)
 #   /pods/<ns>/<pod>                 = Pod JSON (its container's named ports)
+#   /lb-addr/<ns>/<svc>              = ip=<the load-balancer address> (svc_alloc's)
 #   /np-rows/proxy/<ns>/<svc>/<pod>  = kind=dnat;vip=…;vports=…;tports=…;protos=…;backend=…;pnames=…;pnums=…;
 #                                      nports=…;lbip=…;node=…;etp=…;itp=…
 #   /np-rows/hostport/<ns>/<pod>/<i> = kind=hostport;hports=…;tports=…;protos=…;hostips=…;backend=…;node=…
@@ -54,18 +56,18 @@ np_build
 
 echo "== 2. four Services: two backends, one backend on two ports, headless, no backends =="
 np_put "/services/default/web"      '{"metadata":{"name":"web"},"spec":{"selector":{"app":"web"},"clusterIP":"10.96.0.10","ports":[{"port":80,"targetPort":8080}]}}'
-np_put "/endpointslices/default/web/web-1" "10.0.0.1"
-np_put "/endpointslices/default/web/web-2" "10.0.0.2"
+np_put "/endpointslices/default/web/web-1" "ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpointslices/default/web/web-2" "ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/services/default/multi"    '{"metadata":{"name":"multi"},"spec":{"clusterIP":"10.96.0.20","ports":[{"port":443,"targetPort":8443},{"port":53,"protocol":"UDP"}]}}'
-np_put "/endpointslices/default/multi/m-1" "10.0.0.3"
+np_put "/endpointslices/default/multi/m-1" "ip=10.0.0.3;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/services/default/headless" '{"metadata":{"name":"headless"},"spec":{"clusterIP":"None","ports":[{"port":80}]}}'
-np_put "/endpointslices/default/headless/h-1" "10.0.0.4"
+np_put "/endpointslices/default/headless/h-1" "ip=10.0.0.4;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/services/default/noep"     '{"metadata":{"name":"noep"},"spec":{"clusterIP":"10.96.0.30","ports":[{"port":80}]}}'
 # Named targetPorts: each resolves against the backend's own Pod — n-1 and
 # n-2 name `http` differently, and only n-1 has `metrics`.
 np_put "/services/default/named"    '{"metadata":{"name":"named"},"spec":{"clusterIP":"10.96.0.40","ports":[{"port":80,"targetPort":"http"},{"port":9090,"targetPort":"metrics"}]}}'
-np_put "/endpointslices/default/named/n-1" "10.0.0.5"
-np_put "/endpointslices/default/named/n-2" "10.0.0.6"
+np_put "/endpointslices/default/named/n-1" "ip=10.0.0.5;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpointslices/default/named/n-2" "ip=10.0.0.6;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/pods/default/n-1" '{"metadata":{"name":"n-1"},"spec":{"nodeName":"node-a","containers":[{"name":"c","ports":[{"name":"http","containerPort":8080},{"name":"metrics","containerPort":9100}]}]}}'
 np_put "/pods/default/n-2" '{"metadata":{"name":"n-2"},"spec":{"nodeName":"node-b","containers":[{"name":"c","ports":[{"name":"http","containerPort":8081}]}]}}'
 np_run 5
@@ -104,8 +106,8 @@ grep -qF "ct original ip daddr 10.96.0.10 ct original protocol tcp ct original p
 echo "   balanced, multi-port, UDP, named targetPorts per backend, each ClusterIP hairpinned; status: $(np_last /np-status/proxy)"
 np_kernel_check proxy
 
-echo "== 5. a backend leaves its slice; a Service is deleted =="
-np_put "/endpointslices/default/web/web-2" "-DELETE-"
+echo "== 5. a backend DRAINS (its slice terminating, still present); a Service is deleted =="
+np_put "/endpointslices/default/web/web-2" "ip=10.0.0.2;state=terminating;zone=;node=;gen=1;af=4;uid=;at=1;grace=30000"
 np_put "/services/default/multi" "-DELETE-"
 np_put "/services/default/named" "-DELETE-"
 np_run 5
@@ -115,25 +117,30 @@ RS="$(cat "$D/np/proxy.nft")"
 grep -q "ip daddr 10.96.0.10 tcp dport 80 dnat to 10.0.0.1:8080" <<<"$RS" || fail "web now has one backend"
 grep -q "10.96.0.20" <<<"$RS" && fail "multi is gone"
 grep -q "10.96.0.40" <<<"$RS" && fail "named is gone"
-echo "   the table follows: web -> 10.0.0.1 only; multi and named gone"
+echo "   the table follows: web -> 10.0.0.1 only (web-2 terminating takes no new flows); multi and named gone"
 
 echo "== 6. NodePort and LoadBalancer: ports and an address allocated and claimed, DNATed at the node and the pool =="
 np_put "/services/default/np" '{"metadata":{"name":"np","namespace":"default"},"spec":{"type":"NodePort","clusterIP":"10.96.0.50","ports":[{"port":80,"targetPort":8080},{"port":443,"targetPort":8443,"nodePort":31443}]}}'
-np_put "/endpointslices/default/np/np-1" "10.0.0.7"
+np_put "/endpointslices/default/np/np-1" "ip=10.0.0.7;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/services/default/lb" '{"metadata":{"name":"lb","namespace":"default"},"spec":{"type":"LoadBalancer","clusterIP":"10.96.0.60","ports":[{"port":80,"targetPort":8080}]}}'
-np_put "/endpointslices/default/lb/lb-1" "10.0.0.8"
+np_put "/endpointslices/default/lb/lb-1" "ip=10.0.0.8;state=ready;zone=;node=;gen=1;af=4;uid="
 np_run 6
 NP="$(np_last /services/default/np)"; LB="$(np_last /services/default/lb)"
 read -r P0 P1 < <(python3 -c 'import json,sys; print(*[p.get("nodePort",0) for p in json.loads(sys.argv[1])["spec"]["ports"]])' "$NP")
 [ "$P1" = 31443 ] || fail "np's own nodePort was not kept: $NP"
 [ "$P0" -ge 30000 ] && [ "$P0" -le 32767 ] && [ "$P0" != 31443 ] || fail "np's port 80 was given no nodePort in range: $NP"
-read -r LP LIP < <(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); print(o["spec"]["ports"][0].get("nodePort",0), (o.get("status",{}).get("loadBalancer",{}).get("ingress") or [{}])[0].get("ip",""))' "$LB")
-[ "$LIP" = 10.250.0.1 ] || fail "lb was given no address of the pool: $LB"
+read -r LP SIP < <(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); print(o["spec"]["ports"][0].get("nodePort",0), (o.get("status",{}).get("loadBalancer",{}).get("ingress") or [{}])[0].get("ip","-"))' "$LB")
+# The address is recorded by Service (/lb-addr/), never in its status: that
+# is the VIP's readiness to say (wormhole.plan wh_status), and no Wormhole
+# VIP runs here.
+LIP="$(np_last /lb-addr/default/lb)"; LIP="${LIP#ip=}"
+[ "$LIP" = 10.250.0.1 ] || fail "lb was given no address of the pool: /lb-addr/default/lb = '$(np_last /lb-addr/default/lb)'"
+[ "$SIP" = "-" ] || fail "svc_alloc wrote status.loadBalancer ($SIP): the status is gated on the VIP"
 [ "$LP" -ge 30000 ] && [ "$LP" != "$P0" ] && [ "$LP" != 31443 ] || fail "lb's nodePort collides or is missing: $LB"
 for c in "/ipam/nodeport/$P0=default/np" "/ipam/nodeport/31443=default/np" "/ipam/nodeport/$LP=default/lb" "/ipam/lb/$(python3 -c 'print(int.from_bytes(bytes([10,250,0,1]),"big"))')=default/lb"; do
   [ "$(np_last "${c%%=*}")" = "${c#*=}" ] || fail "claim ${c%%=*} = '$(np_last "${c%%=*}")', want ${c#*=}"
 done
-echo "   np: nodePorts $P0 (allocated), 31443 (its own); lb: nodePort $LP, ingress $LIP; each claimed under /ipam/"
+echo "   np: nodePorts $P0 (allocated), 31443 (its own); lb: nodePort $LP, address $LIP (/lb-addr/, its status untouched); each claimed under /ipam/"
 RS="$(cat "$D/np/proxy.nft")"
 for r in "ip daddr 192.0.2.10 tcp dport $P0 dnat to 10.0.0.7:8080" "ip daddr 192.0.2.10 tcp dport 31443 dnat to 10.0.0.7:8443" \
          "ip daddr 10.250.0.1 tcp dport 80 dnat to 10.0.0.8:8080" "ip daddr 192.0.2.10 tcp dport $LP dnat to 10.0.0.8:8080"; do
@@ -150,7 +157,7 @@ np_kernel_check proxy
 np_put "/services/default/np" '{"metadata":{"name":"np","namespace":"default"},"spec":{"clusterIP":"10.96.0.50","ports":[{"port":80,"targetPort":8080}]}}'
 np_put "/services/default/lb" "-DELETE-"
 np_run 6
-for c in "/ipam/nodeport/$P0" /ipam/nodeport/31443 "/ipam/nodeport/$LP"; do
+for c in "/ipam/nodeport/$P0" /ipam/nodeport/31443 "/ipam/nodeport/$LP" /lb-addr/default/lb "/ipam/lb/$(python3 -c 'print(int.from_bytes(bytes([10,250,0,1]),"big"))')"; do
   [ -z "$(np_last "$c")" ] || fail "$c was not released"
 done
 RS="$(cat "$D/np/proxy.nft")"
@@ -160,14 +167,14 @@ echo "   np made a ClusterIP Service, lb deleted: their ports and address releas
 echo "== 7. traffic policies Local: only this node's backends; the client's address kept =="
 # node-a is this node (node_name). loc's two backends: l-1 here, l-2 on node-b.
 np_put "/services/default/loc" '{"metadata":{"name":"loc","namespace":"default"},"spec":{"type":"NodePort","clusterIP":"10.96.0.70","externalTrafficPolicy":"Local","internalTrafficPolicy":"Local","ports":[{"port":80,"targetPort":8080,"nodePort":31080}]}}'
-np_put "/endpointslices/default/loc/l-1" "10.0.0.9"
-np_put "/endpointslices/default/loc/l-2" "10.0.0.10"
+np_put "/endpointslices/default/loc/l-1" "ip=10.0.0.9;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpointslices/default/loc/l-2" "ip=10.0.0.10;state=ready;zone=;node=;gen=1;af=4;uid="
 np_put "/pods/default/l-1" '{"metadata":{"name":"l-1"},"spec":{"nodeName":"node-a","containers":[{"name":"c"}]}}'
 np_put "/pods/default/l-2" '{"metadata":{"name":"l-2"},"spec":{"nodeName":"node-b","containers":[{"name":"c"}]}}'
 # clu: the same backends, Cluster: both, from any node.
 np_put "/services/default/clu" '{"metadata":{"name":"clu","namespace":"default"},"spec":{"type":"NodePort","clusterIP":"10.96.0.71","ports":[{"port":80,"targetPort":8080,"nodePort":31081}]}}'
-np_put "/endpointslices/default/clu/l-1" "10.0.0.9"
-np_put "/endpointslices/default/clu/l-2" "10.0.0.10"
+np_put "/endpointslices/default/clu/l-1" "ip=10.0.0.9;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpointslices/default/clu/l-2" "ip=10.0.0.10;state=ready;zone=;node=;gen=1;af=4;uid="
 np_run 6
 [ "$(np_last /np-rows/proxy/default/loc/l-2)" = "kind=dnat;vip=10.96.0.70;vports=80;tports=8080;protos=-;backend=10.0.0.10;pnames=;pnums=;nports=31080;lbip=;node=node-b;etp=Local;itp=Local" ] \
   || fail "loc row: '$(np_last /np-rows/proxy/default/loc/l-2)'"

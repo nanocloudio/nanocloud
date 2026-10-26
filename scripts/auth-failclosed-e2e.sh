@@ -6,8 +6,8 @@
 # is safe only because Chronicle never lets an ABSENT field read as 0: absence
 # is a type error that fails the decision (and a decoder cannot synthesize a
 # value for input that is not there — chronicle docs/conformance.md). This
-# pins it on the two decisions that read the verdict — apiplane_auth.uproc
-# `decide` and apiplane.uproc `authz` — through `chronicle decide`, the
+# pins it on the two decisions that read the verdict — apiplane_auth.plan
+# `decide` and apiplane.plan `authz` — through `chronicle decide`, the
 # decision module's own evaluation path:
 #   absent   -> the decision fails (no outcome: nothing is answered)
 #   refusal  -> a refusal (401/503), never 200 and never a probe
@@ -19,8 +19,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 fail() { echo "FAIL: $1"; exit 1; }
 
-DECIDE="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.uproc" decide)"
-AUTHZ="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane.uproc" authz)"
+DECIDE="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_auth.plan" decide)"
+AUTHZ="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane.plan" authz)"
 [ -n "$DECIDE" ] && [ -n "$AUTHZ" ] || fail "the auth decisions did not compile"
 
 # frame <num>:<i|s|x|m>:<value> ...  -> a Chronicle record frame, hex

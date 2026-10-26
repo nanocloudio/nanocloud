@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # A node registers itself and keeps its lease, and the control plane takes a
 # node that stops renewing out of service; chains from
-# modules/app/_chronicle/node_lease.uproc, readiness projected by
-# daemonset.uproc `rdy` as in the control plane.
+# modules/app/_chronicle/node_lease.plan, readiness projected by
+# daemonset.plan `rdy` as in the control plane.
 #
 #   renew  (node)   /nodes/<self>: absent or due -> ready, heartbeat now
 #   seen   (plane)  /nodes/ -> /node-seen/<node> rev, at (the plane's clock)
@@ -75,10 +75,10 @@ print(n)
 PY
 }
 
-DEC_RENEW="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.uproc" renew_p)"
-DEC_SEEN="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.uproc" seen_p)"
-DEC_STALE="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.uproc" stale_p)"
-DEC_RDY="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.uproc" rdy)"
+DEC_RENEW="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.plan" renew_p)"
+DEC_SEEN="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.plan" seen_p)"
+DEC_STALE="$(nc_decision "$ROOT/modules/app/_chronicle/node_lease.plan" stale_p)"
+DEC_RDY="$(nc_decision "$ROOT/modules/app/_chronicle/daemonset.plan" rdy)"
 for v in "$DEC_RENEW" "$DEC_SEEN" "$DEC_STALE" "$DEC_RDY"; do
   [ -n "$v" ] || { echo "FAIL: a decision did not compile"; exit 1; }
 done

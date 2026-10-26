@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live E2E: ResourceQuota as Kubernetes enforces it, driven with kubectl
-# against the packaged control plane (quota.uproc keeps the usage;
-# admission_k8s.uproc `ad_q` refuses what would exceed it).
+# against the packaged control plane (quota.plan keeps the usage;
+# admission_k8s.plan `ad_q` refuses what would exceed it).
 #
 #   1. `kubectl create quota` -> status.hard, and status.used kept current
 #   2. pods within pods / requests / limits are admitted; the one past them

@@ -2,7 +2,7 @@
 # Anonymous access is a DEPLOYMENT CHOICE, and this proves both halves of it.
 #
 # The shipped graph answers 401 to a request with no credential. Adding the
-# `anon` node — one decision, from modules/app/_chronicle/apiplane_anon.uproc —
+# `anon` node — one decision, from modules/app/_chronicle/apiplane_anon.plan —
 # maps that request to `system:anonymous` and lets RBAC decide. The node is
 # absent from the shipped graph on purpose: flipping who can reach the API
 # should be visible in the file, not inherited from a default.
@@ -127,8 +127,8 @@ case "${R#*|}" in *'"reason":"Unauthorized"'*) ;; *) fail "shipped body: ${R#*|}
 echo "   GET /pods/default/web-0 (no credential) -> 401 'no usable credential'"
 
 echo "== 3. the SAME graph plus the `anon` node admits it, and RBAC decides =="
-ANON="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_anon.uproc" anon)"
-[ -n "$ANON" ] || { echo "FAIL: apiplane_anon.uproc did not compile"; exit 1; }
+ANON="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_anon.plan" anon)"
+[ -n "$ANON" ] || { echo "FAIL: apiplane_anon.plan did not compile"; exit 1; }
 python3 - "$D/shipped.yaml" "$D/anon.yaml" "$ANON" <<'PY'
 import sys
 src, dst, param = sys.argv[1], sys.argv[2], sys.argv[3]

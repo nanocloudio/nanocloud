@@ -11,20 +11,20 @@ material, share envelopes or attachment bundles.
 
 | Source | Holds |
 |---|---|
-| `modules/app/_chronicle/volume_provision.uproc` | PVC + StorageClass → provision record → provision steps |
-| `modules/app/_chronicle/volume_attach.uproc` | attach steps, renewal |
-| `modules/app/_chronicle/volume_attach_epoch.uproc` | an attachment's second key epoch; the clone device guard |
-| `modules/app/_chronicle/volume_detach.uproc` | ordered teardown: detach, crypto-erase, and every failure cleanup |
-| `modules/app/_chronicle/volume_effect.uproc` | the typed-effect seam of provision, attach and detach: `act` (phase → request) and `record` (outcome → record) |
-| `modules/app/_chronicle/volume_key_effect.uproc` | the seam of grant, rotation, the second epoch and crypto-erase |
-| `modules/app/_chronicle/volume_data_effect.uproc` | the seam of snapshot, recovery and deletion |
-| `modules/app/_chronicle/volume_grant.uproc` | grant rotation, device replacement, revocation |
-| `modules/app/_chronicle/volume_rotate.uproc` | data-key rotation: `vt_prepare`, `vt_migrate` |
-| `modules/app/_chronicle/volume_snapshot.uproc` | snapshot, retention and restore into a clone |
-| `modules/app/_chronicle/volume_recovery.uproc` | recovery-authority use: `vr_recover`, `vr_unwind` |
-| `modules/app/_chronicle/volume_delete.uproc` | secure deletion (`ve_step`) and retention expiry (`ve_retain`) |
-| `modules/app/_chronicle/volume_claim.uproc` | the device claim form and the mount effect |
-| `modules/app/_chronicle/volume.uproc` | unchanged: a claim's `path=` → `/volume-binds/<uid>/<i>` |
+| `modules/app/_chronicle/volume_provision.plan` | PVC + StorageClass → provision record → provision steps |
+| `modules/app/_chronicle/volume_attach.plan` | attach steps, renewal |
+| `modules/app/_chronicle/volume_attach_epoch.plan` | an attachment's second key epoch; the clone device guard |
+| `modules/app/_chronicle/volume_detach.plan` | ordered teardown: detach, crypto-erase, and every failure cleanup |
+| `modules/app/_chronicle/volume_effect.plan` | the typed-effect seam of provision, attach and detach: `act` (phase → request) and `record` (outcome → record) |
+| `modules/app/_chronicle/volume_key_effect.plan` | the seam of grant, rotation, the second epoch and crypto-erase |
+| `modules/app/_chronicle/volume_data_effect.plan` | the seam of snapshot, recovery and deletion |
+| `modules/app/_chronicle/volume_grant.plan` | grant rotation, device replacement, revocation |
+| `modules/app/_chronicle/volume_rotate.plan` | data-key rotation: `vt_prepare`, `vt_migrate` |
+| `modules/app/_chronicle/volume_snapshot.plan` | snapshot, retention and restore into a clone |
+| `modules/app/_chronicle/volume_recovery.plan` | recovery-authority use: `vr_recover`, `vr_unwind` |
+| `modules/app/_chronicle/volume_delete.plan` | secure deletion (`ve_step`) and retention expiry (`ve_retain`) |
+| `modules/app/_chronicle/volume_claim.plan` | the device claim form and the mount effect |
+| `modules/app/_chronicle/volume.plan` | unchanged: a claim's `path=` → `/volume-binds/<uid>/<i>` |
 
 ## Claims
 
@@ -45,7 +45,7 @@ filesystem. The mount effect adds its own fields to a device claim:
 | `path` | the same directory, present only while mounted |
 | `code`, `at` | the last exit status; when the state was entered |
 
-`volume.uproc` reads `path` alone, so the bind step never learns whether a
+`volume.plan` reads `path` alone, so the bind step never learns whether a
 claim is a directory or an encrypted device. A device claim without `path`
 yields no bind row, and the pod's sandbox waits.
 
@@ -53,7 +53,7 @@ Validation, in order:
 
 | Claim | Result |
 |---|---|
-| no `device`, no `fs` | a path claim: left to `volume.uproc` |
+| no `device`, no `fs` | a path claim: left to `volume.plan` |
 | `fs` without `device` | `invalid` |
 | `fs` other than `ext4` or `xfs` | `invalid` |
 | `device` ≠ the `dev` the attachment record published | `refused`, looked at again once they match |
@@ -163,7 +163,7 @@ grant names, it is refused `shared_key_device` before anything is acquired.
 | `recipient` | `RECIPIENT` | crypt_block announced its fresh FXRK recipient key |
 | `releasing` | `KAGI_RELEASE` | Kagi's attachment release, against the node's proof over recipient, volume, fence and nonce; `exp` is the handle expiry. The FXSB bundle stays with the effector. |
 | `unlocking` | `BUNDLE_DELIVER` | the bundle on crypt_block's `bundle` port; `ready` once it rebuilt its key. A bundle for another recipient or volume is `eacces`; one for an epoch the container has already retired is `stale`. |
-| `e_recipient` · `e_releasing` · `e_unlocking` | `CB_RECIPIENT` · `KAGI_RELEASE` · `CB_BUNDLE` | only with `next` set (`volume_attach_epoch.uproc`): the second epoch's recipient, release and bundle, so the container holds every key its units use before anything is published |
+| `e_recipient` · `e_releasing` · `e_unlocking` | `CB_RECIPIENT` · `KAGI_RELEASE` · `CB_BUNDLE` | only with `next` set (`volume_attach_epoch.plan`): the second epoch's recipient, release and bundle, so the container holds every key its units use before anything is published |
 | `publishing` | `NBD_START` | nbd_serve over crypt_block, attached as `dev` |
 | `claiming` | `CLAIM_PUT` | `device=<dev>;fs=<fs>[;mkfs=1]` |
 | `mounting` | the mount effect | `mounted`; any failed state becomes `reason=mount:<state>` |
@@ -224,7 +224,7 @@ attaches it again.
 
 ## Grant rotation and device replacement
 
-`volume_grant.uproc`. None of these rewrites data: the key stays, and only
+`volume_grant.plan`. None of these rewrites data: the key stays, and only
 which device may be issued a fresh bundle changes.
 
 | op | Steps |
@@ -239,7 +239,7 @@ is Kagi first, then the detach order. A clone is refused `shared_key`.
 
 ## Data-key rotation
 
-`volume_rotate.uproc`, one record through the design's persisted state
+`volume_rotate.plan`, one record through the design's persisted state
 machine. `vt_prepare` owns the phases up to PREPARED and `vt_migrate` the
 rest; the two never both write.
 
@@ -278,7 +278,7 @@ recovery set is unrecorded).
 
 ## Snapshot and restore
 
-`volume_snapshot.uproc`, one record per snapshot, keyed
+`volume_snapshot.plan`, one record per snapshot, keyed
 `<ns>/<pvc>/<snap>`; related records are read at the key's parent.
 
 | Phase | Effect | |
@@ -297,7 +297,7 @@ snapshot. Snapshots are crash-consistent: the filesystem is not frozen.
 
 ## Recovery authority
 
-`volume_recovery.uproc`. Admission, before anything runs: an `actor` and a
+`volume_recovery.plan`. Admission, before anything runs: an `actor` and a
 different `approver`; the volume itself, not a clone; no rotation in flight
 (a ticket names one epoch); nothing attached; a `device` other than the one
 the grant names; a `ttl` of 1 … 3600 s.
@@ -317,7 +317,7 @@ accepted again.
 
 ## Secure deletion and retention
 
-`volume_delete.uproc`.
+`volume_delete.plan`.
 
 | Phase | Effect |
 |---|---|
@@ -357,8 +357,8 @@ The outcome is `1 cid · 2 op · 3 key · 4 code · 5 fence · 6 lease_exp · 7 
 · 8 inst · 9 dev · 10 vol · 11 set · 12 grant · 254 carry`. Codes are `ok`,
 `ready`, `held`, `lost`, `refused`, `eacces`, `failed` and `unavailable`.
 
-The key and data seams add these (`volume_key_effect.uproc`,
-`volume_data_effect.uproc`); their outcome appends `13 n · 14 r1 · 15 r2 ·
+The key and data seams add these (`volume_key_effect.plan`,
+`volume_data_effect.plan`); their outcome appends `13 n · 14 r1 · 15 r2 ·
 16 r3`, and codes add `stale`, `custodians`, `fence_changed`, `expired` and
 `conflict`:
 
@@ -408,7 +408,7 @@ the snapshot, recovery and deletion chains `vl_act`. A snapshot's related
 records are its key's parent (`/volume-attachments/^1`, …); rotation reads the
 attachment's `fence#` as an integer. The record effects (ops 40-44, 62-64,
 66, 70, 75, 77, 83) are not an effector module but a chain on the effect bus,
-`volume_records.uproc`:
+`volume_records.plan`:
 
 ```text
 effect → store_effect vw_s1 → store_effect vw_s2 → store_effect vw_s3

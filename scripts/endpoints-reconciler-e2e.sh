@@ -15,7 +15,7 @@
 # Compact format:
 #   /services/<ns>/<name>  = "sel=k=v,k=v"
 #   /pods/<ns>/<name>      = "ip=<addr>;l=k=v,k=v;r=0|1"
-#   /endpoints/<ns>/<name> = "<pod>=<addr>,<pod>=<addr>"
+#   /endpoints/<ns>/<name> = "<pod>=ip=<addr>;state=ready;…,…" (endpoints_doc.plan)
 #
 # Two phases prove durable reconcile: phase A seeds services + pods (web-2 NOT
 # ready) and checks the projection; phase B appends web-2's readiness flip to the
@@ -103,10 +103,10 @@ run_runtime
 
 WEB="$(store_last /endpoints/default/web)"
 API="$(store_last /endpoints/default/api)"
-[ "$WEB" = "web-1=10.0.0.1" ] \
-  || fail "phase A web endpoints wrong: got '$WEB', want 'web-1=10.0.0.1' (web-2 not ready)"
-[ "$API" = "api-1=10.0.0.3" ] \
-  || fail "phase A api endpoints wrong: got '$API', want 'api-1=10.0.0.3' (db-1 must not match; multi-label selector)"
+[ "$WEB" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
+  || fail "phase A web endpoints wrong: got '$WEB', want web-1's ready slice (web-2 not ready)"
+[ "$API" = "api-1=ip=10.0.0.3;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
+  || fail "phase A api endpoints wrong: got '$API', want api-1's ready slice (db-1 must not match; multi-label selector)"
 echo "   web: $WEB"
 echo "   api: $API"
 
@@ -115,8 +115,8 @@ store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"we
 run_runtime
 
 WEB2="$(store_last /endpoints/default/web)"
-[ "$WEB2" = "web-1=10.0.0.1,web-2=10.0.0.2" ] \
-  || fail "phase B web endpoints wrong: got '$WEB2', want 'web-1=10.0.0.1,web-2=10.0.0.2' (readiness flip included)"
+[ "$WEB2" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000,web-2=ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
+  || fail "phase B web endpoints wrong: got '$WEB2', want both ready slices (readiness flip included)"
 echo "   web: $WEB2"
 
 echo "== E2E green: selector-matched endpoints over the fluxor-native store =="

@@ -2,7 +2,7 @@
 #
 # Real rbac.authorization.k8s.io/v1 objects, written straight into a store log
 # (the same wire the store writes), and a settle step that runs a graph until
-# the grant index (rbac_*.uproc) holds — or no longer holds — given keys.
+# the grant index (rbac_*.plan) holds — or no longer holds — given keys.
 #
 #   rbac_clusterrole <log> <name> <verbs,…> <resources,…> [resourceNames,…]
 #   rbac_role        <log> <ns> <name> <verbs,…> <resources,…>

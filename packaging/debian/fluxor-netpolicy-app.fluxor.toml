@@ -2,7 +2,7 @@
 # publishes it into the node's OCI store, so `netpolicy:1.0.0` resolves offline.
 # Portless — the chains and net_apply drive the store and net.policy providers
 # via provider_call, not a socket. The graph (linux.yaml, staged beside this
-# file) is packaging/debian/fluxor-netpolicy.yaml: netpolicy.uproc params plus
+# file) is packaging/debian/fluxor-netpolicy.yaml: netpolicy.plan params plus
 # net_apply.
 [workload]
 name = "netpolicy"

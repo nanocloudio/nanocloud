@@ -121,14 +121,14 @@ for m in ("fetch", "fetch_tls", "im_req", "im_q", "im_ans", "im_tag", "im_as1", 
     assert re.search(rf"^  - name: {m}$", g, re.M), f"{m} is not in the worker's graph"
 # Every key the image chain writes or reads, from its sources.
 keys = set()
-for f in glob.glob(f"{root}/modules/app/_chronicle/image*.uproc") + [f"{root}/modules/app/_chronicle/pod_image.uproc"]:
+for f in glob.glob(f"{root}/modules/app/_chronicle/image*.plan") + [f"{root}/modules/app/_chronicle/pod_image.plan"]:
     keys |= set(re.findall(r'key: "(/[a-z-]+/)', open(f).read()))
 keys |= {"/image-blobs/", "/image-fetch-q/", "/image-digests/", "/image-requests/", "/image-manifests/",
          "/image-config/", "/image-index/", "/image-layer-ok/", "/image-rootfs/", "/sandboxes/"}
 # A Pod's events are the plane's to serve: written unscoped on purpose.
 keys.discard("/events/")
 # A Pod and its ServiceAccount are the cluster's: READ for its pull
-# credentials (image_auth.uproc), never written.
+# credentials (image_auth.plan), never written.
 keys -= {"/pods/", "/serviceaccounts/"}
 unscoped = [k for k in sorted(keys) if not any(k.startswith(p) for p in scoped)]
 assert not unscoped, f"image records the worker's store does not scope: {unscoped}"

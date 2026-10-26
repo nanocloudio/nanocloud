@@ -18,7 +18,7 @@ modules:
     join_scoped: 1
   - name: ns_collect
     type: store_effect
-    # chronicle-source: modules/app/_chronicle/namespace.uproc sw
+    # chronicle-source: modules/app/_chronicle/namespace.plan sw
     decision: {hex: "0105000000170001000204000000120b005465726d696e6174696e6720000900000027000100020100000040010000001004000000000000004002000000010002180000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"}
   - name: ns_source
     type: store_source
@@ -29,7 +29,7 @@ modules:
     watch: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
   - name: ns_remove
     type: store_effect
-    # chronicle-source: modules/app/_chronicle/namespace.uproc fin
+    # chronicle-source: modules/app/_chronicle/namespace.plan fin
     decision: {hex: "010a000000290001000204000000120b005465726d696e6174696e6720010002160000001000000000000000002030000900000027000100020100000040010000001004000000000000004002000000010002030000004003000000410800000023000100020100000040010000001000000000000000004002000000120000400300000041"}
     key_prefix: "/namespaces/"
   # The node plane is NOT here: it is a node's (the kubelet's chains and
@@ -40,7 +40,7 @@ modules:
   # measured from the Pods themselves at pick time — PATCHes spec.nodeName;
   # one bind per pass, the spread emergent. Then the Scheduled event. Reads
   # /ready-nodes/ from the DaemonSet chain's projection. Params from
-  # modules/app/_chronicle/scheduler.uproc.
+  # modules/app/_chronicle/scheduler.plan.
 
 wiring:
   - from: ns_objects.record_out

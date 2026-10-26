@@ -1,0 +1,96 @@
+name = "wormhole_emit"
+version = "0.1.0"
+description = "Wormhole intent rows → Wormhole's v1 route, endpoint and manifest records, one sealed generation at a time, activated by compare-and-swap"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The Wormhole projection's effect half (rfc_lb_vip §6.1), as `net_apply` is
+# the proxy's: the ONE writer of `/wh/` and `/wh-status/`.
+#
+# The chains decide what a Service and its endpoints mean to Wormhole, as flat
+# rows (`wormhole.plan`): `/wh-intent/<ns>/<svc>` (the Service: listeners,
+# ports, families, traffic policies, affinity, source ranges; only a Service
+# whose loadBalancerClass is unset or `wormhole.nanocloud.io/lb`) and
+# `/wh-intent-ep/<ns>/<svc>/<pod>` (each endpoint: the EndpointSlice row with
+# its state, zone, node, generation and family), and — when the
+# failure-domain controller or an operator set one — the Service's traffic
+# dial at `/wh-dial/<ns>/<svc>` (one WHR1 TrafficDial record, folded into
+# every generation). This module does what the VM
+# cannot: derive the 128-bit identities, encode Wormhole's binary records with
+# Wormhole's own codecs (`target/fluxor/wormhole-common/traffic/`, through
+# `_shared/wormhole_traffic.rs`), and publish them in the §9.5 order. The
+# records, the key layout and the identities are `_shared/whemit.rs`'s, and
+# docs/architecture/wormhole-projection.md says them for Wormhole.
+#
+# One generation `g` of a Service, under `/wh/<tenant hex>/<service hex>/gen/<g>/`:
+#   r<i>-<4|6>/ep/<endpoint hex>   EndpointRecord, per (route, endpoint)
+#   r<i>-<4|6>/manifest            EndpointManifest
+#   policy, admission              normalized locality/affinity; source ranges
+#   dial                           the Service's TrafficDial, when it has one
+#   r<i>-<4|6>/route               RouteRecord, per (Service port, family)
+#   seal                           count and digest of the rest, key order
+# written in that order, then `/wh/<t>/<s>/active` advanced by a PUT
+# conditional on the revision it read (absent: the absent precondition):
+#   gen=<g>;intent=<hex>;seal=<hex>;records=<n>;routes=<r>;svc=<ns>/<name>
+# A generation number is the active pointer's plus one and is never reused
+# once active: a publisher that loses the compare-and-swap removes what it
+# staged and stages after the winner. A Service whose intent row is gone is
+# withdrawn the same way (the next generation, empty, `withdrawn=1`): the
+# pointer is kept so a Service that returns continues its sequence.
+#
+# Status, put-if-changed, per Service: `/wh-status/<ns>/<svc>` =
+#   gen=<g>;written=<records>;routes=<r>;endpoints=<e>   — active
+#   error=<name|malformed|too-many|buffer|write>         — not published
+#                                                          (the last good
+#                                                          generation stands)
+# and it is also this module's index of what it has published: the
+# withdrawal walks it.
+#
+# Garbage: after an activation, every generation but the active one and the
+# one before it (the flows pinned to it, §9.3) is deleted; an abandoned
+# staging (its intent moved, or it lost a race) is deleted before the next.
+#
+# One store write at a time, as every writer here: a write the store answers
+# EINPROGRESS is asked again next step with the same bytes, which the record
+# set rebuilds identically from the same intent; at most WRITE_BUDGET records
+# a step, so a large Service does not hold a step. A read answered EAGAIN
+# runs the pass again; a refused one, POLL_MS later.
+#
+# A scan waits SETTLE_MS (250 ms) past the last ring, so a burst of rows (a
+# Service and its endpoints, arriving together) becomes one generation.
+#
+# No parameters.
+# Reads the clock for that quiet period, and to look again when a
+# subscription was refused or a pass failed.
+timer_class = "wall_clock"
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# The three subscriptions (/wh-intent/, /wh-intent-ep/, /wh-dial/) ring the
+# module's one kernel event: the store writes no
+# channel of this module's.
+[[resources]]
+requires_contract = "event"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one store action per change, observed through `/wh-status/` and the records it writes"
+
+# Store subscriptions an instance opens: /wh-intent/ and /wh-intent-ep/, its
+# inputs (never /wh/, its output), on one kernel event.
+[capacities]
+store_subscriptions = 2
+store_subscribers = 1

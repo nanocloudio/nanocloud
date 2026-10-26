@@ -35,6 +35,13 @@ loam = "0.0.1"
 # each node (a learner) hold the same store, and a node's writes are decided
 # by the control plane.
 clustor = "0.0.1"
+# wormhole owns traffic: load balancing, virtual IPs and their authority
+# (its rfc_lb_vip). nanocloud projects Kubernetes Services into it rather
+# than restating its records: `wormhole_emit` and `wormhole_status` compile
+# its published `wormhole-common` traffic cores (the v1 route, endpoint,
+# manifest and VIP-binding codecs) through `_shared/wormhole_traffic.rs`,
+# and write the records Wormhole's controllers read.
+wormhole = "0.0.1"
 
 # Bundles the e2e scripts run by name, which no graph names: loam's admin
 # plane (`fluxor run loam-admin`, scripts/support/loam-admin.sh) and its

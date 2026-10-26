@@ -1,0 +1,43 @@
+name = "wormhole_dns"
+version = "0.1.0"
+description = "Kagi-signed service_dns projections → one /wh-dns/ row per Service, the rows cluster_dns answers from"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The write half of `service_dns` (rfc_lb_vip §13.6, §22): the ONE writer of
+# `/wh-dns/`.
+#
+# The deployment's Kagi signer signs the region controller's 224-byte
+# projection (its `manifest_out` 0xB6) verbatim inside a `KSDN` record and
+# hands it on `ksdn_in`, framed `[len u16 LE][KSDN record]`. Each record is
+# opened with Kagi's own codec under the `SERVICE_DNS` key (`dns_issuer`,
+# `dns_kid`, `dns_public`: Ed25519, 64 hex), its projection decoded with
+# Wormhole's codec, and written verbatim at
+#   /wh-dns/<service hex>
+# the Service's Wormhole identity — only when it is newer (a later global
+# generation, or the same and a later projection generation) than the row
+# holds; an older or equal one is left, a record that does not open is
+# refused and counted. `cluster_dns` answers from these rows
+# (`_shared/whdns.rs`), checking each again at query time (expiry, the
+# newest generation it answered, healthy regions). One write at a time; a
+# refused write is asked again after `retry_ms`.
+#
+# Params: `dns_issuer`, `dns_kid` (strings), `dns_public` (64 hex),
+# `retry_ms` (default 1000).
+timer_class = "wall_clock"
+
+[[ports]]
+name = "ksdn_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+exempt = "control-plane projection — one store write per newer projection, observed through `/wh-dns/` and the answers cluster_dns gives"

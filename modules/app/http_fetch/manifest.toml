@@ -8,7 +8,7 @@ hardware_targets = ["bcm2712", "linux"]
 
 # `store_effect`'s role for a remote HTTP origin: a registry, an artifact
 # server. The chain decides WHAT to fetch (params — the OCI distribution API is
-# `image.uproc`); this carries one GET at a time over its net pair (through
+# `image.plan`); this carries one GET at a time over its net pair (through
 # `tls` in client mode, or straight to `linux_net`) and hands back what the
 # chain asked of the answer. It knows no API: the path, the Accept header, the
 # file name, the digest and the JSON members to read are the record's.
@@ -58,7 +58,7 @@ hardware_targets = ["bcm2712", "linux"]
 # origin has answered some of the request (a transfer cut off mid-way resumes
 # from what it has), two while it has answered nothing at all — an origin
 # that is not there is the chain's to back off from (an image pull's
-# ImagePullBackOff, image_back.uproc), not this connector's to wait out while
+# ImagePullBackOff, image_back.plan), not this connector's to wait out while
 # every request behind it waits too. An HTTP answer is final and goes
 # straight back.
 timer_class = "wall_clock"

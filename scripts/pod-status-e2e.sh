@@ -2,16 +2,16 @@
 # Live E2E: a Pod's status, as its node reports it, becomes the Pod object's
 # status as Kubernetes states it — and what every client reads from it.
 #
-# The node's status chain (pod_report.uproc) reports under /podstatus/<uid>,
+# The node's status chain (pod_report.plan) reports under /podstatus/<uid>,
 # a prefix the node does not scope, so the record lands in the plane's store
-# as written; pod_status.uproc writes it onto the Pod: phase, startTime,
+# as written; pod_status.plan writes it onto the Pod: phase, startTime,
 # hostIP/podIP (the node's InternalIP — the Pod shares its network), the
 # conditions PodScheduled, Initialized, ContainersReady and Ready with their
 # lastTransitionTime, and containerStatuses[0] (name, image, imageID, ready,
 # started, restartCount, state, lastState) — only when the Pod there is the
 # record's, by uid: records an earlier incarnation of a name left behind
 # patch nothing. The ReplicaSet and Deployment count Ready Pods
-# (replicaset_status.uproc, deployment_status.uproc).
+# (replicaset_status.plan, deployment_status.plan).
 #
 # Runs on one store: the first run creates the Pods through the API; between
 # runs the node's reports are appended to the plane's durable log, as a
@@ -93,7 +93,7 @@ store_put "/authn-keys/sa" "$(cat "$D/keyframe.hex")"
 rbac_clusterrole "$STORE/store.log" admin "*" "*"
 rbac_crb "$STORE/store.log" admins admin ServiceAccount admin default
 put_text "/namespaces/default" '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}'
-# The node advertises its address, as its lease writes it (node_lease.uproc):
+# The node advertises its address, as its lease writes it (node_lease.plan):
 # the hostIP of the Pods it runs.
 put_text "/nodes/node-1" '{"apiVersion":"v1","kind":"Node","metadata":{"name":"node-1"},"status":{"ready":true,"addresses":[{"type":"InternalIP","address":"10.0.0.9"},{"type":"Hostname","address":"node-1"}],"conditions":[{"type":"Ready","status":"True"}]}}'
 
@@ -240,7 +240,7 @@ boot2() { # restart the runtime over the same store
   done
   fail "no API after the restart: ${r:0:200}"
 }
-# The node's report (pod_report.uproc), keyed by the Pod's uid; its moments
+# The node's report (pod_report.plan), keyed by the Pod's uid; its moments
 # are the node's wall clock in Unix ms.
 T0=1760000000000; TR=1760000005000; TRDY=1760000006000; LTR=1760000001000; LTF=1760000004000
 DIG=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

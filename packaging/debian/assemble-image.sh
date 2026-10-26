@@ -2,7 +2,7 @@
 # assemble-image.sh <rootfs-dir> <blob-dir> <layer-hex64>...
 #
 # The rootfs-assembly EFFECT (container backend), run as a host workload: the
-# assembly job image_asm.uproc projects (/sandboxes/img-asm-<digest>) through
+# assembly job image_asm.plan projects (/sandboxes/img-asm-<digest>) through
 # the sandbox runtime. Extracts the digest-verified layer blobs (tar.gz, manifest
 # order) into the rootfs, applies OCI whiteouts, and populates the /dev nodes
 # a container entrypoint expects (best-effort — mknod needs root; a rootless
@@ -13,7 +13,7 @@
 #
 # Exit 65 (EX_DATAERR) says the CACHE is wrong — a layer missing, or not the
 # bytes its digest names (a cut write, a power cut, a disk): every layer is
-# checked before anything is extracted, and image_asm.uproc has the image's
+# checked before anything is extracted, and image_asm.plan has the image's
 # layers dropped and fetched again. Any other failure is the node's (a
 # rootfs it cannot write, a layer that is not a tar) and is retried with a
 # growing delay.

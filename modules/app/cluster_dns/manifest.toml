@@ -13,7 +13,9 @@ hardware_targets = ["bcm2712", "linux"]
 #       a Service with a ClusterIP: that address (`spec.clusterIP`);
 #       a headless one (`clusterIP: None`): the address of every ready
 #       backend, from its Endpoints document (`/endpoints/<ns>/<svc>`,
-#       "<pod>=<ip>,…", the endpoints chain's);
+#       "<pod>=ip=<ip>;state=<ready|serving|terminating>;…,…", the
+#       endpoints chain's; only a `ready` one answers — a draining
+#       endpoint takes no new flows);
 #       an ExternalName Service: a CNAME to `spec.externalName`, whatever
 #       the type asked;
 #       no such Service: NXDOMAIN
@@ -41,12 +43,26 @@ hardware_targets = ["bcm2712", "linux"]
 # address claimed in the Service pool (`/ipam/svc/<u32>`, create-only, owned
 # as the allocator owns one — never another Service's), its one endpoint
 # this resolver (`/endpointslices/kube-system/kube-dns/cluster-dns-<a-b-c-d>`
-# = `address`), and `/cluster-dns` is then the ClusterIP: every node's proxy
+# = `ip=<address>;state=ready;…`, the endpoints chain's slice form), and
+# `/cluster-dns` is then the ClusterIP: every node's proxy
 # translates it to this resolver, so a Pod on any node (and a workload that
 # reaches the cluster only through service translation) resolves through
 # it. Written once each, put-if-changed. When the address is another
 # Service's, nothing is published, `/cluster-dns` is `address`, and the log
 # says so.
+#
+# With the `SERVICE_DNS` key (`dns_issuer`, `dns_kid`, `dns_public`: Kagi's
+# profile key, Ed25519, the public half as 64 hex), a Service whose signed
+# `service_dns` projection is stored at `/wh-dns/<service hex>` (Kagi's
+# `KSDN` over Wormhole's region controller's 224-byte projection, the
+# Service's Wormhole identity) is answered from it: the record opened with
+# Kagi's own codec, checked by Wormhole's `dns_answers` (`_shared/whdns.rs`),
+# and its healthy regions' IPv4 addresses answered in the projection's
+# preference order at its TTL; a projection that is another Service's, older
+# than the newest global generation this resolver already answered, expired,
+# unsigned by the key or with no healthy region is refused — SERVFAIL, never
+# the store's local records in its place. A Service with no projection is
+# answered as above.
 #
 # A read the store answers EAGAIN holds the query and asks again on a later
 # step — never answered as absent.
