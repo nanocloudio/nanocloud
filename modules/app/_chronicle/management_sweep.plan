@@ -1,0 +1,99 @@
+// ManagementBinding sweeps as params (management.plan derives; these take
+// back what a binding no longer states):
+//
+//   wd      an enrollment offer (/enrollment-offers/<b>/<grant>/<uid>/<digest>)
+//           its binding no longer states — another grant, cell UID or
+//           digest, the binding deleting or gone — is CLAIMED: withdrawn and
+//           spent, as an enrollment leaves it, so a superseded grant can
+//           neither enroll nor be offered again
+//   gc      a gone binding's ClusterRoleBinding, ClusterRole and
+//           ServiceAccount, probed by their first ownerReference and
+//           collected (gc.plan `act`)
+plan nanocloud.management_sweep {
+
+  enum NOOP = 0;
+  enum GET = 1;
+  enum EXISTS = 2;
+  // store_effect CLAIM: a take that leaves the record, spent.
+  enum CLAIM = 22;
+
+  // ---- withdrawal: an offer its binding no longer states ----
+  // store_source over /enrollment-offers/ (watching the bindings): its key
+  // tail `<b>/<grant>/<uid>/<digest>`; the binding read for what it states.
+  message mb.OfferRow {
+    seq: int = 1;
+    key: string = 3;
+  }
+  message mb.BindingGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    offer: string = 30;
+  }
+  message mb.Stated {
+    cid: int = 1;
+    status: int = 2;
+    offer: string = 30;
+    grant: string = 40;     // spec.grant
+    cell: string = 41;      // spec.cellUID
+    digest: string = 42;    // spec.envelopeDigest
+    deleting: string = 43;  // metadata.deletionTimestamp
+  }
+  message mb.Withdraw {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+  decision d_wd_get(o: mb.OfferRow) -> mb.BindingGet {
+    when o.key.indexOf("/") <= 0 ->
+      mb.BindingGet { cid: o.seq, op: NOOP, key: "", offer: "" };
+    default ->
+      mb.BindingGet { cid: o.seq, op: GET, key: o.key.substring(0, o.key.indexOf("/")), offer: o.key };
+  }
+  // The offer its binding states now stands; any other is claimed — spent,
+  // as an enrollment would leave it, so it is neither presented nor made
+  // again (a claim of one already spent answers 404 and changes nothing).
+  // A read the store did not decide withdraws nothing.
+  decision d_wd(r: mb.Stated) -> mb.Withdraw {
+    when r.offer == "" || (r.status != 200 && r.status != 404) ->
+      mb.Withdraw { cid: r.cid, op: NOOP, key: "" };
+    when r.status == 200 && r.deleting == ""
+         && r.offer == r.offer.substring(0, r.offer.indexOf("/")) + "/" + r.grant + "/" + r.cell + "/" + r.digest ->
+      mb.Withdraw { cid: r.cid, op: NOOP, key: "" };
+    default ->
+      mb.Withdraw { cid: r.cid, op: CLAIM, key: "enrollment-offers/" + r.offer };
+  }
+
+  // ---- gc: a gone binding's ClusterRoleBinding, ClusterRole, ServiceAccount ----
+  // gc.plan `probe` names a namespaced owner (`<ns>/<owner>`); a binding is
+  // cluster-scoped, its key the owner's name alone. One decision for the
+  // three sweeps (their sources' prefixes differ); each owned object names
+  // the binding in its first ownerReference.
+  message mb.Owned {
+    seq: int = 1;
+    key: string = 3;     // the ClusterRoleBinding's name
+    owner: string = 4;   // metadata.ownerReferences.0.name
+    kind: string = 5;    // metadata.ownerReferences.0.kind
+  }
+  message mb.Probe {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    owned: string = 30;
+  }
+  decision d_ask(o: mb.Owned) -> mb.Probe {
+    when o.owner == "" || o.kind != "ManagementBinding" ->
+      mb.Probe { cid: o.seq, op: NOOP, key: "", owned: o.key };
+    default ->
+      mb.Probe { cid: o.seq, op: EXISTS, key: o.owner, owned: o.key };
+  }
+
+  pipeline mb_wd_get(o: mb.OfferRow) -> mb.BindingGet { call y = d_wd_get(o); return y; }
+  pipeline mb_wd(r: mb.Stated) -> mb.Withdraw { call y = d_wd(r); return y; }
+  pipeline mb_gc_ask(o: mb.Owned) -> mb.Probe { call y = d_ask(o); return y; }
+  entry mb_wd_get = mb_wd_get;
+  entry mb_wd = mb_wd;
+  entry mb_gc_ask = mb_gc_ask;
+
+  provenance revision "management-sweep" toolchain "chronicle-authoring";
+}

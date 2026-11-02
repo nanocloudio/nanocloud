@@ -5,8 +5,9 @@
 # <uid>~i<n>) — and a Pod deleted outright (its tomb under
 # index entry under /~tomb-at/pods/) into desired=deleted. Each lands in its node's scope,
 # /~node/<node>/pod-specs/<uid> (a worker's store names it /pod-specs/<uid>).
-# A container Pod's records are pod_resolve's (_shared/podres.rs), a
-# graph-backed Pod's and every tomb's modules/app/_chronicle/pod_specs.plan.
+# A scheduled Pod's records are pod_resolve's (_shared/podres.rs) — a
+# graph-backed Pod's (runtimeClassName: fluxor) one, its subgraph's, with its
+# environment and volumes — and every tomb's modules/app/_chronicle/pod_specs.plan.
 #
 #   spec   /pods/ (scheduled) -> /pod-specs/<uid>[~<container>]
 #          node image pull restart grace desired cmd args env workdir cpu mem
@@ -89,11 +90,8 @@ print(n)
 PY
 }
 
-DEC_SPEC="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.plan" spec_p)"
 DEC_GONE="$(nc_decision "$ROOT/modules/app/_chronicle/pod_specs.plan" gone_p)"
-for v in "$DEC_SPEC" "$DEC_GONE"; do
-  [ -n "$v" ] || { echo "FAIL: a pod_specs.plan entry did not compile"; exit 1; }
-done
+[ -n "$DEC_GONE" ] || { echo "FAIL: pod_specs.plan gone_p did not compile"; exit 1; }
 # The projection the control plane ships, not a copy of it.
 PS_PATHS="$(python3 - "$ROOT/packaging/debian/fluxor-controlplane.yaml" <<'PY'
 import re, sys
@@ -123,10 +121,6 @@ modules:
     type: store_source
     prefix: "/pods/"
     paths: "${PS_PATHS}"
-  - name: ps_spec
-    type: store_effect
-    decision: {hex: "${DEC_SPEC}"}
-    key_prefix: "/~node/"
   - name: ps_resolve
     type: pod_resolve
   - name: ps_rput
@@ -143,8 +137,6 @@ modules:
 wiring:
   - from: ps_pods.record_out
     to: ps_resolve.request_in
-  - from: ps_resolve.forward_out
-    to: ps_spec.request_in
   - from: ps_resolve.request_out
     to: ps_rput.request_in
   - from: ps_tombs.record_out
@@ -195,7 +187,7 @@ store_put "/pods/default/dflt" '{"metadata":{"name":"dflt","namespace":"default"
 # A Job's Pod keeps the policy its template must state.
 store_put "/pods/default/job-0" '{"metadata":{"name":"job-0","namespace":"default","uid":"uid-job","ownerReferences":[{"kind":"Job","name":"job"}]},"spec":{"nodeName":"node-a","restartPolicy":"Never","containers":[{"name":"c","image":"busybox:1.36","command":["true"]}]}}'
 # A graph-backed Pod defaults the same way and carries its limits.
-store_put "/pods/default/g" '{"metadata":{"name":"g","namespace":"default","uid":"uid-g"},"spec":{"nodeName":"node-a","runtimeClassName":"fluxor","containers":[{"name":"g","image":"probe","resources":{"limits":{"cpu":"100m","memory":"64Mi"}}}]}}'
+store_put "/pods/default/g" '{"metadata":{"name":"g","namespace":"default","uid":"uid-g"},"spec":{"nodeName":"node-a","runtimeClassName":"fluxor","containers":[{"name":"g","image":"probe","env":[{"name":"CELL","value":"c-1"},{"name":"NODE","valueFrom":{"fieldRef":{"fieldPath":"spec.nodeName"}}}],"volumeMounts":[{"name":"d","mountPath":"/data"}],"resources":{"limits":{"cpu":"100m","memory":"64Mi"}}}],"volumes":[{"name":"d","hostPath":{"path":"/srv/g"}}]}}'
 store_put "/pods/default/hnet" '{"metadata":{"name":"hnet","namespace":"default","uid":"uid-hnet"},"spec":{"nodeName":"node-a","hostNetwork":true,"runtimeClassName":"fluxor","containers":[{"name":"k","image":"nanocloud/kv:1"}]}}'
 store_put "/pods/default/wimg" '{"metadata":{"name":"wimg","namespace":"default","uid":"uid-wimg"},"spec":{"nodeName":"node-a","restartPolicy":"Never","runtimeClassName":"fluxor","containers":[{"name":"w","image":"nanocloud/probe:1","resources":{"limits":{"ephemeral-storage":"10Mi"}}}]}}'
 # An exec readinessProbe rides along for the node's probe chain; a
@@ -236,12 +228,12 @@ is /~node/node-a/pod-specs/uid-dflt "node=node-a;image=nanocloud/app:1;pull=;res
 echo "   dflt: no restartPolicy -> always (a ReplicaSet's Pod), no grace -> 30; args with no command"
 is /~node/node-a/pod-specs/uid-job "node=node-a;image=busybox:1.36;pull=;restart=never;grace=30;desired=running;cmd=true;args=;env=;workdir=;cpu=;mem=;eph=;tasks=4194304;pod=default/job-0;rp_cmd=;ruid=;rgid=;nonroot=;volumes=/etc/resolv.conf:/etc/resolv.conf:ro;gate=0;ord=;ctr=c;paused=;cfgerr="
 echo "   job-0: a Job's Never kept"
-is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;restart=always;grace=0;desired=running;cmd=;cpu=100;mem=67108864;eph=;pod=default/g;paused=;hostnet="
-is /~node/node-a/pod-specs/uid-wimg "node=node-a;graph=nanocloud/probe:1;image=nanocloud/probe:1;restart=never;grace=0;desired=running;cmd=;cpu=;mem=;eph=10485760;pod=default/wimg;paused=;hostnet="
+is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;restart=always;grace=0;desired=running;cmd=;env=CELL=c-1,NODE=node-a;cpu=100;mem=67108864;eph=;pod=default/g;paused=;hostnet=;volumes=/srv/g:/data;cfgerr="
+is /~node/node-a/pod-specs/uid-wimg "node=node-a;graph=nanocloud/probe:1;image=nanocloud/probe:1;restart=never;grace=0;desired=running;cmd=;env=;cpu=;mem=;eph=10485760;pod=default/wimg;paused=;hostnet=;volumes=;envok=;cfgerr="
 # hostNetwork: the node's network, no address of its own (node_net and the
 # metal sandbox read hostnet=true).
-is /~node/node-a/pod-specs/uid-hnet "node=node-a;graph=nanocloud/kv:1;image=nanocloud/kv:1;restart=always;grace=0;desired=running;cmd=;cpu=;mem=;eph=;pod=default/hnet;paused=;hostnet=true"
-echo "   g, wimg: graph-backed Pods defaulted alike, their limits carried"
+is /~node/node-a/pod-specs/uid-hnet "node=node-a;graph=nanocloud/kv:1;image=nanocloud/kv:1;restart=always;grace=0;desired=running;cmd=;env=;cpu=;mem=;eph=;pod=default/hnet;paused=;hostnet=true;volumes=;envok=;cfgerr="
+echo "   g, wimg: graph-backed Pods defaulted alike, their limits, environment (a literal, the downward API) and volumes carried"
 
 echo "== 2. a pass with nothing changed spends no revision =="
 W0="$(store_writes /~node/node-a/pod-specs/uid-web)"
@@ -259,7 +251,7 @@ store_put "/pods/default/g" '{"metadata":{"name":"g","namespace":"default","uid"
 run 4
 is /~node/node-a/pod-specs/uid-web "node=node-a;image=busybox:1.37;pull=;grace=5;desired=deleted;cmd=sh -c;args=echo%20hi%3B%20sleep%209;env=;workdir=;cpu=;mem=;eph=;tasks=4194304;pod=default/web;ruid=;rgid=;nonroot=;volumes=/etc/resolv.conf:/etc/resolv.conf:ro;gate=0;ord=;ctr=web;paused=;cfgerr="
 echo "   desired=deleted, its own 5 s grace"
-is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;grace=0;desired=deleted;cmd=;cpu=;mem=;eph=;pod=default/g"
+is /~node/node-a/pod-specs/uid-g "node=node-a;graph=probe;grace=0;desired=deleted;cmd=;env=;cpu=;mem=;eph=;pod=default/g;paused=;hostnet=;volumes=;cfgerr="
 echo "   a graph-backed Pod being deleted still names its graph (its metal sandbox is torn down)"
 
 echo "== E2E green: scheduled Pods projected to their node's ask, exactly: defaults, command/args, env, workingDir, limits; deletion carried =="

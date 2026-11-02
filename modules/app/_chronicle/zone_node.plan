@@ -1,0 +1,193 @@
+// A ZoneSummary's inputs, one row per Node (zone_summary.plan sums them):
+//
+//   /zone-node/<node>  `zone=<z>;ready=<0|1>;sched=<0|1>;voter=<0|1>;
+//                       ca=<m>;ma=<bytes>;cr=<m>;mr=<bytes>`
+//
+// from the Node (`topology.kubernetes.io/zone`, "" when it has none; its
+// Ready condition True; schedulable when ready and not
+// spec.unschedulable; a store voter when labelled
+// `nanocloud.io/store-voter: "true"`; its allocatable cpu and memory,
+// capacity when it states none) and the Pods bound to it
+// (spec.nodeName), not terminal: their requests (`!reqcpu`, `!reqmem`).
+// A Node with no zone is kept too — a voter outside every zone counts as
+// outside each of them. And `/zone-list/<zone>` `rg=<rev>`: the store
+// revision a Node's readiness in that zone was last written at — set when
+// a Node joins the zone or its readiness flips, which the store itself
+// tells: `/zone-ready/<node>` `<zone>|<0|1>`, written put-if-changed, answers
+// 200 only when it changed.
+//
+//   zn_src   /nodes/ (and any Pod changing) -> each Node
+//   zn_rc    COUNT its Pods' cpu requests (`pw`, a sum)
+//   zn_rm    COUNT their memory requests
+//   zn_put   PUT its row (put-if-changed)
+//   zn_rdy   PUT /zone-ready/<node> <zone>|<ready> (put-if-changed)
+//   zn_mark  MERGE /zone-list/<zone> rg=<rev> when that changed
+//   zn_gsrc  a row whose Node is gone (`unless`) -> zn_gdel drops it and its
+//            readiness record
+plan nanocloud.zone_node {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum MERGE = 6;
+  enum COUNT = 12;
+  enum DROP_EACH = 18;
+
+  // carried by every stage after the source (254)
+  message NCtx {
+    node: string = 1;
+    zone: string = 2;
+    ready: int = 3;       // 1: its Ready condition is True
+    sched: int = 4;       // 1: ready and not spec.unschedulable
+    voter: int = 5;       // 1: labelled nanocloud.io/store-voter "true"
+    ca: int = 6;          // allocatable cpu, milli
+    ma: int = 7;          // allocatable memory, bytes
+    rev: int = 8;         // the store revision the Node was read at
+    cr: int = 11;         // its Pods' cpu requests, milli
+    mode: string = 12;    // "c" counting cpu, "m" memory, "x" stopped
+  }
+  message zn.Node {
+    seq: int = 1;
+    rev: int = 2;
+    zone: string = 4;     // metadata.labels."topology.kubernetes.io/zone"
+    rs: string = 5;       // status.conditions[type=Ready].status
+    us: string = 6;       // spec.unschedulable
+    vl: string = 7;       // metadata.labels."nanocloud.io/store-voter"
+    name: string = 29;
+    acpu: int = 50; amem: int = 51;   // status.allocatable
+    ccpu: int = 52; cmem: int = 53;   // status.capacity
+  }
+  message zn.Cnt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: NCtx = 254;
+  }
+  // A label's or a condition's value as 0 or 1 by EXACT match: `|v|` holds
+  // `|True|` only when v is exactly `True`.
+  decision ask(n: zn.Node) -> zn.Cnt {
+    default ->
+      zn.Cnt { cid: n.seq, op: COUNT, key: "pods/",
+               ctx: NCtx { node: n.name, zone: n.zone,
+                           ready: math.least(1, ("|" + n.rs + "|").indexOf("|True|") + 1),
+                           sched: math.least(1, ("|" + n.rs + "|").indexOf("|True|") + 1)
+                                  * (1 - math.least(1, ("|" + n.us + "|").indexOf("|true|") + 1)),
+                           voter: math.least(1, ("|" + n.vl + "|").indexOf("|true|") + 1),
+                           ca: n.acpu + n.ccpu * (1 - math.least(1, n.acpu)),
+                           ma: n.amem + n.cmem * (1 - math.least(1, n.amem)),
+                           rev: n.rev, cr: 0, mode: "c" } };
+  }
+  // One Pod, and what it weighs: its requests while it is bound to the
+  // Node and not terminal.
+  message zn.Pod {
+    nn: string = 40;      // spec.nodeName
+    ph: string = 41;      // status.phase
+    rc: int = 50;         // `.!reqcpu`
+    rm: int = 51;         // `.!reqmem`
+    ctx: NCtx = 254;
+  }
+  message zn.Keep {
+    k: int = 1;
+  }
+  decision pw(p: zn.Pod) -> zn.Keep {
+    when p.nn == p.ctx.node && p.ph != "Succeeded" && p.ph != "Failed" && p.ctx.mode == "c" -> zn.Keep { k: p.rc };
+    when p.nn == p.ctx.node && p.ph != "Succeeded" && p.ph != "Failed" && p.ctx.mode == "m" -> zn.Keep { k: p.rm };
+    default -> zn.Keep { k: 0 };
+  }
+  message zn.Got {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: NCtx = 254;
+  }
+  decision more(g: zn.Got) -> zn.Cnt {
+    when g.status == 200 && g.ctx.mode == "c" ->
+      zn.Cnt { cid: g.cid, op: COUNT, key: "pods/",
+               ctx: NCtx { node: g.ctx.node, zone: g.ctx.zone, ready: g.ctx.ready, sched: g.ctx.sched,
+                           voter: g.ctx.voter, ca: g.ctx.ca, ma: g.ctx.ma, rev: g.ctx.rev,
+                           cr: g.n, mode: "m" } };
+    default ->
+      zn.Cnt { cid: g.cid, op: NOOP, key: "",
+               ctx: NCtx { node: g.ctx.node, zone: g.ctx.zone, ready: g.ctx.ready, sched: g.ctx.sched,
+                           voter: g.ctx.voter, ca: g.ctx.ca, ma: g.ctx.ma, rev: g.ctx.rev,
+                           cr: g.ctx.cr, mode: "x" } };
+  }
+  message zn.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: int = 9;
+    v7: string = 10; v8: int = 11; v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16; v14: int = 80; v15: string = 81; v16: int = 82;
+    ctx: NCtx = 254;
+  }
+  decision row(g: zn.Got) -> zn.Put {
+    when g.status == 200 && g.ctx.mode == "m" ->
+      zn.Put { cid: g.cid, op: PUT, key: g.ctx.node,
+               v1: "zone=", v2: g.ctx.zone, v3: ";ready=", v4: g.ctx.ready, v5: ";sched=", v6: g.ctx.sched,
+               v7: ";voter=", v8: g.ctx.voter, v9: ";ca=", v10: g.ctx.ca, v11: ";ma=", v12: g.ctx.ma,
+               v13: ";cr=", v14: g.ctx.cr, v15: ";mr=", v16: g.n, ctx: g.ctx };
+    default ->
+      zn.Put { cid: g.cid, op: NOOP, key: "",
+               ctx: NCtx { node: g.ctx.node, zone: g.ctx.zone, ready: g.ctx.ready, sched: g.ctx.sched,
+                           voter: g.ctx.voter, ca: g.ctx.ca, ma: g.ctx.ma, rev: g.ctx.rev,
+                           cr: g.ctx.cr, mode: "x" } };
+  }
+  message zn.Wrote {
+    cid: int = 1;
+    status: int = 2;
+    ctx: NCtx = 254;
+  }
+  message zn.Rdy {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: string = 5; v3: int = 6;
+    ctx: NCtx = 254;
+  }
+  // Its zone and readiness, written put-if-changed: the store answers 200
+  // when either moved (or the Node is new), 204 when not.
+  decision rdy(w: zn.Wrote) -> zn.Rdy {
+    when w.ctx.mode == "m" && (w.status == 200 || w.status == 204) ->
+      zn.Rdy { cid: w.cid, op: PUT, key: w.ctx.node, v1: w.ctx.zone, v2: "|", v3: w.ctx.ready, ctx: w.ctx };
+    default ->
+      zn.Rdy { cid: w.cid, op: NOOP, key: "", ctx: w.ctx };
+  }
+  message zn.Merge {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5;
+  }
+  // A Node new to its zone, or whose readiness flipped: the zone's
+  // readiness generation is the revision the Node was read at (revisions
+  // only grow, so the latest is the greatest).
+  decision mark(w: zn.Wrote) -> zn.Merge {
+    when w.ctx.mode == "m" && w.status == 200 && w.ctx.zone != "" ->
+      zn.Merge { cid: w.cid, op: MERGE, key: w.ctx.zone, v1: "rg=", v2: w.ctx.rev };
+    default ->
+      zn.Merge { cid: w.cid, op: NOOP, key: "" };
+  }
+  // A row whose Node is gone.
+  message zn.Row {
+    seq: int = 1;
+    key: string = 3;
+  }
+  message zn.Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+  }
+  decision gone(r: zn.Row) -> zn.Drop {
+    default -> zn.Drop { cid: r.seq, op: DROP_EACH, key: r.key, v1: "zone-node,zone-ready" };
+  }
+
+  pipeline ask_p(n: zn.Node) -> zn.Cnt { call x = ask(n); return x; }
+  pipeline pw_p(p: zn.Pod) -> zn.Keep { call x = pw(p); return x; }
+  pipeline more_p(g: zn.Got) -> zn.Cnt { call x = more(g); return x; }
+  pipeline row_p(g: zn.Got) -> zn.Put { call x = row(g); return x; }
+  pipeline rdy_p(w: zn.Wrote) -> zn.Rdy { call x = rdy(w); return x; }
+  pipeline mark_p(w: zn.Wrote) -> zn.Merge { call x = mark(w); return x; }
+  pipeline gone_p(r: zn.Row) -> zn.Drop { call x = gone(r); return x; }
+  provenance revision "zone-node" toolchain "chronicle-authoring";
+}

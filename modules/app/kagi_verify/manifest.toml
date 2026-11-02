@@ -59,12 +59,30 @@ hardware_targets = ["bcm2712", "linux"]
 # KEY DELIVERY. kagi's verifier is PUSHED its keys on `verify_key` and answers
 # ST_NO_KEY until one lands; nanocloud keeps its truth in the store, where
 # `kagi_mint` stores the key kagi's `token_mint` announces as a `MSG_KEY_ADD`
-# frame at `/authn-keys/sa`. So this connector reads that key once and forwards
-# the frame VERBATIM on `key_out` — it never parses it, because the frame is
-# kagi's and the moment nanocloud interprets it there are two readings of it.
+# frame (at `/authn-keys/sa` by default). `key_paths` names the key sets this
+# verifier trusts — up to four store keys, `,`-separated (default
+# `/authn-keys/sa`): a cell's own ServiceAccount issuer and the key its mint
+# signs with, when the two are kept apart, and a provisioned issuer beside
+# them. Each frame is forwarded VERBATIM — never parsed, because the frame is
+# kagi's and the moment nanocloud interprets it there are two readings of it —
+# as one record of ONE `MSG_KEYSET_SNAPSHOT` on `key_out` (`[count u16]` then
+# each frame's `KeyRecord` payload, its envelope checked and dropped). kagi
+# takes a snapshot as the whole keyset, so the set is replaced, never
+# accumulated: a key that leaves its path stops verifying at the next refresh.
+# Re-read every few seconds and re-sent only when it changed. A path whose
+# read the store has not decided publishes nothing that pass (a set without
+# that key would refuse its every credential meanwhile); an absent path is
+# simply not in the set; a frame that is not one whole `MSG_KEY_ADD` is left
+# out (kagi refuses a snapshot with one bad record, all of it).
 #
-# The store read is a direct `storage.object` GET rather than a `store_source`
-# edge: the key is read once at start, forwarded whole, and never watched, so a
+# `issuer`: the issuers a credential may name — one, or up to four
+# `,`-separated. One is kagi's to hold the credential to (`expected_issuer`);
+# with several, kagi is asked for none and the issuer it verified is held to
+# the list here, a credential naming another refused WRONG_ISSUER. Empty
+# accepts any issuer whose key is in the set.
+#
+# The store reads are direct `storage.object` GETs rather than a `store_source`
+# edge: the keys are read on a timer, forwarded whole, and never watched, so a
 # subscription and a graph edge would buy nothing. (A source CAN carry an
 # opaque value — a `paths` entry of `.` is the whole record — which is what the
 # endpoint addresses and this same key frame use elsewhere.)
@@ -110,8 +128,8 @@ max_record = 8192
 name = "key_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 8192
-max_record = 4096
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
 name = "response_out"
@@ -120,8 +138,8 @@ content_type = "OctetStream"
 buffer_size = 16384
 max_record = 8192
 
-# READ-ONLY on the store. This module fetches exactly one object — the
-# verification key `kagi_mint` stored — and writes nothing: a connector that
+# READ-ONLY on the store. This module fetches only the verification keys
+# named by `key_paths` and writes nothing: a connector that
 # could write the keyset is a connector that could install a key it then
 # accepts tokens against.
 [[resources]]

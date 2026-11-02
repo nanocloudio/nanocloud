@@ -19,7 +19,9 @@ hardware_targets = ["bcm2712", "linux"]
 #                                 17 = TAKE: answer the value and delete it,
 #                                 conditional on the revision read (404 when
 #                                 absent or taken first) — a single-use claim
-#                                 in one step.
+#                                 in one step. 22 = CLAIM: a take that
+#                                 leaves its claim — the record stays, spent:
+#                                 later takes answer 404, a create is refused.
 #                3, 17, 18 = KEY PARTS (bytes), joined after `key_prefix`. An
 #                     owner key `<ns>/<owner>` is two projected fields and a
 #                     literal separator, and the VM cannot concatenate.
@@ -46,7 +48,9 @@ hardware_targets = ["bcm2712", "linux"]
 #     1,2,3   cid / op / key
 #     4..16   value parts
 #     80..99  twenty more value parts, joined after 16 — a record of more
-#             parts than thirteen (a Pod's node ask)
+#             parts than thirteen (a Pod's node ask). The joined value is at
+#             most 6144 bytes (an image manifest at its 65-layer bound); one
+#             past it is answered 413 and not written — never written cut
 #     17,18   extra key parts, joined after field 3
 #     25..27  three MORE key parts, for keys the first three cannot build —
 #             `/authz/<subject>/<verb>/<resource>` is five parts and two
@@ -63,7 +67,7 @@ hardware_targets = ["bcm2712", "linux"]
 #     70,71   SPLICE: a write's value with subtrees copied from a STORED
 #             document — 70 the source key's tail, 71
 #             `<prefix>|<at>=<path>[;<at>=<path>…]` (each subtree before value
-#             part <at>, 0 = after the last; `<path>.*` its members, a leading
+#             part <at>, 0 = after the last; `<path>.*` its members (an array's elements), a leading
 #             `,` a comma when there are any; a missing whole subtree is
 #             `null`). A controller's template is as large as its user makes
 #             it: the decision names where the bytes are, never carries them.
@@ -115,6 +119,31 @@ hardware_targets = ["bcm2712", "linux"]
 # 18 DROP_EACH (one key under several collections: for each name in the
 # value, comma-separated, delete-if-present `<key_prefix><name>/<key>`; 200).
 # A Pod's node records, keyed by its uid in a dozen collections, go together.
+# 21 EP_DOCS (a Service's API documents; the key is `<ns>/<svc>`, the
+# prefixes the `ep_docs` param, `<services>|<rows>|<pods>|<slices>|<endpoints>`):
+# the discovery.k8s.io/v1 EndpointSlice and the v1 Endpoints rendered from
+# the Service and the endpoints chain's rows under `<rows><ns>/<svc>/` (a Pod
+# read for a targetPort that names a port) by `_shared/epdoc.rs`, each
+# written put-if-changed with its uid and creationTimestamp kept — the slice
+# only when absent or this controller's (its managed-by label), the
+# Endpoints also over another's when the Service has a selector; a Service
+# gone, or with no selector and no rows, has this controller's deleted
+# (leaving its `tomb`). 200 written, 204 unchanged, 500 a refusal, 413 no
+# heap: store_stamped or store_big.
+# 23 COVER (RBAC escalation prevention, `_shared/rbac_cover.rs`; the prefixes
+# the `cover` param, `<grants>|<roles>|<clusterroles>|<agg>`): may the writer
+# (field 3, its identity) store this Role / ClusterRole / RoleBinding /
+# ClusterRoleBinding / ManagementBinding (72 the resource, 73 the namespace)?
+# The body is the value parts or a staged `sha256:<hex>` (`blob`); a patch
+# (75: 13 merge, 14 JSON Patch, 15 strategic, 16 apply; 0 a whole object) is
+# checked on the object at 74 patched by it; 76 the path's name. Every
+# permission the object would grant must be held in the grant index (the
+# request path's own probe, wildcards and all), or the writer may `escalate`
+# / `bind` it. 200 held; 403 not held and 404 a binding's role not found,
+# each with the Status to answer as the value; 422 a body or patch not of its
+# kind; 413 past the check's bounds or the heap; 500 a read refused; a read
+# not yet answered holds the record. Reads unjournaled; needs the heap
+# (store_big).
 # 8 CREATE (PUT under the store's ABSENT precondition: 200 created, 409 the key
 # already existed), 9 REPLACE (PUT under ETAG: conditional on field 28, or on
 # the body's `rv_path` when 28 is absent; 409 when the key moved; an ordinary

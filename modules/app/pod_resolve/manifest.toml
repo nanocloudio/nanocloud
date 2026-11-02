@@ -1,6 +1,6 @@
 name = "pod_resolve"
 version = "0.1.0"
-description = "A scheduled Pod's containers as the node's asks — environment, command, user, volumes and order resolved by Kubernetes' rules"
+description = "A scheduled Pod's containers as the node's asks — environment, command, user, volumes and order resolved by Kubernetes' rules, a graph-backed Pod's environment and volumes alike"
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
@@ -18,11 +18,24 @@ hardware_targets = ["bcm2712", "linux"]
 #
 # In (`request_in`, the control plane's store_source record over /pods/,
 # `ps_pods`): 3 the key `<ns>/<name>`, 4 metadata.uid, 5 spec.nodeName,
-# 8 metadata.deletionTimestamp, 9 spec.runtimeClassName. A Pod not yet
-# scheduled, or graph-backed (`runtimeClassName: fluxor`, whose record
-# pod_specs.plan writes), is not this module's. Every record is passed on
-# unchanged at `forward_out` to that decision, which shares the source (one
-# store subscription for both).
+# 6 metadata.deletionTimestamp, 7 spec.runtimeClassName. A Pod not yet
+# scheduled is not this module's.
+#
+# A graph-backed Pod (`runtimeClassName: fluxor`) is one record, its
+# subgraph's: `node graph [image] restart grace=0 desired cmd= env cpu mem
+# eph pod paused hostnet volumes [envok] cfgerr` (podres.rs `pr_graph`) — `graph`
+# the Graph object's name or the pulled workload image's reference (then
+# `image` too), its environment resolved as a container's is (`envFrom`,
+# `env`, `valueFrom` ConfigMap/Secret keys and the downward API; no Service
+# links), which its node hands the subgraph as `env`/`var` entries, and its
+# volumes, lent as `mount`/`bind` entries. A name the Graph binds a param
+# to (its `spec.env`) that the container does not set is `cfgerr`, and the
+# node refuses the sandbox with why. So is a required name of a pulled
+# image's bindings (its config blob, which the node's pull records at
+# `~node/<node>/image-config/<manifest>` once `~node/<node>/pod-resolved/<uid>`
+# names the pack): `envok` says the pack it was checked against, the node
+# makes no sandbox before it, and the Pod is resolved again every 3 s until
+# both are recorded.
 #
 # Out (`request_out`, store_effect requests, key_prefix `/`): one PUT
 # per container — `~node/<node>/pod-specs/<uid>` for the first app container,
@@ -62,14 +75,6 @@ content_type = "OctetStream"
 buffer_size = 32768
 max_record = 8192
 required = true
-
-[[ports]]
-name = "forward_out"
-index = 1
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 32768
-max_record = 8192
 
 [[resources]]
 requires_contract = "storage.object"

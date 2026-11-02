@@ -16,13 +16,13 @@ modules:
     type: store_source
     prefix: "/services/"
     paths: "spec.clusterIP,spec.ports[].port,spec.ports[].targetPort,spec.ports[].protocol,spec.ports[].nodePort,spec.externalTrafficPolicy,spec.internalTrafficPolicy"
-    # The load-balancer address svc_alloc gave it (its status waits for the
-    # VIP's readiness, which waits for this table).
+    # The load-balancer address svc_alloc gave it (/lb-addr/; a Service of
+    # a loadBalancerClass has none: its class's controller serves it).
     related: "/lb-addr/!flat:ip"
-    join: "/endpointslices/"
+    join: "/endpoint-rows/"
     join_scoped: 1
     join_paths: "."
-    watch: "/endpointslices/,/lb-addr/"
+    watch: "/endpoint-rows/,/lb-addr/"
   # Each backend's Pod, for its named ports (a targetPort may name one) and
   # its node (a `Local` traffic policy keeps to the backends on a node).
   - name: px_pod
@@ -42,8 +42,8 @@ modules:
     prefix: "/np-rows/proxy/"
     flat: 1
     paths: "vip,backend"
-    related: "/services/^1!json:spec.clusterIP;/endpointslices/:."
-    watch: "/services/,/endpointslices/"
+    related: "/services/^1!json:spec.clusterIP;/endpoint-rows/:."
+    watch: "/services/,/endpoint-rows/"
   - name: px_prune
     type: store_effect
     # chronicle-source: modules/app/_chronicle/proxy.plan px_prune

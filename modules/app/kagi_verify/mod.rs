@@ -46,17 +46,30 @@ const BUF: usize = 8192;
 const MAX_AUD: usize = 128;
 const MAX_ISS: usize = 128;
 const MAX_KEY_PATH: usize = 128;
-/// A `MSG_KEY_ADD` frame: envelope plus the largest public key in kagi's
-/// implemented set (ML-DSA-87), with room for the ref and suite fields.
-const KEY_BUF: usize = 4096;
+/// How many key sets one verifier trusts (`key_paths`), and how many issuers
+/// (`issuer`): a cell's own ServiceAccount issuer and the key it mints with,
+/// and room for a provisioned one or two beside them.
+const MAX_KEY_PATHS: usize = 4;
+const MAX_ISSUERS: usize = 4;
+/// `key_paths`: up to four paths, `,`-separated.
+const KEY_PATHS_BUF: usize = MAX_KEY_PATHS * (MAX_KEY_PATH + 1);
+/// `issuer`: up to four issuers, `,`-separated.
+const ISSUERS_BUF: usize = MAX_ISSUERS * (MAX_ISS + 1);
+/// The keyset as ONE `MSG_KEYSET_SNAPSHOT`: envelope, count, and every
+/// stored `MSG_KEY_ADD` payload. Four ES256 records are ~500 bytes; a set
+/// past this (post-quantum keys at every path) is not published, rather than
+/// published short.
+const SNAP_BUF: usize = 8192;
 const DEFAULT_KEY_PATH: &[u8] = b"/authn-keys/sa";
 /// Steps between key-fetch attempts while the key is absent.
 const KEY_RETRY_STEPS: u32 = 64;
-/// Steps between re-reads of a key already forwarded. The key changes when
-/// the mint's does — every boot of a node whose vault cannot keep keys, or
-/// once when a mint key replaces a seeded one — and a verifier that read it
-/// once would reject every token the new key signs.
-const KEY_REFRESH_STEPS: u32 = 4096;
+/// Steps between re-reads of a keyset already forwarded. A key changes when
+/// its mint's does — every boot of a node whose vault cannot keep keys, or
+/// once when a mint key replaces a seeded one — and a key set lands after
+/// the first read when its mint starts after this module: a verifier that
+/// read once would reject every token the new key signs. About a second: a
+/// few GETs, and a token minted at boot is honoured that soon after.
+const KEY_REFRESH_STEPS: u32 = 1024;
 
 /// The status a reply carries when the verifier gave no typed answer: its
 /// exchange ended with a refusal status, an ABORT, or an answer that was not
@@ -103,9 +116,11 @@ struct State {
 
     credential_field: u32,
     min_assurance: u32,
-    key_path: [u8; MAX_KEY_PATH],
-    key_path_len: u16,
-    /// Whether the verification key has been forwarded. The store may not hold
+    /// The store keys of the key sets this verifier trusts, `,`-separated
+    /// (empty: [`DEFAULT_KEY_PATH`] alone).
+    key_paths: [u8; KEY_PATHS_BUF],
+    key_paths_len: u16,
+    /// Whether the verification key set has been forwarded. The store may not hold
     /// it yet when this module starts — the mint announces it on ITS start —
     /// so this is retried every step until it lands rather than resolved once.
     key_published: u32,
@@ -113,12 +128,16 @@ struct State {
     /// absent for a while (the mint announces on ITS start), and retrying a
     /// store read every tick turns a normal startup race into a log flood.
     key_backoff: u32,
-    /// FNV-1a of the frame last forwarded, so an unchanged re-read sends
+    /// FNV-1a of the keyset last forwarded, so an unchanged re-read sends
     /// nothing.
     key_hash: u32,
+    /// Key frames skipped because they were not one whole `MSG_KEY_ADD`.
+    key_bad: u32,
     audience: [u8; MAX_AUD],
     audience_len: u16,
-    issuer: [u8; MAX_ISS],
+    /// The issuers a credential may name, `,`-separated (empty: any the
+    /// keyset verifies).
+    issuer: [u8; ISSUERS_BUF],
     issuer_len: u16,
 
     /// The verify exchange in flight. One at a time: see the manifest on why
@@ -139,6 +158,8 @@ struct State {
 
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
+    /// The keyset snapshot being assembled (and the frames read into it).
+    snap: [u8; SNAP_BUF],
     /// This module's refused store reads, said rate-limited (`ReadNag`).
     nag: ReadNag,
 }
@@ -147,9 +168,9 @@ mod params_def {
     use super::p_u32;
     use super::ptr_copy;
     use super::State;
+    use super::ISSUERS_BUF;
+    use super::KEY_PATHS_BUF;
     use super::MAX_AUD;
-    use super::MAX_ISS;
-    use super::MAX_KEY_PATH;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -167,7 +188,7 @@ mod params_def {
 
         3, issuer, str, 0
             => |s, d, len| {
-                let n = if len > MAX_ISS { MAX_ISS } else { len };
+                let n = if len > ISSUERS_BUF { ISSUERS_BUF } else { len };
                 s.issuer_len = n as u16;
                 if n > 0 { ptr_copy(s.issuer.as_mut_ptr(), d, n); }
             };
@@ -175,11 +196,11 @@ mod params_def {
         4, min_assurance, u32, 0
             => |s, d, len| { s.min_assurance = p_u32(d, len, 0, 0); };
 
-        5, key_path, str, 0
+        5, key_paths, str, 0
             => |s, d, len| {
-                let n = if len > MAX_KEY_PATH { MAX_KEY_PATH } else { len };
-                s.key_path_len = n as u16;
-                if n > 0 { ptr_copy(s.key_path.as_mut_ptr(), d, n); }
+                let n = if len > KEY_PATHS_BUF { KEY_PATHS_BUF } else { len };
+                s.key_paths_len = n as u16;
+                if n > 0 { ptr_copy(s.key_paths.as_mut_ptr(), d, n); }
             };
     }
 }
@@ -340,7 +361,8 @@ pub unsafe extern "C" fn module_new(
         s.key_published = 0;
         s.key_backoff = 0;
         s.key_hash = 0;
-        s.key_path_len = 0;
+        s.key_bad = 0;
+        s.key_paths_len = 0;
         s.call.reset();
         s.held_len = 0;
         s.reply_len = 0;
@@ -372,13 +394,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.response_out = dev_channel_port(sys, PORT_OUTPUT, 2);
             s.resolved = 1;
         }
-        // Until the key is out, nothing this module sends can be answered with
+        // Until a key is out, nothing this module sends can be answered with
         // anything but ST_NO_KEY. Retried rather than resolved once: the issuer
         // publishes on its own start, which may be after ours.
-        // Then re-read every KEY_REFRESH_STEPS, forwarding a changed key:
-        // re-adding (issuer, profile, kid) replaces it in kagi's keyset.
+        // Then re-read every KEY_REFRESH_STEPS, forwarding a changed keyset:
+        // a snapshot replaces kagi's whole set.
         if s.key_backoff == 0 {
-            publish_key(s, sys);
+            publish_keys(s, sys);
             s.key_backoff = if s.key_published == 0 {
                 KEY_RETRY_STEPS
             } else {
@@ -407,40 +429,101 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Forward the verification key to kagi, verbatim.
+/// The `,`-separated entries of a list param, trimmed of spaces, empty
+/// entries skipped.
+fn list_entries(list: &[u8]) -> impl Iterator<Item = &[u8]> {
+    list.split(|&c| c == b',')
+        .map(trim)
+        .filter(|e| !e.is_empty())
+}
+
+fn trim(mut v: &[u8]) -> &[u8] {
+    while let [b' ', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' '] = v {
+        v = rest;
+    }
+    v
+}
+
+/// Forward the trusted key sets to kagi as ONE keyset, every key verbatim.
 ///
-/// The frame at `key_path` is a kagi `MSG_KEY_ADD` that `kagi_mint` stored. It is
-/// copied to `key_out` WITHOUT being parsed: it is kagi's wire, and a second
-/// reading of it here is a second answer to "which key is this".
-unsafe fn publish_key(s: &mut State, sys: &SyscallTable) {
+/// The frame at each of `key_paths` is a kagi `MSG_KEY_ADD` that a mint
+/// stored (or an operator provisioned). Each is taken WITHOUT being parsed —
+/// it is kagi's wire, and a second reading of it here is a second answer to
+/// "which key is this" — only its envelope checked, and its payload, a
+/// `KeyRecord`, placed in a `MSG_KEYSET_SNAPSHOT`: the shape kagi takes a
+/// whole keyset in, which REPLACES the verifier's set. So a key that left
+/// its path (replaced, or removed) stops verifying at the next refresh,
+/// rather than lingering beside its successor until a restart.
+///
+/// A read the store has not decided (not yet, or refused) publishes
+/// nothing this pass: a set built without one of its keys would revoke
+/// that key's every credential until the next pass. An absent path is
+/// simply not in the set. Nothing is published until some path holds a
+/// key; once one has been, an empty set is published when none does.
+unsafe fn publish_keys(s: &mut State, sys: &SyscallTable) {
     unsafe {
         if s.key_out < 0 {
             return;
         }
-        let path: &[u8] = if s.key_path_len > 0 {
-            core::slice::from_raw_parts(s.key_path.as_ptr(), s.key_path_len as usize)
+        let paths_buf = s.key_paths;
+        let paths: &[u8] = if s.key_paths_len > 0 {
+            &paths_buf[..s.key_paths_len as usize]
         } else {
             DEFAULT_KEY_PATH
         };
-        let mut key = [0u8; KEY_BUF];
-        // `get_value` REFUSES an oversized value rather than truncating it — a
-        // half key would verify nothing and say nothing about why.
-        let Some(n) = get_value(&Store::plain(sys, &s.nag), path, &mut key) else {
-            return; // not published yet, or too large; retried next step
-        };
-        if n == 0 {
-            return;
+        // [MSG_KEYSET_SNAPSHOT][len u16][count u16], then the records.
+        let mut at = 5usize;
+        let mut count = 0u16;
+        for path in list_entries(paths).take(MAX_KEY_PATHS) {
+            let room = &mut s.snap[at..];
+            // `get_value_live` REFUSES an oversized value rather than
+            // truncating it — a half key would verify nothing.
+            match get_value_live(sys, &s.nag, path, room) {
+                Got::Found(n) => {
+                    let frame = &s.snap[at..at + n];
+                    let whole = n > 3
+                        && frame[0] == auth_wire::MSG_KEY_ADD
+                        && usize::from(u16::from_le_bytes([frame[1], frame[2]])) == n - 3;
+                    if !whole {
+                        // Not one whole MSG_KEY_ADD: kagi would refuse the
+                        // whole snapshot for it, so it is left out.
+                        s.key_bad = s.key_bad.wrapping_add(1);
+                        continue;
+                    }
+                    s.snap.copy_within(at + 3..at + n, at);
+                    at += n - 3;
+                    count += 1;
+                }
+                Got::Absent => {}
+                Got::Pending | Got::Refused(_) => return,
+            }
         }
+        if count == 0 && s.key_published == 0 {
+            return; // nothing published yet; retried
+        }
+        let payload = at - 3;
+        s.snap[0] = auth_wire::MSG_KEYSET_SNAPSHOT;
+        s.snap[1..3].copy_from_slice(&(payload as u16).to_le_bytes());
+        s.snap[3..5].copy_from_slice(&count.to_le_bytes());
         let mut h: u32 = 0x811C_9DC5;
-        for &b in &key[..n] {
+        for &b in &s.snap[..at] {
             h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
         }
         if s.key_published != 0 && h == s.key_hash {
             return;
         }
-        if (sys.channel_write)(s.key_out, key.as_ptr(), n) > 0 {
+        if (sys.channel_write)(s.key_out, s.snap.as_ptr(), at) > 0 {
             s.key_published = 1;
             s.key_hash = h;
+            // Said once per change: which set is trusted is what an operator
+            // asks first when a token is refused.
+            let mut m = *b"[kagi_verify] keyset published: 0 key(s), 0 skipped";
+            m[32] = b'0' + (count as u8 % 10);
+            m[42] = b'0' + (s.key_bad % 10) as u8;
+            dev_log(sys, 2, m.as_ptr(), m.len());
         }
     }
 }
@@ -509,6 +592,21 @@ unsafe fn answered(s: &mut State, sys: &SyscallTable) {
     } else {
         None
     };
+    // A credential kagi verified under a key this node trusts, naming an
+    // issuer it does not: refused as kagi refuses one, WRONG_ISSUER, with
+    // nothing it established. (With one issuer configured kagi held it to
+    // that one already.)
+    if let Some(i) = id.as_ref() {
+        let issuers = &s.issuer[..s.issuer_len as usize];
+        if i.status == auth_wire::verify_err::OK
+            && !issuers.is_empty()
+            && !list_entries(issuers).any(|n| n == i.issuer)
+        {
+            let refusal = VerifiedIdentity::refused(auth_wire::verify_err::WRONG_ISSUER);
+            reply(s, sys, Some(&refusal));
+            return;
+        }
+    }
     reply(s, sys, id.as_ref());
 }
 
@@ -566,10 +664,19 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
         let now_secs =
             u64::from_le_bytes(tt[TT_UNIX_SECONDS..TT_UNIX_SECONDS + 8].try_into().unwrap());
 
+        // One configured issuer is kagi's to hold the credential to; with
+        // several, kagi is asked for none and the issuer it reports is held
+        // to the list when it answers (`answered`).
+        let issuers = s.issuer;
+        let mut named = list_entries(&issuers[..s.issuer_len as usize]);
+        let expected_issuer = match (named.next(), named.next()) {
+            (Some(one), None) => one,
+            _ => &b""[..],
+        };
         let req = VerifyRequest {
             credential,
             expected_profile: 0,
-            expected_issuer: &s.issuer[..s.issuer_len as usize],
+            expected_issuer,
             expected_audience: &s.audience[..s.audience_len as usize],
             // Empty: no proof-of-possession binding. See `manifest.toml`.
             method: b"",

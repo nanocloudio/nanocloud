@@ -43,6 +43,9 @@ plan nanocloud.podproject {
     mem: string = 15;         //         bytes
     eph: string = 16;         //         ephemeral-storage bytes
     pod: string = 17;         // "<ns>/<name>"
+    envok: string = 18;       // a workload image's pack whose env bindings
+                              //   pod_resolve checked the Pod against
+                              //   (pj_msource only)
     res_rootfs: string = 70;  // related /pod-resolved/
     res_cmd: string = 71;     //   the argv, command/args against the image's
     res_env: string = 72;     //   the image's Env
@@ -206,22 +209,37 @@ plan nanocloud.podproject {
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }
   // A graph-backed Pod's sandbox, with the same limits (the CREATE header is
-  // one for every kind of workload).
+  // one for every kind of workload) and its environment (`env=`, the
+  // container's, which workload_effect hands the subgraph as `env`/`var`
+  // entries: the params its graph binds by name). Its volumes are its
+  // /pod-specs/ record's, bound as a container's are (volume.plan), and the
+  // sandbox waits for them (sandbox.plan). Not created, as a container would
+  // not be — the sandbox's status says `refused` with why
+  // (CreateContainerConfigError), which a live sandbox is never overwritten
+  // with: a config error pod_resolve found (a missing ConfigMap or Secret, a
+  // name the Graph binds that the container does not set).
   decision metal(s: pp.Spec) -> pp.Art {
+    when s.graph != "" && has(s.cfgerr) && s.cfgerr != "" && (!has(s.st) || s.st == "" || s.st == "refused") ->
+      pp.Art { cid: s.seq, op: PUT, key: "sandbox-status/" + s.key,
+               p1: "state=refused;code=", p2: s.cfgerr, ctx: Ctx { key: s.key } };
+    when s.graph != "" && has(s.cfgerr) && s.cfgerr != "" ->
+      pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     // A workload image: no sandbox until its pull resolved to a pack — the
-    // Pod is Pending meanwhile — then the sandbox names it.
+    // Pod is Pending meanwhile — and pod_resolve has checked the Pod's env
+    // against that pack's bindings (`envok`, its image config's required
+    // names: one missing is `cfgerr` above), then the sandbox names it.
     when s.graph != "" && has(s.image) && s.image != "" && has(s.res_rootfs)
-         && s.res_rootfs.startsWith("pack:") ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+         && s.res_rootfs.startsWith("pack:") && has(s.envok) && s.envok == s.res_rootfs ->
+      pp.Art { cid: s.seq, op: MERGE, key: "metal-sandboxes/" + s.key,
                p1: "graph=", p2: s.graph, p3: ";pack=", p4: s.res_rootfs.substring(5),
                p5: ";cpu=", p6: s.cpu, p7: ";mem=", p8: s.mem, p9: ";eph=", p10: s.eph,
-               ctx: Ctx { key: s.key } };
+               p11: ";env=", p12: s.env, ctx: Ctx { key: s.key } };
     when s.graph != "" && has(s.image) && s.image != "" ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
     when s.graph != "" ->
-      pp.Art { cid: s.seq, op: MERGE, key: s.key,
+      pp.Art { cid: s.seq, op: MERGE, key: "metal-sandboxes/" + s.key,
                p1: "graph=", p2: s.graph, p3: ";cpu=", p4: s.cpu, p5: ";mem=", p6: s.mem,
-               p7: ";eph=", p8: s.eph, ctx: Ctx { key: s.key } };
+               p7: ";eph=", p8: s.eph, p9: ";env=", p10: s.env, ctx: Ctx { key: s.key } };
     default ->
       pp.Art { cid: s.seq, op: NOOP, key: "", ctx: Ctx { key: s.key } };
   }

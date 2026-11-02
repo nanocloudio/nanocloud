@@ -55,6 +55,7 @@ use storage_key_service as svc;
 
 include!("../_shared/kagi_attach_ops.rs");
 include!("../_shared/volume_graph.rs");
+include!("../_shared/pem.rs");
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -69,12 +70,25 @@ const REC: usize = 8192;
 const MAX_INST: usize = 4;
 const MAX_CLAIM: usize = 128;
 const MAX_CRED: usize = 4096;
+/// The longest `verify_hostname` held, as the subgraph's tls holds it.
+const MAX_VERIFY_HOSTNAME: usize = 64;
 const MAX_LABEL: usize = 64;
 /// The node's capability file, read whole (one `fxcap1.` chain per line):
 /// as much as loam_volume takes, its `CAP_FILE_MAX` — eight chains
 /// (`MAX_SESSION_GRANTS`) of at most 1375 bytes (`MAX_TEXT_LEN`) and a newline.
 const CAP_TEXT_MAX: usize = 8 * (1375 + 1);
 const FLXA_CAP: usize = 3 * MAX_CRED + CAP_TEXT_MAX + 2048;
+/// A credential file as read, before its PEM is decoded: a `MAX_CRED` DER
+/// as PEM (base64, 64-column lines, its armour) with room to spare.
+const CRED_RAW_MAX: usize = 2 * MAX_CRED;
+/// The files an attach reads, in turn: the capability, then each
+/// credential named by path (one given embedded is not read).
+const RD_CAP: u8 = 0;
+const RD_CERT: u8 = 1;
+const RD_KEY: u8 = 2;
+const RD_TRUST: u8 = 3;
+const RD_DONE: u8 = 4;
+
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
 const FS_CLOSE: u32 = 0x0903;
@@ -135,7 +149,8 @@ const W_ERASE: u8 = 3;
 const W_KAGI: u8 = 4;
 /// A tool's exit.
 const W_TOOL: u8 = 5;
-/// The node's capability file, read across steps (`GRAPH_START`).
+/// The node's capability and credential files, read across steps
+/// (`GRAPH_START`).
 const W_CAP: u8 = 6;
 /// The volume graph's CREATE, asked once per step until it decides: a
 /// graph backend stages a subgraph a batch of modules per call
@@ -255,6 +270,20 @@ struct State {
     /// the file system answers "not yet" resumes where it stopped.
     cap_fd: i32,
     cap_filled: u32,
+    /// Which of the attach's files is being read (`RD_CAP`…), the
+    /// capability's length once read, and a credential file as read.
+    rd_stage: u8,
+    cap_len: usize,
+    cred_raw: [u8; CRED_RAW_MAX],
+    /// The certificate chain, key and trust anchors by path, read at each
+    /// attach (`cert_file`, `key_file`, `trust`) into `cert`, `key`,
+    /// `trust`; empty when the build embedded them instead.
+    cert_path: [u8; 255],
+    cert_path_len: u8,
+    key_path: [u8; 255],
+    key_path_len: u8,
+    trust_path: [u8; 255],
+    trust_path_len: u8,
     /// The CREATE in flight: its slot, generation, spec length (the spec
     /// itself is `flxa`, unchanged until decided) and whether a stale
     /// identity has already been destroyed once.
@@ -284,8 +313,12 @@ struct State {
     key_len: u16,
     trust: [u8; MAX_CRED],
     trust_len: u16,
-    verify_hostname: [u8; 128],
+    /// The name Loam's certificate must carry (empty: the dialled host),
+    /// handed to the subgraph's tls whole; past `MAX_VERIFY_HOSTNAME`
+    /// the module refuses construction, as tls does.
+    verify_hostname: [u8; MAX_VERIFY_HOSTNAME],
     verify_hostname_len: u8,
+    verify_hostname_refused: bool,
 
     device_key: issuer_key::IssuerKey,
     sign_scratch: [u8; sk::MAX_PROOF_INPUT + issuer_key::SIGN_SCRATCH_OVERHEAD],
@@ -378,105 +411,214 @@ mod params_def {
         22, clock_unchecked, u8, 0
             => |s, d, len| { s.clock_unchecked = p_u8(d, len, 0, 0); };
 
-        // The trust anchors the volume's subgraph verifies Loam under:
-        // `${file:<der>}`. The builder resolves it into the extended
-        // credential entries this module reads; the schema entry only
-        // admits the key.
+        // The trust anchors the volume's subgraph verifies Loam under: an
+        // absolute path (DER, or PEM CERTIFICATE blocks), read at each
+        // attach as the capability is. A target with no file surface
+        // embeds it instead (`${file:<path>}`: the builder lifts it into
+        // the extended credential entry 12, and this entry stays empty).
         23, trust, str, 0
-            => |_s, _d, _len| {};
+            => |s, d, len| { super::set_str(&mut s.trust_path, &mut s.trust_path_len, d, len); };
 
         // The capability file every volume's subgraph presents to Loam's
         // gate: this node's, as the operator minted it.
         24, loam_capability, str, 0
             => |s, d, len| { super::set_str(&mut s.loam_capability, &mut s.loam_capability_len, d, len); };
+
+        // This node's certificate chain (leaf first) and its key (PKCS#8),
+        // which the subgraph's tls dials Loam under: absolute paths, DER or
+        // PEM, read at each attach (a rotated pair holds from the next
+        // attach on), or embedded at build (`${file:<path>}`: extended
+        // entries 10 and 11).
+        25, cert_file, str, 0
+            => |s, d, len| { super::set_str(&mut s.cert_path, &mut s.cert_path_len, d, len); };
+        26, key_file, str, 0
+            => |s, d, len| { super::set_str(&mut s.key_path, &mut s.key_path_len, d, len); };
+
+        // The name Loam's certificate must carry, when it is not the
+        // dialled host: at most 64 bytes, held whole or refused (a
+        // truncated name authenticates a different host). A schema string,
+        // so it binds from the environment (`{env: NAME}`) as tls's does.
+        27, verify_hostname, str, 0
+            => |s, d, len| {
+                if len <= s.verify_hostname.len() {
+                    super::set_str(&mut s.verify_hostname, &mut s.verify_hostname_len, d, len);
+                } else {
+                    s.verify_hostname_refused = true;
+                }
+            };
     }
 }
 
-/// Where the read of the node's capability file stands.
+/// Where the read of one of the attach's files stands.
 enum CapRead {
     /// The file system answered "not yet": the FD and the bytes read so far
     /// are kept, and the next step resumes from there.
     Pending,
-    /// The whole file, in `cap_text[..n]`; its FD closed.
+    /// The whole file, `n` bytes; its FD closed.
     Done(usize),
-    /// Missing, unreadable, empty or larger than `CAP_TEXT_MAX`; FD closed.
+    /// Missing, unreadable, empty or larger than its buffer; FD closed.
     Bad,
 }
 
-/// One step of reading the node's capability file into `cap_text`. The fs
-/// provider never waits on its device inside a call: `EAGAIN` means nothing
-/// moved, so the read is resumed on a later step, never restarted and never
-/// taken for its end. Bytes are taken while they move; a short count
-/// advances by what moved.
-unsafe fn read_capability(s: &mut State, sys: &SyscallTable) -> CapRead {
-    if s.cap_fd < 0 {
-        let mut path = [0u8; 256];
-        let pl = (s.loam_capability_len as usize)
-            .min(path.len())
-            .min(s.loam_capability.len());
-        let (Some(dst), Some(src)) = (path.get_mut(..pl), s.loam_capability.get(..pl)) else {
+/// One step of reading the file at `path` whole into `dst`. The fs provider
+/// never waits on its device inside a call: `EAGAIN` means nothing moved,
+/// so the read is resumed on a later step (`fd`, `filled` held), never
+/// restarted and never taken for its end. Bytes are taken while they move;
+/// a short count advances by what moved.
+unsafe fn read_whole(
+    sys: &SyscallTable,
+    fd: &mut i32,
+    filled: &mut u32,
+    path: &[u8],
+    dst: &mut [u8],
+) -> CapRead {
+    let cap = dst.len();
+    if *fd < 0 {
+        let mut p = [0u8; 256];
+        let pl = path.len().min(p.len());
+        let (Some(d), Some(src)) = (p.get_mut(..pl), path.get(..pl)) else {
             return CapRead::Bad;
         };
-        dst.copy_from_slice(src);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), pl);
-        if fd == FS_EAGAIN || fd == FS_EINPROGRESS {
+        d.copy_from_slice(src);
+        let h = (sys.provider_call)(-1, FS_OPEN, p.as_mut_ptr(), pl);
+        if h == FS_EAGAIN || h == FS_EINPROGRESS {
             return CapRead::Pending;
         }
-        if fd < 0 {
+        if h < 0 {
             return CapRead::Bad;
         }
-        s.cap_fd = fd;
-        s.cap_filled = 0;
+        *fd = h;
+        *filled = 0;
     }
-    let fd = s.cap_fd;
-    let mut filled = (s.cap_filled as usize).min(CAP_TEXT_MAX);
+    let h = *fd;
+    let mut got = (*filled as usize).min(cap);
     let mut eof = false;
-    while filled < CAP_TEXT_MAX {
-        let room = CAP_TEXT_MAX - filled;
-        let n = (sys.provider_call)(fd, FS_READ, s.cap_text.as_mut_ptr().add(filled), room);
+    while got < cap {
+        let room = cap - got;
+        let n = (sys.provider_call)(h, FS_READ, dst.as_mut_ptr().add(got), room);
         if n == FS_EAGAIN || n == FS_EINPROGRESS {
-            s.cap_filled = filled as u32;
+            *filled = got as u32;
             return CapRead::Pending;
         }
         if n < 0 {
-            close_capability(s, sys);
+            close_fd(sys, fd, filled);
             return CapRead::Bad;
         }
         if n == 0 {
             eof = true;
             break;
         }
-        filled += (n as usize).min(room);
+        got += (n as usize).min(room);
     }
-    s.cap_filled = filled as u32;
+    *filled = got as u32;
     if !eof {
         // At the ceiling: one byte past it refuses the file, not cuts it.
         let mut probe = [0u8; 1];
-        let n = (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), 1);
+        let n = (sys.provider_call)(h, FS_READ, probe.as_mut_ptr(), 1);
         if n == FS_EAGAIN || n == FS_EINPROGRESS {
             return CapRead::Pending;
         }
         if n != 0 {
-            close_capability(s, sys);
+            close_fd(sys, fd, filled);
             return CapRead::Bad;
         }
     }
-    close_capability(s, sys);
-    if filled == 0 {
+    close_fd(sys, fd, filled);
+    if got == 0 {
         return CapRead::Bad;
     }
-    CapRead::Done(filled)
+    CapRead::Done(got)
 }
 
-/// Release the capability file's FD, if one is open. Nothing here relies
-/// on the close: the file is only read.
-unsafe fn close_capability(s: &mut State, sys: &SyscallTable) {
-    if s.cap_fd >= 0 {
+/// Release a read's FD, if one is open. Nothing here relies on the close:
+/// the file is only read.
+unsafe fn close_fd(sys: &SyscallTable, fd: &mut i32, filled: &mut u32) {
+    if *fd >= 0 {
         let mut z = [0u8; 4];
-        (sys.provider_call)(s.cap_fd, FS_CLOSE, z.as_mut_ptr(), 0);
+        (sys.provider_call)(*fd, FS_CLOSE, z.as_mut_ptr(), 0);
     }
-    s.cap_fd = -1;
-    s.cap_filled = 0;
+    *fd = -1;
+    *filled = 0;
+}
+
+/// Every file an attach reads, read now (a rotated file holds from the
+/// next attach on) — the node's capability chains, then the certificate
+/// chain, key and trust anchors named by path — each a step at a time:
+/// `Pending` resumes where it stopped. `Done(n)`: the capability is
+/// `cap_text[..n]`, and `cert`, `key`, `trust` the DER the subgraph's tls
+/// is handed. `Bad` says which file, and the next attach reads afresh.
+unsafe fn read_inputs(s: &mut State, sys: &SyscallTable) -> CapRead {
+    loop {
+        let stage = s.rd_stage;
+        let (path, plen): (&[u8; 255], u8) = match stage {
+            RD_CAP => (&s.loam_capability, s.loam_capability_len),
+            RD_CERT => (&s.cert_path, s.cert_path_len),
+            RD_KEY => (&s.key_path, s.key_path_len),
+            RD_TRUST => (&s.trust_path, s.trust_path_len),
+            _ => {
+                s.rd_stage = RD_CAP;
+                return CapRead::Done(s.cap_len);
+            }
+        };
+        if plen == 0 {
+            // Embedded at build: nothing to read.
+            s.rd_stage = stage + 1;
+            continue;
+        }
+        let mut p = [0u8; 255];
+        let pl = plen as usize;
+        p[..pl].copy_from_slice(&path[..pl]);
+        let path = &p[..pl];
+        let got = if stage == RD_CAP {
+            read_whole(sys, &mut s.cap_fd, &mut s.cap_filled, path, &mut s.cap_text)
+        } else {
+            read_whole(sys, &mut s.cap_fd, &mut s.cap_filled, path, &mut s.cred_raw)
+        };
+        let n = match got {
+            CapRead::Pending => return CapRead::Pending,
+            CapRead::Bad => {
+                // Each message in its own arm: a match yielding the literals
+                // would be a table of absolute pointers.
+                match stage {
+                    RD_CAP => log(sys, 1, b"[volume_host] the Loam capability file cannot be read, or is empty or too large"),
+                    RD_CERT => log(sys, 1, b"[volume_host] cert_file cannot be read, or is empty or too large"),
+                    RD_KEY => log(sys, 1, b"[volume_host] key_file cannot be read, or is empty or too large"),
+                    _ => log(sys, 1, b"[volume_host] trust cannot be read, or is empty or too large"),
+                }
+                s.rd_stage = RD_CAP;
+                return CapRead::Bad;
+            }
+            CapRead::Done(n) => n,
+        };
+        if stage == RD_CAP {
+            s.cap_len = n;
+        } else {
+            let raw = &s.cred_raw[..n];
+            let (dst, dlen, key) = match stage {
+                RD_CERT => (&mut s.cert[..], &mut s.cert_len, false),
+                RD_KEY => (&mut s.key[..], &mut s.key_len, true),
+                _ => (&mut s.trust[..], &mut s.trust_len, false),
+            };
+            match pem_or_der(raw, key, dst) {
+                Some(l) => *dlen = l as u16,
+                None => {
+                    *dlen = 0;
+                    match stage {
+                        RD_CERT => log(sys, 1, b"[volume_host] cert_file is neither DER nor PEM CERTIFICATE blocks, or too large"),
+                        RD_KEY => log(sys, 1, b"[volume_host] key_file is neither DER nor a PEM private key, or too large"),
+                        _ => log(sys, 1, b"[volume_host] trust is neither DER nor PEM CERTIFICATE blocks, or too large"),
+                    }
+                    s.rd_stage = RD_CAP;
+                    return CapRead::Bad;
+                }
+            }
+        }
+        s.rd_stage = stage + 1;
+        if s.rd_stage == RD_DONE {
+            s.rd_stage = RD_CAP;
+            return CapRead::Done(s.cap_len);
+        }
+    }
 }
 
 unsafe fn set_str(dst: &mut [u8], dst_len: &mut u8, d: *const u8, len: usize) {
@@ -487,7 +629,8 @@ unsafe fn set_str(dst: &mut [u8], dst_len: &mut u8, d: *const u8, len: usize) {
 
 /// The extended entries after the schema's end marker, as the config
 /// builder lays them for any module: `cert_file` (10), `key_file` (11),
-/// `trust` (12), `verify_hostname` (13), `[tag][0x00][len BE][payload]`.
+/// `trust` (12) — the build-time `${file:<path>}` forms, for a target with
+/// no file surface — `[tag][0x00][len BE][payload]`.
 unsafe fn parse_credentials(s: &mut State, params: *const u8, params_len: usize) {
     if params.is_null() || params_len < 4 {
         return;
@@ -510,7 +653,7 @@ unsafe fn parse_credentials(s: &mut State, params: *const u8, params_len: usize)
     }
     while pos + 4 <= params_len {
         let tag = data[pos];
-        if matches!(tag, 10..=13) && data[pos + 1] == 0 {
+        if matches!(tag, 10..=12) && data[pos + 1] == 0 {
             let len = ((data[pos + 2] as usize) << 8) | data[pos + 3] as usize;
             let at = pos + 4;
             if at + len > params_len {
@@ -529,10 +672,6 @@ unsafe fn parse_credentials(s: &mut State, params: *const u8, params_len: usize)
                 12 if len <= MAX_CRED => {
                     s.trust[..len].copy_from_slice(v);
                     s.trust_len = len as u16;
-                }
-                13 if len <= s.verify_hostname.len() => {
-                    s.verify_hostname[..len].copy_from_slice(v);
-                    s.verify_hostname_len = len as u8;
                 }
                 _ => {}
             }
@@ -750,12 +889,24 @@ pub unsafe extern "C" fn module_new(
     s.proc_h = -1;
     s.cap_fd = -1;
     s.cap_filled = 0;
+    s.rd_stage = RD_CAP;
+    s.cap_len = 0;
     s.device_key = issuer_key::IssuerKey::empty();
     s.attach = KagiAttach::empty();
     s.inst = [NO_INST; MAX_INST];
+    s.verify_hostname_len = 0;
+    s.verify_hostname_refused = false;
     params_def::set_defaults(s);
     params_def::parse_tlv(s, params, params_len);
     parse_credentials(s, params, params_len);
+    if s.verify_hostname_refused {
+        log(
+            &*s.syscalls,
+            1,
+            b"[volume_host] refusing to construct: `verify_hostname` must be at most 64 bytes; a truncated name authenticates a different host",
+        );
+        return -1;
+    }
     0
 }
 
@@ -809,12 +960,16 @@ unsafe fn configure(s: &mut State, sys: &SyscallTable) {
         && s.issuer_len != 0
         && s.device_len != 0
         && s.key_label_len != 0
-        && s.cert_len != 0
-        && s.key_len != 0
-        && s.trust_len != 0
+        && (s.cert_len != 0) != (s.cert_path_len != 0)
+        && (s.key_len != 0) != (s.key_path_len != 0)
+        && (s.trust_len != 0) != (s.trust_path_len != 0)
+        && [&s.cert_path[..], &s.key_path[..], &s.trust_path[..]]
+            .iter()
+            .zip([s.cert_path_len, s.key_path_len, s.trust_path_len])
+            .all(|(p, l)| l == 0 || p.first() == Some(&b'/'))
         && matches!(suite, auth_wire::suite::ED25519 | auth_wire::suite::ES256);
     if !ok {
-        log(sys, 1, b"[volume_host] FAULT: loam_authority, loam_capability, issuer, device, device_key_label, cert_file, key_file and trust are required");
+        log(sys, 1, b"[volume_host] FAULT: loam_authority, loam_capability, issuer, device, device_key_label, cert_file, key_file and trust are required (each credential an absolute path or embedded, not both)");
         s.configured = 2;
         return;
     }
@@ -1100,23 +1255,19 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
         answer(s, sys, Outcome::Unavailable);
         return;
     };
-    // The capability's chains, read now (a rotated file holds from the next
-    // attach on) and handed to the subgraph: it cannot read the file itself.
-    // A read the file system answers "not yet" holds the effect: the next
-    // step resumes it (`W_CAP`) and runs this again on the held record,
-    // which moved nothing before this point.
-    let cap_len = match read_capability(s, sys) {
+    // The capability's chains and this node's certificate, key and trust
+    // anchors, read now (a rotated file holds from the next attach on) and
+    // handed to the subgraph: as a workload it reads none of the node's
+    // files itself. A read the file system answers "not yet" holds the
+    // effect: the next step resumes it (`W_CAP`) and runs this again on the
+    // held record, which moved nothing before this point.
+    let cap_len = match read_inputs(s, sys) {
         CapRead::Done(n) => n,
         CapRead::Pending => {
             s.wait = W_CAP;
             return;
         }
         CapRead::Bad => {
-            log(
-                sys,
-                1,
-                b"[volume_host] the Loam capability file cannot be read, or is empty or too large",
-            );
             answer(s, sys, Outcome::Failed);
             return;
         }
@@ -1654,8 +1805,10 @@ unsafe fn poll_tool(s: &mut State, sys: &SyscallTable) {
 unsafe fn answer(s: &mut State, sys: &SyscallTable, o: Outcome) {
     s.busy = 0;
     s.wait = W_NONE;
-    // A capability read still open (the effect timed out) is given up on.
-    close_capability(s, sys);
+    // A file read still open (the effect timed out) is given up on: the
+    // next attach reads every file afresh.
+    close_fd(sys, &mut s.cap_fd, &mut s.cap_filled);
+    s.rd_stage = RD_CAP;
     // A call still open is given up on: a late answer is not the next
     // effect's, and the client is told.
     s.call.cancel();

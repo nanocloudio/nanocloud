@@ -484,7 +484,7 @@ modules:
     type: tls
     mode: 0
     peer_auth: ca_dns
-    trust: "${file:/etc/nanocloud/volumes/ca.der}"
+    trust: /etc/nanocloud/volumes/ca.der
     cert_file: /etc/nanocloud/volumes/node.der
     key_file: /etc/nanocloud/volumes/node.key.der
   - name: kagi_storage_effect
@@ -493,7 +493,7 @@ modules:
   - name: volume_host
     loam_authority: "127.0.0.1:7443"
     loam_capability: /etc/nanocloud/volumes/node.cap
-    trust: "${file:/etc/nanocloud/volumes/ca.der}"
+    trust: /etc/nanocloud/volumes/ca.der
     cert_file: /etc/nanocloud/volumes/node.der
     key_file: /etc/nanocloud/volumes/node.key.der
     issuer: "https://kagi.nanocloud"
@@ -508,7 +508,7 @@ modules:
     type: tls
     mode: 0
     peer_auth: ca_dns
-    trust: "${file:/etc/nanocloud/volumes/ca.der}"
+    trust: /etc/nanocloud/volumes/ca.der
     cert_file: /etc/nanocloud/volumes/node.der
     key_file: /etc/nanocloud/volumes/node.key.der
   # ── Kagi: the storage-key service, its ledger, custodians and endpoint ──
@@ -542,7 +542,7 @@ modules:
     mode: 1
     verify_peer: 1
     peer_auth: ca_dns
-    trust: "${file:/etc/nanocloud/volumes/ca.der}"
+    trust: /etc/nanocloud/volumes/ca.der
     cert_file: /etc/nanocloud/volumes/kagi.der
     key_file: /etc/nanocloud/volumes/kagi.key.der
 

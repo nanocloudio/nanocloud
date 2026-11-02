@@ -185,33 +185,47 @@ FLUXOR_STORE_DIR="$D6" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
 echo "   bound: $D6 -> /data (ro) passed as a workload bind; refused without a rootfs, as it must be"
 
 # ── Privileged path: the ISOLATED sandbox through the same module→contract
-# chain. Namespace surgery needs CAP_SYS_ADMIN, so this block runs only as
-# root; unprivileged runs stop after the null-sandbox proof above.
-if [ "$(id -u)" != 0 ]; then
-  echo "== isolated path: SKIPPED (needs root; re-run with sudo -E to exercise it) =="
+# chain. Namespace creation needs CAP_SYS_ADMIN in the runtime's user
+# namespace — asked of this process (CapEff), not of `id -u`: root in a user
+# namespace (`unshare -Ur`) holds it there, a uid 1000 mapped into one does
+# not, and the backend refuses `isolate` without it (fail-closed).
+CAPEFF="$(awk '/^CapEff:/ {print $2}' /proc/self/status)"
+if ! (( 0x${CAPEFF:-0} & (1 << 21) )); then
+  echo "== isolated (6-7) and net=own (8) paths: SKIPPED — this process lacks CAP_SYS_ADMIN (uid $(id -u), CapEff ${CAPEFF:-?}); the backend refuses isolate and an own netns without it =="
   exit 0
 fi
 
-echo "== 6. project an ISOLATED sandbox (isolate=1 => unshare MOUNT|UTS|IPC) =="
-HOST_HOSTNAME="$(hostname)"
-# No rootfs: unshare + private-mount, no pivot; set the UTS hostname and exit 0.
+echo "== 6. project an ISOLATED sandbox (isolate=1 => unshare MOUNT|UTS|IPC|PID) =="
+# The workload names the namespaces it runs in, and they must not be the
+# runtime's. (It cannot prove UTS by setting the hostname: a workload runs
+# with the OCI default capabilities, which leave out CAP_SYS_ADMIN, so its
+# sethostname is EPERM in any namespace — the confinement working, not the
+# isolation failing.)
+HOST_NS="$(readlink /proc/self/ns/uts /proc/self/ns/ipc /proc/self/ns/mnt /proc/self/ns/pid | tr '\n' ' ')"
+# No rootfs: unshare + private-mount, no pivot.
 D2="$(mktemp -d /tmp/nc-sb-iso-XXXXXX)"; trap 'rm -rf "$D" "$D2"' EXIT
 # Pre-seed the spec (cold-start reconcile lists it) — writing after launch
 # raced the runtime's bounded 3s window on external WAL appends.
-D="$D2" wal_put "/sandboxes/iso1" "cmd=hostname sandbox-ns-iso;iso=1;phase=start"
+D="$D2" wal_put "/sandboxes/iso1" "cmd=/usr/bin/readlink /proc/self/ns/uts /proc/self/ns/ipc /proc/self/ns/mnt /proc/self/ns/pid;iso=1;phase=start"
 FLUXOR_STORE_DIR="$D2" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" \
   >"$D/run-iso.log" 2>&1 || true
 
-echo "== 7. verify the isolated sandbox ran and the host UTS is intact =="
+echo "== 7. verify the isolated sandbox ran in namespaces of its own =="
 IST="$(D="$D2" wal_last /sandbox-status/iso1)"
 [[ "$IST" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] \
   || fail "isolated status wrong: got '$IST', want 'state=exited;code=0;started=<moment>'"
-[ "$(hostname)" = "$HOST_HOSTNAME" ] \
-  || fail "host hostname changed ('$HOST_HOSTNAME' -> '$(hostname)') — UTS did NOT isolate"
+ILOG="$(D="$D2" wal_last /sandbox-logs/iso1)"
+for ns in uts ipc mnt pid; do
+  inside="$(printf '%s\n' $ILOG | grep "^$ns:\[" || true)"
+  outside="$(printf '%s\n' $HOST_NS | grep "^$ns:\[")"
+  [ -n "$inside" ] || fail "the isolated sandbox did not report its $ns namespace (logs: '$ILOG')"
+  [ "$inside" != "$outside" ] || fail "the isolated sandbox shares the runtime's $ns namespace ($inside)"
+done
 
-echo "== E2E green (isolated): module -> oci -> unshare(MOUNT|UTS|IPC), host UTS intact =="
-echo "   /sandbox-status/iso1: $IST  (host hostname unchanged: $HOST_HOSTNAME)"
+echo "== E2E green (isolated): module -> workload -> unshare(MOUNT|UTS|IPC|PID), namespaces its own =="
+echo "   /sandbox-status/iso1: $IST"
+echo "   inside: $(echo $ILOG)   runtime: $HOST_NS"
 
 echo "== 8. net=own: leased identity -> own netns + veth carrying the address =="
 # Pod IP allocation is proven by cni-ipam-e2e; here we prove the runner
@@ -231,7 +245,11 @@ D="$D5" wal_put "/sandbox-net"         "seg=0"
 D="$D5" wal_put "/ipam-lease/netbox1"  "10.244.9.7"
 D="$D5" wal_put "/sandboxes/netbox1"   "cmd=$IPBIN addr;phase=start;net=own"
 D="$D5" wal_put "/sandboxes/netbox2"   "cmd=$IPBIN addr;phase=start;net=own"   # no lease -> defer
-FLUXOR_STORE_DIR="$D5" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
+# The link is made under a host registry of the run's own (FLUXOR_RUN_DIR),
+# never the host's /run/fluxor: that one is the host's root's, and a test
+# that wrote it would collide with whatever runtime the host runs — root in
+# a user namespace cannot write it at all (it answered EACCES, -13).
+FLUXOR_RUN_DIR="$D5/run" FLUXOR_STORE_DIR="$D5" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-net.log" 2>&1 || true
 
 NST="$(D="$D5" wal_last /sandbox-status/netbox1)"

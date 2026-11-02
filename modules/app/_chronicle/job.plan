@@ -22,6 +22,12 @@
 //         source as this boot's monotonic ms (`!due+`) and armed on the
 //         kernel timer — nothing polls
 //   fc    the failed count the last backoff was started for
+//   cfa cfw   a pass whose Pod count the store could not answer: the moment
+//         it failed and the ms to wait (1000) — the deadline `cfa+cfw` is
+//         armed like the others, so the pass is asked again. Without it a
+//         count refused at a deadline's pass (activeDeadlineSeconds, a
+//         backoff's end) was the deadline's only pass: nothing else wakes
+//         a Job whose Pod is quietly running, and the Job never failed
 //   sp    "1" suspended, "0" resumed (the Suspended condition)
 //
 // Chains (prefix jb_ in the graphs):
@@ -96,6 +102,7 @@ plan nanocloud.job {
     dfat: int = 50;
     dtf: int = 51;
     now: int = 52;
+    dcf: int = 53;        // cfa+cfw: this boot's monotonic ms (0 when none)
   }
 
   message jb.Ctl {
@@ -112,6 +119,7 @@ plan nanocloud.job {
     d0: int = 50;
     dfat: int = 51;
     dtf: int = 52;
+    dcf: int = 53;
     now: int = 58;
     juid: string = 70;    // the Job, by `related`
     parS: string = 71;
@@ -158,7 +166,7 @@ plan nanocloud.job {
       jb.Count { cid: r.seq, op: DELETE, key: "job-ctl/" + r.key, a: 0, s: 0, f: 0,
                  ctx: Ctx { key: r.key, ns: r.ns, ouid: "", gone: "1", par: 0, comp: 0, mode: "", bol: 0,
                             hads: 0, ads: 0, httl: 0, ttl: 0, sus: "", h0: 0, hfat: 0, htf: 0, fc: 0,
-                            fin: "", sp: "", d0: 0, dfat: 0, dtf: 0, now: 0 } };
+                            fin: "", sp: "", d0: 0, dfat: 0, dtf: 0, now: 0, dcf: 0 } };
     default ->
       jb.Count { cid: r.seq, op: COUNT, key: "pods/" + r.ns + "/", a: 0, s: 0, f: 0,
                  ctx: Ctx { key: r.key, ns: r.ns, ouid: r.juid, gone: "",
@@ -173,7 +181,7 @@ plan nanocloud.job {
                             h0: math.least(1, size(r.t0)), hfat: math.least(1, size(r.fat)),
                             htf: math.least(1, size(r.tf)),
                             fc: int("0" + r.fc), fin: r.fin, sp: r.sp,
-                            d0: r.d0, dfat: r.dfat, dtf: r.dtf, now: r.now } };
+                            d0: r.d0, dfat: r.dfat, dtf: r.dtf, now: r.now, dcf: r.dcf } };
   }
   // The Job's Pods, counted in ONE walk: each Pod counts as the SUM of the
   // weights of what it is — active 1, succeeded 2^16, failed 2^32, ready
@@ -224,10 +232,19 @@ plan nanocloud.job {
     ctx: Ctx = 254;
   }
   decision w1(r: jb.Tally) -> jb.Put {
-    when r.ctx.gone != "" || r.status != 200 ->
+    when r.ctx.gone != "" ->
       jb.Put { cid: r.cid, op: NOOP, key: "", ctx: r.ctx };
+    // The TTL's delete needs no count.
     when r.ctx.fin != "" && r.ctx.httl == 1 && r.ctx.htf == 1 && r.ctx.now >= r.ctx.dtf ->
       jb.Put { cid: r.cid, op: DELETE, key: "jobs.batch/" + r.ctx.key, ctx: r.ctx };
+    // A count the store did not answer decides nothing — and is asked again
+    // in a second (`cfa`, the file head), at most once a second however
+    // often the record is passed meanwhile.
+    when r.status != 200 && r.ctx.now >= r.ctx.dcf ->
+      jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
+               v1: "cfa=", v3: r.moment, v5: ";cfw=1000", ctx: r.ctx };
+    when r.status != 200 ->
+      jb.Put { cid: r.cid, op: NOOP, key: "", ctx: r.ctx };
     when r.ctx.fin != "" ->
       jb.Put { cid: r.cid, op: MERGE, key: "job-ctl/" + r.ctx.key,
                v1: "a=", v2: (r.n % 65536), v3: ";s=", v4: (r.n / 65536 % 65536), v5: ";f=", v6: (r.n / 4294967296 % 65536), v7: ";r=", v8: (r.n / 281474976710656),

@@ -1,0 +1,300 @@
+// The API request path's SCOPE stage (apiplane.plan's chain, between
+// `rbac` and `gate`), compiled to params: whether the kind the path names is
+// served at the path's scope, and the discovery documents a store holds.
+//
+//   rbac -> scope (here; a store_effect) -> disc (here; a store_effect)
+//        -> scoped (here) -> gate
+//
+// A kind is namespaced or cluster-scoped, and the path says which it was
+// addressed as (`…/namespaces/<ns>/<res>…` or not). A cluster-scoped kind on
+// a namespaced path is 404, as upstream answers it; so is a namespaced kind
+// on the cluster path with a name or a write (the cluster path of a
+// namespaced kind is its list and watch across namespaces, nothing else).
+//
+//   - A BUILT-IN kind's scope is this file's: the cluster-scoped kinds are
+//     the ones lattice's dialect keys by name alone (fluxor-apiplane.yaml
+//     `id_paths`), every other built-in kind is namespaced.
+//   - A CUSTOM kind's scope is its CustomResourceDefinition's, as crd.plan
+//     keeps it at /crd-scope/<plural>.<group> ("Cluster" | "Namespaced"):
+//     `scope` reads that row, `scoped` decides on it. No row is no such
+//     kind: 404, as upstream answers a resource it does not serve.
+//
+// A custom group is a dotted group that is not a built-in one: not one of
+// the Kubernetes groups below (whose objects the store keys bare,
+// `/<res>/…`, kube.plan `route`), and not nanocloud.io or
+// snapshot.storage.k8s.io (keyed `/<res>.<group>/…` like a custom kind's,
+// but this server's own). The same list is kube.plan's: the two must agree.
+//
+// DISCOVERY that the store holds rides the same stage: `admit`
+// (apiplane_admit.plan) tags `/apis` and a custom group-version's document
+// with the DISC verdict and the prefix to LIST in `c_key`. The documents are
+// LISTs of the rows crd.plan keeps, their values `,`-joined inside the
+// envelope the node's `list_open`/`list_close` wrap them in — `scope`'s an
+// APIGroupList (`/apis`: /discovery-groups/, the built-in groups one row of
+// it), `disc`'s an APIResourceList (/discovery-res/<group>/<version>/, its
+// groupVersion the envelope's `{{tail}}`, store_effect `list_open`). A
+// decision only moves them: its string arena holds a few hundred bytes of
+// concatenation, a document is kilobytes. Unauthenticated, as every
+// discovery document here is.
+plan nanocloud.apiplane_scope {
+
+  enum M_GET = 1;
+  enum OP_NOOP = 0;
+  enum OP_GET = 1;
+  enum OP_LIST = 7;
+  enum PENDING = 0;
+  enum DISC = 3;
+
+  // What `scope` needs carried beyond the ten fields: the request's group
+  // and non-resource path (apiplane.plan ApiCtx) and RBAC's answer, which
+  // the store's reply would otherwise overwrite at field 2.
+  // `scope`'s answer rides here past `disc`: its status, and its value when
+  // that is a scope row (a few bytes; `/apis` rides `c_body`).
+  message ScopeCtx {
+    group: string = 1;
+    nonres: string = 2;
+    granted: int = 3;
+    sstatus: int = 4;
+    svalue: string = 5;
+  }
+  message ApiCtx {
+    group: string = 1;
+    nonres: string = 2;
+  }
+
+  // RBAC's answer (apiplane.plan Authzed): field 2 the grant probe's status.
+  message Authzed {
+    granted: int = 2;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: ApiCtx = 254;
+  }
+
+  // The store call (store_effect): GET a scope row, LIST discovery rows, or
+  // nothing.
+  message ScopeCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: ScopeCtx = 254;
+  }
+
+  // Its answer: 204 for a NOOP, 200 / 404 for the row, the row at 3.
+  message ScopeReply {
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: ScopeCtx = 254;
+  }
+
+  decision d_scope(a: Authzed) -> ScopeCall {
+    // `/apis`: LIST the groups (a group-version's kinds are `disc`'s).
+    when a.c_verdict == DISC && a.c_key == "/discovery-groups/" ->
+      ScopeCall { cid: a.c_cid, op: OP_LIST, key: a.c_key,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                  c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                  c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    // Decided already (a group-version's document too), refused by RBAC, or
+    // not a resource: nothing to scope.
+    when a.c_verdict != PENDING || a.granted != 200 || a.ctx.nonres != "" || a.c_resource == "" ->
+      ScopeCall { cid: a.c_cid, op: OP_NOOP, key: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                  c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                  c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    // A custom group: the CRD's scope row, by the kind's plural (a
+    // subresource's resource less its `/<sub>`).
+    when a.ctx.group.contains(".")
+         && !",rbac.authorization.k8s.io,apiextensions.k8s.io,storage.k8s.io,scheduling.k8s.io,networking.k8s.io,node.k8s.io,admissionregistration.k8s.io,apiregistration.k8s.io,certificates.k8s.io,discovery.k8s.io,coordination.k8s.io,events.k8s.io,flowcontrol.apiserver.k8s.io,resource.k8s.io,authentication.k8s.io,authorization.k8s.io,nanocloud.io,snapshot.storage.k8s.io,".contains("," + a.ctx.group + ",") ->
+      ScopeCall { cid: a.c_cid, op: OP_GET,
+                  key: "/crd-scope/" + a.c_resource.substring(0, a.c_resource.indexOf("/") + (a.c_resource.size() + 1) * (1 - math.least(1, a.c_resource.indexOf("/") + 1))) + "." + a.ctx.group,
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                  c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                  c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    // A built-in cluster-scoped kind on a namespaced path.
+    when a.c_namespace != ""
+         && ",namespaces,nodes,persistentvolumes,clusterroles,clusterrolebindings,customresourcedefinitions,storageclasses,priorityclasses,ingressclasses,runtimeclasses,csidrivers,csinodes,volumeattachments,mutatingwebhookconfigurations,validatingwebhookconfigurations,apiservices,certificatesigningrequests,graphs,zonesummaries,managementbindings,".contains("," + a.c_resource.substring(0, a.c_resource.indexOf("/") + (a.c_resource.size() + 1) * (1 - math.least(1, a.c_resource.indexOf("/") + 1))) + ",") ->
+      ScopeCall { cid: a.c_cid, op: OP_NOOP, key: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: 404,
+                  c_name: a.c_name, c_body: a.c_body,
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the server could not find the requested resource\",\"reason\":\"NotFound\",\"code\":404}",
+                  c_verb: a.c_verb, c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    // A built-in namespaced kind on the cluster path, named or written.
+    when a.c_namespace == "" && (a.c_name != "" || a.c_method != M_GET)
+         && !",namespaces,nodes,persistentvolumes,clusterroles,clusterrolebindings,customresourcedefinitions,storageclasses,priorityclasses,ingressclasses,runtimeclasses,csidrivers,csinodes,volumeattachments,mutatingwebhookconfigurations,validatingwebhookconfigurations,apiservices,certificatesigningrequests,graphs,zonesummaries,managementbindings,".contains("," + a.c_resource.substring(0, a.c_resource.indexOf("/") + (a.c_resource.size() + 1) * (1 - math.least(1, a.c_resource.indexOf("/") + 1))) + ",") ->
+      ScopeCall { cid: a.c_cid, op: OP_NOOP, key: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: 404,
+                  c_name: a.c_name, c_body: a.c_body,
+                  c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the server could not find the requested resource\",\"reason\":\"NotFound\",\"code\":404}",
+                  c_verb: a.c_verb, c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    default ->
+      ScopeCall { cid: a.c_cid, op: OP_NOOP, key: "",
+                  c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                  c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                  c_resource: a.c_resource, c_namespace: a.c_namespace,
+                  ctx: ScopeCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+  }
+
+  // `disc`'s call and answer: a group-version's kinds LISTed, else nothing,
+  // `scope`'s answer moved into the context either way.
+  message DiscReply {
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: ScopeCtx = 254;
+  }
+  decision d_disc(r: ScopeReply) -> ScopeCall {
+    // `/apis` as `scope` LISTed it rides the body's field (a discovery
+    // request has none): kilobytes do not fit the context's message.
+    when r.c_verdict == DISC && r.c_key == "/discovery-groups/" ->
+      ScopeCall { cid: r.c_cid, op: OP_NOOP, key: "",
+                  c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: r.c_verdict,
+                  c_name: r.c_name, c_body: r.value, c_reason: r.c_reason, c_verb: r.c_verb,
+                  c_resource: r.c_resource, c_namespace: r.c_namespace,
+                  ctx: ScopeCtx { group: r.ctx.group, nonres: r.ctx.nonres, granted: r.ctx.granted,
+                                  sstatus: r.status, svalue: "" } };
+    when r.c_verdict == DISC ->
+      ScopeCall { cid: r.c_cid, op: OP_LIST, key: r.c_key,
+                  c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: r.c_verdict,
+                  c_name: r.c_name, c_body: r.c_body, c_reason: r.c_reason, c_verb: r.c_verb,
+                  c_resource: r.c_resource, c_namespace: r.c_namespace,
+                  ctx: ScopeCtx { group: r.ctx.group, nonres: r.ctx.nonres, granted: r.ctx.granted,
+                                  sstatus: r.status, svalue: "" } };
+    default ->
+      ScopeCall { cid: r.c_cid, op: OP_NOOP, key: "",
+                  c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: r.c_verdict,
+                  c_name: r.c_name, c_body: r.c_body, c_reason: r.c_reason, c_verb: r.c_verb,
+                  c_resource: r.c_resource, c_namespace: r.c_namespace,
+                  ctx: ScopeCtx { group: r.ctx.group, nonres: r.ctx.nonres, granted: r.ctx.granted,
+                                  sstatus: r.status, svalue: r.value } };
+  }
+
+  // The scope row's verdict, back in the shape `gate` reads (RBAC's answer
+  // at 2 again).
+  decision d_scoped(r: DiscReply) -> Authzed {
+    // `/apis`, as `scope` LISTed it.
+    when r.c_verdict == DISC && r.c_key == "/discovery-groups/" && r.ctx.sstatus == 200 ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: "", c_verdict: 200,
+                c_name: "", c_body: "", c_reason: r.c_body, c_verb: "", c_resource: "", c_namespace: "",
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    when r.c_verdict == DISC && r.c_key == "/discovery-groups/" ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: "", c_verdict: 503,
+                c_name: "", c_body: "", c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the group list could not be read\",\"reason\":\"ServiceUnavailable\",\"code\":503}", c_verb: "", c_resource: "", c_namespace: "",
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    // A group-version's kinds, as `disc` LISTed them; none is no such
+    // group-version.
+    when r.c_verdict == DISC && r.status == 200 && !r.value.endsWith("\"resources\":[]}") ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: "", c_verdict: 200,
+                c_name: "", c_body: "", c_reason: r.value, c_verb: "", c_resource: "", c_namespace: "",
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    when r.c_verdict == DISC ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: "", c_verdict: 404,
+                c_name: "", c_body: "", c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the server could not find the requested resource\",\"reason\":\"NotFound\",\"code\":404}", c_verb: "", c_resource: "", c_namespace: "",
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    // A custom kind no CustomResourceDefinition defines (the row's GET 404),
+    // or one addressed at the scope it is not.
+    when r.ctx.sstatus == 404
+         || (r.ctx.sstatus == 200 && r.ctx.svalue == "Cluster" && r.c_namespace != "")
+         || (r.ctx.sstatus == 200 && r.ctx.svalue == "Namespaced" && r.c_namespace == "" && (r.c_name != "" || r.c_method != M_GET))
+         || (r.ctx.sstatus == 200 && r.ctx.svalue != "Cluster" && r.ctx.svalue != "Namespaced") ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: 404,
+                c_name: r.c_name, c_body: r.c_body, c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the server could not find the requested resource\",\"reason\":\"NotFound\",\"code\":404}",
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    // A row the store could not read is no verdict on the kind: refused as
+    // the store's failure, not as an absent kind.
+    when r.ctx.sstatus != 200 && r.ctx.sstatus != 204 ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: 503,
+                c_name: r.c_name, c_body: r.c_body, c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the resource's scope could not be read\",\"reason\":\"ServiceUnavailable\",\"code\":503}",
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    default ->
+      Authzed { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key, c_verdict: r.c_verdict,
+                c_name: r.c_name, c_body: r.c_body, c_reason: r.c_reason,
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: ApiCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+  }
+
+  // EVERY field: a pass stage that drops one leaves the decision after it
+  // reading a field that is not there.
+  transformation pass_authzed(a: Authzed) -> Authzed {
+    Authzed { granted: a.granted, c_cid: a.c_cid, c_method: a.c_method,
+              c_key: a.c_key, c_verdict: a.c_verdict, c_name: a.c_name,
+              c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+              c_resource: a.c_resource, c_namespace: a.c_namespace, ctx: a.ctx }
+  }
+  transformation pass_disc(r: DiscReply) -> DiscReply {
+    DiscReply { status: r.status, value: r.value, c_cid: r.c_cid, c_method: r.c_method,
+                c_key: r.c_key, c_verdict: r.c_verdict, c_name: r.c_name,
+                c_body: r.c_body, c_reason: r.c_reason, c_verb: r.c_verb,
+                c_resource: r.c_resource, c_namespace: r.c_namespace, ctx: r.ctx }
+  }
+  transformation pass_reply(r: ScopeReply) -> ScopeReply {
+    ScopeReply { status: r.status, value: r.value, c_cid: r.c_cid, c_method: r.c_method,
+                 c_key: r.c_key, c_verdict: r.c_verdict, c_name: r.c_name,
+                 c_body: r.c_body, c_reason: r.c_reason, c_verb: r.c_verb,
+                 c_resource: r.c_resource, c_namespace: r.c_namespace, ctx: r.ctx }
+  }
+
+  pipeline scope(a: Authzed) -> ScopeCall {
+    call x = pass_authzed(a);
+    call y = d_scope(x);
+    return y;
+  }
+  pipeline disc(r: ScopeReply) -> ScopeCall {
+    call x = pass_reply(r);
+    call y = d_disc(x);
+    return y;
+  }
+  pipeline scoped(r: DiscReply) -> Authzed {
+    call x = pass_disc(r);
+    call y = d_scoped(x);
+    return y;
+  }
+
+  entry scope = scope;
+  entry disc = disc;
+  entry scoped = scoped;
+
+  provenance revision "apiplane-scope" toolchain "chronicle-authoring";
+}

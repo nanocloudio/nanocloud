@@ -1,8 +1,8 @@
 // Service proxying as params — kube-proxy's decision half.
 //
-//   row    /services/ JOIN its /endpointslices/<ns>/<svc>/ (scoped): one row
+//   row    /services/ JOIN its /endpoint-rows/<ns>/<svc>/ (scoped): one row
 //          per (Service, READY backend) at /np-rows/proxy/<ns>/<svc>/<pod> =
-//          — a slice is `ip=<ip>;state=<ready|serving|terminating>;…`
+//          — a row is `ip=<ip>;state=<ready|notready|serving|terminating>;…`
 //          (endpoints.plan), and only a ready one is a backend: a serving
 //          or terminating endpoint is draining and takes no new flows —
 //          "kind=dnat;vip=…;vports=…;tports=…;protos=…;backend=<ip>;

@@ -1,0 +1,239 @@
+// The API request path's RBAC ESCALATION check, between `rbac` and `scope`
+// (apiplane.plan's chain):
+//
+//   rbac -> esc (here; a store_big COVER) -> escd (here) -> scope
+//
+// Authorization answered whether the caller may write a Role, ClusterRole,
+// RoleBinding, ClusterRoleBinding or ManagementBinding at all. Upstream asks
+// one thing more of such a write, and so does this: the permissions the
+// object would grant must already be the writer's — or the writer may
+// `escalate` the role (a role write) or `bind` it (a binding write) — so a
+// subject allowed to manage RBAC cannot hand out more than it holds. A
+// ManagementBinding is a ClusterRole and its ClusterRoleBinding in one
+// (management.plan derives both), and takes both rules. What "held" means,
+// and how a patch is checked on its result, is `_shared/rbac_cover.rs`'s: the
+// same grant index `rbac` probed, with the same wildcards.
+//
+//   esc    a write (create, replace, any patch) of one of those five, by a
+//          caller `rbac` granted it: OP_COVER on the body, as the caller
+//          sent it (inline, or staged by digest). Anything else: NOOP.
+//   escd   200 (held) or 204 (not checked): on, RBAC's answer back at 2 for
+//          `scope`. 403 / 404: the Status the check wrote becomes the
+//          verdict. 422 a body or patch that is no object of its kind, 413
+//          one past the check's bounds, any other answer 503: refused —
+//          never admitted on a check that did not run.
+//
+// CARRY. The ten fields ride 30..39 as `rbac` left them; RBAC's answer,
+// which the store's reply overwrites at 2, rides the reserved carry field
+// (254) with the request's group and non-resource path. The caller's
+// identity is `authz`'s (apiplane.plan ApiCtx `who`).
+plan nanocloud.apiplane_esc {
+
+  enum M_GET = 1;
+  enum M_POST = 3;
+  enum M_PUT = 5;
+  enum M_PATCH = 6;
+  enum M_PATCH_JSON = 16;
+  enum M_PATCH_SMP = 26;
+  enum M_PATCH_APPLY = 36;
+  enum OP_NOOP = 0;
+  enum OP_COVER = 23;
+  enum PENDING = 0;
+
+  message ApiCtx {
+    group: string = 1;
+    nonres: string = 2;
+    who: string = 4;
+  }
+  message EscCtx {
+    group: string = 1;
+    nonres: string = 2;
+    granted: int = 3;
+  }
+
+  // RBAC's answer (apiplane.plan Authzed): field 2 the grant probe's status.
+  message Authzed {
+    granted: int = 2;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: ApiCtx = 254;
+  }
+  // What `escd` hands `scope`: the same shape, its context the request's.
+  message Checked {
+    granted: int = 2;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: EscCtx = 254;
+  }
+
+  // The store call (store_effect OP_COVER, see its manifest): the writer,
+  // the body, the resource and namespace, the stored object's key, how the
+  // body applies (0 whole, else the patch's op), the path's name.
+  message EscCall {
+    cid: int = 1;
+    op: int = 2;
+    id: string = 3;
+    body: string = 4;
+    res: string = 72;
+    ns: string = 73;
+    okey: string = 74;
+    how: int = 75;
+    pname: string = 76;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: EscCtx = 254;
+  }
+  message EscReply {
+    status: int = 2;
+    value: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_verdict: int = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_reason: string = 36;
+    c_verb: string = 37;
+    c_resource: string = 38;
+    c_namespace: string = 39;
+    ctx: EscCtx = 254;
+  }
+
+  // Which writes the check guards: a write of one of the five kinds,
+  // granted. Each branch states how its body applies (`how`), one per
+  // method — a number is chosen here, not computed.
+  decision d_esc(a: Authzed) -> EscCall {
+    when a.c_verdict != PENDING || a.granted != 200 || a.ctx.who == ""
+         || a.c_method == M_GET
+         || !((a.ctx.group == "rbac.authorization.k8s.io"
+               && (a.c_resource == "roles" || a.c_resource == "clusterroles"
+                   || a.c_resource == "rolebindings" || a.c_resource == "clusterrolebindings"))
+              || (a.ctx.group == "nanocloud.io" && a.c_resource == "managementbindings")) ->
+      EscCall { cid: a.c_cid, op: OP_NOOP, id: "",
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    when a.c_method == M_POST || a.c_method == M_PUT ->
+      EscCall { cid: a.c_cid, op: OP_COVER, id: a.ctx.who, body: a.c_body, res: a.c_resource,
+                ns: a.c_namespace, okey: a.c_key, how: 0, pname: a.c_name,
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    when a.c_method == M_PATCH ->
+      EscCall { cid: a.c_cid, op: OP_COVER, id: a.ctx.who, body: a.c_body, res: a.c_resource,
+                ns: a.c_namespace, okey: a.c_key, how: 13, pname: a.c_name,
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    when a.c_method == M_PATCH_JSON ->
+      EscCall { cid: a.c_cid, op: OP_COVER, id: a.ctx.who, body: a.c_body, res: a.c_resource,
+                ns: a.c_namespace, okey: a.c_key, how: 14, pname: a.c_name,
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    when a.c_method == M_PATCH_SMP ->
+      EscCall { cid: a.c_cid, op: OP_COVER, id: a.ctx.who, body: a.c_body, res: a.c_resource,
+                ns: a.c_namespace, okey: a.c_key, how: 15, pname: a.c_name,
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    when a.c_method == M_PATCH_APPLY ->
+      EscCall { cid: a.c_cid, op: OP_COVER, id: a.ctx.who, body: a.c_body, res: a.c_resource,
+                ns: a.c_namespace, okey: a.c_key, how: 16, pname: a.c_name,
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+    // A delete grants nothing: not checked, as upstream.
+    default ->
+      EscCall { cid: a.c_cid, op: OP_NOOP, id: "",
+                c_cid: a.c_cid, c_method: a.c_method, c_key: a.c_key, c_verdict: a.c_verdict,
+                c_name: a.c_name, c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+                c_resource: a.c_resource, c_namespace: a.c_namespace,
+                ctx: EscCtx { group: a.ctx.group, nonres: a.ctx.nonres, granted: a.granted } };
+  }
+
+  // The check's verdict, back in the shape `scope` reads (RBAC's answer at
+  // 2 again).
+  decision d_escd(r: EscReply) -> Checked {
+    when r.status == 200 || r.status == 204 ->
+      Checked { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                c_verdict: r.c_verdict, c_name: r.c_name, c_body: r.c_body, c_reason: r.c_reason,
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: EscCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    // Not held (403), or the binding's role not found (404): the Status
+    // the check wrote.
+    when (r.status == 403 || r.status == 404) && r.value != "" ->
+      Checked { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                c_verdict: r.status, c_name: r.c_name, c_body: r.c_body, c_reason: r.value,
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: EscCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    when r.status == 422 ->
+      Checked { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                c_verdict: 422, c_name: r.c_name, c_body: r.c_body,
+                c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the object (or the patch applied to it) is not a valid object of its kind\",\"reason\":\"Invalid\",\"code\":422}",
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: EscCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    when r.status == 413 ->
+      Checked { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                c_verdict: 413, c_name: r.c_name, c_body: r.c_body,
+                c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the permissions this object grants are more than the escalation check reads\",\"reason\":\"RequestEntityTooLarge\",\"code\":413}",
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: EscCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+    default ->
+      Checked { granted: r.ctx.granted, c_cid: r.c_cid, c_method: r.c_method, c_key: r.c_key,
+                c_verdict: 503, c_name: r.c_name, c_body: r.c_body,
+                c_reason: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the escalation check could not be completed\",\"reason\":\"ServiceUnavailable\",\"code\":503}",
+                c_verb: r.c_verb, c_resource: r.c_resource, c_namespace: r.c_namespace,
+                ctx: EscCtx { group: r.ctx.group, nonres: r.ctx.nonres } };
+  }
+
+  transformation pass_authzed(a: Authzed) -> Authzed {
+    Authzed { granted: a.granted, c_cid: a.c_cid, c_method: a.c_method,
+              c_key: a.c_key, c_verdict: a.c_verdict, c_name: a.c_name,
+              c_body: a.c_body, c_reason: a.c_reason, c_verb: a.c_verb,
+              c_resource: a.c_resource, c_namespace: a.c_namespace, ctx: a.ctx }
+  }
+  pipeline esc(a: Authzed) -> EscCall {
+    call x = pass_authzed(a);
+    call y = d_esc(x);
+    return y;
+  }
+  pipeline escd(r: EscReply) -> Checked {
+    call y = d_escd(r);
+    return y;
+  }
+  entry esc = esc;
+  entry escd = escd;
+
+  provenance revision "apiplane-rbac-escalation" toolchain "chronicle-authoring";
+}

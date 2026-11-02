@@ -21,6 +21,11 @@
 //   @age(path)         the time since the RFC 3339 timestamp at path, as
 //                      kubectl's HumanDuration prints it
 //   @jobstatus()       a Job's STATUS as kubectl prints it
+//   @more(path:k)      member k of each element of the list at path (each of
+//                      its elements when k is a list), the first three
+//                      joined by `,`, `+ <n> more...` past them, `<unset>`
+//                      for none — kubectl's listWithMoreString (an
+//                      EndpointSlice's PORTS and ENDPOINTS)
 //
 // Every cell is a string, pre-rendered, so a client prints it as sent.
 
@@ -313,6 +318,56 @@ fn tbl_fn(f: &[u8], arg: &[u8], obj: &[u8], now_ms: u64, out: &mut [u8], at: &mu
         b"podstatus" => {
             let reason = tbl_pod_reason(obj);
             put(out, at, reason.as_slice())
+        }
+        b"more" => {
+            let (path, member) = match arg.iter().position(|&b| b == b':') {
+                Some(i) => (&arg[..i], &arg[i + 1..]),
+                None => return false,
+            };
+            let list = tbl_sub(obj, path).unwrap_or(b"[]");
+            let mut count = 0usize;
+            let mut shown = 0usize;
+            let mut ok = true;
+            let mut one = |v: &[u8], out: &mut [u8], at: &mut usize| {
+                let v = jp_trim(v);
+                let v = if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+                    &v[1..v.len() - 1]
+                } else {
+                    v
+                };
+                if v.is_empty() || v == b"null" {
+                    return;
+                }
+                count += 1;
+                if shown < 3 {
+                    if shown > 0 {
+                        ok &= put(out, at, b",");
+                    }
+                    ok &= put(out, at, v);
+                    shown += 1;
+                }
+            };
+            for e in jp_elems(list) {
+                let Some(v) = jp_get(e, member) else {
+                    continue;
+                };
+                if jp_kind(v) == b'[' {
+                    for x in jp_elems(v) {
+                        one(x, out, at);
+                    }
+                } else {
+                    one(v, out, at);
+                }
+            }
+            if count == 0 {
+                ok && put(out, at, b"<unset>")
+            } else if count > 3 {
+                ok && put(out, at, b" + ")
+                    && tbl_dec((count - 3) as u64, out, at)
+                    && put(out, at, b" more...")
+            } else {
+                ok
+            }
         }
         _ => false,
     }

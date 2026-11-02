@@ -20,8 +20,8 @@ hardware_targets = ["bcm2712", "linux"]
 #   ROUTES    a peer route to every other node: its spec.podCIDR via its
 #             InternalIP (status.addresses).
 #   HOLD      the addresses of LoadBalancer Services
-#             (svc_alloc's pool, `/lb-addr/<ns>/<name>` = `ip=…` — not their
-#             status, which reports the VIP's readiness), each
+#             (svc_alloc's pool, `/lb-addr/<ns>/<name>` = `ip=…`, the
+#             record the cell writes before their status), each
 #             answered by ONE node: the node holding its claim
 #             `/net-hold/<address as u32>` (created under ABSENT, value
 #             `node=<name>`) arms it, every other node fences it. A node
@@ -35,15 +35,18 @@ hardware_targets = ["bcm2712", "linux"]
 #             by the provider's CAPS: `announce` where HOLD_ANNOUNCE (Linux),
 #             else `deliver` where HOLD_DELIVER (bare metal: node-terminated
 #             only), else none and the address reads `unsupported`.
-#             With the VIP controller wired (`vip_ctl`/`vip_evt`), an
+#             With an address controller wired (`vip_ctl`/`vip_evt`), an
 #             address it drives is marked `/net-vip/<addr>` = `node=<name>`,
 #             and while a mark stands no node's own hold makes a NEW claim on
 #             it (a claim already held keeps answering). ADDR_ADD on the
 #             claim's own node adopts it in place (the row stays armed, the
 #             claim stays); elsewhere it installs the row fenced, and its
 #             ADDR_ARM waits until the claim is released, then claims under
-#             ABSENT and arms. ADDR_FENCE then ADDR_DEL is the handover: the
-#             claim is released, the mark kept for the destination. ADDR_DEL
+#             ABSENT and arms. ADDR_FENCE is the handover (the old owner's
+#             confirmed emission-disable, which suffices): the row stops
+#             emitting and the claim is released on the next pass, the mark
+#             kept for the destination; a later ADDR_DEL removes the fenced
+#             row. ADDR_DEL
 #             without a fence (a controller restart's clean slate, or one
 #             that let the address go uncut) hands the address back to the
 #             own hold with the claim it has. A mark whose node is not ready
@@ -95,7 +98,8 @@ name = "status"
 direction = "output"
 content_type = "OctetStream"
 
-# Wormhole's VIP controller on this node (optional, both wired or neither):
+# An address controller on this node — any module that moves the node's
+# load-balancer addresses between nodes (optional, both wired or neither):
 # Fluxor's `addr_ctl` contract (contracts/net/identity.rs) — ADDR_ADD
 # (disarmed), ADDR_ARM and ADDR_FENCE under the install token node_net
 # mints, ADDR_DEL — realised over the HOLD table, answered on `addr_evt`

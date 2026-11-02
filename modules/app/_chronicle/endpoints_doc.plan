@@ -1,11 +1,22 @@
-// The Endpoints document as params (endpoints.plan writes the slices).
-//   doc     /services/ with list_children over /endpointslices/ ->
-//           /endpoints/<ns>/<svc> = "<pod>=<slice value>,…" — the
-//           consumers' document (cluster_dns takes the ready ones, a slice
-//           being `ip=…;state=<ready|serving|terminating>;…`); a
-//           materialised view of the slices
-//   gone    an /endpoints/ document whose Service is gone is deleted,
+// The Endpoints documents as params (endpoints.plan writes the rows).
+//   doc     /services/ with list_children over /endpoint-rows/ ->
+//           /endpoint-lists/<ns>/<svc> = "<pod>=<row>,…" — a summary of
+//           the rows (a row being `ip=…;state=<ready|notready|serving|
+//           terminating>;…`), bounded by one record: past about 100 rows it
+//           is cut at a whole entry, so no reader that needs every backend
+//           reads it (cluster_dns walks the rows themselves)
+//   gone    an /endpoint-lists/ fold whose Service is gone is deleted,
 //           conditional on the revision judged
+//   api     /services/ (and any row changing) -> store_effect EP_DOCS
+//           (_shared/epdoc.rs): the API's discovery.k8s.io/v1
+//           EndpointSlice /endpointslices/<ns>/<svc> and v1 Endpoints
+//           /endpoints/<ns>/<svc>, rendered from the Service and its rows,
+//           written put-if-changed — kept current, so a watch sees each
+//           change once
+//   api_gone  an EndpointSlice or Endpoints this controller manages (its
+//           managed-by label) whose Service is gone: EP_DOCS again, which
+//           deletes it. Anyone else's — a selectorless Service's own
+//           Endpoints, a user's EndpointSlice — is never touched.
 plan nanocloud.endpoints_doc {
   message ep.Svc {
     seq: int = 1;
@@ -14,8 +25,25 @@ plan nanocloud.endpoints_doc {
     selector: string = 4;   // spec.selector; a Service without one has no endpoints
     list: string = 56;      // "<pod>=<value>,…"
   }
+  // A Service, by its key alone (the connector reads the rest).
+  message ep.SvcKey {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<svc>"
+  }
+  // An API document (EndpointSlice or Endpoints) and its Service now.
+  message ep.Api {
+    seq: int = 1;
+    key: string = 3;      // "<ns>/<name>"
+    mgr: string = 4;      // its managed-by label ("" without one)
+    svc: string = 70;     // the Service of that name (related)
+  }
+  message ep.Docs {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;      // "<ns>/<svc>"
+  }
 
-  message ep.Doc {        // an /endpoints/ document and its Service now
+  message ep.Doc {        // an /endpoint-lists/ fold and its Service now
     seq: int = 1;
     rev: int = 2;         // the document's revision (source `rev = 1`)
     key: string = 3;      // "<ns>/<svc>"
@@ -37,6 +65,7 @@ plan nanocloud.endpoints_doc {
   enum NOOP = 0;
   enum PUT = 3;
   enum DELETE = 4;
+  enum EP_DOCS = 21;
 
   decision doc(v: ep.Svc) -> ep.Act {
     when v.selector == "" ->
@@ -50,6 +79,16 @@ plan nanocloud.endpoints_doc {
   decision gone(d: ep.Doc) -> ep.Del {
     when d.svc == "" -> ep.Del { cid: d.seq, op: DELETE, key: d.key, rev: d.rev };
     default -> ep.Del { cid: d.seq, op: NOOP, key: "", rev: 0 };
+  }
+
+  // Every Service: its documents rendered (or, with no selector and no
+  // rows, this controller's deleted) by the connector.
+  decision api(v: ep.SvcKey) -> ep.Docs {
+    default -> ep.Docs { cid: v.seq, op: EP_DOCS, key: v.key };
+  }
+  decision api_gone(a: ep.Api) -> ep.Docs {
+    when a.svc == "" && a.mgr != "" -> ep.Docs { cid: a.seq, op: EP_DOCS, key: a.key };
+    default -> ep.Docs { cid: a.seq, op: NOOP, key: "" };
   }
 
   transformation pass_doc(d: ep.Doc) -> ep.Doc {
@@ -68,7 +107,25 @@ plan nanocloud.endpoints_doc {
     call y = gone(x);
     return y;
   }
+  transformation pass_api(a: ep.Api) -> ep.Api {
+    ep.Api { seq: a.seq, key: a.key, mgr: a.mgr, svc: a.svc }
+  }
+  transformation pass_key(v: ep.SvcKey) -> ep.SvcKey {
+    ep.SvcKey { seq: v.seq, key: v.key }
+  }
+  pipeline ad(v: ep.SvcKey) -> ep.Docs {
+    call x = pass_key(v);
+    call y = api(x);
+    return y;
+  }
+  pipeline ag(a: ep.Api) -> ep.Docs {
+    call x = pass_api(a);
+    call y = api_gone(x);
+    return y;
+  }
   entry dc = dc;
   entry gn = gn;
+  entry ad = ad;
+  entry ag = ag;
   provenance revision "endpoints-doc" toolchain "chronicle-authoring";
 }

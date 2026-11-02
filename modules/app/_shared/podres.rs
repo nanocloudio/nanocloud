@@ -171,6 +171,11 @@ struct PrScratch {
     fsg: u32,
     fsg_set: bool,
     fsg_policy: u8,
+    /// A graph-backed Pod of a pulled workload image whose env bindings
+    /// its node has not recorded yet (the pack it resolved to, or that
+    /// pack's image config): resolved again, as a Pod waiting on a
+    /// ConfigMap is, so its record says `envok` once they are read.
+    again: bool,
     /// The node's allocatable and capacity (a downward-API volume's
     /// resourceFieldRef of a limit not set).
     node_obj: [u8; 512],
@@ -1766,19 +1771,27 @@ enum PrRes {
 
 /// Which container of which Pod a record is asked for: init container
 /// `idx` (`init`) or app container `idx` of the Pod `pod` (`<ns>/<name>` at
-/// `key`), its desired state `deleted` once `deleting`.
+/// `key`), its desired state `deleted` once `deleting`. `graph`: the Pod is
+/// graph-backed (`runtimeClassName: fluxor`), its one container a module
+/// subgraph — [`pr_graph`]'s record.
 struct PrAsk<'a> {
     pod: &'a [u8],
     key: &'a [u8],
     init: bool,
     idx: usize,
     deleting: bool,
+    graph: bool,
 }
 
 /// The node's record (`/pod-specs/<uid>[~<container>]`) for the container
 /// `ask` names.
 fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]) -> PrRes {
     let (pod, key, init, idx, deleting) = (ask.pod, ask.key, ask.init, ask.idx, ask.deleting);
+    let graph = ask.graph;
+    if graph && (init || idx > 0) {
+        // A graph-backed Pod is its first container: the subgraph.
+        return PrRes::NoContainer;
+    }
     let slash = key.iter().position(|&c| c == b'/').unwrap_or(0);
     let ns = key.get(..slash).unwrap_or(&[]);
     let spec = pr_m(pod, b"spec").unwrap_or(b"{}");
@@ -1798,6 +1811,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     x.env.clear();
     x.svc.clear();
     x.claims_len = 0;
+    x.again = false;
 
     // The node: its address (the downward API's hostIP/podIP) and allocatable.
     let mut node_len = 0usize;
@@ -1875,7 +1889,33 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
         && pr_m(spec, b"initContainers")
             .and_then(|l| pr_at(l, 0))
             .is_none();
-    if pr_ms(spec, b"hostNetwork") != b"true" && single && !uid.is_empty() && !node.is_empty() {
+    // A graph-backed Pod's address is its node's to ask for (node_net, once
+    // its sandbox joins the node's segment): its lease when it has one.
+    if graph && !uid.is_empty() {
+        let mut lk = [0u8; 160];
+        let mut kl2 = PrOut {
+            b: &mut lk,
+            n: 0,
+            over: false,
+        };
+        kl2.lit(b"/ipam-lease/");
+        kl2.lit(uid);
+        let ll = if kl2.over { 0 } else { kl2.n };
+        match w.raw(lk.get(..ll).unwrap_or(&[]), &mut pod_ip) {
+            PrLook::Pending => return PrRes::Pending,
+            PrLook::Found(n) if n > 0 => {
+                pil = n;
+                own = true;
+            }
+            _ => {}
+        }
+    }
+    if !graph
+        && pr_ms(spec, b"hostNetwork") != b"true"
+        && single
+        && !uid.is_empty()
+        && !node.is_empty()
+    {
         let mut nk = [0u8; 160];
         let mut kn = PrOut {
             b: &mut nk,
@@ -1928,7 +1968,9 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
 
     // Service links: the namespace's (unless enableServiceLinks: false), and
     // the default namespace's `kubernetes` always.
-    let links = pr_ms(spec, b"enableServiceLinks") != b"false";
+    // A graph-backed Pod's environment is what it states (its graph binds
+    // params by name, never to the namespace's Services).
+    let links = !graph && pr_ms(spec, b"enableServiceLinks") != b"false";
     if links {
         let svc = &mut x.svc;
         let r = w.services(ns, &mut x.sbuf, |s| pr_svc_env(s, svc));
@@ -1936,7 +1978,7 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
             return PrRes::Pending;
         }
     }
-    if !links || ns != b"default" {
+    if !graph && (!links || ns != b"default") {
         match w.object(b"services", b"default", b"kubernetes", &mut x.sbuf) {
             PrLook::Pending => return PrRes::Pending,
             PrLook::Found(n) => pr_svc_env(x.sbuf.get(..n).unwrap_or(&[]), &mut x.svc),
@@ -2163,6 +2205,9 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     }
     if x.env.over || x.svc.over {
         err.set1(b"the container's environment is larger than this node carries");
+    }
+    if graph {
+        return pr_graph(w, x, pod, key, ctr, deleting, &mut err, out);
     }
 
     // The record.
@@ -2665,6 +2710,324 @@ fn pr_spec<W: PrWorld>(w: &mut W, x: &mut PrScratch, ask: &PrAsk, out: &mut [u8]
     let ann = pr_m(meta, b"annotations").unwrap_or(b"{}");
     if pr_ms(ann, b"nanocloud.io/paused") == b"true" {
         o.lit(b"true");
+    }
+    o.lit(b";cfgerr=");
+    o.esc(err.get());
+    if o.over {
+        return PrRes::Built(pm_overflow(o.b));
+    }
+    PrRes::Built(o.n)
+}
+
+/// `esc` (an entry of a `%`-escaped list: `%25`, `%2C`, `%3B`) spells `raw`.
+fn pr_pct_eq(esc: &[u8], raw: &[u8]) -> bool {
+    let (mut i, mut k) = (0usize, 0usize);
+    while let Some(&c) = esc.get(i) {
+        let (b, w) = match (c, esc.get(i + 1..i + 3)) {
+            (b'%', Some(b"25")) => (b'%', 3),
+            (b'%', Some(b"2C")) => (b',', 3),
+            (b'%', Some(b"3B")) => (b';', 3),
+            _ => (c, 1),
+        };
+        if raw.get(k) != Some(&b) {
+            return false;
+        }
+        i += w;
+        k += 1;
+    }
+    k == raw.len()
+}
+
+/// A pulled workload image's env bindings checked against the container's
+/// environment (`x.env`): its node's `/~node/<node>/pod-resolved/<uid>`
+/// names the pack its pull resolved to (`rootfs=pack:<manifest>`), and
+/// `/~node/<node>/image-config/<manifest>` that image's bindings
+/// (`kind=workload;names=;required=;modules=;params=`, aligned `%`-escaped
+/// lists: image.plan from the image's config blob). A required name the
+/// container does not set is `err`. `Found(n)`: the pack, `pack:<manifest>`,
+/// in `envok[..n]` — what was checked; `Absent` while either is not
+/// recorded yet.
+fn pr_image_env<W: PrWorld>(
+    w: &mut W,
+    x: &mut PrScratch,
+    pod: &[u8],
+    image: &[u8],
+    err: &mut PrErr,
+    envok: &mut [u8; 80],
+) -> PrLook {
+    let spec = pr_m(pod, b"spec").unwrap_or(b"{}");
+    let node = pr_ms(spec, b"nodeName");
+    let uid = pr_ms(pr_m(pod, b"metadata").unwrap_or(b"{}"), b"uid");
+    if node.is_empty() || uid.is_empty() {
+        return PrLook::Absent;
+    }
+    let mut kb = [0u8; 256];
+    let mut k = PrOut {
+        b: &mut kb,
+        n: 0,
+        over: false,
+    };
+    k.lit(b"/~node/");
+    k.lit(node);
+    k.lit(b"/pod-resolved/");
+    k.lit(uid);
+    if k.over {
+        return PrLook::Absent;
+    }
+    let kl = k.n;
+    let mut rv = [0u8; 512];
+    let rl = match w.raw(kb.get(..kl).unwrap_or(&[]), &mut rv) {
+        PrLook::Pending => return PrLook::Pending,
+        PrLook::Found(n) => n,
+        PrLook::Absent => return PrLook::Absent,
+    };
+    let pack = pr_flat(rv.get(..rl).unwrap_or(&[]), b"rootfs");
+    let Some(hex) = pack.strip_prefix(b"pack:") else {
+        return PrLook::Absent;
+    };
+    if hex.is_empty() || pack.len() > envok.len() {
+        return PrLook::Absent;
+    }
+    let mut k = PrOut {
+        b: &mut kb,
+        n: 0,
+        over: false,
+    };
+    k.lit(b"/~node/");
+    k.lit(node);
+    k.lit(b"/image-config/");
+    k.lit(hex);
+    if k.over {
+        return PrLook::Absent;
+    }
+    let kl = k.n;
+    let cl = match w.raw(kb.get(..kl).unwrap_or(&[]), &mut x.obj) {
+        PrLook::Pending => return PrLook::Pending,
+        PrLook::Found(n) => n,
+        PrLook::Absent => return PrLook::Absent,
+    };
+    let cfg = x.obj.get(..cl).unwrap_or(&[]);
+    // An image config that is not a workload image's binds nothing.
+    if pr_flat(cfg, b"kind") == b"workload" {
+        let list = |k: &[u8]| {
+            let l = pr_flat(cfg, k);
+            l.split(|&c| c == b',').filter(move |_| !l.is_empty())
+        };
+        let mut req = list(b"required");
+        let mut mods = list(b"modules");
+        let mut params = list(b"params");
+        for name in list(b"names") {
+            let (r, m, p) = (
+                req.next().unwrap_or(b""),
+                mods.next().unwrap_or(b""),
+                params.next().unwrap_or(b""),
+            );
+            if r != b"true" || name.is_empty() || name == b"-" {
+                continue;
+            }
+            let set = (0..x.env.n).any(|i| pr_pct_eq(name, x.env.name(i)));
+            if !set {
+                err.set(&[
+                    b"the image \"",
+                    image,
+                    b"\" binds ",
+                    m,
+                    b".",
+                    p,
+                    b" to env \"",
+                    name,
+                    b"\" but the container does not set it",
+                ]);
+            }
+        }
+    }
+    for (d, &c) in envok.iter_mut().zip(pack) {
+        *d = c;
+    }
+    PrLook::Found(pack.len())
+}
+
+/// A graph-backed Pod's node record (`runtimeClassName: fluxor`): its one
+/// container is a module subgraph — a Graph object's (`image` a name) or a
+/// pulled workload image's (`image` a reference: `image=` beside it) — run
+/// with no SIGTERM window (`grace=0`). The container's environment as the
+/// graph's (`env=`: what it states, `envFrom` then `env`, `valueFrom` and
+/// the downward API resolved — no Service links, which its graph does not
+/// bind), each `NAME=VALUE` a Tier-2 `env`/`var` entry of its CREATE, and
+/// its volumes (`volumes=`, the same list a container's is) lent as
+/// `mount`/`bind` entries once bound. A Graph that binds a param to a name
+/// the container does not set (`spec.env`, the build's `workload-image.json`
+/// list: `name`, `required`) is a config error: the node refuses it with
+/// why rather than have its CREATE fail on it. So is a pulled image's
+/// required name the container does not set: the image's config blob
+/// lists its bindings, which its node's pull records at
+/// `/~node/<node>/image-config/<manifest>` (image.plan) once the Pod's
+/// pull resolved to that pack (`/~node/<node>/pod-resolved/<uid>`
+/// `rootfs=pack:<manifest>`); the record names the pack it was checked
+/// against (`envok=pack:<manifest>`), and its node makes no sandbox for a
+/// pack the plane has not checked (pod_project.plan `mtl`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the transcription's world, scratch, Pod, container, error and output, as pr_spec holds them"
+)]
+fn pr_graph<W: PrWorld>(
+    w: &mut W,
+    x: &mut PrScratch,
+    pod: &[u8],
+    key: &[u8],
+    ctr: &[u8],
+    deleting: bool,
+    err: &mut PrErr,
+    out: &mut [u8],
+) -> PrRes {
+    let spec = pr_m(pod, b"spec").unwrap_or(b"{}");
+    let meta = pr_m(pod, b"metadata").unwrap_or(b"{}");
+    let image = pr_ms(ctr, b"image");
+    let pulled = image.iter().any(|&c| c == b'/' || c == b':');
+    // The pulled image's bindings, once its node has them: the pack its pull
+    // resolved to, then that pack's image config.
+    let mut envok = [0u8; 80];
+    let mut envok_len = 0usize;
+    if pulled && !deleting {
+        match pr_image_env(w, x, pod, image, err, &mut envok) {
+            PrLook::Pending => return PrRes::Pending,
+            PrLook::Found(n) => envok_len = n,
+            PrLook::Absent => x.again = true,
+        }
+    }
+    // The names its Graph binds.
+    if !pulled && !image.is_empty() {
+        let n = match w.object(b"graphs.nanocloud.io", b"", image, &mut x.obj) {
+            PrLook::Pending => return PrRes::Pending,
+            PrLook::Found(n) => n,
+            PrLook::Absent => 0,
+        };
+        let g = x.obj.get(..n).unwrap_or(&[]);
+        let binds = pr_m(pr_m(g, b"spec").unwrap_or(b"{}"), b"env").unwrap_or(b"[]");
+        let mut k = 0usize;
+        while let Some(b) = pr_at(binds, k) {
+            k += 1;
+            let name = pr_ms(b, b"name");
+            if name.is_empty() || pr_ms(b, b"required") == b"false" || x.env.get(name).is_some() {
+                continue;
+            }
+            err.set(&[
+                b"the graph \"",
+                image,
+                b"\" binds ",
+                pr_ms(b, b"module"),
+                b".",
+                pr_ms(b, b"param"),
+                b" to env \"",
+                name,
+                b"\" but the container does not set it",
+            ]);
+        }
+    }
+    let mut o = PrOut {
+        b: out,
+        n: 0,
+        over: false,
+    };
+    o.lit(b"node=");
+    o.lit(pr_ms(spec, b"nodeName"));
+    o.lit(b";graph=");
+    o.esc(image);
+    if pulled {
+        o.lit(b";image=");
+        o.esc(image);
+    }
+    if !deleting {
+        o.lit(b";restart=");
+        let restart = pr_ms(spec, b"restartPolicy");
+        if restart.is_empty() {
+            o.lit(b"always");
+        } else {
+            for &c in restart.iter().take(16) {
+                o.byte(c.to_ascii_lowercase());
+            }
+        }
+    }
+    o.lit(if deleting {
+        b";grace=0;desired=deleted;cmd="
+    } else {
+        b";grace=0;desired=running;cmd="
+    });
+    o.lit(b";env=");
+    let mut first = true;
+    for i in 0..x.env.n {
+        if x.env.shadowed(i) {
+            continue;
+        }
+        if !first {
+            o.byte(b',');
+        }
+        first = false;
+        o.esc(x.env.name(i));
+        o.byte(b'=');
+        o.esc(x.env.value(i));
+    }
+    let limits = pr_m(pr_m(ctr, b"resources").unwrap_or(b"{}"), b"limits").unwrap_or(b"{}");
+    o.lit(b";cpu=");
+    if let Some(v) = pm_quantity(pr_ms(limits, b"cpu"), 3) {
+        o.dec(v);
+    }
+    o.lit(b";mem=");
+    if let Some(v) = pm_quantity(pr_ms(limits, b"memory"), 0) {
+        o.dec(v);
+    }
+    o.lit(b";eph=");
+    if let Some(v) = pm_quantity(pr_ms(limits, b"ephemeral-storage"), 0) {
+        o.dec(v);
+    }
+    o.lit(b";pod=");
+    o.lit(key);
+    o.lit(b";paused=");
+    let ann = pr_m(meta, b"annotations").unwrap_or(b"{}");
+    if pr_ms(ann, b"nanocloud.io/paused") == b"true" {
+        o.lit(b"true");
+    }
+    // hostNetwork: the node's network, no address of its own (node_net and
+    // the metal sandbox read hostnet=true).
+    o.lit(b";hostnet=");
+    if pr_ms(spec, b"hostNetwork") == b"true" {
+        o.lit(b"true");
+    }
+    // Its volumes, as a container's are (the Pod's fsGroup over them).
+    let psc = pr_m(spec, b"securityContext").unwrap_or(b"{}");
+    let fsg = pr_ms(psc, b"fsGroup");
+    x.fsg_set = pr_gid_ok(fsg);
+    x.fsg = if x.fsg_set { pr_gid(fsg) } else { 0 };
+    x.fsg_policy = if pr_ms(psc, b"fsGroupChangePolicy") == b"OnRootMismatch" {
+        b'r'
+    } else {
+        b'a'
+    };
+    o.lit(b";volumes=");
+    let mounts = pr_m(ctr, b"volumeMounts").unwrap_or(b"[]");
+    let mut k = 0usize;
+    while let Some(m) = pr_at(mounts, k) {
+        if k > 0 {
+            o.byte(b',');
+        }
+        k += 1;
+        let start = o.n;
+        if pr_volume(w, x, pod, key, m, err, &mut o).is_none() {
+            return PrRes::Pending;
+        }
+        if o.n.saturating_sub(start) > PR_VOL_MAX {
+            err.set(&[
+                b"volume \"",
+                pr_ms(m, b"name"),
+                b"\": larger than this node carries",
+            ]);
+        }
+    }
+    // A subgraph has no exec seam: no probes.
+    x.probes_len = 0;
+    if pulled {
+        o.lit(b";envok=");
+        o.lit(envok.get(..envok_len).unwrap_or(&[]));
     }
     o.lit(b";cfgerr=");
     o.esc(err.get());

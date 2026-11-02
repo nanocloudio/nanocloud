@@ -25,6 +25,7 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../_shared/argv.rs");
+include!("../_shared/vault_opt.rs");
 // `Got`, `refused` and the rate-limited `ReadNag` of every store read.
 const MAX_KEY: usize = 256;
 include!("../_shared/head_rev.rs");
@@ -90,8 +91,10 @@ const FMOD_HEADER: usize = 80;
 const FMOD_NAME_AT: usize = 28;
 const FMOD_NAME_LEN: usize = 32;
 const CODE_ALIGN: usize = 4096;
-/// Layers of one workload image: its FLXA and up to 32 modules.
-const MAX_LAYERS: usize = 33;
+/// Layers of one workload image: its FLXA and up to 64 modules — one
+/// subgraph holds at most 64 (Fluxor's `MAX_ADD_MODULES`), and the image
+/// plane refuses a manifest past it with its count (image.plan `ans`).
+const MAX_LAYERS: usize = 65;
 /// A pack is assembled in a grant from the kernel's elastic region, taken
 /// at the first pack and kept for every one after: grants are not freed one
 /// by one, so the node pays only when it runs a workload image, and only
@@ -104,7 +107,9 @@ const PACK_MAX: usize = 16 << 20;
 /// One read per step: a provider (fat32 on metal) answers within its budget.
 const READ_CHUNK: usize = 64 * 1024;
 const MANIFESTS_PREFIX: &[u8] = b"/image-manifests/";
-const MAX_MANIFEST: usize = 4096;
+/// /image-manifests/<pack> at the layer bound: the store modules' value
+/// bound (`MAX_VALUE`, 6144 B — 4224 B of digests, the sizes, the names).
+const MAX_MANIFEST: usize = 6144;
 const MAX_DIR: usize = 96;
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
@@ -179,7 +184,9 @@ const MOMENT_MAX: usize = 64;
 const MAX_SB: usize = 64;
 const MAX_TTY: usize = 4;
 const MAX_SRC: usize = 4096;
-const MAX_OPTS: usize = 1024;
+/// A CREATE's Tier-2 options at most: a subgraph's environment (a token or
+/// two among it), its volumes and its resolver context.
+const MAX_OPTS: usize = 4096;
 /// The `net`/`resolver` Tier-2 entry at most: its head and the context's
 /// bound.
 const RESOLVER_OPT: usize = 1 + 3 + 1 + 8 + 1 + 2 + abi::contracts::workload::resolver::MAX;
@@ -1135,6 +1142,74 @@ fn bind_options(binds: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(p)
 }
 
+/// The Tier-2 `env`/`var` entries for an environment `NAME=VALUE,…` (each
+/// `%XX`-escaped; a later entry of a name overriding an earlier, so only the
+/// last is written), each `REQUIRED`: a backend that cannot hand a workload
+/// its environment refuses it (`ENOSYS`) rather than run it without. None
+/// when an entry does not decode or does not fit — an OVERFLOW (`%00`) is an
+/// environment that did not fit, refused rather than cut.
+fn env_options(env: &[u8], out: &mut [u8]) -> Option<usize> {
+    use abi::contracts::workload::env as ev;
+    let mut p = 0usize;
+    if env.is_empty() {
+        return Some(0);
+    }
+    for (i, e) in env.split(|&c| c == b',').enumerate() {
+        let Some(name) = env_name(e) else {
+            if e.windows(3).any(|w| w == b"%00") {
+                return None;
+            }
+            continue;
+        };
+        if env
+            .split(|&c| c == b',')
+            .skip(i + 1)
+            .any(|l| env_name(l) == Some(name))
+        {
+            continue;
+        }
+        // The vault's names are the runtime's (the `vault`/`store` entry,
+        // `_shared/vault_opt.rs`), never the workload's environment.
+        if vault_env(e) {
+            continue;
+        }
+        let head = 1 + ev::NS.len() + 1 + ev::KEY.len() + 1;
+        let dst = out.get_mut(p..)?;
+        if dst.len() < head + 2 {
+            return None;
+        }
+        dst[0] = ev::NS.len() as u8;
+        dst[1..1 + ev::NS.len()].copy_from_slice(ev::NS);
+        let k = 1 + ev::NS.len();
+        dst[k] = ev::KEY.len() as u8;
+        dst[k + 1..k + 1 + ev::KEY.len()].copy_from_slice(ev::KEY);
+        dst[head - 1] = OPT_REQUIRED;
+        let vl = decode_text(e, dst.get_mut(head + 2..)?)?;
+        dst[head..head + 2].copy_from_slice(&u16::try_from(vl).ok()?.to_le_bytes());
+        p += head + 2 + vl;
+    }
+    Some(p)
+}
+
+/// A module subgraph's CREATE options (a Graph's or a pulled workload
+/// image's): its environment (field 14, `env`/`var`), its volumes (field 10,
+/// `mount`/`bind`), its resolver context (field 23, `net`/`resolver`) and,
+/// when its environment names one (`FLUXOR_VAULT_DIR` + `FLUXOR_VAULT_KEY`,
+/// `_shared/vault_opt.rs`), its own vault (`vault`/`store`), into `out`.
+/// None when the environment, a volume or the vault cannot be stated, or
+/// they do not fit: refused, never created without them.
+fn graph_options(req: &[u8], out: &mut [u8]) -> Option<usize> {
+    let el = env_options(frame_bytes(req, 14), out)?;
+    let bl = bind_options(frame_bytes(req, 10), out.get_mut(el..)?)?;
+    let rest = out.get_mut(el + bl..)?;
+    let rl = resolver_option(frame_bytes(req, 23), rest);
+    if rl == 0 && !frame_bytes(req, 23).is_empty() && rest.len() < RESOLVER_OPT {
+        return None;
+    }
+    let vl = vault_option(frame_bytes(req, 14), out.get_mut(el + bl + rl..)?).ok()?;
+    Some(el + bl + rl + vl)
+}
+
 /// The FLXA bytes of graph `name`: the Graph object at
 /// `/graphs.nanocloud.io/<name>` read through `storage.object`, its
 /// `spec.flxa` decoded from hex into `out`. [`Got::Absent`] when the object
@@ -1482,9 +1557,16 @@ unsafe fn asm_begin(s: &mut State, req: &[u8], cid: i64, id: &[u8], name: &[u8])
     }
     let mods = n - 1;
     // The CREATE arg: header, pack reference, a pin per module, the FLXA,
-    // then its options (its resolver context).
-    let mut ropt = [0u8; RESOLVER_OPT];
-    let ol = resolver_option(frame_bytes(req, 23), &mut ropt);
+    // then its options (its environment, volumes and resolver context),
+    // measured here in `cbuf` — no CREATE holds it while a pack is begun —
+    // and written in place once the pack is read.
+    let st = s as *mut State;
+    let Some(ol) = graph_options(req, &mut (&mut (*st).cbuf)[WL_CREATE_HEADER..]) else {
+        say_create_refused(sys, b"the environment or the volume binds", -22);
+        emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+        return;
+    };
+    let a = &mut s.asm;
     a.opts_len = ol as u16;
     let arg_len = WL_CREATE_HEADER + PACK_REF + PIN * mods + a.size[0] as usize + ol;
     a.at[0] = (WL_CREATE_HEADER + PACK_REF + PIN * mods) as u32;
@@ -1720,11 +1802,8 @@ unsafe fn asm_create(s: &mut State) {
         return;
     }
     let oat = WL_CREATE_HEADER + src_len;
-    let wrote = resolver_option(
-        frame_bytes(req, 23),
-        arg.get_mut(oat..oat + ol).unwrap_or(&mut []),
-    );
-    if wrote != ol {
+    let wrote = graph_options(req, arg.get_mut(oat..oat + ol).unwrap_or(&mut []));
+    if wrote != Some(ol) {
         asm_end(s, -22);
         return;
     }
@@ -1849,22 +1928,28 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
     }
     let graph = frame_bytes(req, 12);
     let mut src = [0u8; MAX_SRC];
-    let mut opts = [0u8; MAX_OPTS];
+    // The spec is held in `cbuf` until the CREATE answers (it may stage);
+    // its options are written there, after the source, directly.
+    let st = s as *mut State;
+    let opts = &mut (&mut (*st).cbuf)[WL_CREATE_HEADER + MAX_SRC..];
     // A graph-backed workload: its source is the FLXA subgraph the node's
-    // render seeded at `/graphs/<name>`, not a process. Its one option is
-    // its resolver context: the kernel realises it as modules of the node's
-    // own image.
+    // render seeded at `/graphs/<name>`, not a process; the kernel realises
+    // it as modules of the node's own image. Its options: its environment,
+    // its volumes and its resolver context.
     let (sl, ol, kind) = if !graph.is_empty() {
         match graph_source(sys, &s.nag, graph, &mut src) {
             Got::Pending => {
                 hold_op(s, req);
                 return;
             }
-            Got::Found(n) => (
-                n,
-                resolver_option(frame_bytes(req, 23), &mut opts),
-                SOURCE_FMOD_GRAPH,
-            ),
+            Got::Found(n) => {
+                let Some(ol) = graph_options(req, opts) else {
+                    say_create_refused(sys, b"the environment or the volume binds", -22);
+                    emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
+                    return;
+                };
+                (n, ol, SOURCE_FMOD_GRAPH)
+            }
             // Refused for good: failed with the store's errno, never held.
             Got::Refused(rc) => {
                 emit(
@@ -1893,7 +1978,7 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
                 return;
             }
         };
-        let Some(ol) = bind_options(frame_bytes(req, 10), &mut opts) else {
+        let Some(ol) = bind_options(frame_bytes(req, 10), opts) else {
             say_create_refused(sys, b"the volume binds", -22);
             emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
             return;
@@ -1901,15 +1986,20 @@ unsafe fn op_create(s: &mut State, req: &[u8], cid: i64, id: &[u8]) {
         let rl = resolver_option(frame_bytes(req, 23), opts.get_mut(ol..).unwrap_or(&mut []));
         (sl, ol + rl, SOURCE_HOST_PROCESS)
     };
-    // The spec is held in `cbuf` until the CREATE answers (it may stage).
-    let st = s as *mut State;
     let arg = &mut (*st).cbuf;
     if !create_header(arg, kind, id, req, sl, ol) {
         emit(s, cid, EV_STATUS, id, b"failed", -22, &[], Some(req));
         return;
     }
+    // The options move up against the source (written past MAX_SRC; `sl`
+    // is at most MAX_SRC, so they move down or stay).
+    let base = arg.as_mut_ptr();
+    core::ptr::copy(
+        base.add(WL_CREATE_HEADER + MAX_SRC),
+        base.add(WL_CREATE_HEADER + sl.min(MAX_SRC)),
+        ol.min(MAX_OPTS),
+    );
     arg[WL_CREATE_HEADER..WL_CREATE_HEADER + sl].copy_from_slice(&src[..sl]);
-    arg[WL_CREATE_HEADER + sl..WL_CREATE_HEADER + sl + ol].copy_from_slice(&opts[..ol]);
     let _ = sys;
     create_begin(
         s,

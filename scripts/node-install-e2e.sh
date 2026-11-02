@@ -133,11 +133,11 @@ keys -= {"/pods/", "/serviceaccounts/"}
 unscoped = [k for k in sorted(keys) if not any(k.startswith(p) for p in scoped)]
 assert not unscoped, f"image records the worker's store does not scope: {unscoped}"
 assert "BEGIN" not in g and "PRIVATE" not in g, "a certificate or key is IN the graph"
-ca = re.search(r'^  - name: fetch_tls\n(?:    .*\n)*?    trust: "\$\{file:([^}]*)\}"', g, re.M)
+ca = re.search(r'^  - name: fetch_tls\n(?:    .*\n)*?    trust: "(/[^"$]*)"', g, re.M)
 assert ca, "fetch_tls does not name the registry CA by path"
 assert re.search(r'^    verify_hostname: "registry.nanocloud.io"$', g, re.M)
 print("   scoped: every image record (" + ", ".join(sorted(keys)) + ") under " + ",".join(scoped))
-print(f"   fetch_tls trusts ${{file:{ca.group(1)}}} (by path) as registry.nanocloud.io")
+print(f"   fetch_tls trusts {ca.group(1)} (read at runtime) as registry.nanocloud.io")
 PY
 nc_build_workload "$ROOT" "$D/worker.yaml" "$D/worker-config.bin" "$D/worker-modules.bin" \
   || fail "the worker's graph, with its pull, did not build"
@@ -145,7 +145,7 @@ echo "   the worker's graph builds ($(grep -c '^  - name: ' "$D/worker.yaml") mo
 
 echo "== 3. the plane's render: a cluster of one — the kubelet, the pull behind tls, its own lease, its store scoped =="
 render plane "$D/plane.rendered" 2>"$D/render-plane.err" || { cat "$D/render-plane.err"; fail "the plane did not render"; }
-for m in nl_self nl_renew pi_source fetch fetch_tls im_req ps_spec sc_patch; do
+for m in nl_self nl_renew pi_source fetch fetch_tls im_req ps_resolve sc_patch; do
   grep -qx "  - name: $m" "$D/plane.rendered" || fail "$m is not in the single node's graph"
 done
 grep -qx '      scope: "node-a"' "$D/plane.rendered" || fail "the single node's store is not scoped to it"

@@ -61,6 +61,20 @@ plan nanocloud.apiplane_reply {
     when w.c_verb == "join" && w.status != 200 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 401,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Unauthorized\",\"code\":401,\"message\":\"join secret not recognised\"}", c_stream: 0, c_key: w.c_key };
+    // An enrollment whose offer was not there to take: the grant, the cell
+    // UID or the envelope digest is not the offer's, or the grant was spent.
+    // One answer for all of them — which part was wrong is not the caller's
+    // to learn. A take the store could not decide leaves the grant unspent.
+    when w.c_verb == "enroll" && w.status == 503 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 503,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the enrollment could not be decided; present the grant again\"}", c_stream: 0, c_key: w.c_key };
+    when w.c_verb == "enroll" && w.status != 200 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 403,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Forbidden\",\"code\":403,\"message\":\"enrollment refused: no unspent offer of this binding matches the grant, cell UID and envelope digest\"}", c_stream: 0, c_key: w.c_key };
+    // An epoch the store did not commit is not one to renew under.
+    when w.c_verb == "epoch" && w.status >= 400 ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 503,
+              c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the authority epoch could not be committed; retry\"}", c_stream: 0, c_key: w.c_key };
     // A TokenRequest for a ServiceAccount that does not exist.
     when w.c_verb == "token" && w.status != 200 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 404,
@@ -73,6 +87,11 @@ plan nanocloud.apiplane_reply {
     when w.c_verb == "delete" && w.status == 409 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 409,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Conflict\",\"code\":409,\"message\":\"the object has been modified; please apply your changes to the latest version and try again\"}", c_stream: 0, c_key: w.c_key };
+    // A delete the writer refuses with its own Status (store_doc: the
+    // namespaces upstream never deletes).
+    when w.c_verb == "delete" && w.status == 403 && w.value != "" ->
+      Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 403,
+              c_answer: w.value, c_stream: 0, c_key: w.c_key };
     when w.c_verb == "delete" && w.status == 503 ->
       Acted { cid: w.cid, status: w.status, value: "", c_cid: w.c_cid, c_status: 503,
               c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the store could not decide the delete in time; it may still be applied - retry\"}", c_stream: 0, c_key: w.c_key };

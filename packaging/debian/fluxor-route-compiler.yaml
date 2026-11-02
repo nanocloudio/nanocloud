@@ -10,19 +10,19 @@
 # whose fan-out a SOURCE performs:
 #
 #   A  /routes/          -> /route-be/<ns>/<svc>          keyed BY SERVICE
-#   B  /route-be/ JOIN /endpointslices/<ns>/<svc>/<pod>
+#   B  /route-be/ JOIN /endpoint-rows/<ns>/<svc>/<pod>
 #                        -> /edge-be/<ns>/<svc>/<pod>     one per (route, backend)
 #   C  /route-be/ + list_children over /edge-be/
 #                        -> /dataplane/edge/<ns>/<route>  folded to one row
 #
 # Pass A rekeys BY SERVICE on purpose: that is what lets pass B scope its join
-# to the object (`join_scoped: 1` -> `/endpointslices/<tail>/…`) and get one
+# to the object (`join_scoped: 1` -> `/endpoint-rows/<tail>/…`) and get one
 # record per backend without matching a middle key segment, which a decision
 # cannot do. The rekey is the whole trick, and it is the same two-pass fold
 # `endpoints.plan` uses.
 #
-# It reads /endpointslices/, NOT the folded /endpoints/ document: the slices are
-# already one key per backend, so the per-element work is a JOIN rather than a
+# It reads /endpoint-rows/, NOT the folded /endpoint-lists/ document: the rows
+# are already one key per backend, so the per-element work is a JOIN rather than a
 # map over a list. Params from modules/app/_chronicle/route.plan.
 target: linux
 tick_us: 1000
@@ -50,11 +50,11 @@ modules:
     prefix: "/route-be/"
     flat: 1
     paths: "host,path,port,route"
-    join: "/endpointslices/"
+    join: "/endpoint-rows/"
     join_scoped: 1
-    # `.` is the slice's WHOLE VALUE — a bare address, with no path to read.
+    # `.` is the row's WHOLE VALUE — a bare address, with no path to read.
     join_paths: "."
-    watch: "/endpointslices/"
+    watch: "/endpoint-rows/"
   - name: rt_edgebe
     type: store_effect
     # chronicle-source: modules/app/_chronicle/route.plan backend

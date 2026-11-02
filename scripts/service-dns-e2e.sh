@@ -5,7 +5,9 @@
 #
 #   <svc>.<ns>.svc.cluster.local  A  -> the Service's ClusterIP
 #                                       a headless Service: its ready
-#                                       backends (/endpoints/<ns>/<svc>)
+#                                       backends (its /endpoint-rows/<ns>/<svc>/
+#                                       rows, a paged walk: every row, past
+#                                       the ~100 one folded value held)
 #                                       an ExternalName Service: a CNAME
 #   _<port>._<proto>.<svc>.<ns>.svc.cluster.local  SRV
 #                                    -> the named port: at the Service's
@@ -136,8 +138,31 @@ echo "== 2. a Service, a headless Service with two ready backends, one with none
 np_put "/services/default/web" '{"metadata":{"name":"web","namespace":"default"},"spec":{"selector":{"app":"web"},"clusterIP":"10.96.0.10","ports":[{"name":"http","port":80,"targetPort":8080},{"name":"dns","port":53,"protocol":"UDP"}]}}'
 np_put "/services/default/db" '{"metadata":{"name":"db","namespace":"default"},"spec":{"selector":{"app":"db"},"clusterIP":"None","ports":[{"name":"pg","port":5432,"targetPort":5433}]}}'
 np_put "/services/default/ext" '{"metadata":{"name":"ext","namespace":"default"},"spec":{"type":"ExternalName","externalName":"db.example.com"}}'
-# The document as endpoints_doc.plan folds it; db-2 is draining and answers nothing.
-np_put "/endpoints/default/db" "db-0=ip=10.244.0.5;state=ready;zone=;node=;gen=1;af=4;uid=,db-1=ip=10.244.0.6;state=ready;zone=;node=;gen=1;af=4;uid=,db-2=ip=10.244.0.7;state=terminating;zone=;node=;gen=1;af=4;uid=;at=1;grace=30000"
+# The rows as the endpoints chain writes them; db-2 is draining and answers nothing.
+np_put "/endpoint-rows/default/db/db-0" "ip=10.244.0.5;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpoint-rows/default/db/db-1" "ip=10.244.0.6;state=ready;zone=;node=;gen=1;af=4;uid="
+np_put "/endpoint-rows/default/db/db-2" "ip=10.244.0.7;state=terminating;zone=;node=;gen=1;af=4;uid=;at=1;grace=30000"
+# A headless Service of 160 endpoints, the first 120 (by key) not ready: its
+# ready ones all sit past the ~100 rows a folded /endpoint-lists/ value held.
+np_put "/services/default/big" '{"metadata":{"name":"big","namespace":"default"},"spec":{"selector":{"app":"big"},"clusterIP":"None","ports":[{"name":"p","port":9000}]}}'
+python3 - "$D/store.log" <<'PY'
+import struct, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+with os.fdopen(fd, "r+b") as f:
+    data = f.read(); p = last = 0
+    while p + 15 <= len(data):
+        rev, o, kl, vl = struct.unpack("<QBHI", data[p:p+15])
+        if p + 15 + kl + vl > len(data): break
+        last, p = rev, p + 15 + kl + vl
+    f.truncate(p); f.seek(0, 2)
+    for i in range(160):
+        key = b"/endpoint-rows/default/big/big-%03d" % i
+        st = b"ready" if i >= 120 else b"notready"
+        val = b"ip=10.245.%d.%d;state=%s;zone=;node=;gen=1;af=4;uid=" % (i // 100, i % 100 + 1, st)
+        last += 1
+        f.write(struct.pack("<QBHI", last, 1, len(key), len(val)) + key + val)
+    f.flush(); os.fsync(f.fileno())
+PY
 np_put "/services/other/lonely" '{"metadata":{"name":"lonely","namespace":"other"},"spec":{"clusterIP":"None"}}'
 boot
 
@@ -177,6 +202,22 @@ R="$(q 10-244-0-6.db.default.svc.cluster.local)"
 R="$(q 10-244-0-9.db.default.svc.cluster.local)"
 [ "$R" = "NXDOMAIN aa=1 id=ok" ] || fail "an address that is no backend: '$R'"
 echo "   _pg._tcp.db… -> each backend at 5433 (10-244-0-5.db…, 10-244-0-6.db…), which resolve; another address does not"
+R="$(q big.default.svc.cluster.local)"
+python3 - "$R" <<'PY' || fail "headless big (160 rows, ready from row 120): '$R'"
+import sys
+f = sys.argv[1].split()
+assert f[:3] == ["NOERROR", "aa=1", "id=ok"], f
+ips = f[3:]
+ready = {"10.245.%d.%d" % (i // 100, i % 100 + 1) for i in range(120, 160)}
+# as many ready backends as one 512-byte answer carries, and only ready ones
+assert len(ips) >= 20 and set(ips) <= ready, (len(ips), ips)
+PY
+echo "   big.default.svc.cluster.local      -> $(($(wc -w <<<"$R") - 3)) ready backends, all past row 120 of 160"
+R="$(q 10-245-1-60.big.default.svc.cluster.local)"
+[ "$R" = "NOERROR aa=1 id=ok 10.245.1.60" ] || fail "the 160th row's backend name: '$R'"
+R="$(q 10-245-0-6.big.default.svc.cluster.local)"
+[ "$R" = "NXDOMAIN aa=1 id=ok" ] || fail "a not-ready backend's name: '$R'"
+echo "   10-245-1-60.big... (row 160) -> 10.245.1.60; 10-245-0-6.big... (not ready) -> NXDOMAIN"
 R="$(q example.org)"
 [ "$R" = "NOERROR aa=0 id=ok 192.0.2.1" ] || fail "example.org forwarded: '$R'"
 grep -q "example" "$D/up.log" || fail "the upstream was never asked"

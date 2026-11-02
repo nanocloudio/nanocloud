@@ -16,7 +16,12 @@ hardware_targets = ["bcm2712", "linux"]
 # announces, its status record, its control input. The subgraph's
 # `loam_volume` dials Loam's admin gate (`loam_authority`) through a
 # client-mode `tls` under this node's certificate (`cert_file`, `key_file`,
-# `trust`, `verify_hostname`), presents this node's capability
+# `trust`: absolute paths, DER or PEM, which this module reads at each attach
+# as it reads the capability and hands the subgraph as DER — a workload reads
+# none of the node's files, and a rotated certificate holds from the next
+# attach on; a target with no file surface embeds them at build instead,
+# `${file:<path>}`; `verify_hostname`, at most 64 bytes, names Loam's
+# certificate when it is not the dialled host), presents this node's capability
 # (`loam_capability`, a file of `fxcap1.` chains), and holds the lease the
 # attach flow acquired (holder sha256(claim)[..16], or of `rc:<claim>` for a
 # recovery) at its fence. The gate binds a lease to the certificate that
@@ -121,9 +126,10 @@ access = "write"
 requires_contract = "proc"
 access = "write"
 
-# The node's Loam capability file (`loam_capability`), read at each attach:
-# its chains are handed to the volume's subgraph, which as a workload reads
-# none of the node's files.
+# The node's Loam capability file (`loam_capability`) and its certificate,
+# key and trust anchors (`cert_file`, `key_file`, `trust`), read at each
+# attach: handed to the volume's subgraph, which as a workload reads none of
+# the node's files.
 [[resources]]
 requires_contract = "fs"
 access = "read"

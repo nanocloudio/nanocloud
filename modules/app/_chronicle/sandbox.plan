@@ -9,7 +9,9 @@
 //          node to say what segment it joins, /sandbox-net — node_net's;
 //          one on segment s >= 1 holds its lease as a single address there,
 //          one on 0 the pool's prefix in a domain of its own; a sandbox
-//          naming volumes waits until each is bound, /volume-binds/), START a
+//          naming volumes waits until each is bound, /volume-binds/ — a
+//          graph-backed one, /metal-sandboxes/<id>, too, its env and binds
+//          the subgraph's `env`/`var` and `mount`/`bind` entries), START a
 //          created one whose phase is start, DESTROY one whose phase is delete
 //   exec   /sandbox-exec/<id>/<req> with no result -> EXEC in sandbox <id>
 //          (an `@`-spelled probe is the node's dialer's, probe_dial)
@@ -129,7 +131,9 @@ plan nanocloud.sandbox {
   // A graph-backed sandbox (/metal-sandboxes/): the workload is the FLXA the
   // node was given at /graphs/<graph>, realised as modules of the node's own
   // image — or a pulled workload image (`pack`), whose modules it brings —
-  // with no rootfs, binds or lease to wait for. Its own message, so the host
+  // with no rootfs. Its environment (`env`) fills the params its graph binds
+  // by name, and its volumes are lent to it once each is bound
+  // (/volume-binds/, as a container's). Its own message, so the host
   // decision never reads a field a host record does not carry.
   message MSpec {
     seq: int = 1;
@@ -140,12 +144,16 @@ plan nanocloud.sandbox {
     cpu: string = 7;       // limits: millicores
     mem: string = 8;       //         bytes
     eph: string = 9;       //         ephemeral-storage bytes
+    env: string = 10;      // NAME=VALUE,… escaped, later entries overriding
+    bound: int = 22;       // /volume-binds/<id>/* present
+    binds: string = 56;    // their values
     st: string = 70;       // /sandbox-status/ state   (related, in order: 70, 80, 90)
     boot: string = 80;     // /sandbox-boot: this runtime's
     sboot: string = 90;    // /sandbox-boot-of/: the boot it was recorded under
-    desired: string = 100; // /pod-specs/<id> desired: `deleted` once its Pod is
-    pod: string = 101;     // /pod-specs/<id> pod: `<ns>/<name>`
-    hnet: string = 102;    // /pod-specs/<id> hostnet: `true` shares the node's network
+    nvol: int = 100;       // /pod-specs/<id> volumes, counted
+    desired: string = 101; // /pod-specs/<id> desired: `deleted` once its Pod is
+    pod: string = 102;     // /pod-specs/<id> pod: `<ns>/<name>`
+    hnet: string = 103;    // /pod-specs/<id> hostnet: `true` shares the node's network
     lease: string = 110;   // /ipam-lease/<id>: its own address
     seg: string = 120;     // /sandbox-net: the node's segment (0: none)
     gnet: string = 121;    //   and `1` when its module workloads join it
@@ -161,20 +169,20 @@ plan nanocloud.sandbox {
     when s.phase == "delete" && s.st != "" && s.st != "destroyed" ->
       Op { cid: s.seq, op: DESTROY, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && s.boot != "" && s.bound >= s.nvol && (!has(s.desired) || s.desired != "deleted")
          && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true")
          && has(s.lease) && s.lease != "" && has(s.cdns) && s.cdns != "" && has(s.pod) && s.pod != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a8: s.lease, a9: "32", a10: s.binds, rev: 0, a12: s.graph, a13: s.pack, a14: s.env,
            a19: s.cpu, a20: s.mem, a21: s.eph, a22: s.seg,
            a23: s.cdns + " " + s.pod.substring(0, s.pod.indexOf("/")) + ".svc.cluster.local svc.cluster.local cluster.local",
            ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && s.boot != "" && s.bound >= s.nvol && (!has(s.desired) || s.desired != "deleted")
          && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true")
          && has(s.lease) && s.lease != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: s.lease, a9: "32", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a8: s.lease, a9: "32", a10: s.binds, rev: 0, a12: s.graph, a13: s.pack, a14: s.env,
            a19: s.cpu, a20: s.mem, a21: s.eph, a22: s.seg, ctx: Ctx { tag: "" } };
     // Not yet created under this boot: wait for the lease and the name
     // service. A created one falls through to START.
@@ -182,18 +190,18 @@ plan nanocloud.sandbox {
          && has(s.gnet) && s.gnet == "1" && has(s.seg) && s.seg != "" && s.seg != "0" && (!has(s.hnet) || s.hnet != "true") ->
       Op { cid: s.seq, op: NOOP, id: "", a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != "" && (!has(s.desired) || s.desired != "deleted")
+         && s.boot != "" && s.bound >= s.nvol && (!has(s.desired) || s.desired != "deleted")
          && has(s.cdns) && s.cdns != "" && has(s.pod) && s.pod != "" ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a8: "", a9: "", a10: s.binds, rev: 0, a12: s.graph, a13: s.pack, a14: s.env,
            a19: s.cpu, a20: s.mem, a21: s.eph,
            a23: s.cdns + " " + s.pod.substring(0, s.pod.indexOf("/")) + ".svc.cluster.local svc.cluster.local cluster.local",
            ctx: Ctx { tag: "" } };
     when s.phase != "delete" && s.graph != "" && (s.st == "" || s.st == "destroyed" || s.sboot != s.boot)
-         && s.boot != ""
+         && s.boot != "" && s.bound >= s.nvol
          && (!has(s.desired) || s.desired != "deleted") ->
       Op { cid: s.seq, op: CREATE, id: s.key, a4: "", a5: "", a6: "", a7: "",
-           a8: "", a9: "", a10: "", rev: 0, a12: s.graph, a13: s.pack,
+           a8: "", a9: "", a10: s.binds, rev: 0, a12: s.graph, a13: s.pack, a14: s.env,
            a19: s.cpu, a20: s.mem, a21: s.eph, ctx: Ctx { tag: "" } };
     when s.phase == "start" && s.st == "created" && s.sboot == s.boot ->
       Op { cid: s.seq, op: START, id: s.key, a4: "", a5: "", a6: "", a7: "", a8: "", a9: "", a10: "", rev: 0, a12: "", ctx: Ctx { tag: "" } };
@@ -395,9 +403,9 @@ plan nanocloud.sandbox {
   }
   transformation t_mspec(s: MSpec) -> MSpec {
     MSpec { seq: s.seq, key: s.key, phase: s.phase, graph: s.graph, pack: s.pack,
-            cpu: s.cpu, mem: s.mem, eph: s.eph,
-            st: s.st, sboot: s.sboot, boot: s.boot, desired: s.desired, pod: s.pod,
-            lease: s.lease, seg: s.seg, gnet: s.gnet, cdns: s.cdns }
+            cpu: s.cpu, mem: s.mem, eph: s.eph, env: s.env, bound: s.bound, binds: s.binds,
+            st: s.st, sboot: s.sboot, boot: s.boot, nvol: s.nvol, desired: s.desired, pod: s.pod,
+            hnet: s.hnet, lease: s.lease, seg: s.seg, gnet: s.gnet, cdns: s.cdns }
   }
   transformation t_req(r: Req) -> Req { Req { seq: r.seq, rev: r.rev, key: r.key, val: r.val, first: r.first, st: r.st, phase: r.phase } }
   transformation t_tty(t: Tty) -> Tty {

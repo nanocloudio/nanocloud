@@ -65,8 +65,12 @@ rbac_clusterrole_agg() {
   _rbac_append "$1" 1 "/clusterroles/$2" "$(_rbac_json "{'apiVersion':'rbac.authorization.k8s.io/v1','kind':'ClusterRole','metadata':{'name':'$2','labels':{${4:-}}},'aggregationRule':{'clusterRoleSelectors':[$3]},'rules':[]}")"
 }
 
+# A Role whose one rule is in the core group, optionally restricted to names:
+#   rbac_role <log> <ns> <name> <verbs> <resources> [resourceNames]
 rbac_role() {
-  _rbac_append "$1" 1 "/roles/$2/$3" "$(_rbac_json "{'apiVersion':'rbac.authorization.k8s.io/v1','kind':'Role','metadata':{'name':'$3','namespace':'$2'},'rules':[{'verbs':$(_rbac_list "$4"),'resources':$(_rbac_list "$5"),'apiGroups':['']}]}")"
+  local rule="{'verbs':$(_rbac_list "$4"),'resources':$(_rbac_list "$5"),'apiGroups':['']"
+  [ -n "${6:-}" ] && rule="$rule,'resourceNames':$(_rbac_list "$6")"
+  _rbac_append "$1" 1 "/roles/$2/$3" "$(_rbac_json "{'apiVersion':'rbac.authorization.k8s.io/v1','kind':'Role','metadata':{'name':'$3','namespace':'$2'},'rules':[$rule}]}")"
 }
 
 _rbac_subject() { # <kind> <name> [ns]

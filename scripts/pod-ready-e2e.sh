@@ -365,15 +365,15 @@ print("   containerStatuses[0]: web nanocloud/srv:1 imageID sha256:" + dig[:12] 
 echo "== 8. the Service reaches it: its endpoint is the Pod's address, where it listens =="
 ep=""
 for _ in $(seq 60); do
-  ep="$(nc_store_get "$STORE" /endpoints/default/web)"
+  ep="$(nc_store_get "$STORE" /endpoint-lists/default/web)"
   case "$ep" in "$WEB=ip=127.0.0.1;state=ready;"*) break ;; esac
   sleep 1
 done
-case "$ep" in "$WEB=ip=127.0.0.1;state=ready;"*) ;; *) fail "/endpoints/default/web = '$ep', want '$WEB=ip=127.0.0.1;state=ready;…'" ;; esac
+case "$ep" in "$WEB=ip=127.0.0.1;state=ready;"*) ;; *) fail "/endpoint-lists/default/web = '$ep', want '$WEB=ip=127.0.0.1;state=ready;…'" ;; esac
 ep_ip="${ep#*=ip=}"; ep_ip="${ep_ip%%;*}"
 body="$(curl -s -m 3 "http://$ep_ip:$APP_PORT/")"
 [ "$body" = "hello" ] || fail "the Pod does not answer at its endpoint $ep_ip:$APP_PORT: '$body'"
-echo "   /endpoints/default/web = $ep; GET http://${ep#*=}:$APP_PORT/ -> $body"
+echo "   /endpoint-lists/default/web = $ep; GET http://${ep#*=}:$APP_PORT/ -> $body"
 
 echo "== 9. a crashing Pod: CrashLoopBackOff, RESTARTS growing, lastState exit 3 =="
 wait_row crashy '^0/1 CrashLoopBackOff [2-9]' 120

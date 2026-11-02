@@ -1,0 +1,42 @@
+name = "pod_env_probe"
+version = "0.1.0"
+description = "Fixture: a graph-backed Pod's environment and volumes as its module sees them — its params logged, a mounted file read, a state file counted up"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# The module a graph-backed Pod's E2E runs (scripts/fluxor-pod-env-e2e.sh):
+# its params are bound to the Pod's environment (`{env: NAME}` in the
+# workload graph), so what it logs is what the Pod's env said; its files are
+# the Pod's volumes, lent to the workload. Once, in order:
+#
+#   [envp] pod=<pod> node=<node> cell=<cell> token=<token>
+#   [envp] secret=<the first bytes of `secret_file`>       (or error=<errno>)
+#   [envp] ro_write=<errno>       creating a file beside `secret_file` (a
+#                                 read-only volume: -13)
+#   [envp] state=<n>              `state_file`'s count, one more than it
+#                                 held (absent: 1), written back and fenced
+#
+# then reads `secret_file` again every 250 steps, and logs a first line that
+# differs from the one it last logged:
+#
+#   [envp] updated=<the first line now>
+#
+# Parameters:
+# | Tag | Name        | Type | Default | Description |
+# |-----|-------------|------|---------|-------------|
+# | 1   | pod         | str  |         | Logged |
+# | 2   | node        | str  |         | Logged |
+# | 3   | cell        | str  |         | Logged |
+# | 4   | token       | str  |         | Logged |
+# | 5   | secret_file | str  |         | A file to read (none: skipped) |
+# | 6   | state_file  | str  |         | A count kept across lives (none: skipped) |
+timer_class = "agnostic"
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "fixture whose evidence is its log lines"

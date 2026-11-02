@@ -10,13 +10,13 @@
 // whose fan-out a SOURCE performs:
 //
 //   A  /routes/          -> /route-be/<ns>/<svc>        one per route, keyed BY SERVICE
-//   B  /route-be/ JOIN /endpointslices/<ns>/<svc>/<pod>
+//   B  /route-be/ JOIN /endpoint-rows/<ns>/<svc>/<pod>
 //                        -> /edge-be/<ns>/<svc>/<pod>   one per (route, backend)
 //   C  /route-be/ + list_children over /edge-be/
 //                        -> /dataplane/edge/<ns>/<route>  folded back to one row
 //
 // Pass A rekeys BY SERVICE on purpose: that is what lets pass B scope its join
-// to the object (`join_scoped = 1`, `/endpointslices/<tail>/…`) and get one
+// to the object (`join_scoped = 1`, `/endpoint-rows/<tail>/…`) and get one
 // record per backend with no key matching a decision cannot do. Rekeying is the
 // whole trick, and it is the same two-pass fold `endpoints.plan` uses.
 plan nanocloud.route {
@@ -81,7 +81,7 @@ plan nanocloud.route {
     port: string = 6;
     route: string = 7;
     pod: string = 21;       // the joined entry's last segment
-    addr: string = 60;      // join_paths "." — the slice's raw value: ip=…;state=…;…
+    addr: string = 60;      // join_paths "." — the row's raw value: ip=…;state=…;…
   }
 
   // `/edge-be/<ns>/<svc>/<pod>` = "<ip>:<port>:<weight>:<ready>". The weight and

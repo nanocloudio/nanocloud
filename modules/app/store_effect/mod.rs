@@ -32,10 +32,12 @@ include!("../_shared/jsonq.rs");
 include!("../_shared/moment.rs");
 include!("../_shared/tomb.rs");
 include!("../_shared/jsonpatch.rs");
+include!("../_shared/rbac_cover.rs");
 include!("../_shared/labelsel.rs");
 include!("../_shared/views.rs");
 include!("../_shared/fieldset.rs");
 include!("../_shared/docschema.rs");
+include!("../_shared/epdoc.rs");
 
 // Chronicle's decision engine, from its published cores — not restated. With a
 // `decision` param the connector DECIDES its own request: the record that
@@ -198,6 +200,12 @@ const OP_APPLY: i64 = 16;
 /// another taker moved it first. A single-use claim (a join secret) is one
 /// store step, so two callers presenting it cannot both be answered.
 const OP_TAKE: i64 = 17;
+/// Claim: a take (17) that leaves its claim — answered the same (200 with
+/// the value, 404 absent or claimed first), but the record stays, SPENT:
+/// every later take or claim answers 404 and a create of the key is refused.
+/// A single-use offer its maker would make again once it is gone (it cannot
+/// tell spent from never made) is spent for good in one step.
+const OP_CLAIM: i64 = 22;
 /// One key's records under several collections, gone together: for each name
 /// in the value (comma-separated), delete-if-present `<key_prefix><name>/<key
 /// parts>`. A Pod's node-side records are keyed by its uid under a dozen
@@ -215,6 +223,34 @@ const OP_PUT_FAMILY: i64 = 19;
 /// A key and its family gone: delete-if-present every `<key>~…`, then
 /// `<key>` (`_shared/tomb.rs` `drop_family`). Answers 200.
 const OP_DELETE_FAMILY: i64 = 20;
+/// A Service's Endpoints documents (`_shared/epdoc.rs`), the key naming it
+/// (`<ns>/<svc>`): the discovery.k8s.io/v1 EndpointSlice and the v1
+/// Endpoints rendered from the Service and the endpoints controller's rows
+/// (and, for a targetPort that names a port, its Pods' named ports), each
+/// written put-if-changed — the slice only when absent or this controller's
+/// (its managed-by label), the Endpoints too unless the Service selects its
+/// Pods (upstream's controller owns a selector Service's Endpoints). A
+/// Service gone, or one with no selector and no rows, has its documents
+/// deleted — only ever this controller's. The prefixes are the `ep_docs`
+/// param. 200 written, 204 unchanged, 500 a read or write refused, 413 a
+/// render past the heap; needs the heap (store_stamped, store_big).
+const OP_EP_DOCS: i64 = 21;
+/// RBAC escalation prevention (`_shared/rbac_cover.rs`): may the writer
+/// (field 3, its identity as the grant index keys it) store this Role,
+/// ClusterRole, RoleBinding, ClusterRoleBinding or ManagementBinding (field
+/// 72, the resource) — the body the value parts, or a STAGED one by its
+/// digest (`blob`) — in namespace 73? Every permission it would grant must
+/// already be the writer's in the grant index, or the writer may `escalate`
+/// / `bind` it. A patch (75: 13 merge, 14 JSON Patch, 15 strategic, 16 apply;
+/// 0 a whole object) is checked on its result: the object at 74 (the
+/// request's key, its marks after `#` ignored) patched by the body; 76 the
+/// name the path gives. The prefixes are the `cover` param. 200 held, 403
+/// not held, 404 the binding's role is not found (both with the Status to
+/// answer as the value), 422 a body or patch that is not its kind's, 413
+/// past the check's bounds or the heap, 500 a read refused; a read not yet
+/// answered holds the record. Reads unjournaled (a role's check reads a
+/// grant per permission): needs the heap (store_big).
+const OP_COVER: i64 = 23;
 /// Request fields `echo` may carry through (see the param).
 const ECHO_MAX: usize = 8;
 
@@ -224,7 +260,15 @@ const MAX_KEY: usize = 256;
 const NS_LIST: u32 = 0x1302;
 const MAX_PREFIX: usize = 64;
 const MAX_PATHS_SPEC: usize = 192;
-const MAX_VALUE: usize = 4096;
+/// The largest value read or written in place. Sized for the longest
+/// record a node keeps of one image: /image-manifests/<hex> of an image at
+/// its layer bound (65 — a Fluxor workload image, its graph and 64 modules):
+/// `;layers=` 65 x 65 - 1 = 4224 B of digests, `;sizes=` up to 65 x 11, the
+/// config digest and size, and repo, host, registry and pull names — under
+/// 5.9 KiB with a 255-byte repo and a 256-byte pull; its /image-gc/ and
+/// /image-blob-bad/ rows carry the same list. A reply holds one with its
+/// header and carry inside `BUF`. A value past it is refused, never cut.
+const MAX_VALUE: usize = 6144;
 const BUF: usize = 8192;
 /// The largest object read whole onto the heap (store_big): a staged request
 /// body is at most 3 MiB.
@@ -245,9 +289,12 @@ struct State {
     /// Literals wrapped around a LIST answer. Bytes, joined by this module
     /// because the VM cannot concatenate — the ENVELOPE they spell is the
     /// graph's to choose, which is why they are params and not a constant.
-    list_open: [u8; 64],
+    /// `{{tail}}` in either is the listed prefix past its first segment,
+    /// its trailing `/` dropped (`/discovery-res/<group>/<version>/` ->
+    /// `<group>/<version>`): an APIResourceList states its groupVersion.
+    list_open: [u8; LIST_LIT_MAX],
     list_open_len: u8,
-    list_close: [u8; 64],
+    list_close: [u8; LIST_LIT_MAX],
     list_close_len: u8,
     syscalls: *const SyscallTable,
     request_in: i32,
@@ -291,6 +338,25 @@ struct State {
     /// `tomb_ms`: how long a tomb stays, ms (default `TOMB_MS`) — a Pod's
     /// node specs live as long (tomb.plan).
     tomb_ms: u32,
+    /// `ep_docs = "<services>|<rows>|<pods>|<slices>|<endpoints>"`: the
+    /// prefixes OP_EP_DOCS reads and writes (`_shared/epdoc.rs`).
+    ep_docs: [u8; 192],
+    ep_docs_len: u8,
+    /// `cover = "<grants>|<roles>|<clusterroles>|<agg>"`: what OP_COVER
+    /// reads (`_shared/rbac_cover.rs`).
+    cover: [u8; 96],
+    cover_len: u8,
+    /// OP_EP_DOCS's rows of the Service it serves, kept on the heap across
+    /// the serves of ONE held record (`ep_memo_*`, see `ep_read_rows`): the
+    /// rows are read outside the record's journal, and a row already read is
+    /// not asked again when a later read holds the record. Freed when the
+    /// record is answered.
+    ep_memo: core::cell::Cell<*mut u8>,
+    ep_memo_cap: core::cell::Cell<u32>,
+    ep_memo_n: core::cell::Cell<u32>,
+    ep_memo_tag: core::cell::Cell<u32>,
+    /// The memo holds every row: a later serve of the record reads none.
+    ep_memo_whole: core::cell::Cell<bool>,
     /// `blob = <prefix>`: a PUT/CREATE/REPLACE whose value is `sha256:<hex>`
     /// writes the STAGED body at `<prefix><hex>` instead (a request body the
     /// HTTP server staged because it outgrew a record). Needs a heap: the
@@ -488,6 +554,32 @@ fn flat_merge(cur: &[u8], set: &[u8], out: &mut [u8]) -> usize {
         ss = se + 1;
     }
     o
+}
+
+/// The longest `list_open` / `list_close` literal.
+const LIST_LIT_MAX: usize = 112;
+
+/// `lit` onto `buf` at `at`, each `{{tail}}` in it written as `key` past
+/// its first segment with its trailing `/` dropped (`/a/g/v/` -> `g/v`).
+fn append_lit(buf: &mut [u8], mut at: usize, lit: &[u8], key: &[u8]) -> usize {
+    const MARK: &[u8] = b"{{tail}}";
+    let k = key.strip_prefix(b"/").unwrap_or(key);
+    let tail = match k.iter().position(|&b| b == b'/') {
+        Some(i) => &k[i + 1..],
+        None => &k[..0],
+    };
+    let tail = tail.strip_suffix(b"/").unwrap_or(tail);
+    let mut i = 0usize;
+    while i < lit.len() {
+        if lit[i..].starts_with(MARK) {
+            at = append(buf, at, tail);
+            i += MARK.len();
+        } else {
+            at = append(buf, at, &lit[i..i + 1]);
+            i += 1;
+        }
+    }
+    at
 }
 
 fn append_flat(out: &mut [u8], at: usize, name: &[u8], v: &[u8]) -> usize {
@@ -960,11 +1052,14 @@ fn part_bytes<'a>(req: &'a [u8], f: u8, digits: &'a mut [u8; 21]) -> &'a [u8] {
     }
 }
 
-/// An object's members, braces and surrounding whitespace stripped.
+/// An object's members, or an array's elements, braces (brackets) and
+/// surrounding whitespace stripped: what a decision splices more members or
+/// elements in beside, with literals (a ClusterRole's rules: its own and the
+/// ones a ManagementBinding states, management.plan).
 fn splice_members(sub: &[u8]) -> &[u8] {
     let t = sub.trim_ascii();
     match (t.first(), t.last()) {
-        (Some(b'{'), Some(b'}')) if t.len() >= 2 => {
+        (Some(b'{'), Some(b'}')) | (Some(b'['), Some(b']')) if t.len() >= 2 => {
             t.get(1..t.len() - 1).unwrap_or(&[]).trim_ascii()
         }
         _ => &[],
@@ -1129,6 +1224,1081 @@ unsafe fn patch_whole(sys: &Store, key: &[u8], segs: &[&[u8]], val: &[u8]) -> i6
     heap_free(sys.table(), wp);
     heap_free(sys.table(), cp);
     status
+}
+
+/// One shard's rows, as OP_EP_DOCS hands a slice render them (on the heap):
+/// EPD_SHARD rows of at most EP_REC bytes.
+const EP_SHARD_BUF: usize = EPD_SHARD * EP_REC;
+/// One row as the walk builds it: the Pod's name, its row, its named ports
+/// and its other address, separated.
+const EP_REC: usize = MAX_KEY + 512 + 512 + 64 + 4;
+/// The most the v1 Endpoints' rows (EPD_EP_MAX of them) take on the heap; a
+/// buffer grows to it from EP_EP_BUF0.
+const EP_EP_BUF_MAX: usize = 1 << 20;
+const EP_EP_BUF0: usize = 64 << 10;
+/// A Service's rows read once into the heap, up to this; past it every pass
+/// walks the store again instead.
+const EP_ALL_BUF_MAX: usize = 1 << 20;
+
+/// `<a><b><c>` into a key buffer; None past MAX_KEY.
+fn ep_key(parts: &[&[u8]], out: &mut [u8; MAX_KEY]) -> Option<usize> {
+    let mut n = 0usize;
+    for p in parts {
+        out.get_mut(n..n + p.len())?.copy_from_slice(p);
+        n += p.len();
+    }
+    Some(n)
+}
+
+/// One of a Service's documents decided: written (rendered by `render`) when
+/// `manage` and this controller may write it, deleted when it is this
+/// controller's and nothing is managed. Answers (ok, wrote).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one document's facts, each read by the caller"
+)]
+unsafe fn ep_doc_write(
+    s: &State,
+    sys: &Store,
+    wr: &Store,
+    key: &[u8],
+    manage: bool,
+    owns_any: bool,
+    label: &[u8],
+    manager: &[u8],
+    render: impl FnOnce(&[u8], &[u8], &mut [u8]) -> Option<usize>,
+    cap: usize,
+) -> (bool, bool) {
+    // Through the journal: a held write's serve must see what it first read.
+    let cur = read_whole(wr, key, DOC_MAX);
+    if wr.waiting() {
+        if let Some((p, _)) = cur {
+            heap_free(sys.table(), p);
+        }
+        return (false, false);
+    }
+    let doc: &[u8] = match cur {
+        Some((p, n)) => core::slice::from_raw_parts(p, n),
+        None => &[],
+    };
+    let ours = !doc.is_empty() && epd_managed(doc, label, manager);
+    let result = if !manage {
+        if ours {
+            leave_tomb(s, wr, key, doc);
+            (done(delete_value(wr, key)), true)
+        } else {
+            (true, false)
+        }
+    } else if !doc.is_empty() && !ours && !owns_any {
+        // Someone else's: left alone.
+        (true, false)
+    } else {
+        // Identity: kept from this controller's object, else drawn now.
+        let mut uid = [0u8; 36];
+        let mut ts = [0u8; 20];
+        let (u, t): (&[u8], &[u8]) = match (
+            ours.then(|| epd_str2(doc, b"metadata", b"uid")).flatten(),
+            ours.then(|| epd_str2(doc, b"metadata", b"creationTimestamp"))
+                .flatten(),
+        ) {
+            (Some(u), Some(t)) => (u, t),
+            _ => {
+                let mut r = [0u8; 16];
+                rand_fill(wr, &mut r);
+                epd_uuid(&r, &mut uid);
+                rfc3339(now_millis(wr), &mut ts);
+                (&uid[..], &ts[..])
+            }
+        };
+        let wp = heap_alloc(sys.table(), cap as u32);
+        if wp.is_null() {
+            let m = b"[store_effect] EP_DOCS: no heap for the render - REFUSED";
+            dev_log(sys.table(), 1, m.as_ptr(), m.len());
+            (false, false)
+        } else {
+            let work = core::slice::from_raw_parts_mut(wp, cap);
+            let r = match render(u, t, work) {
+                // Put-if-changed against the document read whole above:
+                // put_guarded's own read is a record's buffer, and a slice
+                // or Endpoints past it would be REFUSED there — failing the
+                // pass rather than comparing.
+                Some(n) if work[..n] == *doc => (true, false),
+                Some(n) => (done(put_value(wr, key, &work[..n])), true),
+                None => {
+                    let m = b"[store_effect] EP_DOCS: a render past its room - REFUSED";
+                    dev_log(sys.table(), 1, m.as_ptr(), m.len());
+                    (false, false)
+                }
+            };
+            heap_free(sys.table(), wp);
+            r
+        }
+    };
+    if let Some((p, _)) = cur {
+        heap_free(sys.table(), p);
+    }
+    result
+}
+
+/// Walk a Service's rows (`<rows_pre><ns>/<svc>/<pod>`), each built into
+/// one record (`_shared/epdoc.rs` rows: pod, row, named ports when `named`,
+/// the Pod's other address when `dual`) and handed to `f`, which answers
+/// whether to go on. Err(503) when a read is not answered yet, Err(500)
+/// when the walk fails.
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "where the rows and Pods are, and what to read of them"
+)]
+unsafe fn ep_walk(
+    sys: &Store,
+    rows_pre: &[u8],
+    pods: &[u8],
+    ns: &[u8],
+    tail: &[u8],
+    named: bool,
+    dual: bool,
+    mut f: impl FnMut(&[u8]) -> bool,
+) -> Result<(), i64> {
+    let mut rk = [0u8; MAX_KEY];
+    let rkl = ep_key(&[rows_pre, tail, b"/"], &mut rk).ok_or(400i64)?;
+    let mut walk = ListWalk::new(&rk[..rkl]);
+    let mut kb = [0u8; MAX_KEY];
+    let mut rec = [0u8; EP_REC];
+    while let Some(one) = walk.next(sys) {
+        let kl = one.len().min(MAX_KEY);
+        kb[..kl].copy_from_slice(&one[..kl]);
+        let pod = kb.get(rkl..kl).unwrap_or(&[]);
+        if pod.is_empty() || pod.iter().any(|&c| c == b'/') {
+            continue;
+        }
+        let mut v = [0u8; 512];
+        let Some(vl) = get_value(sys, &kb[..kl], &mut v) else {
+            continue;
+        };
+        let mut pp = [0u8; 512];
+        let mut ppl = 0usize;
+        let mut alt = [0u8; 64];
+        let mut altl = 0usize;
+        if named || dual {
+            let mut pk = [0u8; MAX_KEY];
+            if let Some(pkl) = ep_key(&[pods, ns, b"/", pod], &mut pk) {
+                if let Some((p, n)) = read_whole(sys, &pk[..pkl], DOC_MAX) {
+                    let doc = core::slice::from_raw_parts(p, n);
+                    if named {
+                        ppl = epd_pod_ports(doc, &mut pp);
+                    }
+                    if dual {
+                        altl = epd_pod_other_ip(doc, epd_flat(&v[..vl], b"ip"), &mut alt);
+                    }
+                    heap_free(sys.table(), p);
+                }
+            }
+        }
+        let mut n = 0usize;
+        for piece in [
+            pod,
+            &[EPD_US][..],
+            &v[..vl],
+            &[EPD_US][..],
+            &pp[..ppl],
+            &[EPD_US][..],
+            &alt[..altl],
+            &[EPD_RS][..],
+        ] {
+            let Some(d) = rec.get_mut(n..n + piece.len()) else {
+                return Err(500);
+            };
+            d.copy_from_slice(piece);
+            n += piece.len();
+        }
+        if !f(&rec[..n]) {
+            break;
+        }
+    }
+    if sys.waiting() {
+        return Err(503);
+    }
+    if walk.failed {
+        return Err(500);
+    }
+    Ok(())
+}
+
+unsafe fn ep_memo_clear(s: &State, sys: &Store) {
+    let p = s.ep_memo.get();
+    if !p.is_null() {
+        heap_free(sys.table(), p);
+    }
+    s.ep_memo.set(core::ptr::null_mut());
+    s.ep_memo_cap.set(0);
+    s.ep_memo_n.set(0);
+    s.ep_memo_tag.set(0);
+    s.ep_memo_whole.set(false);
+}
+
+/// Pass 1's rows (`ep_walk`), each one already read in an earlier serve of
+/// this record taken from the memo instead of asked again: a Service's rows
+/// are read outside the record's journal (they outnumber the calls it
+/// holds), so without it a serve held by any one read would ask every row
+/// again, and a Service of many rows might never be read whole. The rows
+/// are handed to `f` in key order; the memo becomes this serve's rows.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "where the rows and Pods are, and what to read of them"
+)]
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+unsafe fn ep_read_rows(
+    s: &State,
+    sys: &Store,
+    rows_pre: &[u8],
+    pods: &[u8],
+    ns: &[u8],
+    tail: &[u8],
+    named: bool,
+    dual: bool,
+    mut f: impl FnMut(&[u8]) -> bool,
+) -> Result<(), i64> {
+    let tag = key_hash(tail) | 1;
+    if s.ep_memo_tag.get() != tag {
+        ep_memo_clear(s, sys);
+        s.ep_memo_tag.set(tag);
+    }
+    let old_p = s.ep_memo.get();
+    let old_n = s.ep_memo_n.get() as usize;
+    let old: &[u8] = if old_p.is_null() {
+        &[]
+    } else {
+        core::slice::from_raw_parts(old_p, old_n)
+    };
+    // Read whole by an earlier serve of this record: those rows ARE the
+    // rows. A serve held for a write asks it again as first asked, so it
+    // must render what the first serve rendered — rows arrived since are
+    // the next record's.
+    if s.ep_memo_whole.get() {
+        let mut at = 0usize;
+        while let Some((_, _, _, _, next)) = epd_row(old, at) {
+            if !f(&old[at..next]) {
+                break;
+            }
+            at = next;
+        }
+        return Ok(());
+    }
+    let Some(mut fresh) = EpBuf::new(sys, old_n.max(EP_EP_BUF0), EP_ALL_BUF_MAX) else {
+        return Err(413);
+    };
+    let mut rk = [0u8; MAX_KEY];
+    let rkl = ep_key(&[rows_pre, tail, b"/"], &mut rk).ok_or(400i64)?;
+    let mut walk = ListWalk::new(&rk[..rkl]);
+    let mut kb = [0u8; MAX_KEY];
+    let mut rec = [0u8; EP_REC];
+    let mut mi = 0usize;
+    let mut stop = false;
+    let mut over = false;
+    while let Some(one) = walk.next(sys) {
+        let kl = one.len().min(MAX_KEY);
+        kb[..kl].copy_from_slice(&one[..kl]);
+        let pod = kb.get(rkl..kl).unwrap_or(&[]);
+        if pod.is_empty() || pod.iter().any(|&c| c == b'/') {
+            continue;
+        }
+        // The memo is in key order too: skip rows since gone, take this
+        // one's when it was read.
+        let mut hit: Option<&[u8]> = None;
+        while let Some((mpod, _, _, _, next)) = epd_row(old, mi) {
+            if mpod < pod {
+                mi = next;
+                continue;
+            }
+            if mpod == pod {
+                hit = Some(&old[mi..next]);
+                mi = next;
+            }
+            break;
+        }
+        let r: &[u8] = match hit {
+            Some(h) => h,
+            None => match ep_build_rec(sys, &kb[..kl], pod, pods, ns, named, dual, &mut rec) {
+                Some(n) => &rec[..n],
+                None => {
+                    if sys.waiting() || sys.refusal().is_some() {
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
+        if !over && !fresh.push(sys, r) {
+            over = true;
+        }
+        if !f(r) {
+            stop = true;
+            break;
+        }
+    }
+    // What this serve read is the memo now (the rows past a "not yet" are
+    // asked in the next serve).
+    if !old_p.is_null() {
+        heap_free(sys.table(), old_p);
+    }
+    if over {
+        fresh.free(sys);
+        s.ep_memo.set(core::ptr::null_mut());
+        s.ep_memo_n.set(0);
+    } else {
+        s.ep_memo.set(fresh.p);
+        s.ep_memo_cap.set(fresh.cap as u32);
+        s.ep_memo_n.set(fresh.n as u32);
+    }
+    if sys.waiting() {
+        return Err(503);
+    }
+    if walk.failed || sys.refusal().is_some() {
+        return Err(500);
+    }
+    // Every row read (not a walk the caller stopped short): kept as the
+    // record's rows unless they outgrew the memo.
+    s.ep_memo_whole.set(!stop && !over);
+    Ok(())
+}
+
+/// One row's record (`_shared/epdoc.rs` rows) into `rec`: its length, or
+/// None when the row is gone or a read did not answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row, and where its Pod is and what to read of it"
+)]
+unsafe fn ep_build_rec(
+    sys: &Store,
+    key: &[u8],
+    pod: &[u8],
+    pods: &[u8],
+    ns: &[u8],
+    named: bool,
+    dual: bool,
+    rec: &mut [u8; EP_REC],
+) -> Option<usize> {
+    let mut v = [0u8; 512];
+    let vl = get_value(sys, key, &mut v)?;
+    let mut pp = [0u8; 512];
+    let mut ppl = 0usize;
+    let mut alt = [0u8; 64];
+    let mut altl = 0usize;
+    if named || dual {
+        let mut pk = [0u8; MAX_KEY];
+        if let Some(pkl) = ep_key(&[pods, ns, b"/", pod], &mut pk) {
+            match read_whole(sys, &pk[..pkl], DOC_MAX) {
+                Some((p, n)) => {
+                    let doc = core::slice::from_raw_parts(p, n);
+                    if named {
+                        ppl = epd_pod_ports(doc, &mut pp);
+                    }
+                    if dual {
+                        altl = epd_pod_other_ip(doc, epd_flat(&v[..vl], b"ip"), &mut alt);
+                    }
+                    heap_free(sys.table(), p);
+                }
+                None if sys.waiting() || sys.refusal().is_some() => return None,
+                None => {}
+            }
+        }
+    }
+    let mut n = 0usize;
+    for piece in [
+        pod,
+        &[EPD_US][..],
+        &v[..vl],
+        &[EPD_US][..],
+        &pp[..ppl],
+        &[EPD_US][..],
+        &alt[..altl],
+        &[EPD_RS][..],
+    ] {
+        let d = rec.get_mut(n..n + piece.len())?;
+        d.copy_from_slice(piece);
+        n += piece.len();
+    }
+    Some(n)
+}
+
+/// A Service's rows, from `mem` (read once, whole) when there, else walked
+/// from the store again (`ep_walk`) — the second for a Service whose rows
+/// outgrow the buffer, so no number of endpoints is refused.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "where the rows and Pods are, and what to read of them"
+)]
+unsafe fn ep_rows(
+    sys: &Store,
+    mem: Option<&[u8]>,
+    rows_pre: &[u8],
+    pods: &[u8],
+    ns: &[u8],
+    tail: &[u8],
+    named: bool,
+    dual: bool,
+    mut f: impl FnMut(&[u8]) -> bool,
+) -> Result<(), i64> {
+    match mem {
+        Some(all) => {
+            let mut at = 0usize;
+            while let Some((_, _, _, _, next)) = epd_row(all, at) {
+                let rec = &all[at..next];
+                at = next;
+                if !f(rec) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        None => ep_walk(sys, rows_pre, pods, ns, tail, named, dual, f),
+    }
+}
+
+/// A heap buffer of rows that grows (doubling, up to `max`).
+struct EpBuf {
+    p: *mut u8,
+    cap: usize,
+    n: usize,
+    max: usize,
+}
+
+impl EpBuf {
+    unsafe fn new(sys: &Store, cap: usize, max: usize) -> Option<EpBuf> {
+        let p = heap_alloc(sys.table(), cap as u32);
+        (!p.is_null()).then_some(EpBuf { p, cap, n: 0, max })
+    }
+    /// Append `rec`; false when it would pass `max` or the heap.
+    unsafe fn push(&mut self, sys: &Store, rec: &[u8]) -> bool {
+        if self.n + rec.len() > self.cap {
+            let mut cap = self.cap;
+            while cap < self.n + rec.len() {
+                cap *= 2;
+            }
+            if cap > self.max {
+                return false;
+            }
+            let q = heap_alloc(sys.table(), cap as u32);
+            if q.is_null() {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(self.p, q, self.n);
+            heap_free(sys.table(), self.p);
+            self.p = q;
+            self.cap = cap;
+        }
+        core::ptr::copy_nonoverlapping(rec.as_ptr(), self.p.add(self.n), rec.len());
+        self.n += rec.len();
+        true
+    }
+    unsafe fn bytes(&self) -> &[u8] {
+        core::slice::from_raw_parts(self.p, self.n)
+    }
+    unsafe fn free(self, sys: &Store) {
+        heap_free(sys.table(), self.p);
+    }
+}
+
+/// The store as OP_COVER's check reads it: unjournaled (a role's check is a
+/// probe per permission, past what one record's journal holds), each answer
+/// "not yet" or refused leaving the pass undecided.
+struct CvLive<'a> {
+    sys: &'a Store,
+}
+
+/// An object read whole onto the heap, freed with its handle.
+struct CvHeap {
+    p: *mut u8,
+    n: usize,
+    sys: *const SyscallTable,
+}
+
+impl AsRef<[u8]> for CvHeap {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `read_whole`'s allocation of `n` bytes, live until drop.
+        unsafe { core::slice::from_raw_parts(self.p, self.n) }
+    }
+}
+
+impl Drop for CvHeap {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `read_whole` through this table.
+        unsafe { heap_free(&*self.sys, self.p) }
+    }
+}
+
+impl CvStore for CvLive<'_> {
+    type Obj = CvHeap;
+    fn has(&mut self, key: &[u8]) -> Option<bool> {
+        // SAFETY: the serve's store, live for the pass.
+        let e = unsafe { exists(self.sys, key) };
+        (!self.sys.waiting() && self.sys.refusal().is_none()).then_some(e)
+    }
+    fn read(&mut self, key: &[u8]) -> Option<Option<CvHeap>> {
+        // SAFETY: as `has`.
+        let got = unsafe { read_whole(self.sys, key, DOC_MAX) };
+        if self.sys.waiting() || self.sys.refusal().is_some() {
+            if let Some((p, _)) = got {
+                // SAFETY: just allocated through this table.
+                unsafe { heap_free(self.sys.table(), p) };
+            }
+            return None;
+        }
+        Some(got.map(|(p, n)| CvHeap {
+            p,
+            n,
+            sys: self.sys.table(),
+        }))
+    }
+    fn children(&mut self, prefix: &[u8], out: &mut CvNames) -> Option<bool> {
+        let mut walk = ListWalk::new(prefix);
+        let mut fits = true;
+        // SAFETY: as `has`.
+        while let Some(name) = unsafe { walk.next(self.sys) } {
+            if !out.push(name) {
+                fits = false;
+                break;
+            }
+        }
+        if !fits {
+            return Some(false);
+        }
+        if walk.failed || walk.pending || self.sys.waiting() || self.sys.refusal().is_some() {
+            return None;
+        }
+        Some(true)
+    }
+}
+
+/// OP_COVER: see the op. Answers (status, length of the Status in `why`).
+unsafe fn cover(s: &State, outer: &Store, req: &[u8], body: &[u8], why: &mut [u8]) -> (i64, usize) {
+    let spec = core::slice::from_raw_parts(s.cover.as_ptr(), s.cover_len as usize);
+    let Some(pre) = cv_prefixes(spec) else {
+        let m = b"[store_effect] COVER without a `cover` param - REFUSED";
+        dev_log(outer.table(), 1, m.as_ptr(), m.len());
+        return (500, 0);
+    };
+    let bytes = |n: u8| match frame_field(req, n) {
+        Some((TY_BYTES, b)) => b,
+        _ => &[][..],
+    };
+    let (id, res, ns, name) = (bytes(3), bytes(72), bytes(73), bytes(76));
+    let okey = view_split(bytes(74)).0;
+    let how = frame_i64(req, 75).unwrap_or(0);
+    let Some(kind) = cv_kind(res) else {
+        // Not a write the check guards.
+        return (200, 0);
+    };
+    if id.is_empty() {
+        return (500, 0);
+    }
+    let nag = ReadNag::new();
+    let sys = Store::plain(outer.table(), &nag);
+    // A patch's result is checked: the stored object, patched.
+    let stored = if how != 0 && !okey.is_empty() {
+        read_whole(&sys, okey, DOC_MAX)
+    } else {
+        None
+    };
+    let free = |p: Option<(*mut u8, usize)>| {
+        if let Some((p, _)) = p {
+            heap_free(outer.table(), p);
+        }
+    };
+    if sys.waiting() {
+        free(stored);
+        outer.wait();
+        return (503, 0);
+    }
+    if sys.refusal().is_some() {
+        free(stored);
+        return (500, 0);
+    }
+    let sbytes = stored.map(|(p, n)| core::slice::from_raw_parts(p as *const u8, n));
+    // Room for the result: three times the document for a JSON Patch.
+    let room = (body.len() + sbytes.map_or(0, <[u8]>::len) + 4096).saturating_mul(3);
+    let work = if how != 0 && room <= 3 * DOC_MAX {
+        heap_alloc(outer.table(), room as u32)
+    } else {
+        core::ptr::null_mut()
+    };
+    if how != 0 && work.is_null() {
+        free(stored);
+        return (413, 0);
+    }
+    let wbuf: &mut [u8] = if work.is_null() {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(work, room)
+    };
+    let verdict = match cv_final(how, body, sbytes, wbuf) {
+        Ok(obj) => {
+            let r = CvReq {
+                pre,
+                id,
+                ns,
+                kind,
+                obj,
+                name,
+            };
+            let mut o = JpOut::new(&mut *why);
+            let mut st = CvLive { sys: &sys };
+            let v = cv_check(&mut st, &r, &mut o);
+            Ok((v, o.n))
+        }
+        Err(JpErr::Full) => Err(413),
+        Err(_) => Err(422),
+    };
+    if !work.is_null() {
+        heap_free(outer.table(), work);
+    }
+    free(stored);
+    if sys.waiting() {
+        outer.wait();
+        return (503, 0);
+    }
+    if sys.refusal().is_some() {
+        return (500, 0);
+    }
+    match verdict {
+        Err(st) => (st, 0),
+        Ok((CvVerdict::Allowed, _)) => (200, 0),
+        Ok((CvVerdict::Refused, n)) => (403, n),
+        Ok((CvVerdict::RoleMissing, n)) => (404, n),
+        Ok((CvVerdict::Malformed, _)) => (422, 0),
+        Ok((CvVerdict::TooLarge, _)) => (413, 0),
+        Ok((CvVerdict::Undecided, _)) => (500, 0),
+    }
+}
+
+/// OP_EP_DOCS for the Service `<ns>/<svc>` (`tail`): see the op. A tail that
+/// names one of a Service's other slices (`<svc>-<digest>…`, its
+/// service-name label another name) is that Service's.
+unsafe fn ep_docs(s: &State, outer: &Store, tail: &[u8]) -> i64 {
+    // Reads unjournaled: a Service's documents read every row (and, for a
+    // named targetPort or a second family, every Pod) — past the 96 calls
+    // one record's journal holds, which then refused every write and left a
+    // Service of ~75 endpoints frozen there. A render is a re-derivation, so
+    // its reads are asked afresh each serve (a "not yet" holds the record,
+    // as a source's pass waits); its WRITES (and the draw of a new
+    // document's identity) stay the journal's, so a held write is asked
+    // again as it was first asked, never proposed twice.
+    let nag = ReadNag::new();
+    let sys = Store::plain(outer.table(), &nag);
+    let status = ep_docs_plain(s, &sys, outer, tail);
+    if sys.waiting() {
+        outer.wait();
+        return 503;
+    }
+    if outer.waiting() {
+        // Held by a journaled read or write: served again with these rows.
+        return status;
+    }
+    // Answered: the next record reads its rows afresh.
+    ep_memo_clear(s, outer);
+    if sys.refusal().is_some() {
+        return 500;
+    }
+    status
+}
+
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+unsafe fn ep_docs_plain(s: &State, sys: &Store, wr: &Store, tail: &[u8]) -> i64 {
+    let spec = core::slice::from_raw_parts(s.ep_docs.as_ptr(), s.ep_docs_len as usize);
+    let mut pre: [&[u8]; 5] = [&[]; 5];
+    let mut np = 0usize;
+    for part in spec.split(|&c| c == b'|') {
+        if np < 5 {
+            pre[np] = part;
+        }
+        np += 1;
+    }
+    let Some(slash) = tail.iter().position(|&c| c == b'/') else {
+        return 400;
+    };
+    if np != 5 || slash == 0 || slash + 1 >= tail.len() {
+        return 400;
+    }
+    let [svcs, rows_pre, pods, slices, endpoints] = pre;
+    // Another slice of a Service: the Service it names.
+    let mut tb = [0u8; MAX_KEY];
+    let mut tl = tail.len().min(MAX_KEY);
+    tb[..tl].copy_from_slice(&tail[..tl]);
+    {
+        let mut k = [0u8; MAX_KEY];
+        if let Some(kl) = ep_key(&[slices, tail], &mut k) {
+            let got = read_whole(wr, &k[..kl], DOC_MAX);
+            if wr.waiting() {
+                if let Some((p, _)) = got {
+                    heap_free(sys.table(), p);
+                }
+                return 503;
+            }
+            if let Some((p, n)) = got {
+                let doc = core::slice::from_raw_parts(p, n);
+                if epd_managed(doc, EPD_LABEL_SLICE, EPD_MANAGER_SLICE) {
+                    if let Some(l) = epd_str3(doc, b"metadata", b"labels", EPD_LABEL_SVC) {
+                        if !l.is_empty()
+                            && l != &tail[slash + 1..]
+                            && !l.iter().any(|&c| c == b'/')
+                            && slash + 1 + l.len() <= MAX_KEY
+                        {
+                            tb[slash + 1..slash + 1 + l.len()].copy_from_slice(l);
+                            tl = slash + 1 + l.len();
+                        }
+                    }
+                }
+                heap_free(sys.table(), p);
+            }
+        }
+    }
+    let tail = &tb[..tl];
+    let (ns, name) = (&tail[..slash], &tail[slash + 1..]);
+    let mut k = [0u8; MAX_KEY];
+    let Some(kl) = ep_key(&[svcs, tail], &mut k) else {
+        return 400;
+    };
+    let svc_got = read_whole(wr, &k[..kl], DOC_MAX);
+    if wr.waiting() {
+        if let Some((p, _)) = svc_got {
+            heap_free(sys.table(), p);
+        }
+        return 503;
+    }
+    let svc: &[u8] = match svc_got {
+        Some((p, n)) => core::slice::from_raw_parts(p, n),
+        None => &[],
+    };
+    let status = ep_docs_of(
+        s, sys, wr, svc, tail, ns, name, rows_pre, pods, slices, endpoints,
+    );
+    if let Some((p, _)) = svc_got {
+        heap_free(sys.table(), p);
+    }
+    status
+}
+
+/// The documents of the Service `svc` (empty: gone) — see `ep_docs`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Service and the prefixes the op is given"
+)]
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+unsafe fn ep_docs_of(
+    s: &State,
+    sys: &Store,
+    wr: &Store,
+    svc: &[u8],
+    tail: &[u8],
+    ns: &[u8],
+    name: &[u8],
+    rows_pre: &[u8],
+    pods: &[u8],
+    slices: &[u8],
+    endpoints: &[u8],
+) -> i64 {
+    let named = !svc.is_empty() && epd_named_target(svc);
+    let (first6, dual) = epd_families(svc);
+    // Pass 1: the groups (family x port set) and their sizes.
+    let mut groups = [epd_group_none(); EPD_GROUPS];
+    let mut ng = 0usize;
+    let mut any_row = false;
+    let mut too_many = false;
+    // The rows, kept whole while they fit (`mem_ok`), so every later pass
+    // reads the heap rather than the store.
+    let Some(mut all) = EpBuf::new(sys, EP_EP_BUF0, EP_ALL_BUF_MAX) else {
+        return 413;
+    };
+    let mut mem_ok = true;
+    if !svc.is_empty() {
+        let r = ep_read_rows(s, sys, rows_pre, pods, ns, tail, named, dual, |rec| {
+            any_row = true;
+            if mem_ok && !all.push(sys, rec) {
+                mem_ok = false;
+            }
+            if let Some((_, row, pp, alt, _)) = epd_row(rec, 0) {
+                if !epd_group_add(&mut groups, &mut ng, svc, row, pp, alt) {
+                    too_many = true;
+                    return false;
+                }
+            }
+            true
+        });
+        if let Err(st) = r {
+            all.free(sys);
+            return st;
+        }
+        if too_many {
+            let m = b"[store_effect] EP_DOCS: a Service's endpoints fall in more port sets than EPD_GROUPS - REFUSED";
+            dev_log(sys.table(), 1, m.as_ptr(), m.len());
+            all.free(sys);
+            return 500;
+        }
+    }
+    let status = ep_docs_cut(
+        s,
+        sys,
+        wr,
+        svc,
+        tail,
+        ns,
+        name,
+        rows_pre,
+        pods,
+        slices,
+        endpoints,
+        named,
+        dual,
+        first6,
+        &groups[..ng],
+        any_row,
+        mem_ok.then(|| all.bytes()),
+    );
+    all.free(sys);
+    status
+}
+
+/// The slices and Endpoints of `ep_docs_of`, its groups in hand and its
+/// rows in `mem` (else walked again).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Service, the prefixes the op is given and what pass 1 found"
+)]
+#[allow(
+    clippy::manual_contains,
+    reason = "contains() on a byte slice links memchr, which a PIC module cannot resolve"
+)]
+unsafe fn ep_docs_cut(
+    s: &State,
+    sys: &Store,
+    wr: &Store,
+    svc: &[u8],
+    tail: &[u8],
+    ns: &[u8],
+    name: &[u8],
+    rows_pre: &[u8],
+    pods: &[u8],
+    slices: &[u8],
+    endpoints: &[u8],
+    named: bool,
+    dual: bool,
+    first6: bool,
+    groups: &[EpdGroup],
+    any_row: bool,
+    mem: Option<&[u8]>,
+) -> i64 {
+    let selects = epd_raw2(svc, b"spec", b"selector").is_some_and(|v| v.len() > 2);
+    let manage = !svc.is_empty() && (selects || any_row);
+    let primary = epd_primary(groups, svc);
+    let cap = 2 * EP_SHARD_BUF + 2 * svc.len() + 8192;
+    let mut wrote = false;
+    let mut good = true;
+    // The slices.
+    let mut sk = [0u8; MAX_KEY];
+    let skp = ep_key(&[slices, ns, b"/"], &mut sk).unwrap_or(0);
+    if skp == 0 {
+        return 400;
+    }
+    let write_slice = |name_len: usize,
+                       sk: &mut [u8; MAX_KEY],
+                       manage: bool,
+                       v6: bool,
+                       want: &[EpdPort],
+                       rows: &[u8]|
+     -> (bool, bool) {
+        let key = &sk[..skp + name_len];
+        let sname = &key[skp..];
+        ep_doc_write(
+            s,
+            sys,
+            wr,
+            key,
+            manage,
+            false,
+            EPD_LABEL_SLICE,
+            EPD_MANAGER_SLICE,
+            |u, t, out| epd_slice(svc, ns, name, sname, v6, want, rows, u, t, out),
+            cap,
+        )
+    };
+    if !manage || groups.is_empty() {
+        // One slice, the Service's own: empty (the Service selects and has
+        // no endpoints yet) or, unmanaged, deleted when ours.
+        let Some(nl) = epd_slice_name(name, true, 0, 0, &mut sk[skp..]) else {
+            return 400;
+        };
+        let (o, w) = write_slice(nl, &mut sk, manage, first6, &[], &[]);
+        good &= o;
+        wrote |= w;
+    } else {
+        let Some(mut buf) = EpBuf::new(sys, EP_SHARD_BUF, EP_SHARD_BUF) else {
+            return 413;
+        };
+        for (gi, g) in groups.iter().enumerate() {
+            let mut k = 0usize;
+            let mut taken = 0usize;
+            let mut fail = false;
+            let flush = |buf: &mut EpBuf, k: usize, sk: &mut [u8; MAX_KEY]| -> (bool, bool) {
+                let Some(nl) = epd_slice_name(name, primary == Some(gi), g.hash, k, &mut sk[skp..])
+                else {
+                    return (false, false);
+                };
+                let r = write_slice(nl, sk, true, g.v6, &g.ports[..g.n], buf.bytes());
+                buf.n = 0;
+                r
+            };
+            let r = ep_rows(sys, mem, rows_pre, pods, ns, tail, named, dual, |rec| {
+                let Some((_, row, pp, alt, _)) = epd_row(rec, 0) else {
+                    return true;
+                };
+                if !epd_in_group(svc, row, pp, alt, g.v6, &g.ports[..g.n]) {
+                    return true;
+                }
+                if !buf.push(sys, rec) {
+                    fail = true;
+                    return false;
+                }
+                taken += 1;
+                if taken == EPD_SHARD {
+                    let (o, w) = flush(&mut buf, k, &mut sk);
+                    good &= o;
+                    wrote |= w;
+                    k += 1;
+                    taken = 0;
+                }
+                true
+            });
+            if let Err(st) = r {
+                buf.free(sys);
+                return st;
+            }
+            if fail {
+                buf.free(sys);
+                return 500;
+            }
+            if taken > 0 || k == 0 {
+                let (o, w) = flush(&mut buf, k, &mut sk);
+                good &= o;
+                wrote |= w;
+            }
+        }
+        buf.free(sys);
+    }
+    // The Service's other slices that are no longer made (a group gone, a
+    // shard past its count), or every one of them when nothing is managed —
+    // only this controller's, and only those its service-name label says
+    // are this Service's.
+    {
+        let Some(pl) = ep_key(&[slices, ns, b"/", name, b"-"], &mut sk) else {
+            return 400;
+        };
+        // The prune: through the journal, as every read but the rows.
+        let mut walk = ListWalk::new(&sk[..pl]);
+        let mut kb = [0u8; MAX_KEY];
+        while let Some(one) = walk.next(wr) {
+            let kl = one.len().min(MAX_KEY);
+            kb[..kl].copy_from_slice(&one[..kl]);
+            let sname = kb.get(skp..kl).unwrap_or(&[]);
+            if sname.iter().any(|&c| c == b'/')
+                || (manage && epd_slice_current(sname, name, groups, primary))
+            {
+                continue;
+            }
+            let Some((p, n)) = read_whole(wr, &kb[..kl], DOC_MAX) else {
+                continue;
+            };
+            let doc = core::slice::from_raw_parts(p, n);
+            if epd_managed(doc, EPD_LABEL_SLICE, EPD_MANAGER_SLICE)
+                && epd_str3(doc, b"metadata", b"labels", EPD_LABEL_SVC) == Some(name)
+            {
+                leave_tomb(s, wr, &kb[..kl], doc);
+                good &= done(delete_value(wr, &kb[..kl]));
+                wrote = true;
+            }
+            heap_free(sys.table(), p);
+        }
+        good &= !walk.failed;
+    }
+    // The v1 Endpoints: the first family's listed rows, at most EPD_EP_MAX.
+    let mut ek = [0u8; MAX_KEY];
+    if let Some(ekl) = ep_key(&[endpoints, tail], &mut ek) {
+        let Some(mut buf) = EpBuf::new(sys, EP_EP_BUF0, EP_EP_BUF_MAX) else {
+            return 413;
+        };
+        let pnr = epd_pnr(svc);
+        let mut listed = 0usize;
+        let mut truncated = false;
+        let mut fail = false;
+        if manage {
+            let r = ep_rows(sys, mem, rows_pre, pods, ns, tail, named, dual, |rec| {
+                let Some((_, row, _, alt, _)) = epd_row(rec, 0) else {
+                    return true;
+                };
+                if !epd_ep_listed(row, alt, first6, pnr) {
+                    return true;
+                }
+                if listed == EPD_EP_MAX {
+                    truncated = true;
+                    return false;
+                }
+                if !buf.push(sys, rec) {
+                    fail = true;
+                    return false;
+                }
+                listed += 1;
+                true
+            });
+            if let Err(st) = r {
+                buf.free(sys);
+                return st;
+            }
+        }
+        if fail {
+            let m = b"[store_effect] EP_DOCS: the Endpoints' rows past the heap - REFUSED";
+            dev_log(sys.table(), 1, m.as_ptr(), m.len());
+            buf.free(sys);
+            return 413;
+        }
+        let rows = buf.bytes();
+        let ecap = 2 * rows.len() + 2 * svc.len() + 8192;
+        let (o, w) = ep_doc_write(
+            s,
+            sys,
+            wr,
+            &ek[..ekl],
+            manage,
+            selects,
+            EPD_LABEL_EP,
+            EPD_MANAGER_EP,
+            |u, t, out| epd_endpoints(svc, ns, name, rows, truncated, u, t, out),
+            ecap,
+        );
+        good &= o;
+        wrote |= w;
+        buf.free(sys);
+    }
+    if sys.waiting() {
+        503
+    } else if !good {
+        500
+    } else if wrote {
+        200
+    } else {
+        204
+    }
 }
 
 /// `wild = "18,26,24"` → up to six key-part field numbers.
@@ -2214,14 +3384,14 @@ mod params_def {
 
         9, list_open, str, 0
             => |s, d, len| {
-                let n = if len > 64 { 64 } else { len };
+                let n = if len > super::LIST_LIT_MAX { super::LIST_LIT_MAX } else { len };
                 s.list_open_len = n as u8;
                 if n > 0 { ptr_copy(s.list_open.as_mut_ptr(), d, n); }
             };
 
         10, list_close, str, 0
             => |s, d, len| {
-                let n = if len > 64 { 64 } else { len };
+                let n = if len > super::LIST_LIT_MAX { super::LIST_LIT_MAX } else { len };
                 s.list_close_len = n as u8;
                 if n > 0 { ptr_copy(s.list_close.as_mut_ptr(), d, n); }
             };
@@ -2316,6 +3486,20 @@ mod params_def {
         // How long a tomb stays, ms (default TOMB_MS).
         48, tomb_ms, u32, 300000
             => |s, d, len| { s.tomb_ms = super::p_u32(d, len, 0, super::TOMB_MS as u32).max(1); };
+
+        49, ep_docs, str, 0
+            => |s, d, len| {
+                let n = if len > 192 { 0 } else { len };
+                s.ep_docs_len = n as u8;
+                if n > 0 { ptr_copy(s.ep_docs.as_mut_ptr(), d, n); }
+            };
+
+        24, cover, str, 0
+            => |s, d, len| {
+                let n = if len > 96 { 0 } else { len };
+                s.cover_len = n as u8;
+                if n > 0 { ptr_copy(s.cover.as_mut_ptr(), d, n); }
+            };
 
         16, append_cap, u32, 1024
             => |s, d, len| { s.append_cap = super::p_u32(d, len, 0, 1024); };
@@ -2452,6 +3636,12 @@ pub unsafe extern "C" fn module_new(
         s.wall = 0;
         s.merge_existing = 0;
         s.tomb_len = 0;
+        s.ep_docs_len = 0;
+        s.ep_memo = core::cell::Cell::new(core::ptr::null_mut());
+        s.ep_memo_cap = core::cell::Cell::new(0);
+        s.ep_memo_n = core::cell::Cell::new(0);
+        s.ep_memo_tag = core::cell::Cell::new(0);
+        s.ep_memo_whole = core::cell::Cell::new(false);
         s.blob_len = 0;
         s.patch_keys_len = 0;
         s.patch_keys_bad = 0;
@@ -2641,11 +3831,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // and a number is bytes once someone writes it down.
         // 80..=99 continue the range, joined after 16, for a record of more
         // parts than thirteen (a Pod's node ask: its argv, env, limits).
+        // A value past `MAX_VALUE` is refused whole (413), never written cut:
+        // a cut record reads as a shorter, valid one (a manifest naming
+        // fewer layers than it has).
         let mut vbuf = [0u8; MAX_VALUE];
         let mut vlen = 0usize;
+        let mut value_over = false;
         for f in (4u8..=16).chain(80u8..=99) {
             match frame_field(req, f) {
                 Some((TY_BYTES, part)) => {
+                    if part.len() > MAX_VALUE - vlen {
+                        value_over = true;
+                    }
                     let n = part.len().min(MAX_VALUE - vlen);
                     vbuf[vlen..vlen + n].copy_from_slice(&part[..n]);
                     vlen += n;
@@ -2670,6 +3867,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         digits[i] = b'-';
                     }
                     let part = &digits[i..];
+                    if part.len() > MAX_VALUE - vlen {
+                        value_over = true;
+                    }
                     let n = part.len().min(MAX_VALUE - vlen);
                     vbuf[vlen..vlen + n].copy_from_slice(&part[..n]);
                     vlen += n;
@@ -2691,6 +3891,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     | OP_PATCH_JSON
                     | OP_PATCH_SMP
                     | OP_APPLY
+                    | OP_COVER
             )
             && value.starts_with(b"sha256:")
         {
@@ -2897,6 +4098,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 _ => reply_projected(&mut out, cid, 204, &[], carry, &proj),
             }
+        } else if value_over {
+            // Its parts join past what this connector writes in place.
+            let m = b"[store_effect] a value past 6144 bytes - REFUSED (413), not written cut";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            reply_projected(&mut out, cid, 413, &[], carry, &proj)
         } else if staged_bad {
             // The body it names is gone (collected) or could not be held:
             // writing the reference itself as the object would be a lie.
@@ -2928,7 +4134,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut at = 0usize;
                     let mut walk = ListWalk::new(key);
                     if s.list_open_len > 0 {
-                        at = append(&mut names, at, &s.list_open[..s.list_open_len as usize]);
+                        at = append_lit(
+                            &mut names,
+                            at,
+                            &s.list_open[..s.list_open_len as usize],
+                            key,
+                        );
                     }
                     let opened = at;
                     let mut overflow = false;
@@ -2971,7 +4182,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             last_seg(k)
                         };
                         let need = name.len() + if at == opened { 0 } else { sep.len() };
-                        if at + need + s.list_close_len as usize > names.len() {
+                        if at + need + s.list_close_len as usize + key.len() > names.len() {
                             // REFUSE rather than answer a short list: a
                             // truncated collection reads as a complete one and
                             // a client concludes the missing objects are gone.
@@ -2984,7 +4195,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         at = append(&mut names, at, name);
                     }
                     if s.list_close_len > 0 {
-                        at = append(&mut names, at, &s.list_close[..s.list_close_len as usize]);
+                        at = append_lit(
+                            &mut names,
+                            at,
+                            &s.list_close[..s.list_close_len as usize],
+                            key,
+                        );
                     }
                     let status = if overflow || walk.failed { 500 } else { 200 };
                     let body: &[u8] = if status == 200 { &names[..at] } else { &[] };
@@ -3393,8 +4609,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         };
                         reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else if el == 0 {
-                        s.malformed = s.malformed.wrapping_add(1);
-                        reply_projected(&mut out, cid, 400, &[], carry, &proj)
+                        // Nothing settable at the path — or a result past the
+                        // record (an object that fit grows past it with the
+                        // value set: a 6 KiB Job's status). The latter is
+                        // patched on the heap where this build has one, the
+                        // former answered 400 there as here; never a cut
+                        // object written.
+                        let status = patch_whole(sys, key, &segs[..ns], val);
+                        if status == 400 {
+                            s.malformed = s.malformed.wrapping_add(1);
+                        }
+                        reply_projected(&mut out, cid, status, &[], carry, &proj)
                     } else {
                         let (ok, wrote) = put_guarded(sys, key, &edited[..el]);
                         let status = if !ok {
@@ -3646,7 +4871,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let status = if drop_family(sys, key) { 200 } else { 500 };
                     reply_projected(&mut out, cid, status, &[], carry, &proj)
                 }
-                OP_TAKE => {
+                OP_TAKE | OP_CLAIM => {
                     // 200 with the value, taken by this request alone; 404
                     // only when it is not there. A take not decided this
                     // step holds the record (below), and one that could not
@@ -3656,7 +4881,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     let mut val = [0u8; MAX_VALUE];
                     let mut scratch = [0u8; MAX_VALUE];
-                    match take_value(sys, key, &s.take_nonce, &mut val, &mut scratch) {
+                    let keep = op == OP_CLAIM;
+                    match take_value(sys, key, &s.take_nonce, keep, &mut val, &mut scratch) {
                         Took::Taken(vlen) => reply_projected(
                             &mut out,
                             cid,
@@ -3670,6 +4896,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             reply_projected(&mut out, cid, 503, &[], carry, &proj)
                         }
                     }
+                }
+                OP_EP_DOCS => {
+                    let status = ep_docs(s, sys, key);
+                    reply_projected(&mut out, cid, status, &[], carry, &proj)
+                }
+                OP_COVER => {
+                    let mut why = [0u8; 1536];
+                    let (status, n) = if staged_bad {
+                        (413, 0)
+                    } else {
+                        cover(s, sys, req, value, &mut why)
+                    };
+                    reply_projected(&mut out, cid, status, &why[..n], carry, &proj)
                 }
                 OP_PUT => {
                     let (ok, wrote) = put_guarded(sys, key, value);

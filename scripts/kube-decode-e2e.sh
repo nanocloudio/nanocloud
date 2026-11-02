@@ -155,7 +155,8 @@ def field(num, ty, payload):
     return bytes([num, ty]) + struct.pack("<H", len(payload)) + payload
 
 def frame(wave_id_known, method, resource, namespace, name, body, key,
-          credential=b"", target=b"", query=b"", watch=0, peer=b"", group=b""):
+          credential=b"", target=b"", query=b"", watch=0, peer=b"", group=b"",
+          fence=b"", enrol=b"/"):
     """Every field except the correlation, which the graph assigns."""
     return (field(2, TY_I64, struct.pack("<q", method))
             + field(3, TY_BYTES, resource)
@@ -184,7 +185,12 @@ def frame(wave_id_known, method, resource, namespace, name, body, key,
             # The verified mTLS peer, hex. Empty on plaintext — which is every
             # case here, and the point: the field is always PRESENT, because a
             # consumer indexes by number and an absent field is not an empty one.
-            + field(12, TY_BYTES, peer))
+            + field(12, TY_BYTES, peer)
+            # The Nanocloud-Authority-Epoch header (the fence stage's), and an
+            # enrollment's `<spec.cellUID>/<spec.envelopeDigest>` from the
+            # body: both always PRESENT, empty ("/") when not sent.
+            + field(14, TY_BYTES, fence)
+            + field(15, TY_BYTES, enrol))
 
 # The exchange method byte: GET = 1, POST = 3.
 cases = [
@@ -226,14 +232,14 @@ for (label, tail), log in zip(cases, logs):
     # whole frame, not just the part that was easy to predict.
     corr_at = at - 12          # field 1: [1][TY_I64][8,0] + 8 payload bytes
     count_at = corr_at - 1
-    if count_at < 0 or log[count_at] != 13:
-        fails.append(label + " (field count != 13)")
+    if count_at < 0 or log[count_at] != 15:
+        fails.append(label + " (field count != 15)")
         continue
     if log[corr_at] != 1 or log[corr_at + 1] != TY_I64:
         fails.append(label + " (field 1 is not the i64 correlation)")
         continue
     corr = struct.unpack("<q", log[corr_at + 4:corr_at + 12])[0]
-    print("   ok  %-52s corr=0x%08x, 13 fields, byte-exact" % (label, corr))
+    print("   ok  %-52s corr=0x%08x, 15 fields, byte-exact" % (label, corr))
 
 if fails:
     for f in fails:

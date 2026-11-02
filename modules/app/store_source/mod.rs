@@ -64,7 +64,10 @@ const TY_MSG: u8 = 3;
 /// `peer:` + 64 hex) plus the rows it indexes runs past 160, and a source
 /// SKIPS a key it cannot hold — the row would simply never be seen.
 const MAX_KEY: usize = 256;
-const MAX_VALUE: usize = 4096;
+/// Matches store_effect's: the longest value a scan reads in place (an
+/// image manifest at its 65-layer bound); a longer one is refused, or read
+/// onto the heap by a build that has one (store_scan).
+const MAX_VALUE: usize = 6144;
 /// One LIST PAGE. Not a ceiling: fluxor's store provider pages, filling this
 /// buffer and handing back a cursor, and `list_page` walks to the end across
 /// steps. Deliberately modest — a bigger buffer buys fewer syscalls, not more
@@ -439,8 +442,8 @@ struct State {
     /// is how many children `<prefix><tail><child_sep>*` exist across every
     /// listed prefix, and 21 the same as digits — a per-object fold ("how many of mine are done") that a
     /// per-record decision cannot perform and a status must state.
-    count_children: [u8; MAX_PREFIX],
-    count_children_len: u8,
+    count_children: [u8; MAX_PATHS_SPEC],
+    count_children_len: u16,
     /// `desired = <path>`: field 20 is that path parsed as an integer, so the
     /// decision can compare the fold above against the object's own target
     /// as numbers. `expand` reads the same kind of path but expands on it.
@@ -700,8 +703,10 @@ mod params_def {
 
         12, count_children, str, 0
             => |s, d, len| {
-                let n = if len > MAX_PREFIX { MAX_PREFIX } else { len };
-                s.count_children_len = n as u8;
+                // A namespace's teardown lists every namespaced tree: the
+                // list is a paths spec's length, not one prefix's.
+                let n = if len > MAX_PATHS_SPEC { MAX_PATHS_SPEC } else { len };
+                s.count_children_len = n as u16;
                 if n > 0 { ptr_copy(s.count_children.as_mut_ptr(), d, n); }
             };
 
@@ -3200,7 +3205,10 @@ unsafe fn join_nth(
 /// The `where` filter: `<path>=<value>` (exact) or `<path>=` (absent/empty).
 /// `unless`: true when the object's key tail has NO record under the
 /// `unless` prefix — one existence probe, the same one a decision would need
-/// a whole store round trip for.
+/// a whole store round trip for. The probe is the key's REVISION, not its
+/// value: a value read into a record buffer finds an object past it (a CRD
+/// with a real schema) "not read", and taking that for absence pruned the
+/// rows of every such object as orphans.
 unsafe fn unless_ok(s: &State, sys: &SyscallTable, tail: &[u8]) -> bool {
     if s.unless_len == 0 {
         return true;
@@ -3212,8 +3220,7 @@ unsafe fn unless_ok(s: &State, sys: &SyscallTable, tail: &[u8]) -> bool {
     if kl > MAX_KEY {
         return true;
     }
-    let mut probe = [0u8; MAX_VALUE];
-    get_value(sys, &k[..kl], &mut probe, &s.waited).is_none()
+    head(sys, &k[..kl], &s.waited).is_none()
 }
 
 fn where_ok(s: &State, value: &[u8]) -> bool {

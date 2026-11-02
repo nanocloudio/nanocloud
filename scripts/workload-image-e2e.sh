@@ -15,10 +15,19 @@
 #     pack=… -> CREATE (pack) -> Running, and the module's own log line
 #   DELETE the Pod -> its sandbox destroyed
 #   a second image that SERVES: redis_edge_anchor wired to the node's network
-#   through a lane of its own (`net:0`), answering PING on its port
+#   through a lane of its own (its `linux_net` wires), answering PING on its port
+#   an image at the layer bound: its graph and 64 modules (Fluxor's
+#   MAX_ADD_MODULES) — 65 layers, every hop the list rides sized for it
+#   (http_fetch's answer, the store's values, the assembly record,
+#   workload_effect's pack) — pulled, staged and run
+#   one layer past it: refused with its count, said on the Pod
+#   (ErrImagePull "… has 66 layers, at most 65 …"), no layer fetched; and
+#   80, whose digest list is past what http_fetch answers (413): the same
 #
 # PASS = Running, `[prog]` in the node's log, the module absent from the
-# node's image, the delete settled, and the second Pod answering on its port.
+# node's image, the delete settled, the second Pod answering on its port, the
+# 65-layer Pod Running from its pack, and the 66-layer one Pending with the
+# reason on its status.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -72,12 +81,71 @@ workloads:
         type: redis_edge_anchor
         listen_port: $SERVE_PORT
     wiring:
-      - from: "net:0"
-        to: anchor
-      - from: anchor
-        to: "net:0"
+      - from: linux_net.net_out
+        to: anchor.net_in
+      - from: anchor.net_out
+        to: linux_net.net_in
 YAML
 wn_publish front "$D/front.yaml"
+# At the layer bound: a graph of one program_probe, and 63 more modules in
+# its pack (the pack may carry more than its graph runs; each pinned by its
+# layer digest) — 65 layers, the most a workload image has. One more: 66.
+cat >"$D/wide.yaml" <<'YAML'
+target: linux
+tick_us: 1000
+modules: []
+wiring: []
+workloads:
+  - modules:
+      - name: wide
+        type: program_probe
+YAML
+wn_publish wide "$D/wide.yaml"
+wn_widen() { # wn_widen <from-repo> <to-repo> <layers>: <from>'s image grown to <layers> layers
+  python3 - "$D/reg/$1" "$D/reg/$2" "$3" "$ROOT/target/fluxor/aarch64/modules" <<'PY'
+import functools, glob, hashlib, json, os, shutil, struct, sys
+src, dst, want, mods = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+if os.path.realpath(src) != os.path.realpath(dst):
+    shutil.copytree(src, dst)
+m = json.load(open(os.path.join(src, "manifest.json")))
+fnv = lambda s: functools.reduce(lambda h, c: ((h ^ c) * 0x01000193) & 0xffffffff, s, 0x811c9dc5)
+have = {l["annotations"].get("io.fluxor.module.name") for l in m["layers"]}
+def manifest_of(b):
+    # The fmod's manifest: past its header, code, data, exports and schema.
+    code, data = struct.unpack_from("<II", b, 8)
+    exports = struct.unpack_from("<H", b, 24)[0]
+    schema, size = struct.unpack_from("<HH", b, 62)
+    at = 80 + code + data + exports * 8 + schema
+    return b[at:at + size]
+# What this runtime admits: a module built for it (the linux runtime's bit
+# in its manifest) against its ABI surface (the attestation, the manifest's
+# last 32 bytes) — the graph's own module's.
+own = manifest_of(open(os.path.join(src, m["layers"][1]["digest"][7:]), "rb").read())
+LINUX = 0x10
+# The smallest such modules of distinct names, none the graph's own.
+for p in sorted(glob.glob(mods + "/*.fmod"), key=os.path.getsize):
+    if len(m["layers"]) >= want:
+        break
+    b = open(p, "rb").read()
+    name = b[28:60].split(b"\0")[0].decode(errors="replace")
+    mf = manifest_of(b)
+    if not name or name in have or len(mf) < 49 or mf[-32:] != own[-32:] \
+            or not struct.unpack_from("<H", mf, 10)[0] & LINUX:
+        continue
+    have.add(name)
+    h = hashlib.sha256(b).hexdigest()
+    open(os.path.join(dst, h), "wb").write(b)
+    m["layers"].append({"mediaType": "application/vnd.nanocloud.fluxor.module.v1", "digest": "sha256:" + h,
+                        "size": len(b), "annotations": {"io.fluxor.module.name": name,
+                                                        "io.fluxor.module.name-hash": str(fnv(name.encode()))}})
+assert len(m["layers"]) == want, len(m["layers"])
+open(os.path.join(dst, "manifest.json"), "w").write(json.dumps(m))
+print("   %s: %d layers, the manifest %d bytes" % (os.path.basename(dst), want, len(json.dumps(m))))
+PY
+}
+wn_widen wide wide 65 || fail "the 65-layer image was not laid out"
+wn_widen wide over 66 || fail "the 66-layer image was not laid out"
+wn_widen wide far 80 || fail "the 80-layer image was not laid out"
 wn_registry "$REG_PORT"
 MDIG="$(sha256sum "$D/reg/probe/manifest.json" | cut -d' ' -f1)"
 
@@ -184,4 +252,84 @@ done
 [ "$pong" = "PONG" ] || { dump; fail "the serving Pod never answered on :$SERVE_PORT"; }
 echo "   PING :$SERVE_PORT -> PONG (a pulled module, listening through its lane)"
 
-echo "== E2E green: Pods of workload images pulled, pinned, staged as the modules they brought, run, serving, and deleted =="
+echo "== 9. an image at the layer bound: its graph and 64 modules, 65 layers, pulled and run =="
+WDIG="$(sha256sum "$D/reg/wide/manifest.json" | cut -d' ' -f1)"
+WIDE='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"wide","namespace":"default"},"spec":{"runtimeClassName":"fluxor","containers":[{"name":"wide","image":"nanocloud/wide:1"}]}}'
+# Its module is a program_probe too: its own `[prog]` line is the next one.
+np="$(grep -ac "\[prog\]" "$D/run.log" || true)"
+r="$(api POST /api/v1/namespaces/default/pods "$WIDE")"
+case "$r" in 20[01]\|*) echo "   POST pods -> ${r%%|*}" ;; *) fail "POST wide: ${r:0:200}" ;; esac
+UID_="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["uid"])')"
+MDIG="$WDIG"
+phase=""
+for _ in $(seq 120); do
+  r="$(api GET /api/v1/namespaces/default/pods/wide)"
+  phase="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("status",{}).get("phase",""))
+except Exception: print("")' 2>/dev/null)"
+  [ "$phase" = "Running" ] && [ "$(grep -ac "\[prog\]" "$D/run.log" || true)" -gt "$np" ] && break
+  sleep 1
+done
+echo "   phase=${phase:-}"
+if [ "$phase" != "Running" ]; then dump; fail "the 65-layer Pod never reached Running (phase='${phase:-}')"; fi
+[ "$(grep -ac "\[prog\]" "$D/run.log" || true)" -gt "$np" ] || { dump; fail "Running, but the 65-layer pack's module never logged"; }
+# Every layer marked cached for the manifest — 0..64 — which only a
+# manifest recorded whole (all 65 digests) expands into. (The test's store
+# reader, lattice's redis edge, does not answer a value this long whole.)
+for i in 0 32 64; do
+  [ -n "$(nc_store_get "$STORE" "/~node/node-1/image-layer-ok/$WDIG-$i")" ] \
+    || { dump; fail "layer $i of the 65 is not marked cached"; }
+done
+[ -z "$(nc_store_get "$STORE" "/~node/node-1/image-layer-ok/$WDIG-65")" ] || fail "a 66th layer was marked"
+nb="$(grep -c "^/v2/nanocloud/wide/blobs/" "$D/reg.log" || true)"
+[ "$nb" -ge 65 ] || fail "only $nb blob requests for 65 layers and a config"
+echo "   /image-layer-ok/${WDIG:0:12}…-0..64 marked ($nb blob GETs); the Pod runs from its 65-layer pack"
+
+# refused <repo> <layers>: a Pod of an image past the bound is Pending, its
+# status and its ErrImagePull event naming the count; nothing recorded, no
+# layer asked of the registry.
+refused() {
+  local repo="$1" n="$2" odig pod want got r
+  odig="$(sha256sum "$D/reg/$repo/manifest.json" | cut -d' ' -f1)"
+  pod="{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"$repo\",\"namespace\":\"default\"},\"spec\":{\"runtimeClassName\":\"fluxor\",\"containers\":[{\"name\":\"$repo\",\"image\":\"nanocloud/$repo:1\"}]}}"
+  r="$(api POST /api/v1/namespaces/default/pods "$pod")"
+  case "$r" in 20[01]\|*) echo "   POST pods -> ${r%%|*}" ;; *) fail "POST $repo: ${r:0:200}" ;; esac
+  UID_="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["uid"])')"
+  want="has $n layers, at most 65 (its graph and 64 modules)"
+  got=""
+  for _ in $(seq 90); do
+    r="$(api GET "/api/v1/namespaces/default/pods/$repo")"
+    got="$(printf '%s' "${r#*|}" | python3 -c 'import json,sys
+try:
+    st = json.load(sys.stdin).get("status", {})
+    w = ((st.get("containerStatuses") or [{}])[0].get("state") or {}).get("waiting") or {}
+    print("%s|%s|%s" % (st.get("phase", ""), w.get("reason", ""), w.get("message", "")))
+except Exception: print("")' 2>/dev/null)"
+    case "$got" in *"$want"*) break ;; esac
+    sleep 1
+  done
+  case "$got" in
+    "Pending|ErrImagePull|"*"$want"*|"Pending|ImagePullBackOff|"*"$want"*) echo "   ${got}" ;;
+    *) dump; nc_store_get "$STORE" "/~node/node-1/image-pull-failed/nanocloud~$repo+1" | sed 's/^/   pull-failed: /'
+       fail "the $n-layer Pod does not say why it waits: '${got}'" ;;
+  esac
+  r="$(api GET /api/v1/namespaces/default/events)"
+  printf '%s' "${r#*|}" | python3 -c 'import json,sys
+uid, want = sys.argv[1], sys.argv[2]
+ev = [e for e in json.load(sys.stdin).get("items", []) if e["metadata"]["name"] == uid + ".ErrImagePull"]
+assert ev and want in ev[0]["message"] and ev[0]["type"] == "Warning", ev
+print("   event ErrImagePull: " + ev[0]["message"])' "$UID_" "$want" || fail "no ErrImagePull event naming the count"
+  [ -z "$(nc_store_get "$STORE" "/~node/node-1/image-manifests/$odig" 2>/dev/null)" ] \
+    || fail "the $n-layer manifest was recorded"
+  ! grep -q "^/v2/nanocloud/$repo/blobs/" "$D/reg.log" || fail "a layer of the refused image was fetched"
+  echo "   nothing recorded, no blob asked of the registry"
+}
+echo "== 10. one layer past the bound: refused with its count, on the Pod — no layer fetched =="
+refused over 66
+echo "== 11. far past it — the digest list past what http_fetch answers (its 413): refused the same =="
+refused far 80
+grep -aq "\[http_fetch\] an answer past what a reply carries" "$D/run.log" \
+  || fail "the 80-layer manifest was not answered 413 by http_fetch"
+echo "   http_fetch answered it 413 with its count, not an empty list"
+
+echo "== E2E green: Pods of workload images pulled, pinned, staged as the modules they brought, run, serving, and deleted; a 65-layer image runs, a 66- and an 80-layer one are refused on the Pod with their count =="

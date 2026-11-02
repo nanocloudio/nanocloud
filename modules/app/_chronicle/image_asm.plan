@@ -4,7 +4,9 @@
 //        - every layer present (/image-layer-ok/<n>-* counted against n) and
 //          no rootfs yet (or one due a retry: `state=retry`), its job gone
 //          -> the assembly job at /sandboxes/img-asm-<n> (`/bin/sh <script>
-//          <rootfs>/<n> <blobs> <layer hex…>`); a job left from an attempt
+//          <rootfs>/<n> <blobs> <hex>,<hex>,…` — the layers ONE argument, as
+//          the manifest lists them, so the record carries the list once);
+//          a job left from an attempt
 //          before -> deleted first
 //        - the job's verdict, while `state=assembling`:
 //            exit 0  -> /image-rootfs/<n> `path=…;state=ready`
@@ -63,9 +65,8 @@ plan nanocloud.image_asm {
   message As {
     seq: int = 1;
     key: string = 3;
-    layers: string = 4;    // layers!argv — space-separated
+    layers: string = 4;    // layers, as the manifest lists them (`,`-separated)
     kind: string = 5;      // `workload`: a fluxor workload image
-    lcsv: string = 6;      // layers, as the manifest lists them
     have: int = 22;        // /image-layer-ok/<n>-* present
     n: int = 50;
     now: int = 58;
@@ -138,14 +139,14 @@ plan nanocloud.image_asm {
     // digest): every layer of the image dropped and fetched again
     // (image_heal.plan), which also drops the rootfs record — no backoff
     // here, the fetch has its own.
-    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.lcsv != "" && a.script != "" ->
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.layers != "" && a.script != "" ->
       Job { cid: a.seq, op: PUT, key: "/image-blob-bad/asm-", k2: a.key,
-            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.lcsv, v5: ";at=;code=65",
+            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.layers, v5: ";at=;code=65",
             v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
             ctx: Ctx { next: "bad", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: a.jc, fails: 1, now: a.now } };
-    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.lcsv != "" ->
+    when a.st == "assembling" && (a.js == "exited" || a.js == "failed") && a.jc == "65" && a.layers != "" ->
       Job { cid: a.seq, op: PUT, key: "/image-blob-bad/asm-", k2: a.key,
-            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.lcsv, v5: ";at=;code=65",
+            v1: "pack=", v2: a.key, v3: ";layers=", v4: a.layers, v5: ";at=;code=65",
             v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
             ctx: Ctx { next: "bad", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: 1, now: a.now } };
     when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") && a.script != "" ->
@@ -265,7 +266,7 @@ plan nanocloud.image_asm {
   }
 
   transformation t_as(a: As) -> As {
-    As { seq: a.seq, key: a.key, layers: a.layers, kind: a.kind, lcsv: a.lcsv, have: a.have, n: a.n,
+    As { seq: a.seq, key: a.key, layers: a.layers, kind: a.kind, have: a.have, n: a.n,
          now: a.now, st: a.st, fails: a.fails, js: a.js, jc: a.jc, script: a.script, root: a.root,
          blobs: a.blobs }
   }

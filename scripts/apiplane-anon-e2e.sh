@@ -126,7 +126,7 @@ R="$(run_case "$D/shipped.yaml")"
 case "${R#*|}" in *'"reason":"Unauthorized"'*) ;; *) fail "shipped body: ${R#*|}";; esac
 echo "   GET /pods/default/web-0 (no credential) -> 401 'no usable credential'"
 
-echo "== 3. the SAME graph plus the `anon` node admits it, and RBAC decides =="
+echo "== 3. the SAME graph plus the anon node admits it, and RBAC decides =="
 ANON="$(nc_decision "$ROOT/modules/app/_chronicle/apiplane_anon.plan" anon)"
 [ -n "$ANON" ] || { echo "FAIL: apiplane_anon.plan did not compile"; exit 1; }
 python3 - "$D/shipped.yaml" "$D/anon.yaml" "$ANON" <<'PY'

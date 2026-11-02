@@ -138,7 +138,7 @@ EOF
     mode: 0
     peer_auth: ca_dns
     verify_hostname: localhost
-    trust: "\${file:$D/ca.der}"
+    trust: "$D/ca.der"
     cert_file: $D/node.der
     key_file: $D/node.key.der
   - name: eff_$name

@@ -33,8 +33,7 @@
 #   SERVICES the cluster's Service plane, on the control plane (a template
 #            naming `__SERVICES_MODULES__`): the endpoints controller
 #            (fluxor-endpoints.yaml, installed as endpoints.yaml), the cluster
-#            DNS (fluxor-dns.yaml, as dns.yaml), the Wormhole projection
-#            (fluxor-wormhole.yaml, as wormhole.yaml), and the proxy's chain
+#            DNS (fluxor-dns.yaml, as dns.yaml), and the proxy's chain
 #            (fluxor-proxy.yaml, as proxy.yaml) and the NetworkPolicy chain
 #            (fluxor-netpolicy.yaml, as netpolicy.yaml) — every node of those
 #            but their `net_apply`, which each node runs for itself (KUBELET).
@@ -307,7 +306,7 @@ if [ "$PODS" = 1 ] && grep -q "__KUBELET_MODULES__" "$TEMPLATE"; then
     mode: 0
     alpn_h1_only: 1
     peer_auth: 2
-    trust: \"\${file:$REGISTRY_CA}\"
+    trust: \"$REGISTRY_CA\"
     verify_hostname: \"$REGISTRY_HOST\""
             IMAGE_WIRING="$(printf '%s\n' "$IMAGE_WIRING" | awk '
                 /^  - from: / { f = $3; next }
@@ -367,8 +366,7 @@ $LEASE"
 fi
 
 # The cluster's Service plane, where the template names it (the control
-# plane): endpoints, DNS, the Wormhole projection, and the proxy's and
-# NetworkPolicy's chains.
+# plane): endpoints, DNS, and the proxy's and NetworkPolicy's chains.
 SERVICES_MODULES=""
 SERVICES_WIRING=""
 if grep -q "__SERVICES_MODULES__" "$TEMPLATE"; then
@@ -386,10 +384,7 @@ if grep -q "__SERVICES_MODULES__" "$TEMPLATE"; then
     LB_POOL="${NANOCLOUD_LB_POOL:-}"
     case "$NODE_PORTS" in *[!0-9-]*|"") fail "NANOCLOUD_NODE_PORTS is '$NODE_PORTS', not <lo>-<hi>" ;; esac
     case "$LB_POOL" in *[!0-9./]*) fail "NANOCLOUD_LB_POOL is '$LB_POOL', not <a.b.c.d>/<n>" ;; esac
-    # The Wormhole projection (wormhole.yaml): Services and their slices
-    # declared to Wormhole as its v1 records (docs/architecture/
-    # wormhole-projection.md).
-    for pair in endpoints.yaml:fluxor-endpoints.yaml dns.yaml:fluxor-dns.yaml wormhole.yaml:fluxor-wormhole.yaml $DATAPLANE; do
+    for pair in endpoints.yaml:fluxor-endpoints.yaml dns.yaml:fluxor-dns.yaml $DATAPLANE; do
         F="$(fragment "" "${pair%%:*}" "${pair#*:}")" || fail "no ${pair%%:*} beside $TEMPLATE"
         SERVICES_MODULES="$SERVICES_MODULES
 $(split_modules "$F" out)"
@@ -415,67 +410,6 @@ $(split_wiring "$F" out)"
 }"
     SERVICES_WIRING="${SERVICES_WIRING#
 }"
-fi
-
-# Wormhole's VIP stack, on the control plane's first replica (one
-# coordinator per cluster: it reaches only the controller beside it, there
-# being no channel between nodes): a vip_controller driving node_net's HOLD
-# table through Fluxor's `addr_ctl` contract (node_net's `vip_ctl`/`vip_evt`), the failover coordinator with its
-# operation store in the VIP group's `fo/` namespace, the binding writer,
-# and the requests svc_alloc's addresses become (wormhole_vip). Every other
-# node keeps node_net's own hold. NANOCLOUD_VIP=0 leaves it out;
-# NANOCLOUD_VIP_NAMESPACE names the namespace (tenant) it serves.
-# docs/architecture/wormhole-projection.md, "The VIP authority".
-VIP_MODULES=""
-VIP_WIRING=""
-PARTITIONS=1
-if grep -q "^  - name: consensus_vip$" "$TEMPLATE"; then
-    PARTITIONS=2
-fi
-# H(label, part) = SHA-256(label ‖ 0x00 ‖ part)[..16], as _shared/whemit.rs.
-wh_id() { printf '%s\0%s' "$1" "$2" | sha256sum | cut -c1-32; }
-if [ "$PARTITIONS" = 2 ] && [ "${NANOCLOUD_VIP:-1}" != 0 ] && [ "$REPLICA_ID" = 0 ] \
-        && grep -q "__VIP_MODULES__" "$TEMPLATE" && [ "$PODS" = 1 ]; then
-    VIP_NS="${NANOCLOUD_VIP_NAMESPACE:-default}"
-    case "$VIP_NS" in *[!a-z0-9-]*|"") fail "NANOCLOUD_VIP_NAMESPACE is '$VIP_NS', not a namespace name" ;; esac
-    VIP_MODULES="  - name: vip_controller
-    params:
-      host_id: \"$(wh_id nc-node "$NODE_NAME")\"
-      tenant: \"$(wh_id nc-tenant "$VIP_NS")\"
-  - name: failover_coordinator
-  - name: failover_store
-  - name: binding_writer
-  - name: wormhole_vip
-    namespace: \"$VIP_NS\"
-    node_name: \"$NODE_NAME\""
-    VIP_WIRING="  - from: vip_controller.addr_ctl_out
-    to: node_net.vip_ctl
-  - from: node_net.vip_evt
-    to: vip_controller.addr_evt_in
-  - from: failover_coordinator.ctl_out
-    to: vip_controller.ctl_in
-  - from: vip_controller.ctl_out
-    to: failover_coordinator.ctl_in
-  - from: vip_controller.directory_out
-    to: session_directory.requests
-  - from: failover_coordinator.directory_out
-    to: session_directory.requests
-  - from: failover_store.directory_out
-    to: session_directory.requests
-  - from: session_directory.replies
-    to: vip_controller.directory_in
-  - from: session_directory.replies
-    to: failover_coordinator.directory_in
-  - from: session_directory.replies
-    to: failover_store.directory_in
-  - from: failover_coordinator.store_out
-    to: failover_store.record_in
-  - from: failover_store.answer_out
-    to: failover_coordinator.store_in
-  - from: vip_controller.binding_out
-    to: binding_writer.binding_in
-  - from: wormhole_vip.request_out
-    to: failover_coordinator.request_in"
 fi
 
 pin() { # the SHA-256 of a certificate's raw P-256 point
@@ -530,7 +464,7 @@ if [ "$PEER_TRUST" = authority ]; then
       voters: $VOTERS"
 else
     peer_tls() {
-        printf '    peer_auth: pinned\n    trust: "${file:%s/trust.pem}"\n    cert_file: "%s/peer.der"\n    key_file: "%s/peer.key.der"' \
+        printf '    peer_auth: pinned\n    trust: "%s/trust.pem"\n    cert_file: "%s/peer.der"\n    key_file: "%s/peer.key.der"' \
             "$PKI" "$PKI" "$PKI"
     }
     PEER_SERVER_TRUST="$(peer_tls)"
@@ -581,7 +515,7 @@ if [ "$PEER_TRUST" = authority ]; then
     mode: 0
     alpn_h1_only: 1
     peer_auth: 2
-    trust: \"\${file:$PKI/plane-ca.der}\"
+    trust: \"$PKI/plane-ca.der\"
     verify_hostname: \"kubernetes.default.svc.cluster.local\""
         PEER_PKI_WIRING="$PEER_PKI_WIRING
   - from: plane_api.net_out
@@ -724,9 +658,6 @@ fluxor render-template "$TEMPLATE" \
     --var "KUBELET_WIRING=$KUBELET_WIRING" \
     --var "SERVICES_MODULES=$SERVICES_MODULES" \
     --var "SERVICES_WIRING=$SERVICES_WIRING" \
-    --var "VIP_MODULES=$VIP_MODULES" \
-    --var "VIP_WIRING=$VIP_WIRING" \
-    --var "PARTITIONS=$PARTITIONS" \
     --var "NODE_NAME=$NODE_NAME" \
     --var "NODE_FACTS=$NODE_FACTS" \
     --var "NODE_ADDRESS=$NODE_ADDRESS" \

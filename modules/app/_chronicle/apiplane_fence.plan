@@ -1,0 +1,344 @@
+// The API request path's AUTHORITY-EPOCH FENCE (spec §9: "the cell rejects
+// stale parent authority epochs after learning a newer committed epoch"),
+// between `ident` and `rbac` (apiplane.plan's chain):
+//
+//   ident -> fence (here; a store_effect COUNT) -> fenced (here) -> rbac
+//
+// A management plane reaches a managed cell under ONE credential per
+// ManagementBinding — the ServiceAccount nanocloud-management/<binding>
+// (management.plan) — and every write it makes names the authority epoch it
+// acts under, in the `Nanocloud-Authority-Epoch` header. The epochs the cell
+// has COMMITTED for that credential are the keys under
+//
+//   /authority-epochs/<subject>/<epoch>
+//
+// (written by management.plan from the binding's spec.authorityEpoch, and by
+// the binding's own epoch path, `POST …/managementbindings/<b>/epoch`, below).
+// The committed epoch is the greatest of them: a set that only grows, so two
+// advances in flight cannot take it back, and no write ever lowers it.
+//
+// `fence` COUNTs the subject's committed epochs NEWER than the header's
+// (`fence_newer`, the count_where predicate) — all of them when the header is
+// absent or not a number — and `fenced` decides, for a WRITE (POST, PUT,
+// PATCH, DELETE):
+//
+//   none committed                -> not a managed credential: admitted as before
+//   header absent                 -> 403 Forbidden
+//   header not a decimal number   -> 400 BadRequest
+//   a newer epoch committed       -> 409 Conflict: a stale writer is stopped by
+//                                    the cell, whatever its client-side CAS did
+//   the fence could not be read   -> 503
+//
+// Reads are not fenced. A newer header is admitted and commits nothing: an
+// epoch is committed only through the binding's own epoch path, where
+// `fenced` names the key the write commits (`probe`, apiplane.plan).
+//
+// CARRY. Every field the request needs past `rbac` rides 30..39 as `ident`
+// left them; the verified subject and status, which the store's reply would
+// overwrite at 2 and 3, ride the reserved carry field (254) with the header's
+// epoch, and `fenced` restores them — `rbac` reads the record `ident` made.
+plan nanocloud.apiplane_fence {
+
+  enum M_POST = 3;
+  enum OP_NOOP = 0;
+  enum OP_COUNT = 12;
+  enum PENDING = 0;
+  enum V_OK = 0;
+  /// The header's epoch when there is none, and when it is not a number.
+  enum NO_EPOCH = -1;
+  enum BAD_EPOCH = -2;
+
+  message ApiCtx {
+    group: string = 1;
+    nonres: string = 2;
+    fence: string = 3;
+  }
+  // What rides 254 between `fence` and `fenced`.
+  message FenceCtx {
+    group: string = 1;
+    nonres: string = 2;
+    raw: string = 3;      // the header as sent (its digits, when hep >= 0)
+    subject: string = 4;
+    vst: int = 5;
+    hep: int = 6;
+  }
+  // The rest of the request path's context (apiplane.plan ApiCtx).
+  message RbacCtx {
+    group: string = 1;
+    nonres: string = 2;
+  }
+
+  // As `ident` emits it (apiplane.plan Verified).
+  message Verified {
+    corr: int = 1;
+    status: int = 2;
+    subject: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+    ctx: ApiCtx = 254;
+  }
+
+  message FenceCall {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+    ctx: FenceCtx = 254;
+  }
+
+  // The COUNT's answer (store_effect): 200 with the count at 45 and the last
+  // child counted at 46 (its tail: an epoch), 500 when the walk or the
+  // predicate failed; a NOOP's 204, which carries neither.
+  message FenceReply {
+    st: int = 2;
+    count: int = 45;
+    newer: string = 46;
+    c_cid: int = 30;
+    c_method: int = 31;
+    c_key: string = 32;
+    c_resource: string = 33;
+    c_name: string = 34;
+    c_body: string = 35;
+    c_namespace: string = 36;
+    c_verdict: int = 37;
+    c_answer: string = 38;
+    c_watch: int = 39;
+    ctx: FenceCtx = 254;
+  }
+
+  // ---- fence: which committed epochs to count ----
+  //
+  // A request already decided, or whose credential did not verify, is not
+  // fenced: `authz` answers it as before. Every other one is counted — a read
+  // too, so the reply `fenced` reads always carries the count (a read of an
+  // absent field fails a decision, and a NOOP's reply has none).
+  //
+  // Whose epochs: the caller's own (its subject), except on a binding's
+  // epoch path, which is fenced by THAT binding's committed epochs whoever
+  // calls it, so an advance can never go behind one already committed.
+  decision d_fence(v: Verified) -> FenceCall {
+    when v.c_verdict != PENDING || v.status != V_OK ->
+      FenceCall { cid: v.c_cid, op: OP_NOOP, key: "",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: NO_EPOCH } };
+    // A request whose context carries no header field at all (a stage
+    // between `admit` and here rebuilt it): as one with no header.
+    when !has(v.ctx.fence) && v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io" ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: "system:serviceaccount:nanocloud-management:" + v.c_name + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: NO_EPOCH } };
+    when !has(v.ctx.fence) ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: v.subject + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: NO_EPOCH } };
+    // A binding's epoch path: that binding's committed epochs.
+    when v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io" && v.ctx.fence == "" ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: "system:serviceaccount:nanocloud-management:" + v.c_name + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: NO_EPOCH } };
+    when v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io"
+         && (v.ctx.fence.size() > 18
+         || v.ctx.fence.replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") != "") ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: "system:serviceaccount:nanocloud-management:" + v.c_name + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: BAD_EPOCH } };
+    when v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io" ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: "system:serviceaccount:nanocloud-management:" + v.c_name + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: v.ctx.fence, subject: v.subject,
+                                  vst: v.status, hep: int(v.ctx.fence) } };
+    // Any other request: the caller's own.
+    when v.ctx.fence == "" ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: v.subject + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: NO_EPOCH } };
+    // Not a decimal number of at most 18 digits (an i64 that cannot
+    // overflow): every committed epoch counts, and `fenced` refuses it.
+    when v.ctx.fence.size() > 18
+         || v.ctx.fence.replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") != "" ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: v.subject + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: "", subject: v.subject,
+                                  vst: v.status, hep: BAD_EPOCH } };
+    default ->
+      FenceCall { cid: v.c_cid, op: OP_COUNT, key: v.subject + "/",
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                  c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                  c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                  ctx: FenceCtx { group: v.ctx.group, nonres: v.ctx.nonres, raw: v.ctx.fence, subject: v.subject,
+                                  vst: v.status, hep: int(v.ctx.fence) } };
+  }
+
+
+  // ---- fence_newer: the count_where predicate ----
+  //
+  // One committed epoch (the key's tail past the subject's prefix): counted
+  // when it is newer than the header's, or always when the header had none.
+  // A tail that is not a number fails the predicate, and the COUNT answers
+  // 500 — a write is refused rather than admitted past a fence it could not
+  // read.
+  message Committed {
+    tail: string = 3;
+    ctx: FenceCtx = 254;
+  }
+  message Keep {
+    k: int = 1;
+  }
+  decision d_newer(c: Committed) -> Keep {
+    when c.ctx.hep < 0 -> Keep { k: 1 };
+    when int(c.tail) > c.ctx.hep -> Keep { k: 1 };
+    default -> Keep {};
+  }
+
+  // ---- fenced: the verdict ----
+  //
+  // The record `ident` made, restored for `rbac` (apiplane.plan `authz`): a
+  // refusal is a verdict there, carried to the reply as every other one is
+  // (`c_answer` the Status).
+  decision d_fenced(v: FenceReply) -> Verified {
+    // Not fenced: decided already, or a credential that did not verify.
+    when v.st == 204 ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    // The committed epochs could not be read: a write is not admitted past a
+    // fence that may hold it.
+    when v.st != 200 && v.c_method >= M_POST ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: 503,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"ServiceUnavailable\",\"code\":503,\"message\":\"the authority epoch fence could not be read; retry\"}",
+                 c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    // A read is not fenced.
+    when v.st != 200 || v.c_method < M_POST ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    when v.count > 0 && v.ctx.hep == NO_EPOCH ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: 403,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Forbidden\",\"code\":403,\"message\":\"a managed credential's write must name its authority epoch (header Nanocloud-Authority-Epoch)\"}",
+                 c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    when v.count > 0 && v.ctx.hep == BAD_EPOCH ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: 400,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"BadRequest\",\"code\":400,\"message\":\"Nanocloud-Authority-Epoch is not a decimal number of at most 18 digits\"}",
+                 c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    // A stale writer: the cell has committed a newer epoch than it acts
+    // under. Conflict, as upstream answers a write against a moved object —
+    // the writer re-reads its authority, not the object. (The variable tail
+    // is joined first and the long head once: the head is copied once, which
+    // fits a 512-byte string arena — a 32-bit engine's, and any engine that
+    // predates Chronicle's 12 KiB one, as the `decision` node this runs on
+    // may.)
+    when v.count > 0 ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: 409,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"Conflict\",\"code\":409,\"message\":\"stale authority epoch "
+                           + (v.ctx.raw + ": this cell has committed epoch " + v.newer + "\"}"),
+                 c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    // The epoch path needs the epoch it commits.
+    when v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io" && v.ctx.hep < 0 ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: 400,
+                 c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"BadRequest\",\"code\":400,\"message\":\"the epoch path commits the decimal epoch in Nanocloud-Authority-Epoch\"}",
+                 c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    // The binding's epoch path, not behind the committed epoch: the key the
+    // write commits, `#epoch` marking it for `probe` (apiplane.plan), which
+    // writes it and answers a fresh credential.
+    when v.c_resource == "managementbindings/epoch" && v.ctx.group == "nanocloud.io" && v.c_method == M_POST ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method,
+                 c_key: "/authority-epochs/system:serviceaccount:nanocloud-management:" + v.c_name + "/" + v.ctx.raw + "#epoch",
+                 c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+    default ->
+      Verified { corr: v.c_cid, status: v.ctx.vst, subject: v.ctx.subject,
+                 c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key, c_resource: v.c_resource,
+                 c_name: v.c_name, c_body: v.c_body, c_namespace: v.c_namespace,
+                 c_verdict: v.c_verdict, c_answer: v.c_answer, c_watch: v.c_watch,
+                 ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres } };
+  }
+
+  transformation pass_verified(v: Verified) -> Verified {
+    Verified { corr: v.corr, status: v.status, subject: v.subject,
+               c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+               c_resource: v.c_resource, c_name: v.c_name, c_body: v.c_body,
+               c_namespace: v.c_namespace, c_verdict: v.c_verdict,
+               c_answer: v.c_answer, c_watch: v.c_watch, ctx: v.ctx }
+  }
+  pipeline fence(v: Verified) -> FenceCall {
+    call x = pass_verified(v);
+    call y = d_fence(x);
+    return y;
+  }
+  pipeline fence_newer(c: Committed) -> Keep { call y = d_newer(c); return y; }
+  pipeline fenced(v: FenceReply) -> Verified {
+    call y = d_fenced(v);
+    return y;
+  }
+  entry fence = fence;
+  entry fence_newer = fence_newer;
+  entry fenced = fenced;
+
+  provenance revision "apiplane-authority-fence" toolchain "chronicle-authoring";
+}

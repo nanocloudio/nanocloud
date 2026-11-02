@@ -49,6 +49,12 @@ rbac_rb "$L" team team-scrapers ClusterRole metrics-reader User erin
 rbac_crb "$L" secret-reader one-secret User carol
 rbac_rb "$L" team alice-views ClusterRole viewer User alice
 rbac_rb "$L" team bot-edits Role cm-editor ServiceAccount bot
+# A ServiceAccount allowed to mint ITS OWN token and no other's: the
+# subresource's name restricted by resourceNames (the API probes a create on
+# a subresource with the name its path names; scripts/token-keysets-e2e.sh
+# proves the 201 and the 403 through the API).
+rbac_role "$L" team token-self "create" "serviceaccounts/token" "x"
+rbac_rb "$L" team x-token Role token-self ServiceAccount x
 
 A='/rbac-g/system:serviceaccount:default:admin'
 settle present "$A/*|*|*|*|*" "/rbac-g/alice/team|get|*|pods|*" "/rbac-g/alice/team|list|*|pods|*" \
@@ -56,13 +62,15 @@ settle present "$A/*|*|*|*|*" "/rbac-g/alice/team|get|*|pods|*" "/rbac-g/alice/t
   "/rbac-g/system:serviceaccount:team:bot/team|update||configmaps|*" \
   "/rbac-g/carol/*|get|*|secrets|db-password" \
   "/rbac-g/dave/*|get|apps|deployments|*" \
-  "/rbac-g/mon/~|get|~|/metrics|~"
+  "/rbac-g/mon/~|get|~|/metrics|~" \
+  "/rbac-g/system:serviceaccount:team:x/team|create||serviceaccounts/token|x"
 echo "   admin: *|*|*|*|* (ClusterRoleBinding, wildcards kept literally)"
 echo "   alice: team|get|*|pods|*, team|list|*|pods|* (a ClusterRole bound in ONE namespace)"
 echo "   bot:   team|create||configmaps|* (SA defaults to the binding's namespace; core group is \`\`)"
 echo "   carol: *|get|*|secrets|db-password (resourceNames: that name only)"
 echo "   dave:  *|get|apps|deployments|* (apiGroups distinguished)"
 echo "   mon:   ~|get|~|/metrics|~ (nonResourceURLs, through a ClusterRoleBinding)"
+echo "   x:     team|create||serviceaccounts/token|x (a subresource create, its own name only)"
 
 echo "== 3. what must NOT be granted =="
 if has "/rbac-g/alice/*|get|*|pods|*"; then echo "FAIL: a RoleBinding granted cluster-wide"; exit 1; fi
@@ -76,6 +84,9 @@ if rbac_keys "$L" | grep -q '^/rbac-g/erin/'; then
   echo "FAIL: nonResourceURLs granted through a RoleBinding (they are cluster-scoped)"; exit 1
 fi
 if has "/rbac-g/alice/team|delete|*|pods|*"; then echo "FAIL: a verb the role lacks was granted"; exit 1; fi
+if has "/rbac-g/system:serviceaccount:team:x/team|create||serviceaccounts/token|*"; then
+  echo "FAIL: a resourceNames-restricted token grant was widened to every ServiceAccount"; exit 1
+fi
 echo "   no cluster-wide grant from a RoleBinding; resourceNames not widened; groups not"
 echo "   widened; no URL grant through a RoleBinding; no extra verbs"
 
@@ -88,8 +99,15 @@ echo "   alice's grants removed; admin's untouched"
 echo "== 5. narrowing: cm-editor loses 'create' -> bot keeps only update =="
 rbac_role "$L" team cm-editor "update" "configmaps"
 settle absent "/rbac-g/system:serviceaccount:team:bot/team|create||configmaps|*"
-has "/rbac-g/system:serviceaccount:team:bot/team|update||configmaps|*" \
+# A changed role is re-derived whole (its rows are keyed by its digest), so
+# the verb it keeps may be pruned with the old rows a moment before the new
+# rows grant it again — fail-closed, never wider. `settle` stops the graph
+# the moment `create` is gone, which can be inside that moment: the kept
+# verb is asserted once the graph has run on to it.
+settle present "/rbac-g/system:serviceaccount:team:bot/team|update||configmaps|*" \
   || { echo "FAIL: narrowing a role removed the verb it kept"; exit 1; }
+has "/rbac-g/system:serviceaccount:team:bot/team|create||configmaps|*" \
+  && { echo "FAIL: the narrowed verb came back"; exit 1; }
 echo "   create revoked, update kept"
 
 echo "== 6. aggregationRule: an aggregating role's subjects gain the matched roles' grants =="
@@ -113,13 +131,13 @@ echo "   gina:  the same, through an aggregation of an aggregation"
 echo "== 7. relabel: svc-view leaves the selector -> its grants leave both =="
 rbac_clusterrole_l "$L" svc-view "'agg.example/view':'false'" "get" "services"
 settle absent "/rbac-g/frank/*|get|*|services|*" "/rbac-g/gina/*|get|*|services|*"
-has "/rbac-g/frank/*|get|*|endpoints|*" || { echo "FAIL: relabelling one role removed another's aggregation"; exit 1; }
+settle present "/rbac-g/frank/*|get|*|endpoints|*" || { echo "FAIL: relabelling one role removed another's aggregation"; exit 1; }
 echo "   services revoked from frank and gina; endpoints kept"
 
 echo "== 8. unbinding the aggregating role removes its mirrored grants =="
 rbac_delete "$L" /clusterrolebindings/viewers
 settle absent "/rbac-g/frank/*|get|*|endpoints|*"
-has "/rbac-g/gina/*|get|*|endpoints|*" || { echo "FAIL: unbinding frank removed gina's aggregation"; exit 1; }
+settle present "/rbac-g/gina/*|get|*|endpoints|*" || { echo "FAIL: unbinding frank removed gina's aggregation"; exit 1; }
 echo "   frank's mirrored grants removed; gina's kept"
 
 echo "== E2E green: Kubernetes RBAC as params — grants, scopes, and revocation =="

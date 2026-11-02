@@ -5,7 +5,8 @@
 
 # wn_publish <repo> <graph.yaml> [project-dir]: build the workload image (from
 # the project the graph belongs to, so its modules resolve) and lay it out
-# under $D/reg/<repo> as `fluxor publish workload` would push it.
+# under $D/reg/<repo> as `fluxor publish workload` would push it (its config
+# blob the image's env bindings).
 wn_publish() {
   local proj="${3:-$ROOT}"
   (cd "$proj" && fluxor build "$2" --emit=workload -o "$D/wimg-$1" >"$D/wbuild-$1.log" 2>&1) \
@@ -19,7 +20,10 @@ def blob(b):
     open(os.path.join(reg, h), "wb").write(b)
     return h, len(b)
 meta = json.load(open(os.path.join(src, "workload-image.json")))
-cfg_h, cfg_n = blob(b"{}")
+# The config blob is the image's env bindings, as `fluxor publish workload`
+# writes it: what the plane refuses a Pod not setting a required name by.
+cfg = {"env": [{k: e[k] for k in ("name", "module", "param", "required")} for e in meta.get("env", [])]}
+cfg_h, cfg_n = blob(json.dumps(cfg, separators=(",", ":")).encode())
 flxa_h, flxa_n = blob(open(os.path.join(src, "graph.flxa"), "rb").read())
 layers = [{"mediaType": "application/vnd.nanocloud.fluxor.flxa.v1", "digest": "sha256:" + flxa_h,
            "size": flxa_n, "annotations": {"org.opencontainers.image.title": "graph.flxa"}}]
@@ -32,7 +36,8 @@ for m in meta["modules"]:
                                               "io.fluxor.module.name-hash": str(m["name_hash"])}})
 manifest = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "artifactType": "application/vnd.nanocloud.fluxor.workload-image.v1",
-            "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": "sha256:" + cfg_h, "size": cfg_n},
+            "config": {"mediaType": "application/vnd.nanocloud.fluxor.workload-image.config.v1+json",
+                       "digest": "sha256:" + cfg_h, "size": cfg_n},
             "layers": layers, "annotations": {"io.fluxor.kind": "workload-image"}}
 open(os.path.join(reg, "manifest.json"), "w").write(json.dumps(manifest))
 print("   " + os.path.basename(reg) + ":", " ".join(l["digest"][7:19] for l in layers))
@@ -135,8 +140,9 @@ def parts(path):
         m = re.match(r"    to: (\S+)$", line)
         if m and frm: pairs.append((frm, m.group(1))); frm = None
     return [b for b in blocks if b.startswith("  - name: ")], pairs
-# The kubelet's graph-pod slice, and its image resolution (pi_*).
-KEEP_PREFIX = ("pj_", "pl_", "pr_", "pi_")
+# The kubelet's graph-pod slice, and its image resolution (pi_*); WN_KEEP
+# names more prefixes (`vb_`: a Pod's volumes, bound and lent).
+KEEP_PREFIX = ("pj_", "pl_", "pr_", "pi_") + tuple(os.environ.get("WN_KEEP", "").split())
 KEEP = {"wl", "sb_mspec", "sb_mspecd", "sb_sig", "sb_sigd", "sb_pause", "sb_paused", "sb_ev", "sb_evout"}
 def kept(name): return name in KEEP or name.startswith(KEEP_PREFIX)
 blocks, pairs = parts(f"{root}/packaging/debian/fluxor-podlifecycle.yaml")
@@ -154,7 +160,7 @@ if ca:
     ipairs += [("linux_net.net_out", "fetch_tls.cipher_in"), ("fetch_tls.cipher_out", "linux_net.net_in"),
                ("fetch_tls.clear_out", "fetch.net_in"), ("fetch.net_out", "fetch_tls.clear_in")]
     img_mods += ("  - name: fetch_tls\n    type: tls\n    mode: 0\n    alpn_h1_only: 1\n"
-                 "    peer_auth: 2\n    trust: \"${file:" + ca + "}\"\n"
+                 "    peer_auth: 2\n    trust: \"" + ca + "\"\n"
                  "    verify_hostname: \"registry.nanocloud.io\"\n")
 edges += ipairs
 mods, wiring = g.split("\nwiring:\n", 1)

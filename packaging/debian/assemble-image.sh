@@ -1,5 +1,9 @@
 #!/bin/sh
-# assemble-image.sh <rootfs-dir> <blob-dir> <layer-hex64>...
+# assemble-image.sh <rootfs-dir> <blob-dir> <layer-hex64>[,<layer-hex64>…]...
+#
+# The layers come as the manifest lists them, `,`-separated in one argument
+# (image_asm.plan: the record that starts the job carries the list once);
+# separate arguments are read the same.
 #
 # The rootfs-assembly EFFECT (container backend), run as a host workload: the
 # assembly job image_asm.plan projects (/sandboxes/img-asm-<digest>) through
@@ -20,6 +24,12 @@
 set -eu
 
 R="$1"; B="$2"; shift 2
+# One digest per word: the `,`-joined list split, globbing off. Anything
+# that is not a cached digest is refused below as a blob that is not there.
+set -f
+# shellcheck disable=SC2046
+set -- $(printf '%s\n' "$@" | tr ',' ' ')
+set +f
 [ $# -ge 1 ] || { echo "no layers" >&2; exit 2; }
 
 # 0. The cache is what its markers say, before anything is built from it.

@@ -29,12 +29,17 @@ hardware_targets = ["bcm2712", "linux"]
 #            work each scan — this is how a layer is fetched once.
 #   13     = expected size (i64): the body must be exactly that; with the
 #            `chunk_bytes` param a file is fetched in Range chunks of it
-#   14..21 = JSON queries over the body (sink 1), each answered at 40..47:
+#   14..21 = JSON queries over the body (sink 1), each answered at 40..47,
+#            at most 4352 bytes an answer (a 65-layer manifest's digests,
+#            _shared/fetch_answer.rs):
 #            dotted paths, `a[].b[!mod]` collect, `a[k=v].b` select — see
 #            `_shared/jsonq.rs`
 #   30..39 = carry, echoed with number and type
 # Out (`response_out`): 1 correlation, 2 status (the HTTP status; 304 skipped;
-#   422 digest or size mismatch; 0 when the origin could not be reached after
+#   422 digest or size mismatch; 413 an answer this cannot carry whole — a
+#   member past 4352 bytes, the answers that fit given and that one empty, or
+#   a record past 8192, no answers — never cut, never empty as if absent;
+#   0 when the origin could not be reached after
 #   retries), 3 bytes received (i64), 4 Content-Type, 5 the sha256 of the
 #   body as 64 hex (a 200 answered in the reply; empty otherwise) — what a
 #   manifest fetched by tag IS, so its chain keys it by digest — 40..47 the

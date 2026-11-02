@@ -49,7 +49,8 @@ hardware_targets = ["bcm2712", "linux"]
 # whose op is PREPARE (40) is this module's — field 3 the volume's spec
 # (`@e/<vol>[/<gid>/<a|r>]`,
 # `@c/<vol>/<ns>/<name>/<mode>/<optional>/<gid>[/<key>=<path>[=<mode>]|…]`,
-# `@s/…` for a Secret, `@g/…`), field 17 the sandbox id
+# `@s/…` for a Secret, `@w/…`/`@p/…` a downwardAPI or projected volume,
+# `@g/…`), field 17 the sandbox id
 # (`<pod uid>[~<container>]`) — and leaves as a NOOP carrying the directory
 # at field 39 (none when it could not be prepared), which the store
 # connector echoes to the chain's next decision; any other request passes

@@ -351,7 +351,7 @@ if images:
     extra.append("  # ── The image plane: packaging/debian/fluxor-imagepull.yaml, behind tls ──\n")
     extra.append(pull_mods.rstrip("\n") + "\n")
     extra.append("  - name: fetch_tls\n    type: tls\n    mode: 0\n    alpn_h1_only: 1\n"
-                 "    peer_auth: 2\n    trust: \"${file:" + ca_der + "}\"\n"
+                 "    peer_auth: 2\n    trust: \"" + ca_der + "\"\n"
                  "    verify_hostname: \"registry.nanocloud.io\"\n")
     for line in pull[pull.index("wiring:\n") + len("wiring:\n"):].split("\n  - from: "):
         line = line.strip()

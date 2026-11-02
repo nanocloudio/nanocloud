@@ -12,18 +12,24 @@ hardware_targets = ["bcm2712", "linux"]
 #   type NodePort or LoadBalancer
 #       every port without a `nodePort` is given one from `node_ports`
 #       (default 30000-32767), written into `spec.ports[i].nodePort`
-#   type LoadBalancer, with `lb_pool` set, and a loadBalancerClass that is
-#   unset or `wormhole.nanocloud.io/lb` (another class is another
-#   controller's: it gets node ports only)
+#   type LoadBalancer, its loadBalancerClass unset, with `lb_pool` set
 #       one address of the pool, recorded by Service at
-#       `/lb-addr/<ns>/<name>` = `ip=<a.b.c.d>` — what the proxy, node_net
-#       and the Wormhole projection read. NOT `status.loadBalancer`: that
-#       says the address is reachable, which only the VIP's readiness can,
-#       and is written by wormhole.plan `wh_status` once Wormhole's VIP
-#       binding for it is ACTIVE (rfc_lb_vip §6.1). A Service whose status
-#       already names an address (a cluster from before) has it recorded
-#       and claimed rather than replaced. Without a pool the Service stays
-#       pending, as it does upstream with no load-balancer controller
+#       `/lb-addr/<ns>/<name>` = `ip=<a.b.c.d>` — what the proxy and node_net
+#       read — and said in its `status.loadBalancer` as
+#       `{"ingress":[{"ip":"<a.b.c.d>"}]}` (`{}` while it has none): the
+#       cell is its own load balancer, as k3s's ServiceLB is. A Service
+#       whose status already names an address (a cluster from before) has
+#       it recorded and claimed rather than replaced. Without a pool the
+#       Service stays pending, as it does upstream with no load-balancer
+#       controller. A Service of no class that is no longer a LoadBalancer
+#       has a stale ingress cleared to `{}`
+#   type LoadBalancer with ANY loadBalancerClass
+#       node ports only: no address of the pool, no `/lb-addr/`, and its
+#       status is never touched. The class names an external load-balancer
+#       controller, which watches Services through the API, allocates an
+#       address itself and writes `status.loadBalancer` through the
+#       `/status` subresource — upstream's `spec.loadBalancerClass` hook
+#       (README, "Services and the network": External load balancers)
 #
 # Uniqueness is the store's: a port is held by the key
 # `/ipam/nodeport/<port>`, an address by `/ipam/lb/<address as u32>` (and,
@@ -41,6 +47,8 @@ hardware_targets = ["bcm2712", "linux"]
 #             lowest free one at or after the module's cursor, its object
 #             written back conditional on the revision read — and is claimed
 #             by the next pass's `claim`, before anything else is allocated
+#   status    the first Service of no class whose status.loadBalancer is
+#             not what it says is written, conditional on the revision read
 #
 # And for every Node, its Pod CIDR, as upstream's node IPAM controller
 # (`--allocate-node-cidrs`) carves it: a block of `node_prefix` bits of

@@ -9,13 +9,16 @@
 # Because the store lives INSIDE the runtime process (no shared WAL, no flock),
 # the projection's writes are replayed from `$D/store.log` at boot rather than
 # raced in live. The chain cold-starts: its sources SUBSCRIBE /services/ and
-# /pods/, then a full pass selector-matches ready pods per service and writes
-# /endpoints/<ns>/<name>.
+# /pods/, then a full pass selector-matches pods per service and writes
+# their rows, the /endpoint-lists/<ns>/<name> fold, and the API's JSON
+# Endpoints (/endpoints/) and EndpointSlice (/endpointslices/).
 #
 # Compact format:
 #   /services/<ns>/<name>  = "sel=k=v,k=v"
 #   /pods/<ns>/<name>      = "ip=<addr>;l=k=v,k=v;r=0|1"
-#   /endpoints/<ns>/<name> = "<pod>=ip=<addr>;state=ready;…,…" (endpoints_doc.plan)
+#   /endpoint-lists/<ns>/<name> = "<pod>=ip=<addr>;state=ready;…,…" (endpoints_doc.plan)
+#   /endpoints/<ns>/<name>      = v1 Endpoints JSON (subsets: addresses, notReadyAddresses)
+#   /endpointslices/<ns>/<name> = discovery.k8s.io/v1 EndpointSlice JSON
 #
 # Two phases prove durable reconcile: phase A seeds services + pods (web-2 NOT
 # ready) and checks the projection; phase B appends web-2's readiness flip to the
@@ -101,22 +104,40 @@ store_put "/pods/default/api-1"  '{"metadata":{"name":"api-1","labels":{"app":"a
 store_put "/pods/default/db-1"   '{"metadata":{"name":"db-1","labels":{"app":"db"}},"status":{"podIP":"10.0.0.4","conditions":[{"type":"Ready","status":"True"}]}}'  # matches nothing
 run_runtime
 
-WEB="$(store_last /endpoints/default/web)"
-API="$(store_last /endpoints/default/api)"
-[ "$WEB" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
-  || fail "phase A web endpoints wrong: got '$WEB', want web-1's ready slice (web-2 not ready)"
+WEB="$(store_last /endpoint-lists/default/web)"
+API="$(store_last /endpoint-lists/default/api)"
+[ "$WEB" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000,web-2=ip=10.0.0.2;state=notready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
+  || fail "phase A web endpoints wrong: got '$WEB', want web-1 ready and web-2 notready"
 [ "$API" = "api-1=ip=10.0.0.3;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
   || fail "phase A api endpoints wrong: got '$API', want api-1's ready slice (db-1 must not match; multi-label selector)"
 echo "   web: $WEB"
 echo "   api: $API"
+# The API's documents, as JSON: web-2 is a notReadyAddress and an endpoint
+# whose ready condition is false.
+python3 - "$(store_last /endpoints/default/web)" "$(store_last /endpointslices/default/web)" <<'PYJ' || fail "phase A: the API's Endpoints / EndpointSlice for web"
+import json, sys
+ep, sl = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert ep["kind"] == "Endpoints" and ep["metadata"]["labels"]["endpoints.kubernetes.io/managed-by"] == "endpoint-controller", ep
+ss = ep["subsets"]
+assert [a["ip"] for a in ss[0]["addresses"]] == ["10.0.0.1"] and [a["ip"] for a in ss[0]["notReadyAddresses"]] == ["10.0.0.2"], ss
+assert sl["kind"] == "EndpointSlice" and sl["addressType"] == "IPv4" and sl["metadata"]["labels"]["kubernetes.io/service-name"] == "web", sl
+assert [(e["addresses"][0], e["conditions"]["ready"]) for e in sl["endpoints"]] == [("10.0.0.1", True), ("10.0.0.2", False)], sl
+print("   /endpoints/default/web: addresses [10.0.0.1], notReadyAddresses [10.0.0.2]; its EndpointSlice says so")
+PYJ
 
 echo "== phase B: web-2 becomes ready, re-boot, reconcile follows =="
 store_put "/pods/default/web-2" '{"metadata":{"name":"web-2","labels":{"app":"web"}},"status":{"podIP":"10.0.0.2","conditions":[{"type":"Ready","status":"True"}]}}'  # readiness flips
 run_runtime
 
-WEB2="$(store_last /endpoints/default/web)"
-[ "$WEB2" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000,web-2=ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000" ] \
+WEB2="$(store_last /endpoint-lists/default/web)"
+[ "$WEB2" = "web-1=ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid=;grace=30000,web-2=ip=10.0.0.2;state=ready;zone=;node=;gen=2;af=4;uid=;grace=30000" ] \
   || fail "phase B web endpoints wrong: got '$WEB2', want both ready slices (readiness flip included)"
 echo "   web: $WEB2"
+python3 - "$(store_last /endpoints/default/web)" <<'PYJ' || fail "phase B: the API's Endpoints for web"
+import json, sys
+ss = json.loads(sys.argv[1])["subsets"]
+assert len(ss) == 1 and [a["ip"] for a in ss[0]["addresses"]] == ["10.0.0.1", "10.0.0.2"] and "notReadyAddresses" not in ss[0], ss
+print("   /endpoints/default/web: addresses [10.0.0.1, 10.0.0.2]")
+PYJ
 
 echo "== E2E green: selector-matched endpoints over the fluxor-native store =="

@@ -14,7 +14,7 @@ modules:
     type: store_source
     prefix: "/namespaces/"
     paths: "status.phase"
-    join: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+    join: "/pods/,/services/,/endpoints/,/endpointslices/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
     join_scoped: 1
   - name: ns_collect
     type: store_effect
@@ -24,9 +24,9 @@ modules:
     type: store_source
     prefix: "/namespaces/"
     paths: "status.phase"
-    count_children: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+    count_children: "/pods/,/services/,/endpoints/,/endpointslices/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
     child_sep: "/"
-    watch: "/pods/,/services/,/endpoints/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
+    watch: "/pods/,/services/,/endpoints/,/endpointslices/,/configmaps/,/secrets/,/serviceaccounts/,/pvcs/,/deployments.apps/,/replicasets.apps/,/daemonsets.apps/,/statefulsets.apps/,/jobs.batch/,/hpa/,/networkpolicies/"
   - name: ns_remove
     type: store_effect
     # chronicle-source: modules/app/_chronicle/namespace.plan fin

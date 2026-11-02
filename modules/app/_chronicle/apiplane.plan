@@ -15,6 +15,9 @@
 //   ident    (here)    -> AuthzCall             identity + ns + verb + resource
 //   rbac               ONE store probe of the grant index rbac_*.plan maintains
 //                      (this file's `authz` entry drives it)
+//   esc / escd         a Role/ClusterRole/binding/ManagementBinding write may
+//                      grant only what its writer holds (apiplane_esc.plan)
+//   scope/disc/scoped  the kind's scope (apiplane_scope.plan)
 //   gate     (here)    -> AdmitCall             admitted, or the refusal
 //   ad_pol/ad_cnt/ad_dec   admission: policy, quota count, verdict (admission.plan)
 //   probe    (here)    -> StoreCall             GET the object, or LIST the collection
@@ -60,6 +63,8 @@ plan nanocloud.apiplane {
   enum OP_REPLACE = 9;
   enum OP_EXISTS_ANY = 10;
   enum OP_TAKE = 17;
+  // A take that leaves its claim: the record stays, spent (store_effect).
+  enum OP_CLAIM = 22;
 
   // kagi auth_wire verify_err
   enum V_OK = 0;
@@ -88,6 +93,14 @@ plan nanocloud.apiplane {
   /// Not authenticated by kagi and not authorized by RBAC: holding the
   /// secret IS the authorization, and it is spent by the answer.
   enum JOIN = 2;
+  /// An ENROLLMENT (apiplane_admit.plan): the bearer credential is a
+  /// ManagementBinding's one-time grant, `c_key` the offer the grant, the
+  /// cell UID and the envelope digest name together (management.plan). The
+  /// offer is CLAIMED — spent by the answer, and left spent — and the answer is the binding's
+  /// credential, minted as a TokenRequest's (apiplane_token.plan). Not
+  /// authenticated by kagi and not authorized by RBAC: matching the offer IS
+  /// the authorization, and it is spent by the answer.
+  enum ENROLL = 4;
 
   // ---- records ----
 
@@ -95,9 +108,13 @@ plan nanocloud.apiplane {
   // What authorization needs beyond the ten carried fields, riding the
   // reserved carry field (254) every connector echoes: the request's API group,
   // and — for a non-resource path RBAC guards — that path.
+  // `who`: the identity authorized, for the escalation check after `rbac`
+  // (apiplane_esc.plan) — set by `authz` on every request it probes.
+  // Field 3 is the fence's (apiplane_admit.plan), spent by now.
   message ApiCtx {
     group: string = 1;
     nonres: string = 2;
+    who: string = 4;
   }
 
 
@@ -338,19 +355,35 @@ plan nanocloud.apiplane {
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "get",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
+    // A create names no object — its name is in the body, which a
+    // resourceNames rule cannot restrict, as upstream — except a create ON
+    // a subresource (`serviceaccounts/<n>/token`, `pods/<n>/eviction`),
+    // which acts on the object the path names: that name is probed, so a
+    // grant restricted to it matches (and a `*` grant still does — the
+    // name is one of the `wild` fields).
+    when v.c_method == M_POST && v.c_name != "" ->
+      AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "create", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: v.c_name,
+                  c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
+                  c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
+                  c_reason: "", c_verb: "create",
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     when v.c_method == M_POST ->
       AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "create", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: "*",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "create",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     when v.c_method == M_PUT ->
       AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "update", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: v.c_name,
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "update",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     // `patch` is its own RBAC verb upstream; admission still sees an UPDATE.
     when v.c_method == M_PATCH || v.c_method == M_PATCH_JSON || v.c_method == M_PATCH_SMP
          || v.c_method == M_PATCH_APPLY ->
@@ -358,13 +391,15 @@ plan nanocloud.apiplane {
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "update",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     when v.c_method == M_DELETE ->
       AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "delete", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: v.c_name,
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "delete",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     // `watch` is a distinct Kubernetes RBAC verb, not a flavour of `list`, so
     // a role that grants list does NOT grant watch. Deciding that here is the
     // point: it is API semantics, and API semantics are data.
@@ -373,19 +408,22 @@ plan nanocloud.apiplane {
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "watch",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     when v.c_name == "" ->
       AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "list", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: "*",
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "list",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
     default ->
       AuthzCall { op: OP_EXISTS_ANY, identity: v.subject, k1: "/", ns: v.c_namespace, k3: "|", verb: "get", k5: "|", resource: v.ctx.group, k7: "|", res: v.c_resource, k9: "|", name: v.c_name,
                   c_cid: v.c_cid, c_method: v.c_method, c_key: v.c_key,
                   c_verdict: PENDING, c_name: v.c_name, c_body: v.c_body,
                   c_reason: "", c_verb: "get",
-                  c_resource: v.c_resource, c_namespace: v.c_namespace, ctx: v.ctx };
+                  c_resource: v.c_resource, c_namespace: v.c_namespace,
+                  ctx: ApiCtx { group: v.ctx.group, nonres: v.ctx.nonres, who: v.subject } };
   }
 
   // Authorization's verdict becomes an admission call. A refusal still passes
@@ -449,6 +487,14 @@ plan nanocloud.apiplane {
     when a.c_verdict == JOIN ->
       ActCall { cid: a.c_cid, op: OP_TAKE, key: a.c_key, key2: "", value: "",
                 c_cid: a.c_cid, c_status: 200, c_answer: "@stored", c_stream: 0, c_key: a.c_key, c_verb: "join" };
+    // An enrollment CLAIMS its offer: answered like a take, and the offer
+    // stays, spent — management.plan makes an offer only where none of its
+    // grant is (spent, superseded or made), so a grant is never offered twice.
+    when a.c_verdict == ENROLL ->
+      ActCall { cid: a.c_cid, op: OP_CLAIM, key: a.c_key, key2: "", value: "",
+                c_cid: a.c_cid, c_status: 201,
+                c_answer: "@mint/serviceaccounts/nanocloud-management/" + a.c_name + " ", c_stream: 0,
+                c_key: a.c_key, c_verb: "enroll" };
     when a.c_verdict != PENDING ->
       ActCall { cid: a.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
                 c_cid: a.c_cid, c_status: a.c_verdict, c_answer: a.c_reason, c_stream: 0, c_key: a.c_key, c_verb: a.c_verb };
@@ -457,6 +503,26 @@ plan nanocloud.apiplane {
     when a.status != 200 ->
       ActCall { cid: a.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
                 c_cid: a.c_cid, c_status: a.status, c_answer: a.object, c_stream: 0, c_key: a.c_key, c_verb: a.c_verb };
+    // A ManagementBinding's epoch path (`POST …/managementbindings/<b>/epoch`):
+    // the fence (apiplane_fence.plan) admitted the epoch it names — not
+    // behind the binding's committed epoch — and named the key that commits
+    // it, `/authority-epochs/<the binding's subject>/<epoch>#epoch`. Written
+    // (an epoch already committed is written again, unchanged), and answered
+    // with a fresh credential for the binding, minted as a TokenRequest's:
+    // the management plane renews under the epoch it holds.
+    when a.c_method == M_POST && a.c_key.startsWith("/authority-epochs/system:serviceaccount:nanocloud-management:")
+         && a.c_key.endsWith("#epoch") ->
+      ActCall { cid: a.c_cid, op: OP_PUT, key: a.c_key.substring(0, a.c_key.size() - 6), key2: "", value: "committed=1",
+                c_cid: a.c_cid, c_status: 201,
+                c_answer: "@mint/serviceaccounts/nanocloud-management/" + a.c_name + " ", c_stream: 0,
+                c_key: a.c_key.substring(0, a.c_key.size() - 6), c_verb: "epoch" };
+    // A ZoneSummary is the base's own derivation (zone_summary.plan): a
+    // client reads it (get, list, watch) and writes nothing — any other verb
+    // is refused as upstream refuses a verb a resource does not serve, once
+    // RBAC has allowed it.
+    when a.c_key.startsWith("/zonesummaries.nanocloud.io/") && a.c_method != M_GET ->
+      ActCall { cid: a.c_cid, op: OP_NOOP, key: "", key2: "", value: "",
+                c_cid: a.c_cid, c_status: 405, c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the server does not allow this method on the requested resource\",\"reason\":\"MethodNotAllowed\",\"details\":{\"group\":\"nanocloud.io\",\"kind\":\"zonesummaries\"},\"code\":405}", c_stream: 0, c_key: a.c_key, c_verb: a.c_verb };
     // A ConfigMap or Secret holds at most 1 MiB of data (upstream's bound, so
     // an object always fits etcd's request limit). Only a staged body can
     // pass it — an inline one is a record at most.

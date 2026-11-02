@@ -98,12 +98,10 @@ install -Dm644 "${SCRIPT_DIR}/fluxor-podlifecycle.yaml" "${STAGING_ROOT}/etc/nan
 # (its CA by path, from cluster.env — never a certificate in the package).
 install -Dm644 "${SCRIPT_DIR}/fluxor-imagepull.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/image.yaml"
 # The Service plane, spliced into the control plane (endpoints, the cluster
-# DNS, the Wormhole projection, the proxy's and NetworkPolicy's chains), and
-# each node's enforcement of
+# DNS, the proxy's and NetworkPolicy's chains), and each node's enforcement of
 # it (the proxy's and NetworkPolicy's net_apply), spliced beside the kubelet.
 install -Dm644 "${SCRIPT_DIR}/fluxor-endpoints.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/endpoints.yaml"
 install -Dm644 "${SCRIPT_DIR}/fluxor-dns.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/dns.yaml"
-install -Dm644 "${SCRIPT_DIR}/fluxor-wormhole.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/wormhole.yaml"
 install -Dm644 "${SCRIPT_DIR}/fluxor-proxy.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/proxy.yaml"
 install -Dm644 "${SCRIPT_DIR}/fluxor-netpolicy.yaml" "${STAGING_ROOT}/etc/nanocloud.io/fluxor/netpolicy.yaml"
 install -Dm755 "${SCRIPT_DIR}/nanocloud-graph.sh" "${STAGING_ROOT}/usr/lib/nanocloud/nanocloud-graph.sh"

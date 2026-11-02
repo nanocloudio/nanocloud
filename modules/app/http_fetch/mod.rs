@@ -31,6 +31,7 @@ include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonq.rs");
+include!("../_shared/fetch_answer.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 include!("../_shared/regcred.rs");
 
@@ -60,13 +61,6 @@ const NET_CMD_CLOSE: u8 = 0x12;
 const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
 
-const TY_BYTES: u8 = 0;
-const TY_I64: u8 = 1;
-const CARRY_LO: u8 = 30;
-const CARRY_HI: u8 = 39;
-/// The record's carried context (chronicle `CARRY_FIELD`): one nested
-/// message, echoed unchanged beside the legacy 30..=39 range.
-const CARRY_FIELD: u8 = 254;
 /// `channel_peek` on a mailbox channel, which has no byte stream to peek.
 const CHAN_EINVAL: i32 = -22;
 
@@ -104,9 +98,8 @@ const MAX_PULL_AUTH: usize = 64;
 /// The candidates a challenge is answered with, at most: a pull's Secrets,
 /// the node's credentials, and none.
 const MAX_CANDIDATES: u8 = 32;
-/// One answer to one query.
-const ANSWER: usize = 2048;
-const MAX_QUERIES: u8 = 8;
+// One answer to one query (`ANSWER`), the queries (`MAX_QUERIES`) and the
+// status of an answer past it: _shared/fetch_answer.rs.
 
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const RESPONSE_TIMEOUT_MS: u64 = 30_000;
@@ -351,41 +344,6 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
     core::ptr::copy_nonoverlapping(src, dst, n);
 }
 
-fn frame_field(frame: &[u8], number: u8) -> Option<(u8, &[u8])> {
-    let count = *frame.first()? as usize;
-    let mut p = 1usize;
-    for _ in 0..count {
-        if p + 4 > frame.len() {
-            return None;
-        }
-        let num = frame[p];
-        let ty = frame[p + 1];
-        let len = u16::from_le_bytes([frame[p + 2], frame[p + 3]]) as usize;
-        if p + 4 + len > frame.len() {
-            return None;
-        }
-        if num == number {
-            return Some((ty, &frame[p + 4..p + 4 + len]));
-        }
-        p += 4 + len;
-    }
-    None
-}
-
-fn frame_i64(frame: &[u8], number: u8) -> Option<i64> {
-    match frame_field(frame, number) {
-        Some((TY_I64, b)) if b.len() == 8 => Some(i64::from_le_bytes(b.try_into().unwrap())),
-        _ => None,
-    }
-}
-
-fn frame_bytes(frame: &[u8], number: u8) -> &[u8] {
-    match frame_field(frame, number) {
-        Some((TY_BYTES, b)) => b,
-        _ => &[],
-    }
-}
-
 fn frame_len(data: &[u8]) -> Option<usize> {
     let count = *data.first()? as usize;
     let mut off = 1usize;
@@ -410,17 +368,6 @@ fn join(frame: &[u8], lo: u8, hi: u8, out: &mut [u8]) -> Option<usize> {
         n += part.len();
     }
     Some(n)
-}
-
-fn put_field(out: &mut [u8], at: usize, number: u8, ty: u8, payload: &[u8]) -> Option<usize> {
-    if payload.len() > u16::MAX as usize || at + 4 + payload.len() > out.len() {
-        return None;
-    }
-    out[at] = number;
-    out[at + 1] = ty;
-    out[at + 2..at + 4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    out[at + 4..at + 4 + payload.len()].copy_from_slice(payload);
-    Some(at + 4 + payload.len())
 }
 
 fn parse_dec(b: &[u8], at: usize) -> (u64, usize) {
@@ -645,75 +592,41 @@ unsafe fn fsync_step(s: &mut State) {
     reply(s, if r < 0 { 500 } else { 200 });
 }
 
-/// The outcome record for the held request; the slot freed.
+/// The outcome record for the held request; the slot freed. An answer this
+/// connector cannot carry whole goes back `ANSWER_TOO_LARGE` (413), said in
+/// the log — never cut, never empty as if absent, never dropped.
 unsafe fn answer(s: &mut State, status: u16) {
     let sys = &*s.syscalls;
     let h = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
     let body = core::slice::from_raw_parts(s.body.as_ptr(), s.body_fill as usize);
+    let ctype = core::slice::from_raw_parts(s.ctype.as_ptr(), s.ctype_len as usize);
     // The answer's own digest, for a body answered whole: what a tag
     // resolved to, so a chain keys the content by it.
     let sha = hasher_hex(&s.hasher);
-    let sha_len = if status == 200 && s.sink == SINK_REPLY as u8 {
-        sha.len()
-    } else {
-        0
+    let o = FetchOutcome {
+        status,
+        received: s.body_received as i64,
+        ctype,
+        sha: &sha,
+        replied: s.sink == SINK_REPLY as u8,
     };
-    let out = &mut s.out_buf;
-    let mut p = 1usize;
-    let mut n = 0u8;
-    macro_rules! field {
-        ($e:expr) => {
-            match $e {
-                Some(v) => {
-                    p = v;
-                    n += 1;
-                }
-                None => {
-                    s.inflight = 0;
-                    s.held_len = 0;
-                    s.phase = Phase::Idle;
-                    return;
-                }
+    match fetch_reply(&mut s.out_buf, h, &o, body) {
+        Some((p, st)) => {
+            if st != status {
+                log(
+                    s,
+                    1,
+                    b"[http_fetch] an answer past what a reply carries (4352 B a member, 8192 B a record): answered 413",
+                );
             }
-        };
-    }
-    let cid = frame_i64(h, 1).unwrap_or(0);
-    field!(put_field(out, p, 1, TY_I64, &cid.to_le_bytes()));
-    field!(put_field(out, p, 2, TY_I64, &(status as i64).to_le_bytes()));
-    field!(put_field(
-        out,
-        p,
-        3,
-        TY_I64,
-        &(s.body_received as i64).to_le_bytes()
-    ));
-    field!(put_field(
-        out,
-        p,
-        4,
-        TY_BYTES,
-        &s.ctype[..s.ctype_len as usize]
-    ));
-    field!(put_field(out, p, 5, TY_BYTES, &sha[..sha_len]));
-    // Every answer field, always — empty when not asked or not answered: a
-    // decision reading a field the record lacks produces nothing at all.
-    for q in 0..MAX_QUERIES {
-        let query = frame_bytes(h, 14 + q);
-        let mut ans = [0u8; ANSWER];
-        let len = if status == 200 && s.sink == SINK_REPLY as u8 && !query.is_empty() {
-            jq(body, query, &mut ans).unwrap_or(0)
-        } else {
-            0
-        };
-        field!(put_field(out, p, 40 + q, TY_BYTES, &ans[..len]));
-    }
-    for f in (CARRY_LO..=CARRY_HI).chain(core::iter::once(CARRY_FIELD)) {
-        if let Some((ty, v)) = frame_field(h, f) {
-            field!(put_field(out, p, f, ty, v));
+            let _ = (sys.channel_write)(s.response_out, s.out_buf.as_ptr(), p);
         }
+        None => log(
+            s,
+            1,
+            b"[http_fetch] a request whose carry is past the reply buffer: not answered",
+        ),
     }
-    out[0] = n;
-    let _ = (sys.channel_write)(s.response_out, s.out_buf.as_ptr(), p);
     s.inflight = 0;
     s.held_len = 0;
     s.phase = Phase::Idle;

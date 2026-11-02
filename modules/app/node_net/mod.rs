@@ -65,9 +65,9 @@ const SEGMENT_ID: u16 = 1;
 
 const NODES: &[u8] = b"/nodes/";
 const SERVICES: &[u8] = b"/services/";
-const SLICES: &[u8] = b"/endpointslices/";
+const SLICES: &[u8] = b"/endpoint-rows/";
 const HOLDS: &[u8] = b"/net-hold/";
-/// The VIP controller's marks: an address a controller drives, which no
+/// An address controller's marks: an address a controller drives, which no
 /// node's own hold claims while the mark stands (`_shared/vip_hold.rs`).
 const MARKS: &[u8] = b"/net-vip/";
 /// svc_alloc's load-balancer addresses, by Service.
@@ -197,7 +197,7 @@ struct State {
     replaced: u32,
     refused: u32,
 
-    /// Wormhole's VIP controller on this node: `addr_ctl` frames in (in[1]),
+    /// An address controller on this node: `addr_ctl` frames in (in[1]),
     /// `addr_evt` events out (out[1]), and the addresses it drives here.
     addr_ctl_in: i32,
     addr_evt_out: i32,
@@ -630,7 +630,7 @@ unsafe fn local_endpoints(s: &State, store: &Store, svc: &[u8]) -> (bool, bool) 
         for (d, &c) in k.iter_mut().zip(key.iter().take(kl)) {
             *d = c;
         }
-        // A slice is `ip=<ip>;state=<ready|serving|terminating>;…`
+        // A row is `ip=<ip>;state=<ready|notready|serving|terminating>;…`
         // (endpoints.plan): only a ready one is an endpoint traffic may be
         // brought to, and its address is its `ip=`.
         let mut v = [0u8; 512];
@@ -701,7 +701,7 @@ unsafe fn read_holder(
 }
 
 /// The load-balancer addresses: each claimed, given up or taken over as the
-/// manifest says — and, where Wormhole's VIP controller drives one here, as
+/// manifest says — and, where an address controller drives one here, as
 /// it does (`_shared/vip_hold.rs`) — one write a pass. Fills `want_*`.
 unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
     s.want_n = 0;
@@ -730,8 +730,8 @@ unsafe fn held_pass(s: &mut State, store: &Store) -> Pass {
             j_get2(doc, b"spec", b"externalTrafficPolicy") == Some(&b"Local"[..])
         };
         // The address svc_alloc gave it (`/lb-addr/<ns>/<name>` = `ip=…`),
-        // not its status: the status is the VIP's readiness to say, and
-        // waits for the address to be held.
+        // not its status: the record is svc_alloc's own, the status follows
+        // it.
         let mut ak = [0u8; MAX_KEY];
         let akl = cat(
             &mut ak,
@@ -1585,7 +1585,7 @@ pub unsafe extern "C" fn module_new(
     }
 }
 
-/// The VIP controller's `addr_ctl` frames, one at a time while events have
+/// The address controller's `addr_ctl` frames, one at a time while events have
 /// room, then the events it is owed. True when a frame moved an address.
 unsafe fn vip_ctl(s: &mut State, sys: &SyscallTable) -> bool {
     let mut moved = false;

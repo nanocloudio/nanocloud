@@ -160,7 +160,7 @@ modules:
   - name: kagi_verify
     audience: "nanocloud"
     issuer: "https://kubernetes.default.svc"
-    key_path: "/authn-keys/sa"
+    key_paths: "/authn-keys/sa"
   - name: token_verify
   - name: decide
     type: decision

@@ -11,14 +11,20 @@
 //           Then the Pod is read for its grace (`pd`), its node for its
 //           zone (`nd`), and the slice it has now for its generation and
 //           its drain moment (`pv`) ->
-//           /endpointslices/<ns>/<svc>/<pod> =
-//             ip=<ip>;state=<ready|serving|terminating>;zone=<z>;node=<n>;
+//           /endpoint-rows/<ns>/<svc>/<pod> =
+//             ip=<ip>;state=<ready|notready|serving|terminating>;zone=<z>;node=<n>;
 //             gen=<u32>;af=<4|6>;uid=<uid>[;at=<moment>];grace=<ms>
 //           (`grace` on every slice: the drain an endpoint is owed, known
 //           before it begins; `at` only while draining)
-//           the EndpointSlice conditions of upstream (rfc_lb_vip §6.1):
+//           (the controller's own rows, one per endpoint; the API's
+//           EndpointSlice and Endpoints documents are rendered from them,
+//           endpoints_doc.plan) with the EndpointSlice conditions of upstream:
 //             ready        Ready (the probe's verdict, else the condition)
 //                          and not being deleted
+//             notready     addressed, not Ready, not being deleted (an
+//                          EndpointSlice endpoint with ready false, an
+//                          Endpoints notReadyAddress; every consumer that
+//                          routes takes `ready` alone)
 //             serving      Ready, but `metadata.deletionTimestamp` is set
 //             terminating  being deleted (or gone, or deselected), with
 //                          the moment the drain began (`at`, a recorded
@@ -31,8 +37,9 @@
 //           generation cannot affect its replacement). `zone` is the node's
 //           `topology.kubernetes.io/zone` label (empty without one; the
 //           node name is beside it). The IP is status.podIP as the node
-//           reports it. A not-ready Pod that is not being deleted has no
-//           slice (health, not drain: removed at once, as before).
+//           reports it. A not-ready Pod with no address has no row, and a
+//           not-ready row is never drained: deselected, or its Pod gone, it
+//           is removed at once (health, not drain).
 //           A Service WITHOUT a selector is left alone, as upstream leaves
 //           it: its slices are whoever made them (the cluster DNS's own,
 //           kube-system/kube-dns), and an absent selector matching every
@@ -45,8 +52,8 @@
 //           deleted at once — not one of a Service without a selector,
 //           which names no Pod
 //   expiry  ttl.plan, over each slice's `at` + `grace`
-// (endpoints_doc.plan: the /endpoints/ document folded from the slices, and
-// a gone Service's document deleted.)
+// (endpoints_doc.plan: the /endpoint-lists/ fold of the rows, a gone
+// Service's fold deleted, and the API's EndpointSlice and Endpoints.)
 plan nanocloud.endpoints {
 
   // The context each chain here carries across its effects: ONE nested
@@ -346,8 +353,11 @@ plan nanocloud.endpoints {
   //   terminating  being deleted, not ready: the slice it has is rewritten
   //                terminating, the same way (a dying Pod with no slice
   //                gets none)
-  //   not ready    not being deleted: the slice is deleted (health, not drain)
-  //   deselected   a slice it still has (and not yet terminating) drains:
+  //   notready     addressed, not ready, not being deleted: PUT notready
+  //                (the generation moves on when another IP or uid)
+  //   not ready    unaddressed, not being deleted: the slice is deleted
+  //   deselected   a notready slice is deleted; any other it still has
+  //                (and not yet terminating) drains:
   //                terminating, its recorded moment else now, its recorded
   //                grace else 30 s
   // `af` is 6 when the address has a `:`; the moment kept is chosen with
@@ -379,12 +389,26 @@ plan nanocloud.endpoints {
                  v1: "ip=", v2: a.ctx.ip, v3: ";state=serving;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
                  v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
                  v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: math.greatest(a.pgrace, a.ctx.grace) };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "0" && a.ctx.del == "" && (a.pip != a.ctx.ip || a.puid != a.ctx.uid) ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=notready;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen + 1, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: "", v14: "", v15: ";grace=", v16: a.ctx.grace };
+    when a.ctx.hit == "1" && a.ctx.ip != "" && a.ctx.ok == "0" && a.ctx.del == "" ->
+      ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "ip=", v2: a.ctx.ip, v3: ";state=notready;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
+                 v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.ctx.ip.indexOf(":") + 1), math.least(1, a.ctx.ip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.ctx.uid,
+                 v13: "", v14: "", v15: ";grace=", v16: a.ctx.grace };
     when a.ctx.hit == "1" && a.ctx.del != "" && a.status == 200 ->
       ep.Slice { cid: a.cid, op: PUT, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
                  v1: "ip=", v2: a.pip, v3: ";state=terminating;zone=", v4: a.ctx.zone, v5: ";node=", v6: a.ctx.node,
                  v7: ";gen=", v8: a.pgen, v9: ";af=", v10: "46".substring(math.least(1, a.pip.indexOf(":") + 1), math.least(1, a.pip.indexOf(":") + 1) + 1), v11: ";uid=", v12: a.puid,
                  v13: ";at=", v14: (a.pat + a.moment).substring(0, math.least(1, size(a.pat)) * size(a.pat) + (1 - math.least(1, size(a.pat))) * size(a.moment)), v15: ";grace=", v16: math.greatest(a.pgrace, a.ctx.grace) };
     when a.ctx.hit == "1" && a.ctx.del == "" && a.status == 200 ->
+      ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
+                 v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: 0, v9: "", v10: "",
+                 v11: "", v12: "", v13: "", v14: "", v15: "", v16: 0 };
+    when a.ctx.hit != "1" && a.status == 200 && a.pstate == "notready" ->
       ep.Slice { cid: a.cid, op: DELETE, key: a.ctx.key, sep: "/", pod: a.ctx.pod,
                  v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: 0, v9: "", v10: "",
                  v11: "", v12: "", v13: "", v14: "", v15: "", v16: 0 };
@@ -416,13 +440,18 @@ plan nanocloud.endpoints {
                   ctx: Ctx { key: s.key, hit: "1", ip: s.ip, state: s.state, zone: s.zone, node: s.node,
                              gen: s.gen, af: s.af, uid: s.uid, at: s.at, grc: s.grace } };
   }
-  // A gone Service: the slice goes. A gone Pod: the slice drains — written
+  // A gone Service: the slice goes. A gone Pod: a notready slice goes; any
+  // other drains — written
   // terminating with the moment its drain began (recorded when it was
   // deleted gracefully) else now, and the grace the slice records (the
   // Pod's, written with every slice) else 30 s; one already terminating
   // with a moment is left to the expiry chain.
   decision prune(k: ep.Known) -> ep.Act {
     when k.ctx.hit == "gone" ->
+      ep.Act { cid: k.cid, op: DELETE, key: k.ctx.key,
+               v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
+               v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
+    when k.status == 404 && k.ctx.hit == "1" && k.ctx.state == "notready" ->
       ep.Act { cid: k.cid, op: DELETE, key: k.ctx.key,
                v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
                v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };

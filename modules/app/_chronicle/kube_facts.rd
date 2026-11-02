@@ -19,6 +19,8 @@ load 0 ; field 10 ; set 10
 load 0 ; field 11 ; set 11
 load 0 ; field 15 ; set 15
 load 0 ; field 16 ; set 16
+load 0 ; field 18 ; set 18
+load 0 ; field 19 ; set 19
 load 0 ; field 12 ; set 12
 load 0 ; field 41 ; set 41
 load 0 ; field 42 ; set 42
@@ -32,6 +34,9 @@ load 0 ; field 51 ; set 51
 load 0 ; field 52 ; set 52
 load 0 ; field 53 ; set 53
 load 0 ; field 54 ; set 54
+load 0 ; field 55 ; set 55
+load 0 ; field 56 ; set 56
+load 0 ; field 20 ; set 20
 # /api or /apis; is the path namespaced
 str "{\"=api\":\"1\"}" ; str "=" ; load 0 ; field 41 ; cat 2 ; jsonat ; store 2
 str "{\"=apis\":\"1\"}" ; str "=" ; load 0 ; field 41 ; cat 2 ; jsonat ; store 7
@@ -47,7 +52,7 @@ str "=" ; load 0 ; field 47 ; cat 2 ; load 0 ; field 46 ; load 5 ; gate ; gate ;
 # apiVersion: v1, or <group>/<version>
 load 0 ; field 42 ; load 2 ; gate
 load 0 ; field 42 ; str "/" ; load 0 ; field 43 ; cat 3 ; load 7 ; gate ; coalesce ; store 5
-str "{\"=pods\":\"Pod\",\"=services\":\"Service\",\"=configmaps\":\"ConfigMap\",\"=secrets\":\"Secret\",\"=namespaces\":\"Namespace\",\"=nodes\":\"Node\",\"=events\":\"Event\",\"=endpoints\":\"Endpoints\",\"=serviceaccounts\":\"ServiceAccount\",\"=persistentvolumeclaims\":\"PersistentVolumeClaim\",\"=persistentvolumes\":\"PersistentVolume\",\"=resourcequotas\":\"ResourceQuota\",\"=limitranges\":\"LimitRange\",\"=deployments\":\"Deployment\",\"=replicasets\":\"ReplicaSet\",\"=statefulsets\":\"StatefulSet\",\"=daemonsets\":\"DaemonSet\",\"=jobs\":\"Job\",\"=cronjobs\":\"CronJob\",\"=horizontalpodautoscalers\":\"HorizontalPodAutoscaler\",\"=networkpolicies\":\"NetworkPolicy\",\"=ingresses\":\"Ingress\",\"=roles\":\"Role\",\"=rolebindings\":\"RoleBinding\",\"=clusterroles\":\"ClusterRole\",\"=clusterrolebindings\":\"ClusterRoleBinding\",\"=leases\":\"Lease\",\"=endpointslices\":\"EndpointSlice\",\"=storageclasses\":\"StorageClass\",\"=poddisruptionbudgets\":\"PodDisruptionBudget\",\"=customresourcedefinitions\":\"CustomResourceDefinition\",\"=priorityclasses\":\"PriorityClass\"}" ; str "=" ; load 3 ; cat 2 ; jsonat ; store 6
+str "{\"=pods\":\"Pod\",\"=services\":\"Service\",\"=configmaps\":\"ConfigMap\",\"=secrets\":\"Secret\",\"=namespaces\":\"Namespace\",\"=nodes\":\"Node\",\"=events\":\"Event\",\"=endpoints\":\"Endpoints\",\"=serviceaccounts\":\"ServiceAccount\",\"=persistentvolumeclaims\":\"PersistentVolumeClaim\",\"=persistentvolumes\":\"PersistentVolume\",\"=resourcequotas\":\"ResourceQuota\",\"=limitranges\":\"LimitRange\",\"=deployments\":\"Deployment\",\"=replicasets\":\"ReplicaSet\",\"=statefulsets\":\"StatefulSet\",\"=daemonsets\":\"DaemonSet\",\"=jobs\":\"Job\",\"=cronjobs\":\"CronJob\",\"=horizontalpodautoscalers\":\"HorizontalPodAutoscaler\",\"=networkpolicies\":\"NetworkPolicy\",\"=ingresses\":\"Ingress\",\"=roles\":\"Role\",\"=rolebindings\":\"RoleBinding\",\"=clusterroles\":\"ClusterRole\",\"=clusterrolebindings\":\"ClusterRoleBinding\",\"=leases\":\"Lease\",\"=endpointslices\":\"EndpointSlice\",\"=storageclasses\":\"StorageClass\",\"=poddisruptionbudgets\":\"PodDisruptionBudget\",\"=customresourcedefinitions\":\"CustomResourceDefinition\",\"=priorityclasses\":\"PriorityClass\",\"=zonesummaries\":\"ZoneSummary\",\"=managementbindings\":\"ManagementBinding\"}" ; str "=" ; load 3 ; cat 2 ; jsonat ; store 6
 # a collection (list or watch): the registration's facts —
 #   {"k","av","l": "1" for a LIST, "h": the List envelope's head (escaped),
 #    …the query's facts (kube_sel.rd, 66)}

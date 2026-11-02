@@ -44,9 +44,14 @@ hardware_targets = ["bcm2712", "linux"]
 #                 unlimited
 #                 12 graph: the workload is the FLXA subgraph of the Graph
 #                 object /graphs.nanocloud.io/<graph> (spec.flxa, hex) — a
-#                 module subgraph of the node's own image; cmd/rootfs/binds
-#                 are then unused. A bare-metal node runs these and pulled
-#                 workload images (13), never a host process
+#                 module subgraph of the node's own image; cmd/rootfs are
+#                 then unused. A bare-metal node runs these and pulled
+#                 workload images (13), never a host process. A subgraph's
+#                 (12 or 13) env (14) is its `env`/`var` entries, each
+#                 `NAME=VALUE` REQUIRED — the params its graph binds by
+#                 name — and its binds (10) its `mount`/`bind` entries,
+#                 REQUIRED: a backend that cannot give either refuses the
+#                 CREATE (-38) rather than run it without
 #                 13 pack: the workload is a PULLED WORKLOAD IMAGE, named
 #                 as its /image-manifests/<pack> record (`kind=workload`;
 #                 layers and sizes, the FLXA first, then one `.fmod` per

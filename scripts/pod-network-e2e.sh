@@ -337,8 +337,7 @@ pod srv-b node-b "$SERVE"
 wait_for 90 "srv-b never became Ready" pod_ready srv-b
 printf '%s' '{"apiVersion":"v1","kind":"Service","metadata":{"name":"lb","namespace":"default"},"spec":{"type":"LoadBalancer","externalTrafficPolicy":"Local","selector":{"app":"srv-b"},"ports":[{"port":80,"targetPort":8080}]}}' \
   | k create --validate=false -f - >/dev/null || fail "could not create the LoadBalancer Service"
-# The address svc_alloc gave it (/lb-addr/): its status.loadBalancer is
-# Wormhole's VIP readiness to say, and no Wormhole VIP controller runs here.
+# The address svc_alloc gave it (/lb-addr/), held by node_net.
 lb_ip() { v="$(get plane /lb-addr/default/lb)"; printf '%s' "${v#ip=}"; }
 lb_given() { [ -n "$(lb_ip)" ]; }
 wait_for 60 "the Service was given no load-balancer address" lb_given

@@ -1,5 +1,5 @@
-// The node's load-balancer address ownership: node_net's own hold and the
-// Wormhole VIP controller's, decided in one place.
+// The node's load-balancer address ownership: node_net's own hold and an
+// address controller's, decided in one place.
 //
 // node_net is the single writer of the host's held-address table (net.route
 // HOLD). It answers for a Service's load-balancer address in one of two ways:
@@ -7,7 +7,8 @@
 // - **its own hold** (legacy): a claim `/net-hold/<addr>` = `node=<n>`,
 //   created under ABSENT by an eligible node, given up when the node may no
 //   longer answer, taken over from a node that is not ready;
-// - **the controller's**: Wormhole's `vip_controller` on this node drives the
+// - **the controller's**: an address controller on this node (any module
+//   speaking Fluxor's `addr_ctl` contract to node_net) drives the
 //   address through Fluxor's `addr_ctl` contract (ADDR_ADD disarmed, ADDR_ARM
 //   and ADDR_FENCE under the install token node_net minted, ADDR_DEL), the
 //   same frames it sends Fluxor `ip` on bare metal, and node_net realises
@@ -27,14 +28,23 @@
 //   another node holds the claim installs the row fenced; its ARM waits
 //   (`arm_pending`) until no claim stands, then claims under ABSENT and arms
 //   once the claim reads as its own. The holder releases only by its own
-//   controller's FENCE then DEL (the fenced handover), or by being taken
-//   over as not ready.
+//   controller's FENCE (the fenced handover), or by being taken over as not
+//   ready.
+// - **a fence is the handover.** FENCE is the old owner's confirmed
+//   emission-disable — all the proof a controller needs before it commits a
+//   new owner (a graceful move needs no more than it, and a move's source
+//   is never told to delete) — so the fenced row stops
+//   emitting at once and the claim is given up on the next pass. The row
+//   stays installed, fenced, and the mark stays, until the controller
+//   re-arms it or deletes it; a re-ARM claims again like any other.
 // - **a delete that was not fenced falls back to the hold.** The controller
 //   restarted (its first act is a clean-slate ADDR_DEL) or let the address
 //   go without cutting it: the row stays as it is, the mark is removed, and
 //   the node's own hold takes the address back with the claim it already
-//   has. A delete after a FENCE is a handover: the claim is released and
-//   the mark stays, for the destination's controller to claim.
+//   has. A delete after a FENCE removes the fenced row; the claim went
+//   with the fence, and the mark goes on a later pass like any mark of
+//   this node's without an entry (a destination that armed holds the
+//   claim and re-marks; with none — a release — the hold resumes).
 // - **controller loss falls back to the hold.** An entry outlives silence
 //   (nothing is torn down for want of frames), and a mark whose node is not
 //   ready is removed, so the own-hold rules resume for the address.
@@ -107,7 +117,7 @@ pub struct VhEntry {
     pub used: u8,
     /// The HOLD row emits.
     pub armed: u8,
-    /// Cut by ADDR_FENCE since the last ARM: a DEL now is a handover.
+    /// Cut by ADDR_FENCE since the last ARM: the claim is given up.
     pub fenced: u8,
     /// ARM asked while the claim was another node's (or not yet ours).
     pub arm_pending: u8,
@@ -454,8 +464,8 @@ impl VipHold {
         let fenced = self.entries[i].fenced != 0;
         self.entries[i] = VhEntry::EMPTY;
         if fenced {
-            // A handover: give the claim up, keep the mark for the
-            // destination's controller.
+            // After the handover: the claim, if this pass has not given it
+            // up yet, goes; the mark stays for the destination's controller.
             self.owe(addr, VhWrite::Unclaim);
         } else {
             // Not cut: the node's own hold takes the address back, with
@@ -517,6 +527,14 @@ impl VipHold {
                         }
                     }
                 }
+            }
+            // A fenced entry no longer emits: the fence is the handover, so
+            // its claim goes now, not at a delete that a move never sends.
+            if e.fenced != 0 && claim == VhClaim::Ours {
+                return VhDecision {
+                    row: Some(false),
+                    write: VhWrite::Unclaim,
+                };
             }
             // An armed entry keeps its claim; a fenced one holds a row that
             // does not emit.

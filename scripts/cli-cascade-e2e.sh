@@ -60,7 +60,10 @@ cp_until() {
   env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$D/cp.bin" --modules "$D/cp.mods" >>"$D/cp.log" 2>&1 &
   RUNTIME_PID=$!
   nc_store_ready "$D" || fail "the store never answered"
-  for _ in $(seq 60); do
+  # Up to 180 s: a whole control plane boots and reconciles here, and on a
+  # host loaded by a full CI run (every other e2e's plane, parallel builds)
+  # that took past the 30 s this once allowed. Done as soon as it holds.
+  for _ in $(seq 360); do
     [ "$(count_pods)" = "$1" ] && break
     sleep 0.5
   done

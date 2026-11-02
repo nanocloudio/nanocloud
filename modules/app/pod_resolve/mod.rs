@@ -85,11 +85,6 @@ struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
     request_out: i32,
-    /// Every record as it came in, on to the graph-backed Pods' decision
-    /// (pod_specs.plan), which shares this source.
-    forward_out: i32,
-    /// The held record has been forwarded.
-    forwarded: bool,
     /// The Pod record being resolved (held across steps until every
     /// container's record is out), and where in it the next container is.
     rec: [u8; REC],
@@ -241,8 +236,6 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = syscalls as *const SyscallTable;
     s.request_in = in_chan;
     s.request_out = out_chan;
-    s.forward_out = dev_channel_port(&*s.syscalls, 1, 1);
-    s.forwarded = false;
     s.retry_len = [0; RETRY];
     s.retry_next = 0;
     s.last_retry_ms = 0;
@@ -288,7 +281,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 match take(sys, s.request_in, &mut s.rec) {
                     Some(n) => {
                         s.rec_len = n;
-                        s.forwarded = false;
                         s.err = false;
                         s.cur = Cursor {
                             phase: C_OWN,
@@ -297,14 +289,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     None => break,
                 }
-            }
-            if !s.forwarded {
-                if s.forward_out >= 0
-                    && (sys.channel_write)(s.forward_out, s.rec.as_ptr(), s.rec_len) <= 0
-                {
-                    break;
-                }
-                s.forwarded = true;
             }
             if !resolve(s, sys) {
                 // A read not answered yet: this Pod again next step.
@@ -328,13 +312,15 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
             span(rec, frame_bytes(rec, 3)),
             span(rec, frame_bytes(rec, 4)),
             span(rec, frame_bytes(rec, 5)),
-            span(rec, frame_bytes(rec, 9)),
-            !frame_bytes(rec, 8).is_empty(),
+            span(rec, frame_bytes(rec, 7)),
+            !frame_bytes(rec, 6).is_empty(),
         )
     };
     let (kl, ul, nl) = (key.1 - key.0, uid.1 - uid.0, node.1 - node.0);
-    let rtc_fluxor = s.rec.get(rtc.0..rtc.1) == Some(b"fluxor".as_slice());
-    if kl == 0 || ul == 0 || nl == 0 || rtc_fluxor || ul > 96 || nl > 96 {
+    // A graph-backed Pod (`runtimeClassName: fluxor`): its one record, the
+    // subgraph's (podres.rs `pr_graph`).
+    let graph = s.rec.get(rtc.0..rtc.1) == Some(b"fluxor".as_slice());
+    if kl == 0 || ul == 0 || nl == 0 || ul > 96 || nl > 96 {
         s.rec_len = 0;
         return true;
     }
@@ -373,6 +359,7 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
             return true;
         }
     }
+    s.x.again = false;
     loop {
         if s.cur.idx >= MAX_CTRS {
             if s.cur.phase == C_INIT {
@@ -391,6 +378,7 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
             init,
             idx: s.cur.idx,
             deleting,
+            graph,
         };
         let mut world = StoreWorld { st: &st };
         let n = match pr_spec(&mut world, &mut s.x, &ask, &mut s.spec) {
@@ -507,7 +495,9 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
     // it). A finalizer holds it until it is removed, as upstream's does.
     // Until then it is looked at again every RETRY_MS.
     let mut keep = false;
-    if deleting {
+    // A graph-backed Pod has no grace to wait out: its delete is outright
+    // (podlive.rs `pl_waits`), so none is finished here.
+    if deleting && !graph {
         let (held, until) = {
             let pod = s.pod.get(..pod_len).unwrap_or(&[]);
             let meta = pr_m(pod, b"metadata").unwrap_or(b"{}");
@@ -549,7 +539,9 @@ unsafe fn resolve(s: &mut State, sys: &SyscallTable) -> bool {
         }
     }
     s.resolved = s.resolved.wrapping_add(1);
-    retry_keep(s, key, s.err || keep);
+    // A pulled workload image whose bindings its node has not recorded yet:
+    // again, until its record says the pack checked (`envok`).
+    retry_keep(s, key, s.err || keep || s.x.again);
     s.rec_len = 0;
     true
 }
@@ -582,12 +574,12 @@ fn retry_keep(s: &mut State, key: &[u8], again: bool) {
     let Some(i) = (0..RETRY).find(|&i| s.retry_len[i] == 0) else {
         return;
     };
-    // The fields resolve() reads: 3 key, 4 uid, 5 node, 8 deleting, 9 rtc.
+    // The fields resolve() reads: 3 key, 4 uid, 5 node, 6 deleting, 7 rtc.
     let rec = s.rec.get(..s.rec_len).unwrap_or(&[]);
     let mut out = [0u8; RETRY_REC];
     let mut p = 1usize;
     let mut count = 0u8;
-    for num in [3u8, 4, 5, 8, 9] {
+    for num in [3u8, 4, 5, 6, 7] {
         match put_field(&mut out, p, num, TY_BYTES, frame_bytes(rec, num)) {
             Some(e) => {
                 p = e;
@@ -601,8 +593,7 @@ fn retry_keep(s: &mut State, key: &[u8], again: bool) {
     s.retry_len[i] = p as u16;
 }
 
-/// The next kept Pod into hand, already forwarded (it is not a source
-/// record).
+/// The next kept Pod into hand (it is not a source record).
 fn retry_take(s: &mut State) {
     for k in 0..RETRY {
         let i = (s.retry_next + k) % RETRY;
@@ -616,7 +607,6 @@ fn retry_take(s: &mut State) {
             *d = c;
         }
         s.rec_len = l;
-        s.forwarded = true;
         s.err = false;
         s.cur = Cursor {
             phase: C_OWN,

@@ -73,9 +73,8 @@ the change and writes its own outputs back.
 [docs/architecture/modules.md](docs/architecture/modules.md) describes each
 chain, the keys it owns, the connectors it reaches them through, and the
 capability surfaces behind them;
-[docs/architecture/wormhole-projection.md](docs/architecture/wormhole-projection.md)
-how Services, their endpoints and load-balancer status are projected into
-Wormhole, nanocloud's load balancer.
+[docs/architecture/zone-summary.md](docs/architecture/zone-summary.md) the
+read-only per-zone summary of the cell's nodes and their capacity.
 
 ## Install
 
@@ -202,6 +201,24 @@ sudo sh -c '. /etc/nanocloud.io/seal.env; export FLUXOR_SEAL_KEY \
 Without the seal key its keys are its own and unsealed for the run: fine
 for a single-voter plane, refused by the peers of a larger one.
 
+## A managed cell
+
+A cell may run under a management plane — a fabric controller that places
+cells and acts in them through their public API. The cell records it as a
+cluster-scoped `ManagementBinding` (the cell UID and bootstrap-envelope
+digest it must prove, a one-time enrollment grant, its authority epoch, its
+public identity and the rules its credential holds) and derives its
+ServiceAccount, role and binding. The management plane enrolls with one
+request (`POST …/managementbindings/<b>/enroll`, the grant as the bearer
+credential; a wrong grant, cell UID or digest is 403, the grant is spent by
+the first success) and receives its credential. Every write it makes names
+its authority epoch (`Nanocloud-Authority-Epoch`); the cell refuses one
+behind the newest epoch it has committed (409), so a stale management writer
+is stopped by the cell, and an epoch is committed only through the binding's
+own `…/epoch` path, which also renews the credential.
+[docs/design/managed-cells.md](docs/design/managed-cells.md) is the contract;
+`scripts/management-binding-e2e.sh` proves it on the shipped control plane.
+
 ## Using it
 
 ```bash
@@ -247,7 +264,7 @@ kubectl --server https://127.0.0.1:7443 get pods -A --watch
 | scheduling.k8s.io/v1 | priorityclasses |
 | policy/v1 | poddisruptionbudgets |
 | networking.k8s.io/v1 | ingresses, ingressclasses, networkpolicies |
-| nanocloud.io/v1 | graphs, devices |
+| nanocloud.io/v1 | graphs, devices, zonesummaries (read-only: derived from nodes and pods — [docs/architecture/zone-summary.md](docs/architecture/zone-summary.md)) |
 
 Those are what the discovery documents advertise. Path resolution is generic —
 the rules read a path's *shape*, not a list of kinds — so an object of any
@@ -261,9 +278,13 @@ record, and every decision after that — which resource a path names, whether t
 what a refusal answers, which store operation the verb implies — is params
 compiled from `modules/app/_chronicle/apiplane.plan`. Authorization is one
 store probe of a grant index that the RBAC chains keep true from the real
-Role/ClusterRole/RoleBinding/ClusterRoleBinding objects. Admission is params
-too: a policy read and a live-object COUNT through `store_effect`, then a
-decision. No node on the path holds Kubernetes meaning in compiled code.
+Role/ClusterRole/RoleBinding/ClusterRoleBinding objects. A write of one of
+those (or of a ManagementBinding) then passes upstream's escalation check:
+it may grant only what its writer holds in the same index, unless the writer
+may `escalate` or `bind` it (`apiplane_esc.plan`, `_shared/rbac_cover.rs`).
+Admission is params too: a policy read and a live-object COUNT through
+`store_effect`, then a decision. No other node on the path holds Kubernetes
+meaning in compiled code.
 
 Discovery documents (`/api`, `/apis`, `/api/v1`, `/apis/<group>/<version>`),
 `/version` and `/openapi/v3` are literals in decisions — the API surface is
@@ -372,6 +393,32 @@ and what is not yet:
   Every node record of every container goes when the Pod's tomb ends.
 - **resources.limits**: `cpu` (cgroup `cpu.max`), `memory` (`memory.max`),
   `ephemeral-storage` (the Pod's own storage root's cap).
+- **A graph-backed Pod** (`runtimeClassName: fluxor`, its one container a
+  Graph object's name or a workload image's reference) takes its container's
+  `envFrom` and `env` as above — `valueFrom` ConfigMap and Secret keys, the
+  downward API, `$(VAR)` — with no Service links and no `HOSTNAME`/`PATH`,
+  each `NAME=VALUE` handed to the subgraph, where it fills the module params
+  its graph binds by name (`port: {env: PORT}` in the workload graph). Its
+  `volumeMounts` are lent to it as they are bound to a container (the
+  module's `fs` paths under a mount resolve beneath the volume; a read-only
+  one takes no change), so a claim keeps its state across its lives. Its
+  `configMap`, `secret`, `projected` and `downwardAPI` volumes are a
+  container's AtomicWriter layout (each key a link through `..data`, which
+  an update swaps whole); the runtime follows a link that stays beneath the
+  volume, so the graph reads `<mount>/<key>` and sees an update whole. A name
+  a Graph binds (its `spec.env`, the build's `workload-image.json` list) or a
+  pulled workload image requires (its config blob's `env`, which the node's
+  pull records and the plane checks the Pod against before its node makes
+  the sandbox) that the container does not set holds the Pod in
+  CreateContainerConfigError, as a missing ConfigMap or Secret does. A graph
+  Pod that keeps its OWN keys names its vault in its env:
+  `FLUXOR_VAULT_DIR` (a path at or beneath one of its writable
+  `volumeMounts`) and `FLUXOR_VAULT_KEY` (the 32-byte seal key as 64 hex
+  digits, typically `valueFrom.secretKeyRef`): the keys its modules persist
+  are sealed under that key in that directory — they follow the volume and
+  the Secret, not the node — and neither name reaches the graph as env. One
+  without the other, or a key that is not 64 hex digits, is refused
+  (CreateContainerError), never run with its keys in the node's store.
 - A command, an env, a working directory or a user too long for the record it
   crosses is refused and the Pod Fails — never run cut short.
 - **Probes**: `readinessProbe` gates the Pod's Ready condition (and so its
@@ -444,24 +491,21 @@ it in its own kernel:
   `nodePort` from 30000-32767 (`NANOCLOUD_NODE_PORTS`) unless it names one;
   each node DNATs its own address at that port.
 - **LoadBalancer**: with a pool (`NANOCLOUD_LB_POOL=<a.b.c.d>/<n>`), one
-  address of it for each Service whose `loadBalancerClass` is unset or
-  `wormhole.nanocloud.io/lb` (another class is another controller's),
+  address of it for each Service whose `loadBalancerClass` is unset,
   DNATed by every node and answered on the link by one node (node_net: the
   node holding its claim, one with a local endpoint for `Local`, taken over
-  from a node out of service). `status.loadBalancer.ingress` names it only
-  once Wormhole reports the address's VIP ACTIVE (or DRAINING): the status
-  says the address is reachable, and that is the VIP's readiness to say, so
-  without a Wormhole VIP controller the address works and the status stays
-  empty. Without a pool the Service stays pending, as upstream with no
-  load-balancer controller.
-- **Wormhole projection**: every such Service and its endpoints are declared
-  to Wormhole (nanocloud's load balancer, rfc_lb_vip) as Wormhole's own v1
-  records — one route per Service port and IP family (dual stack: linked
-  routes), its endpoints with their state, zone and generation, its traffic
-  policies, ClientIP session affinity and its timeout, and its
-  `loadBalancerSourceRanges` as early admission — published a sealed
-  generation at a time and activated by compare-and-swap
-  ([docs/architecture/wormhole-projection.md](docs/architecture/wormhole-projection.md)).
+  from a node out of service). The cell is its own load balancer, as k3s's
+  ServiceLB is: `status.loadBalancer.ingress` names the address
+  (svc_alloc). Without a pool the Service stays pending, as upstream with
+  no load-balancer controller.
+- **External load balancers**: a LoadBalancer Service that names any
+  `spec.loadBalancerClass` is left to that class's controller, upstream's
+  hook for an external load balancer. The cell gives it node ports and
+  nothing else — no address of its pool, no `status.loadBalancer`; the
+  controller, an ordinary API client, watches Services and EndpointSlices,
+  allocates an address of its own and writes the status through the
+  Service's `/status` subresource, which the cell then leaves alone
+  (`scripts/proxy-e2e.sh` proves both halves).
 - **DNS** on the control plane (port 53): `<svc>.<ns>.svc.cluster.local` is the
   Service's ClusterIP, a headless Service's ready Pod addresses, an
   ExternalName Service's CNAME, NXDOMAIN when there is no such Service;
@@ -482,11 +526,9 @@ it in its own kernel:
   no count of the bytes it has seen, so nothing can tell a follower which
   bytes are new once the tail is trimmed.
 
-Not implemented yet: `sessionAffinity` at the nodes' DNAT (it is declared to
-Wormhole, which enforces it; the nftables path balances per connection),
-named ports in containers past the first, Pod DNS names
-(`<a-b-c-d>.<ns>.pod.cluster.local`), and a load-balancer status without
-Wormhole's VIP controller (see LoadBalancer above).
+Not implemented yet: `sessionAffinity` at the nodes' DNAT (the nftables
+path balances per connection), named ports in containers past the first,
+and Pod DNS names (`<a-b-c-d>.<ns>.pod.cluster.local`).
 
 ### Kubernetes compatibility: workloads, scheduling and policy
 
@@ -596,6 +638,10 @@ together.
 - **Deny-by-default authorization.** Kubernetes RBAC objects are expanded into a
   grant index (`rbac_*.plan`); a request is admitted only when a grant covers
   its namespace, verb and resource, and a deleted binding's grants are pruned.
+  No privilege escalation: a Role, ClusterRole, binding or ManagementBinding
+  written (or patched) may grant only permissions its writer already holds —
+  or the writer holds `escalate` / `bind` on that role, by name — as upstream
+  enforces it (`scripts/rbac-escalation-e2e.sh`).
 - **Admission before the store.** Every mutating request crosses the
   admission decisions (`admission.plan`, `admission_k8s.plan`), which
   validate required fields, apply defaults, enforce ResourceQuotas and judge

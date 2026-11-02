@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Live E2E for the route-compile chain (Chronicle params) as it ships in
-# packaging/debian/fluxor-route-compiler.yaml — the /routes/ + /endpointslices/
+# packaging/debian/fluxor-route-compiler.yaml — the /routes/ + /endpoint-rows/
 # -> /dataplane/edge/ seam, verified UNPRIVILEGED over the control-plane store.
 #
 # An EXTERNAL process (this script, playing the API projection, the route
-# validation's /route-status/ and the endpoints chain's slices) writes Routes,
-# route-statuses and endpoint slices into the shared WAL; the chain, inside the
+# validation's /route-status/ and the endpoints chain's rows) writes Routes,
+# route-statuses and endpoint rows into the shared WAL; the chain, inside the
 # fluxor-linux runtime, resolves each validated Route's service to its ready
 # backends and PUBLISHES one key per route to
 # /dataplane/edge/<ns>/<name> carrying the full backend set. That key IS the
@@ -21,7 +21,7 @@
 # Data model:
 #   /routes/<ns>/<name>       = {"spec":{"host":…,"to":{"name":…},"port":…,"path":…}}  (JSON)
 #   /route-status/<ns>/<name> = "ready=1;endpoint=<svc>:<port>"   (route_validator gate)
-#   /endpoints/<ns>/<svc>     = "<pod>=<addr>,<pod>=<addr>"       (compact)
+#   /endpoint-lists/<ns>/<svc> = "<pod>=<addr>,<pod>=<addr>"      (compact)
 #   /dataplane/edge/<ns>/<name> = host=<h>;path=<prefix>;be=<ip>:<port>:<w>:<r>,…
 set -euo pipefail
 
@@ -114,16 +114,16 @@ echo "== 2. project Routes + route-status + endpoints =="
 wal_put "/routes/default/web"        '{"spec":{"host":"api.example.com","to":{"name":"web"},"port":8080,"path":"/v1/"}}'
 wal_put "/route-status/default/web"  "ready=1;endpoint=web:8080"
 # One key per backend, which is what endpoints.plan materialises on the way to
-# building the /endpoints/ document. The compiler joins these rather than
+# building the /endpoint-lists/ fold. The compiler joins these rather than
 # mapping over the folded list — the per-element work is already done.
-wal_put "/endpointslices/default/web/web-1" "ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid="
-wal_put "/endpointslices/default/web/web-2" "ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid="
-wal_put "/endpoints/default/web"     "web-1=10.0.0.1,web-2=10.0.0.2"
+wal_put "/endpoint-rows/default/web/web-1" "ip=10.0.0.1;state=ready;zone=;node=;gen=1;af=4;uid="
+wal_put "/endpoint-rows/default/web/web-2" "ip=10.0.0.2;state=ready;zone=;node=;gen=1;af=4;uid="
+wal_put "/endpoint-lists/default/web"     "web-1=10.0.0.1,web-2=10.0.0.2"
 # A route that failed validation (ready=0) — must NOT be compiled.
 wal_put "/routes/default/bad"        '{"spec":{"to":{"name":"nohost"},"port":9090,"path":"/"}}'
 wal_put "/route-status/default/bad"  "ready=0;msg=host must be set"
-wal_put "/endpointslices/default/nohost/n-1" "ip=10.0.0.9;state=ready;zone=;node=;gen=1;af=4;uid="
-wal_put "/endpoints/default/nohost"  "n-1=10.0.0.9"
+wal_put "/endpoint-rows/default/nohost/n-1" "ip=10.0.0.9;state=ready;zone=;node=;gen=1;af=4;uid="
+wal_put "/endpoint-lists/default/nohost"  "n-1=10.0.0.9"
 
 echo "== 3. run the compiler; it PUBLISHES one key per validated route =="
 run_compiler

@@ -23,8 +23,12 @@ plan nanocloud.apiplane_anon {
     key: string = 7;
     credential: string = 8;
     target: string = 9;
+    query: string = 10;
     watch: int = 11;
     peer: string = 12;
+    group: string = 13;
+    fence: string = 14;    // Nanocloud-Authority-Epoch (kube.rd), for the fence stage
+    enrol: string = 15;    // an enrollment's `<cellUID>/<envelopeDigest>`
   }
 
   // No credential and no mTLS peer becomes `system:anonymous`.
@@ -40,19 +44,21 @@ plan nanocloud.apiplane_anon {
       Request { cid: r.cid, method: r.method, resource: r.resource,
                 namespace: r.namespace, name: r.name, body: r.body,
                 key: r.key, credential: r.credential, target: r.target,
-                watch: r.watch, peer: "system:anonymous" };
+                query: r.query, watch: r.watch, peer: "system:anonymous",
+                group: r.group, fence: r.fence, enrol: r.enrol };
     default ->
       Request { cid: r.cid, method: r.method, resource: r.resource,
                 namespace: r.namespace, name: r.name, body: r.body,
                 key: r.key, credential: r.credential, target: r.target,
-                watch: r.watch, peer: r.peer };
+                query: r.query, watch: r.watch, peer: r.peer, group: r.group, fence: r.fence, enrol: r.enrol };
   }
 
   transformation pass_req(r: Request) -> Request {
     Request { cid: r.cid, method: r.method, resource: r.resource,
               namespace: r.namespace, name: r.name, body: r.body,
               key: r.key, credential: r.credential, target: r.target,
-              watch: r.watch, peer: r.peer }
+              query: r.query, watch: r.watch, peer: r.peer, group: r.group,
+              fence: r.fence, enrol: r.enrol }
   }
 
   pipeline anon(r: Request) -> Request {

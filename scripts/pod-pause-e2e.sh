@@ -2,23 +2,28 @@
 # Live E2E for PAUSE/RESUME through the node pipeline: the paused-aware status
 # loop in the sandbox runtime and the paused-aware pod_lifecycle state machine.
 #
-# Nothing in the plane issues PAUSE — the Kubernetes API has no pause verb and
-# no module writes /sandbox-pause/ — so this script plays the orchestrator the
-# way the other E2Es drive effects, through the store seam:
-# /sandbox-pause/<id> = "pause" | "resume" (consumed by the sandbox runtime, gated
-# on the backend CAPS PAUSE bit).
+# The plane's pause is the nanocloud-specific Pod annotation
+# (`nanocloud.io/paused: "true"`), which pod_resolve writes into the Pod's
+# /pod-specs/ record as `paused=true`. pod_containers.plan (pj_ctr -> pj_ctre)
+# owns /sandbox-pause/<id>: `pause` while the spec asks, `resume` once it no
+# longer does — so this script drives the SPEC, as pod_resolve would, and
+# never writes /sandbox-pause/ itself (the plane would answer a bare
+# `pause` with `resume`, the spec not asking for one). The sandbox runtime
+# consumes /sandbox-pause/, gated on the backend CAPS PAUSE bit.
 #
-# PRIVILEGE GATE: the Linux backend's PAUSE is the cgroup2 freezer on the
-# per-sandbox cgroup, and moving the container INTO that cgroup needs write
-# access on the cgroup2 common ancestor — unavailable to an unprivileged dev
-# session (the fluxor harness root-gates its freezer tests the same way;
-# unprivileged, the backend returns per-workload ENOSYS). So:
-#   - as root:        the FULL path is asserted (state=paused, phase=Paused,
+# FREEZER GATE: the Linux backend's PAUSE is the cgroup2 freezer on a child
+# of the runtime's own cgroup, and moving the container into it needs write
+# access on that cgroup. Whether this host gives that is asked of the host
+# (nc_freezer_unavailable does what the backend does with a throwaway
+# sleeper), not of `id -u`: root in a user namespace can freeze inside a
+# cgroup delegated to its uid (a `systemd-run --user` scope), and cannot in
+# one that was not. So:
+#   - freezer works:  the FULL path is asserted (state=paused, phase=Paused,
 #                     no restart, resume back to running).
-#   - unprivileged:   DEGRADED assertions — the pause intent must be benign
+#   - it does not:    DEGRADED assertions — the pause intent must be benign
 #                     (workload stays running, phase stays Running, no restart,
 #                     no failed/killed latch) and the paused-state assertions
-#                     are SKIPped with a message.
+#                     are SKIPped, the probe's reason printed.
 #
 # The pod spec carries `tasks=64`: the backend only creates the per-sandbox
 # cgroup (the freezer's home) when the resource envelope is non-empty.
@@ -40,14 +45,15 @@ done
 
 D="$(mktemp -d /tmp/nc-pause-e2e-XXXXXX)"
 cleanup() {
-  # A frozen container survives the runtime: thaw any leftover sandbox cgroup
-  # and reap the distinctive sleeper (best-effort, root path only).
-  if [ "$(id -u)" = 0 ]; then
-    find /sys/fs/cgroup -maxdepth 6 -type d -name 'fluxor.oci.*' 2>/dev/null | while read -r cg; do
-      echo 0 > "$cg/cgroup.freeze" 2>/dev/null || true
-    done
-    pkill -f 'sleep 8787' 2>/dev/null || true
-  fi
+  # A frozen container survives the runtime: thaw any sandbox cgroup the
+  # backend left under ours and reap the distinctive sleeper.
+  local base
+  base="${FLUXOR_HOST_CGROUP_ROOT:-/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)}"
+  for cg in "${base%/}"/fluxor.hostproc.*; do
+    [ -d "$cg" ] || continue
+    echo 0 > "$cg/cgroup.freeze" 2>/dev/null || true
+  done
+  pkill -f 'sleep 8787' 2>/dev/null || true
   rm -rf "$D"
 }
 trap cleanup EXIT
@@ -117,7 +123,8 @@ run_graph() { # run_graph <seconds> <logname>
 }
 
 FULL=0
-if [ "$(id -u)" = 0 ] && [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+NO_FREEZE="$(nc_freezer_unavailable)"
+if [ -z "$NO_FREEZE" ]; then
   FULL=1
 fi
 
@@ -126,7 +133,8 @@ nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
 
 echo "== 2. a long-running pod with a resource envelope (tasks= → cgroup) =="
 mkdir -p "$D/pz"
-store_put "/pod-specs/pod-pz" "cmd=/bin/sleep 8787;desired=running;tasks=64"
+SPEC="cmd=/bin/sleep 8787;desired=running;tasks=64"
+store_put "/pod-specs/pod-pz" "$SPEC"
 
 echo "== 3. run: pod comes up Running =="
 run_graph 4 run1.log
@@ -135,20 +143,21 @@ case "$(store_last /pod-lifecycle-status/pod-pz)" in
   *) fail "pod-pz should be Running, got '$(store_last /pod-lifecycle-status/pod-pz)'";;
 esac
 
-echo "== 4. orchestrate PAUSE via the store seam =="
-store_put "/sandbox-pause/pod-pz" "pause"
-run_graph 4 run2.log
+echo "== 4. ask for PAUSE as pod_resolve does (the spec's paused=true) =="
+store_put "/pod-specs/pod-pz" "$SPEC;paused=true"
+run_graph 5 run2.log
+[ "$(store_last /sandbox-pause/pod-pz)" = pause ] \
+  || fail "pod_containers should ask the sandbox to pause, /sandbox-pause/pod-pz is '$(store_last /sandbox-pause/pod-pz)'"
 
 ST="$(store_last /sandbox-status/pod-pz)"
 PH="$(store_last /pod-lifecycle-status/pod-pz)"
 if [ "$FULL" = 1 ]; then
-  echo "== 5. FULL (root): paused projected, phase=Paused, no restart =="
+  echo "== 5. FULL (the freezer works here): paused projected, phase=Paused, no restart =="
   [[ "$ST" =~ ^state=paused\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] || fail "pod-pz should project state=paused with its run's start, got '$ST'"
   [ "$PH" = "phase=Paused" ] || fail "pod-pz should be phase=Paused, got '$PH'"
 else
-  echo "== 5. DEGRADED (unprivileged: cgroup containment unavailable — the"
-  echo "      backend returns per-workload ENOSYS; paused-state assertions"
-  echo "      SKIPped; asserting the pause intent is benign) =="
+  echo "== 5. DEGRADED — SKIP the paused-state assertions: no freezer here ($NO_FREEZE);"
+  echo "      the backend returns per-workload ENOSYS; asserting the pause intent is benign =="
   case "$ST" in
     state=running*) ;;
     *) fail "unprivileged pause must leave the workload running, got '$ST'";;
@@ -168,9 +177,11 @@ if store_history /pod-lifecycle-status/pod-pz | grep -Eq 'Restarting|restarts=';
 fi
 echo "   no terminal latch, no restart — OK"
 
-echo "== 6. orchestrate RESUME; pod returns to Running =="
-store_put "/sandbox-pause/pod-pz" "resume"
-run_graph 4 run3.log
+echo "== 6. stop asking (paused dropped from the spec); pod returns to Running =="
+store_put "/pod-specs/pod-pz" "$SPEC"
+run_graph 5 run3.log
+[ "$(store_last /sandbox-pause/pod-pz)" = resume ] \
+  || fail "pod_containers should ask the sandbox to resume, /sandbox-pause/pod-pz is '$(store_last /sandbox-pause/pod-pz)'"
 ST="$(store_last /sandbox-status/pod-pz)"
 PH="$(store_last /pod-lifecycle-status/pod-pz)"
 case "$ST" in
@@ -188,5 +199,5 @@ fi
 if [ "$FULL" = 1 ]; then
   echo "== E2E green (FULL): pause → state=paused/phase=Paused (live, no restart) → resume → Running =="
 else
-  echo "== E2E green (DEGRADED): pause intent benign unprivileged; run as root for the freezer proof =="
+  echo "== E2E green (DEGRADED, freezer SKIPPED: $NO_FREEZE): pause intent benign =="
 fi

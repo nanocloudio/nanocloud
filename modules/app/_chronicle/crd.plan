@@ -1,0 +1,270 @@
+// CustomResourceDefinitions as params: what a CRD makes the API serve.
+//
+// The API plane serves a custom kind's objects wherever its path puts them
+// (kube.plan keys them `/<plural>.<group>/[<ns>/]<name>`, lattice's dialect
+// takes the id from the key's depth). What it needs from the CRD is two
+// facts, kept here as rows:
+//
+//   scope       /crd-scope/<plural>.<group>        "Cluster" | "Namespaced"
+//               read by the request path's scope stage (apiplane_scope.plan):
+//               no row is no such kind (404), a kind addressed at the scope
+//               it is not is 404.
+//   discovery   /discovery-res/<group>/<version>/<plural>/<g>
+//                 the kind's APIResource, one per served
+//                 version — `<g>` the CRD's digest, so a changed CRD's old
+//                 rows are stale by key (rbac_rules.plan's way);
+//               /discovery-res/<group>/<version>/<plural>~status/<g>, ~scale
+//                 the version's status and scale subresources, when it
+//                 serves them (crd_groups.plan);
+//               /discovery-gv/<group>/<rank>~<version>
+//                 one served group-version, shared by every CRD serving it,
+//                 `{"groupVersion":…,"version":…}`; `<rank>` orders a
+//                 group's versions as upstream prefers them (GA, then beta,
+//                 then alpha, each newest first; anything else last), so a
+//                 group's first row is its preferredVersion;
+//               /discovery-groups/<group>
+//                 the APIGroup entry `/apis` lists, ONE per group with every
+//                 version it serves: composed from its /discovery-gv/ rows
+//                 (`group_compose`), created by the first CRD of the group
+//                 (`gname_row`, put-if-absent).
+//               `/apis` is the /discovery-groups/ rows (the built-in groups
+//               one of them, `~builtin`); `/apis/<group>/<version>` the
+//               /discovery-res/ rows under it (apiplane_scope.plan), its
+//               groupVersion stated by that LIST's envelope.
+//
+// A CRD is served only as upstream admits one: its name is
+// `<plural>.<group>`, its group dotted, its scope Cluster or Namespaced, its
+// names free of quotes and backslashes (they are spliced into JSON). Any
+// other CRD is stored and serves nothing.
+//
+// Pruning — every row goes when what it was derived from no longer
+// produces it:
+//   scope       its CRD is gone (`unless`)
+//   resource    its CRD is gone, or its digest is not the row's
+//   gv          no /discovery-res/ row is left under its group-version
+//               (a COUNT)
+//   group       no /discovery-res/ row is left under it (a count), removed
+//               at the revision that count was read against, so a row a
+//               CRD wrote again meanwhile stays; a row of the earlier
+//               per-version form (`<group>/<version>`) always goes.
+plan nanocloud.crd {
+  enum NOOP = 0;
+  enum GET = 1;
+  enum PUT = 3;
+  enum DELETE = 4;
+
+  // ---- scope rows (store_source over /customresourcedefinitions/) ----
+  message Crd {
+    seq: int = 1;
+    key: string = 3;
+    name: string = 4;      // metadata.name
+    group: string = 5;     // spec.group
+    scope: string = 6;     // spec.scope
+    plural: string = 7;    // spec.names.plural
+  }
+  // A row write. The value is PARTS (store_effect joins 4..16 in order): a
+  // decision's string arena holds a few hundred bytes of concatenation, so
+  // each part is built small and the connector joins them.
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+    v8: string = 11;
+    v9: string = 12;
+    v10: string = 13;
+    v11: string = 14;
+  }
+  decision scope_row(c: Crd) -> Put {
+    when c.plural != "" && c.group.contains(".") && c.name == c.plural + "." + c.group
+         && (c.scope == "Cluster" || c.scope == "Namespaced")
+         && !c.name.contains("\"") && !c.name.contains("\\") && !c.name.contains("/") ->
+      Put { cid: c.seq, op: PUT, key: c.name, v1: c.scope };
+    default -> Put { cid: c.seq, op: NOOP, key: "" };
+  }
+
+  // ---- discovery rows (store_source over /customresourcedefinitions/,
+  //      expanded over spec.versions[]) ----
+  message CrdVer {
+    seq: int = 1;
+    key: string = 3;
+    name: string = 4;      // metadata.name
+    group: string = 5;     // spec.group
+    scope: string = 6;     // spec.scope
+    plural: string = 7;    // spec.names.plural
+    singular: string = 8;  // spec.names.singular
+    kind: string = 9;      // spec.names.kind
+    version: string = 10;  // spec.versions.#.name
+    served: string = 11;   // spec.versions.#.served
+    shorts: string = 12;   // spec.names.shortNames, JSON array text
+    status: string = 13;   // spec.versions.#.subresources.status, JSON text ("" absent)
+    scale: string = 14;    // spec.versions.#.subresources.scale
+    g: string = 27;        // the CRD's digest
+  }
+  // A served version of a CRD upstream would admit, its names safe to splice.
+  decision res_row(v: CrdVer) -> Put {
+    when !(v.served == "true" && v.version != "" && v.kind != "" && v.plural != ""
+           && v.group.contains(".") && v.name == v.plural + "." + v.group
+           && (v.scope == "Cluster" || v.scope == "Namespaced")
+           && !v.name.contains("\"") && !v.version.contains("\"") && !v.kind.contains("\"") && !v.singular.contains("\"")
+           && !v.name.contains("\\") && !v.version.contains("\\") && !v.kind.contains("\\") && !v.singular.contains("\\")
+           && !v.name.contains("/") && !v.version.contains("/")) ->
+      Put { cid: v.seq, op: NOOP, key: "" };
+    // The kind's APIResource (the rows are `,`-joined into the document's
+    // JSON array as they are); its status and scale subresources are rows
+    // of their own beside it (crd_groups.plan `res_status`, `res_scale`).
+    // Literals and fields as separate parts: a decision's string arena is
+    // small. `namespaced` is a slice of a literal, `true` when the scope
+    // is `Namespaced` (10 bytes) and `false` for `Cluster` (7), so one arm
+    // writes both scopes.
+    default ->
+      Put { cid: v.seq, op: PUT,
+            key: v.group + "/" + v.version + "/" + v.plural + "/" + v.g,
+            v1: "{\"name\":\"", v2: v.plural, v3: "\",\"singularName\":\"",
+            v4: v.singular + v.kind.lowerAscii().substring(0, v.kind.size() * (1 - math.least(1, v.singular.size()))),
+            v5: "\",\"namespaced\":",
+            v6: "falsetrue".substring(5 * math.least(1, v.scope.size() - 7), 5 + 4 * math.least(1, v.scope.size() - 7)),
+            v7: ",\"kind\":\"", v8: v.kind,
+            v9: "\",\"verbs\":[\"create\",\"delete\",\"get\",\"list\",\"patch\",\"update\",\"watch\"]",
+            v10: (",\"shortNames\":" + v.shorts).substring(0, (14 + v.shorts.size()) * math.least(1, v.shorts.size())),
+            v11: "}" };
+  }
+  // ---- the built-in groups ----
+  // `/apis` is ONE listing of /discovery-groups/ (the scope stage's LIST,
+  // its APIGroupList envelope the node's `list_open`/`list_close`): the
+  // groups this server serves itself are one row there, `~builtin` (sorted
+  // last), written whenever the rows change and while none exist — a PUT of
+  // what is there already changes nothing. A group this server starts
+  // serving is added HERE.
+  message Rows {
+    seq: int = 1;
+  }
+  decision builtin(r: Rows) -> Put {
+    default ->
+      Put { cid: r.seq, op: PUT, key: "~builtin",
+            v1: "{\"name\":\"apps\",\"versions\":[{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"apps/v1\",\"version\":\"v1\"}}",
+            v2: ",{\"name\":\"batch\",\"versions\":[{\"groupVersion\":\"batch/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"batch/v1\",\"version\":\"v1\"}}",
+            v3: ",{\"name\":\"rbac.authorization.k8s.io\",\"versions\":[{\"groupVersion\":\"rbac.authorization.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"rbac.authorization.k8s.io/v1\",\"version\":\"v1\"}}",
+            v4: ",{\"name\":\"scheduling.k8s.io\",\"versions\":[{\"groupVersion\":\"scheduling.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"scheduling.k8s.io/v1\",\"version\":\"v1\"}}",
+            v5: ",{\"name\":\"policy\",\"versions\":[{\"groupVersion\":\"policy/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"policy/v1\",\"version\":\"v1\"}}",
+            v6: ",{\"name\":\"networking.k8s.io\",\"versions\":[{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}}",
+            v7: ",{\"name\":\"discovery.k8s.io\",\"versions\":[{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}}",
+            v8: ",{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}}" };
+  }
+
+  // ---- pruning ----
+  // A scope row whose CRD is gone (the source's `unless`).
+  message Orphan {
+    seq: int = 1;
+    key: string = 3;
+  }
+  message Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;         // DELETE only at this revision (0: unconditional)
+  }
+  decision scope_drop(o: Orphan) -> Drop {
+    when o.key == "" -> Drop { cid: o.seq, op: NOOP, key: "", rev: 0 };
+    default -> Drop { cid: o.seq, op: DELETE, key: o.key, rev: 0 };
+  }
+
+  // A resource row: its CRD, read with its digest now.
+  message Ctx {
+    row: string = 30;
+    g: string = 31;
+  }
+  message ResRow {
+    seq: int = 1;
+    key: string = 3;       // <group>/<version>/<plural>/<g>
+    group: string = 28;
+    g: string = 29;
+  }
+  message CrdGet {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message CrdNow {
+    cid: int = 1;
+    status: int = 2;
+    now: string = 27;      // the CRD's digest now (store_effect `hash: "."`)
+    ctx: Ctx = 254;
+  }
+  decision res_get(r: ResRow) -> CrdGet {
+    when r.key.indexOf("/") < 0 || r.key.lastIndexOf("/") <= r.key.indexOf("/") ->
+      CrdGet { cid: r.seq, op: NOOP, key: "", ctx: Ctx { row: r.key, g: r.g } };
+    // A subresource's row (`<plural>~status`, `<plural>~scale`): its CRD is
+    // the plural's.
+    when r.key.indexOf("~") > 0 ->
+      CrdGet { cid: r.seq, op: GET,
+               key: "/customresourcedefinitions/"
+                    + r.key.substring(0, r.key.indexOf("~")).substring(r.key.substring(0, r.key.indexOf("~")).lastIndexOf("/") + 1)
+                    + "." + r.group,
+               ctx: Ctx { row: r.key, g: r.g } };
+    default ->
+      CrdGet { cid: r.seq, op: GET,
+               key: "/customresourcedefinitions/"
+                    + r.key.substring(0, r.key.lastIndexOf("/")).substring(r.key.substring(0, r.key.lastIndexOf("/")).lastIndexOf("/") + 1)
+                    + "." + r.group,
+               ctx: Ctx { row: r.key, g: r.g } };
+  }
+  decision res_drop(n: CrdNow) -> Drop {
+    when n.status == 404 -> Drop { cid: n.cid, op: DELETE, key: n.ctx.row, rev: 0 };
+    when n.status == 200 && n.now != n.ctx.g -> Drop { cid: n.cid, op: DELETE, key: n.ctx.row, rev: 0 };
+    default -> Drop { cid: n.cid, op: NOOP, key: "", rev: 0 };
+  }
+
+  // A group row no resource row is left under (store_source
+  // `count_children`), at the revision it was read.
+  message GroupRow {
+    seq: int = 1;
+    rev: int = 2;
+    key: string = 3;
+    left: int = 22;
+  }
+  decision group_drop(g: GroupRow) -> Drop {
+    when g.key != "" && g.key != "~builtin" && g.key.contains("/") -> Drop { cid: g.seq, op: DELETE, key: g.key, rev: 0 };
+    when g.key != "" && g.key != "~builtin" && g.left == 0 -> Drop { cid: g.seq, op: DELETE, key: g.key, rev: g.rev };
+    default -> Drop { cid: g.seq, op: NOOP, key: "", rev: 0 };
+  }
+
+  transformation p_crd(c: Crd) -> Crd {
+    Crd { seq: c.seq, key: c.key, name: c.name, group: c.group, scope: c.scope, plural: c.plural }
+  }
+  transformation p_ver(v: CrdVer) -> CrdVer {
+    CrdVer { seq: v.seq, key: v.key, name: v.name, group: v.group, scope: v.scope, plural: v.plural,
+             singular: v.singular, kind: v.kind, version: v.version, served: v.served,
+             shorts: v.shorts, status: v.status, scale: v.scale, g: v.g }
+  }
+  transformation p_rows(r: Rows) -> Rows { Rows { seq: r.seq } }
+  transformation p_orphan(o: Orphan) -> Orphan { Orphan { seq: o.seq, key: o.key } }
+  transformation p_res(r: ResRow) -> ResRow { ResRow { seq: r.seq, key: r.key, group: r.group, g: r.g } }
+  transformation p_now(n: CrdNow) -> CrdNow { CrdNow { cid: n.cid, status: n.status, now: n.now, ctx: n.ctx } }
+  transformation p_grp(g: GroupRow) -> GroupRow { GroupRow { seq: g.seq, rev: g.rev, key: g.key, left: g.left } }
+
+  pipeline cr_scope(c: Crd) -> Put { call x = p_crd(c); call y = scope_row(x); return y; }
+  pipeline cr_res(v: CrdVer) -> Put { call x = p_ver(v); call y = res_row(x); return y; }
+  pipeline cr_builtin(r: Rows) -> Put { call x = p_rows(r); call y = builtin(x); return y; }
+  pipeline cs_drop(o: Orphan) -> Drop { call x = p_orphan(o); call y = scope_drop(x); return y; }
+  pipeline crs_get(r: ResRow) -> CrdGet { call x = p_res(r); call y = res_get(x); return y; }
+  pipeline crs_drop(n: CrdNow) -> Drop { call x = p_now(n); call y = res_drop(x); return y; }
+  pipeline cg_drop(g: GroupRow) -> Drop { call x = p_grp(g); call y = group_drop(x); return y; }
+
+  entry cr_scope = cr_scope;
+  entry cr_res = cr_res;
+  entry cr_builtin = cr_builtin;
+  entry cs_drop = cs_drop;
+  entry crs_get = crs_get;
+  entry crs_drop = crs_drop;
+  entry cg_drop = cg_drop;
+
+  provenance revision "crd-serving" toolchain "chronicle-authoring";
+}

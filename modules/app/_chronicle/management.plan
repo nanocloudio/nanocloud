@@ -1,0 +1,217 @@
+// ManagementBinding as params: what a managed cell derives from the record of
+// ONE management plane (spec §9, "Nanocloud cell lifecycle").
+//
+// A ManagementBinding (nanocloud.io/v1, cluster-scoped) is the cell's side of
+// a bootstrap envelope: the cell UID and the envelope digest the management
+// plane must prove, the one-time enrollment grant, the authority epoch the
+// envelope carries, the management plane's public identity, and the rules its
+// credential holds in this cell. It is written by the cell's administrator,
+// or by a managed cell's installer from the envelope — never by the
+// management plane, which holds no credential until it enrolls.
+//
+//   ns      the Namespace nanocloud-management (create-if-absent)
+//   sa      the ServiceAccount nanocloud-management/<b> — the management
+//           plane's identity in the cell
+//   cr      the ClusterRole nanocloud-management:<b>: the binding's own
+//           rules (read its ManagementBinding, commit its epoch) and
+//           spec.rules, SPLICED from the stored binding so rules of any size
+//           arrive whole; put-if-changed
+//   crb     the ClusterRoleBinding nanocloud-management:<b> of the two
+//   epoch   spec.authorityEpoch committed: the key
+//           /authority-epochs/system:serviceaccount:nanocloud-management:<b>/<epoch>
+//           the request path's fence counts (apiplane_fence.plan)
+//   offer   /enrollment-offers/<b>/<grant>/<uid>/<digest>, the key an
+//           enrollment CLAIMS (apiplane.plan ENROLL) — CREATED only where
+//           its grant has no offer at all (a COUNT of
+//           /enrollment-offers/<b>/<grant>/ first): one write, so a crash
+//           leaves no offer (made on the next pass) or the offer, never a
+//           grant marked and unoffered. A claimed offer STAYS, spent, so the
+//           grant is offered once, ever, whatever spec says later
+//   wd      (management_sweep.plan) an offer its binding no longer states — another grant, cell UID
+//           or digest, the binding deleting or gone — is CLAIMED (withdrawn,
+//           spent): the new grant supersedes it, and it is never made again
+//   gc      (management_sweep.plan) a gone binding's ClusterRoleBinding, ClusterRole and
+//           ServiceAccount: probed, and collected (gc.plan `act`) — deleting
+//           the binding revokes the management plane's grants. Its committed
+//           epochs and its offers' claims are KEPT: a token is the subject's
+//           (system:serviceaccount:nanocloud-management:<b>), not the
+//           binding's, so a binding made again under the same name must still
+//           fence its predecessor's credentials, and must not re-offer a grant
+//           that was spent (docs/design/managed-cells.md)
+//
+// A binding with a part that is empty or holds `/`, `"` or `\` is offered
+// nothing: its grant, UID and digest are key parts, and its name is spliced
+// into JSON.
+plan nanocloud.management {
+
+  enum NOOP = 0;
+  enum EXISTS = 2;
+  enum PUT = 3;
+  enum CREATE = 8;
+  enum COUNT = 12;
+
+  // store_source over /managementbindings.nanocloud.io/
+  message mb.Binding {
+    seq: int = 1;
+    key: string = 3;        // <b>
+    uid: string = 4;        // metadata.uid
+    cell: string = 5;       // spec.cellUID
+    digest: string = 6;     // spec.envelopeDigest
+    grant: string = 7;      // spec.grant
+    deleting: string = 8;   // metadata.deletionTimestamp
+    epoch: int = 50;        // spec.authorityEpoch (absent: 0)
+    name: string = 29;
+  }
+
+  // A write: value PARTS the connector joins (4..16, then 80..), key parts
+  // after the key (17), and a splice from the stored binding (70, 71).
+  message mb.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k2: int = 17;
+    p1: string = 4;   p2: string = 5;   p3: string = 6;   p4: string = 7;
+    p5: string = 8;   p6: string = 9;   p7: string = 10;  p8: string = 11;
+    p9: string = 12;  p10: string = 13; p11: string = 14; p12: string = 15;
+    p13: string = 16;
+    p14: string = 80;
+    src: string = 70;
+    splice: string = 71;
+  }
+
+  decision d_ns(c: mb.Binding) -> mb.Put {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\") ->
+      mb.Put { cid: c.seq, op: NOOP, key: "" };
+    default ->
+      mb.Put { cid: c.seq, op: CREATE, key: "namespaces/nanocloud-management",
+               p1: "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"nanocloud-management\",\"labels\":{\"kubernetes.io/metadata.name\":\"nanocloud-management\",\"app.kubernetes.io/managed-by\":\"nanocloud\"}}}" };
+  }
+
+  decision d_sa(c: mb.Binding) -> mb.Put {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\") ->
+      mb.Put { cid: c.seq, op: NOOP, key: "" };
+    default ->
+      mb.Put { cid: c.seq, op: CREATE, key: "serviceaccounts/nanocloud-management/" + c.name,
+               p1: "{\"apiVersion\":\"v1\",\"kind\":\"ServiceAccount\",\"metadata\":{\"name\":\"", p2: c.name,
+               p3: "\",\"namespace\":\"nanocloud-management\",\"labels\":{\"app.kubernetes.io/managed-by\":\"nanocloud\",\"nanocloud.io/management-binding\":\"", p4: c.name,
+               p5: "\"},\"ownerReferences\":[{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"ManagementBinding\",\"name\":\"", p6: c.name,
+               p7: "\",\"uid\":\"", p8: c.uid, p9: "\"}]}}" };
+  }
+
+  // The binding's own rules first — read its ManagementBinding, commit its
+  // epoch (and so renew its credential), each restricted to its own name —
+  // then spec.rules' elements, spliced in after them.
+  decision d_cr(c: mb.Binding) -> mb.Put {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\") ->
+      mb.Put { cid: c.seq, op: NOOP, key: "" };
+    default ->
+      mb.Put { cid: c.seq, op: PUT, key: "clusterroles/nanocloud-management:" + c.name,
+               p1: "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRole\",\"metadata\":{\"name\":\"nanocloud-management:", p2: c.name,
+               p3: "\",\"labels\":{\"app.kubernetes.io/managed-by\":\"nanocloud\",\"nanocloud.io/management-binding\":\"", p4: c.name,
+               p5: "\"},\"ownerReferences\":[{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"ManagementBinding\",\"name\":\"", p6: c.name,
+               p7: "\",\"uid\":\"", p8: c.uid,
+               p9: "\"}]},\"rules\":[{\"apiGroups\":[\"nanocloud.io\"],\"resources\":[\"managementbindings\"],\"resourceNames\":[\"", p10: c.name,
+               p11: "\"],\"verbs\":[\"get\"]},{\"apiGroups\":[\"nanocloud.io\"],\"resources\":[\"managementbindings/epoch\"],\"resourceNames\":[\"", p12: c.name,
+               p13: "\"],\"verbs\":[\"create\"]}", p14: "]}",
+               src: c.key, splice: "/managementbindings.nanocloud.io/|80=,spec.rules.*" };
+  }
+
+  decision d_crb(c: mb.Binding) -> mb.Put {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\") ->
+      mb.Put { cid: c.seq, op: NOOP, key: "" };
+    default ->
+      mb.Put { cid: c.seq, op: PUT, key: "clusterrolebindings/nanocloud-management:" + c.name,
+               p1: "{\"apiVersion\":\"rbac.authorization.k8s.io/v1\",\"kind\":\"ClusterRoleBinding\",\"metadata\":{\"name\":\"nanocloud-management:", p2: c.name,
+               p3: "\",\"labels\":{\"app.kubernetes.io/managed-by\":\"nanocloud\",\"nanocloud.io/management-binding\":\"", p4: c.name,
+               p5: "\"},\"ownerReferences\":[{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"ManagementBinding\",\"name\":\"", p6: c.name,
+               p7: "\",\"uid\":\"", p8: c.uid,
+               p9: "\"}]},\"roleRef\":{\"apiGroup\":\"rbac.authorization.k8s.io\",\"kind\":\"ClusterRole\",\"name\":\"nanocloud-management:", p10: c.name,
+               p11: "\"},\"subjects\":[{\"kind\":\"ServiceAccount\",\"name\":\"", p12: c.name,
+               p13: "\",\"namespace\":\"nanocloud-management\"}]}" };
+  }
+
+  // spec.authorityEpoch, committed — CREATED, so it is written once; a
+  // larger one stated later is committed beside it, and the committed epoch
+  // (the greatest) never goes back, whatever the spec says.
+  decision d_epoch(c: mb.Binding) -> mb.Put {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.epoch < 0 || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\") ->
+      mb.Put { cid: c.seq, op: NOOP, key: "" };
+    default ->
+      mb.Put { cid: c.seq, op: CREATE, key: "authority-epochs/system:serviceaccount:nanocloud-management:" + c.name + "/",
+               k2: c.epoch, p1: "committed=1" };
+  }
+
+  // What rides from the count to the offer (the reserved carry field).
+  message mb.Offer {
+    name: string = 1;
+    grant: string = 2;
+    cell: string = 3;
+    digest: string = 4;
+  }
+  message mb.Ask {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: mb.Offer = 254;
+  }
+  message mb.Counted {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;            // store_effect COUNT: the keys under the prefix
+    ctx: mb.Offer = 254;
+  }
+  message mb.OfferPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    p1: string = 4;
+    p2: string = 5;
+  }
+
+  // Every offer the grant has had, live or spent: counted first, so an offer
+  // is made only where none ever was.
+  decision d_count(c: mb.Binding) -> mb.Ask {
+    when c.name == "" || c.uid == "" || c.deleting != "" || c.cell == "" || c.digest == "" || c.grant == ""
+         || c.name.contains("/") || c.name.contains("\"") || c.name.contains("\\")
+         || c.grant.contains("/") || c.cell.contains("/") || c.digest.contains("/") ->
+      mb.Ask { cid: c.seq, op: NOOP, key: "", ctx: mb.Offer { name: "", grant: "", cell: "", digest: "" } };
+    default ->
+      mb.Ask { cid: c.seq, op: COUNT, key: "enrollment-offers/" + c.name + "/" + c.grant + "/",
+               ctx: mb.Offer { name: c.name, grant: c.grant, cell: c.cell, digest: c.digest } };
+  }
+
+  // The offer, CREATED (a create that finds it made answers 409: nothing)
+  // when the grant has none — a count the store did not decide makes
+  // nothing, and the next pass asks again.
+  decision d_offer(m: mb.Counted) -> mb.OfferPut {
+    when m.status != 200 || m.ctx.name == "" ->
+      mb.OfferPut { cid: m.cid, op: NOOP, key: "", p1: "", p2: "" };
+    when m.n == 0 ->
+      mb.OfferPut { cid: m.cid, op: CREATE,
+                    key: "enrollment-offers/" + m.ctx.name + "/" + m.ctx.grant + "/" + m.ctx.cell + "/" + m.ctx.digest,
+                    p1: "binding=", p2: m.ctx.name };
+    default ->
+      mb.OfferPut { cid: m.cid, op: NOOP, key: "", p1: "", p2: "" };
+  }
+
+  transformation pass_binding(c: mb.Binding) -> mb.Binding {
+    mb.Binding { seq: c.seq, key: c.key, uid: c.uid, cell: c.cell, digest: c.digest, grant: c.grant,
+                 deleting: c.deleting, epoch: c.epoch, name: c.name }
+  }
+  pipeline mb_ns(c: mb.Binding) -> mb.Put { call x = pass_binding(c); call y = d_ns(x); return y; }
+  pipeline mb_sa(c: mb.Binding) -> mb.Put { call x = pass_binding(c); call y = d_sa(x); return y; }
+  pipeline mb_cr(c: mb.Binding) -> mb.Put { call x = pass_binding(c); call y = d_cr(x); return y; }
+  pipeline mb_crb(c: mb.Binding) -> mb.Put { call x = pass_binding(c); call y = d_crb(x); return y; }
+  pipeline mb_epoch(c: mb.Binding) -> mb.Put { call x = pass_binding(c); call y = d_epoch(x); return y; }
+  pipeline mb_ask(c: mb.Binding) -> mb.Ask { call x = pass_binding(c); call y = d_count(x); return y; }
+  pipeline mb_offer(m: mb.Counted) -> mb.OfferPut { call y = d_offer(m); return y; }
+  entry mb_ns = mb_ns;
+  entry mb_sa = mb_sa;
+  entry mb_cr = mb_cr;
+  entry mb_crb = mb_crb;
+  entry mb_epoch = mb_epoch;
+  entry mb_ask = mb_ask;
+  entry mb_offer = mb_offer;
+
+  provenance revision "management-binding" toolchain "chronicle-authoring";
+}

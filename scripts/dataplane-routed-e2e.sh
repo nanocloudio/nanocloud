@@ -202,7 +202,7 @@ svc() { # svc <name> <clusterIP> <extra spec members>
   np_put "/services/default/$1" "{\"metadata\":{\"name\":\"$1\",\"namespace\":\"default\"},\"spec\":{\"clusterIP\":\"$2\"$3}}"
 }
 slice() { # slice <svc> <pod> <ip> <node>: a ready EndpointSlice, as endpoints.plan writes it
-  np_put "/endpointslices/default/$1/$2" "ip=$3;state=ready;zone=;node=$4;gen=1;af=4;uid=$2;grace=30000"
+  np_put "/endpoint-rows/default/$1/$2" "ip=$3;state=ready;zone=;node=$4;gen=1;af=4;uid=$2;grace=30000"
 }
 seed() {
   pod a1 node-a 10.244.1.2

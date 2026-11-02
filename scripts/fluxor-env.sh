@@ -292,7 +292,9 @@ YAML
 # nc_store_ready <dir> [seconds]
 #   Wait until the store in <dir> answers its reader.
 nc_store_ready() {
-  local port end=$((SECONDS + ${2:-30}))
+  # 120 s by default: done at the first PONG, so the bound only matters on a
+  # host loaded by a full CI run, where a plane's store has taken past 30.
+  local port end=$((SECONDS + ${2:-120}))
   port="$(cat "$1/read.port")"
   until [ "$(redis-cli -p "$port" PING 2>/dev/null)" = PONG ]; do
     [ "$SECONDS" -lt "$end" ] || return 1
@@ -333,4 +335,50 @@ nc_store_keys() {
   local bin
   bin="$(nc_lattice_dump_bin)" || return 1
   "$bin" "$1/lattice" --keys --prefix "${2:-}"
+}
+
+# nc_freezer_unavailable
+#   Whether this host can do what the Linux workload backend's PAUSE does —
+#   and, when it cannot, why, on stdout (empty when it can). The backend makes
+#   a child cgroup of the runtime's own (`FLUXOR_HOST_CGROUP_ROOT`, else the
+#   cgroup /proc/self/cgroup names), moves the container into it (falling back
+#   to a threaded child under a threaded root) and writes `cgroup.freeze`;
+#   this does exactly that with a throwaway sleeper. Asked of the host, not of
+#   `id -u`: root in a user namespace can freeze in a cgroup its own uid was
+#   delegated (a `systemd-run --user` scope) and cannot in one it was not, and
+#   an ordinary user in a delegated scope can as well.
+nc_freezer_unavailable() {
+  [ -r /sys/fs/cgroup/cgroup.controllers ] || { echo "no cgroup2 mount at /sys/fs/cgroup"; return 0; }
+  local base rel cg pid why=""
+  if [ -n "${FLUXOR_HOST_CGROUP_ROOT:-}" ]; then
+    base="$FLUXOR_HOST_CGROUP_ROOT"
+  else
+    rel="$(sed -n 's/^0:://p' /proc/self/cgroup)"
+    [ -n "$rel" ] || { echo "no unified-hierarchy line in /proc/self/cgroup"; return 0; }
+    base="/sys/fs/cgroup${rel%/}"
+  fi
+  cg="$base/nc-freeze-probe.$$"
+  mkdir "$cg" 2>/dev/null || { echo "cannot create a child cgroup of $base (uid $(id -u); not delegated to it)"; return 0; }
+  sleep 30 & pid=$!
+  if ! echo "$pid" > "$cg/cgroup.procs" 2>/dev/null; then
+    echo threaded > "$cg/cgroup.type" 2>/dev/null || true
+    echo "$pid" > "$cg/cgroup.procs" 2>/dev/null || why="cannot move a process into a child of $base (the cgroup2 common-ancestor rule)"
+  fi
+  if [ -z "$why" ]; then
+    if echo 1 > "$cg/cgroup.freeze" 2>/dev/null; then
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        grep -qx 'frozen 1' "$cg/cgroup.events" 2>/dev/null && break
+        sleep 0.1
+      done
+      grep -qx 'frozen 1' "$cg/cgroup.events" 2>/dev/null || why="cgroup.freeze accepted but $cg never reported frozen"
+      echo 0 > "$cg/cgroup.freeze" 2>/dev/null || true
+    else
+      why="cannot write cgroup.freeze under $base"
+    fi
+  fi
+  kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  rmdir "$cg" 2>/dev/null || true
+  printf '%s' "$why"
+  return 0
 }

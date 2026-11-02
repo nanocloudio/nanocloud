@@ -77,7 +77,8 @@ between the decisions moves bytes and decides nothing:
 
 ```
 tls → http ⇄ http_chain → kube_decode → kube_route → admit → kagi_verify ⇄ token_verify
-    → ident → rbac → gate → ad_pol → ad_cnt → ad_dec → se_probe → se_act
+    → ident → fence → fenced → rbac → esc → escd → scope → disc → scoped → gate
+    → ad_pol → ad_cnt → ad_dec → se_probe → se_act
     → reply → enc_http → http_chain ⇄ http
 ```
 
@@ -89,7 +90,11 @@ tls → http ⇄ http_chain → kube_decode → kube_route → admit → kagi_ve
 | `admit` | decision | `apiplane.plan admit` | which credential to verify, the request riding as carry |
 | `kagi_verify` | connector | — | the signature check, which is kagi's |
 | `ident` | decision | `apiplane.plan ident` | the identity, namespace, verb and resource to authorize |
+| `fence` | store_effect | `apiplane_fence.plan fence`, `fence_newer` | one COUNT of the caller's committed authority epochs newer than its `Nanocloud-Authority-Epoch` header (`/authority-epochs/<subject>/<epoch>`) |
+| `fenced` | decision | `apiplane_fence.plan fenced` | a managed credential's write behind a committed epoch is 409, without the header 403; the record `ident` made, for `rbac` |
 | `rbac` | store_effect | `apiplane.plan authz` | one `EXISTS_ANY` probe of the grant index |
+| `esc` | store_big | `apiplane_esc.plan esc` | a write of a Role, ClusterRole, (Cluster)RoleBinding or ManagementBinding: `COVER` (`_shared/rbac_cover.rs`) — every permission it would grant held by the writer, or `escalate` / `bind` held |
+| `escd` | decision | `apiplane_esc.plan escd` | a refusal (403, 404 for a binding's missing role, 422, 413, 503) as the verdict; RBAC's answer back for `scope` |
 | `gate` | decision | `apiplane.plan gate` | admitted, or the refusal and its status |
 | `ad_pol` | store_effect | `admission.plan ad_pol` | reads `/admission-policy/<resource>` |
 | `ad_cnt` | store_effect | `admission.plan ad_cnt` | COUNTs live objects when a create is quota'd |
@@ -117,7 +122,75 @@ ClusterRole is mirrored as a binding of each ClusterRole its selectors match
 (depth ≤ 4), so no ClusterRole object is ever rewritten. Every derived row is
 pruned when the object it came from no longer produces it, so revocation is as
 fast as those chains. No node in the path holds Kubernetes meaning in compiled
-code.
+code — save one, the escalation check below, whose rule cannot be a probe.
+
+Privilege escalation is refused as upstream refuses it
+(pkg/registry/rbac/*/policybased). Authorization answered whether the caller
+may write a Role, ClusterRole, RoleBinding, ClusterRoleBinding or
+ManagementBinding at all; `esc` (store_big op `COVER`, `_shared/rbac_cover.rs`)
+then asks whether the object grants only what the writer already HOLDS:
+
+- a Role's (ClusterRole's) rules, each verb × apiGroup × resource ×
+  resourceName (every name `*` when it names none) and each nonResourceURL
+  (cluster-wide only), probed in the writer's own grant index exactly as the
+  `rbac` node would probe the request it grants — in the Role's namespace,
+  cluster-wide for a ClusterRole — or the writer holds `escalate` on
+  `roles` / `clusterroles` with that name. An `aggregationRule` gathers
+  anything, so it needs full authority (`*` on `*.*` and every URL), as
+  upstream's;
+- a binding's role — read from the store, its rules held in the binding's
+  namespace (cluster-wide for a ClusterRoleBinding); an aggregating
+  ClusterRole's with every role its selectors gather (its /rbac-agg/ rows, to
+  the mirror's depth) — or the writer holds `bind` on that role's name, in
+  the binding's namespace. A roleRef naming no role is 404;
+- a ManagementBinding is a ClusterRole and its ClusterRoleBinding in one
+  (management.plan derives both): spec.rules and its own two rules held
+  cluster-wide, or both `escalate` and `bind` on the ClusterRole
+  `nanocloud-management:<b>`.
+
+A patch (merge, strategic, JSON Patch, apply) is checked on its RESULT: the
+stored object patched there as the store will patch it, so a patch that keeps
+rules the writer does not hold is refused, as upstream checks the whole
+object. A delete is not checked. Rules that grant nothing in the index (no
+verbs, resources without apiGroups, a Role's URLs) need nothing. A body a
+reader could read two ways — a duplicated or escaped member key — is 422;
+past the check's bounds (4096 permissions, 32 gathered roles) 413: refused,
+never admitted on a partial read. The grant index is the derived state the
+`rbac` node trusts, so the check carries its lag: a permission granted the
+writer a moment ago may not be held yet (retry), and an aggregating role's
+gathered set is its /rbac-agg/ rows as they stand, as upstream's controller's
+rules are. `scripts/rbac-escalation-e2e.sh` proves the refusals and both
+exceptions through the API.
+
+Revocation is bounded, not cached: nothing between a request and the grant
+index holds a grant — every request probes the store — and the `rb_` chains
+follow the RBAC objects by watch, so a role emptied, a binding deleted or a
+subject removed is re-derived and its rows pruned at once, a few chained store
+writes after the write that revoked. On the packaged control plane that is
+under one request's round trip (the first request after the revoking write is
+denied, ~30-50 ms on a Pi 5); `scripts/rbac-revoke-e2e.sh` holds it to
+`NC_RBAC_REVOKE_MS` (2000 ms, the bound this documents, room for a loaded
+host) for each of the three, and asserts that a denial, once seen, never flaps
+back to a grant. Like upstream's informer-fed authorizer it is eventually
+consistent, never stale for longer than the derivation takes. The one
+difference in the other direction: a role that is edited is re-derived whole
+(its rows are keyed by its digest), so a verb the edit keeps can be denied for
+the same few writes, between the old rows' prune and the new rows' grant —
+fail-closed, never wider than either the old or the new role.
+
+The authority-epoch FENCE sits before authorization (`apiplane_fence.plan`):
+a management plane's credential in a managed cell (a ManagementBinding's,
+below) names the authority epoch it acts under on every write, and the cell
+refuses a write behind the newest epoch it has committed for that credential
+— 409 Conflict, so a stale management writer is stopped by the cell, not only
+by its own compare-and-swap. The committed epochs are keys,
+`/authority-epochs/<subject>/<epoch>`; the committed epoch is the greatest, a
+set that only grows. `fence` COUNTs those newer than the header's (a
+`count_where` predicate over the key tails), `fenced` decides. Reads and
+callers with no committed epoch are not fenced. An epoch is committed only
+through the binding's own path (`POST …/managementbindings/<b>/epoch`, where
+`fenced` names the key and `probe` writes it).
+[docs/design/managed-cells.md](../design/managed-cells.md) is the contract.
 
 Admission is two store reads, a decode and one decision, all params
 (`admission.plan`, `admission.rd`): `ad_pol` reads
@@ -229,7 +302,7 @@ generation written (`pending` until then); the platform's tables are named
 
 | Prefix | Params | Rows |
 | ------ | ------ | ---- |
-| `px_` | `proxy.plan` | `/services/` JOIN their `/endpointslices/` → each backend's Pod read for its named ports → one DNAT row per (Service, READY backend — a serving or terminating slice is draining and has none), ports as aligned lists (with the node ports and the load-balancer address, svc_alloc's `/lb-addr/`), a named targetPort resolved against that backend's Pod; the platform balances a VIP's rows. Pruned when the ClusterIP or the slice moves, or the slice stops being ready. `px_alloc` (`svc_alloc`) gives NodePort and LoadBalancer Services their node ports and pool address, claimed create-only at `/ipam/nodeport/<port>` and `/ipam/lb/<u32>`, the address recorded by Service at `/lb-addr/<ns>/<svc>` (never in its status, which waits for the VIP), released when no longer held. Each row carries the Service's traffic policies and the backend's node (net_apply keeps a `Local` policy to that node's backends); ClusterIP translates the source on hairpin, a `Cluster` node port or load-balancer address always, `Local` never |
+| `px_` | `proxy.plan` | `/services/` JOIN their `/endpoint-rows/` → each backend's Pod read for its named ports → one DNAT row per (Service, READY backend — a notready row has none, and a serving or terminating one is draining and has none), ports as aligned lists (with the node ports and the load-balancer address, svc_alloc's `/lb-addr/`), a named targetPort resolved against that backend's Pod; the platform balances a VIP's rows. Pruned when the ClusterIP or the row moves, or the row stops being ready. `px_alloc` (`svc_alloc`) gives NodePort and LoadBalancer Services their node ports and pool address, claimed create-only at `/ipam/nodeport/<port>` and `/ipam/lb/<u32>`, the address recorded by Service at `/lb-addr/<ns>/<svc>` and said in its `status.loadBalancer`, released when no longer held; a Service of a `loadBalancerClass` gets node ports only. Each row carries the Service's traffic policies and the backend's node (net_apply keeps a `Local` policy to that node's backends); ClusterIP translates the source on hairpin, a `Cluster` node port or load-balancer address always, `Local` never |
 | `hp_` | `proxy.plan` | `/pods/` one record per container → a row per container with hostPorts, for the node its Pod runs on, at `/np-rows/hostport/`; that node DNATs its address at each hostPort to the Pod. Pruned with the Pod |
 | `np_` | `netpolicy.plan` | `/networkpolicies/` JOIN `/pods/` by podSelector → `/np-sel/` selections → per-rule ALLOW rows and a per-direction ISOLATE (Kubernetes' policyTypes reading); a selector peer allows nothing it cannot name. Selections and rows pruned by digest and pod address, conditional on the revision judged |
 
@@ -252,20 +325,20 @@ to the hex params a graph carries.
 | `pdb_` | `pdb.plan` | PodDisruptionBudget status (the selector judged by `count_sel`) |
 | `q_` | `quota.plan` | ResourceQuota usage (`{}` expansion over `spec.hard`, a COUNT that sums) and status |
 | `pc_` | `priority.plan` | PriorityClass: system classes, the global default, a Pod's priority resolved |
+| `zn_`, `zl_`, `zc_`, `zs_` | `zone_node.plan`, `zone_summary.plan` | each Node → `/zone-node/<node>` (its zone, readiness, schedulability, voter label, allocatable, its Pods' requests) → per zone the sums → `/zonesummaries.nanocloud.io/<zone>`, rewritten only when a figure moves, deleted with the zone's last Node ([zone-summary.md](zone-summary.md)) |
 | `te_` | `scheduler.plan` | the taint manager: NoExecute evictions, now or after `tolerationSeconds` |
 | `hp_` | `hpa.plan` | `desired = ceil(R × currentCPU / targetCPU)` clamped `[min,max]`, patched onto the target |
 | `gc_` | `gc.plan` | the ownerRef cascade, plus the Event count cap |
 | `ns_` | `namespace.plan` | sweep every namespaced prefix of a Terminating namespace, then finalize |
 | `sc_` | `scheduler.plan` | bind the first placeable Pod of the highest priority to the node the source's pick (`sched`, `_shared/sched.rs`: cordon, affinity, taints, resources, pod (anti-)affinity, spread) chose, one per pass; FailedScheduling; preemption |
 | `rb_` | `rbac_rules.plan`, `rbac_grants.plan`, `rbac_prune.plan` | Kubernetes RBAC: roles → per-rule and per-(verb × resource) rows, bindings → per-subject rows, their join → the grant index the API plane probes; stale rows pruned by the source object's digest |
-| `ep_` | `endpoints.plan`, `endpoints_doc.plan`, `ttl.plan` | Services JOIN Pods by selector → per-pod EndpointSlice rows `ip=…;state=<ready\|serving\|terminating>;zone=…;node=…;gen=…;af=…;uid=…[;at=…];grace=…` (the Pod read for its grace, its node for its `topology.kubernetes.io/zone`, the slice for its generation, which moves on whenever the endpoint is reused) → the folded `/endpoints/` document. Removal drains first: a deleted, deselected or vanished Pod's slice is `terminating` from the moment its drain began, and the expiry chain (`ttl.plan` over `at!due+grace`) deletes it when its grace has run; a slice of a gone Service, and its document, go at once |
-| `wh_` | `wormhole.plan` | the Wormhole projection (docs/architecture/wormhole-projection.md): every Service Wormhole load-balances (`loadBalancerClass` unset or `wormhole.nanocloud.io/lb`) → `/wh-intent/<ns>/<svc>` (listeners, ports, families, traffic policies, ClientIP affinity, source ranges), each of its slices (+ the Pod's named ports) → `/wh-intent-ep/<ns>/<svc>/<pod>`, both pruned with their source; and `wh_status`: a LoadBalancer Service's `status.loadBalancer` names its address only while Wormhole's VIP binding of it (`/wh-vip/`) is ACTIVE or DRAINING. (Not the webhook validator's `wh_` nodes below, which share the prefix in their own graph.) |
-| `wc_` | `wh_cell.plan` | Wormhole's ingress-cell demand `/wh-demand/<cell>` = `hosts=<n>;profile=<pi5\|server>;image=<ref>` → the `wormhole-system` Namespace and a Deployment of `hosts` replicas, one per node (required pod anti-affinity on the hostname), host network, sized by the profile; created once, then held to the demand by `spec.replicas` and `spec.template`; deleted when the demand is gone or 0 hosts |
+| `ep_` | `endpoints.plan`, `endpoints_doc.plan`, `ttl.plan` | Services JOIN Pods by selector → per-pod rows at `/endpoint-rows/<ns>/<svc>/<pod>` = `ip=…;state=<ready\|notready\|serving\|terminating>;zone=…;node=…;gen=…;af=…;uid=…[;at=…];grace=…` (the Pod read for its grace, its node for its `topology.kubernetes.io/zone`, the row for its generation, which moves on whenever the endpoint is reused) → the folded `/endpoint-lists/<ns>/<svc>` (a summary bounded by one record — cut at a whole entry past about 100 rows; no reader depends on it being whole), and the API's documents, discovery.k8s.io/v1 EndpointSlices and a v1 Endpoints at `/endpoints/<ns>/<svc>`, rendered from the Service and its rows by store_effect's `EP_DOCS` (`_shared/epdoc.rs`: conditions, targetRef, nodeName, zone, the Service's ports with a named targetPort resolved against each Pod; managed-by labels, each slice owned by its Service) and kept put-if-changed. The slices are cut as upstream's controller cuts them: one group per address family the Service serves (`spec.ipFamilies`, else its clusterIP's; a dual-stack Pod's other address from its `status.podIPs`) and set of resolved ports, each group in slices of at most 100 endpoints — the primary group's first named after the Service (`/endpointslices/<ns>/<svc>`), every other `<svc>-<digest>[-<n>]`, a slice no longer made deleted; the Endpoints holds the first family's addresses, at most 1000 (past them `endpoints.kubernetes.io/over-capacity: truncated`). `EP_DOCS` reads a Service's rows outside its record's journal (they outnumber its 96 calls), remembered across the serves of one held record, and its writes through it. Removal drains first: a deleted, deselected or vanished Pod's row is `terminating` from the moment its drain began, and the expiry chain (`ttl.plan` over `at!due+grace`) deletes it when its grace has run (a `notready` row goes at once); the rows of a gone Service, its fold, and the documents this controller manages go at once — a selectorless Service's own Endpoints and anyone's EndpointSlices are never touched |
 | `pj_`, `pl_`, `pr_` | `pod_project.plan`, `pod_lifecycle.plan`, `pod_effect.plan` | the kubelet's decision half: the sandbox artifact, the lifecycle state machine and its writes, and the prune of a runtime record whose spec is gone |
 | `pb_` | `probe.plan`, `probe_collect.plan` | liveness/readiness probes: per-probe state at `/probe-rt-<l\|r>/<uid>` whose `due`/`deadline` arm the kernel timer, exec attempts over the `/sandbox-exec/` seam, verdicts at `/probe-status/` (the lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates on `ready`) |
 | `pi_` | `pod_image.plan` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
 | `sn_` | `snapshot.plan` | VolumeSnapshot → a bound VolumeSnapshotContent, marked ready |
 | `dv_` | `device.plan` | a Device naming its public key → certified once by kagi's `certificate_endpoint` (via `http_effect`) → `/deviceidentities…/` and `/ca-cert` |
+| `mb_` | `management.plan`, `management_sweep.plan` | a ManagementBinding (a managed cell's record of one management plane) → the Namespace `nanocloud-management`, the plane's ServiceAccount, its ClusterRole (its own rules + `spec.rules`, spliced) and ClusterRoleBinding, `spec.authorityEpoch` committed (`/authority-epochs/`), and the enrollment offer `/enrollment-offers/<b>/<grant>/<cell UID>/<digest>`, made once per grant, ever (CREATED only when a COUNT of the grant's offers, live or spent, is 0 — one write; an enrollment CLAIMS it, store_effect op 22, leaving it spent); an offer the binding no longer states (another grant, UID or digest; deleting; gone) claimed — withdrawn (`mb_wd`); a gone binding's ClusterRoleBinding, ClusterRole and ServiceAccount collected, its committed epochs and spent offers kept (a credential names the subject, so a binding made again under the name must fence its predecessor's) |
 | `tk_` | `sa_token.plan` | a `/token-req/` → kagi's `token_mint` (via `kagi_mint`) → `/token-resp/` `token=<JWT>` |
 | `is_` | `ipam_svc.plan` | ClusterIPs from 10.96.0.0/16: next-fit over a cursor, each address claimed create-only at `/ipam/svc/<u32>` (409 = taken, skip), PATCHed into `spec.clusterIP`; held addresses are claimed before allocation starts; a deleted Service's claim is released |
 | `ip_` | `ipam_pod.plan`, `ipam_pod_release.plan` | pod IPs from the `/ipam-pool` CIDR: the same claims, committed as a create-only `/ipam-lease/<id>`; a request whose sandbox is gone releases its lease, request and claim |
@@ -283,7 +356,7 @@ the source it was compiled from.
 ### The edge-route compile
 
 `route.plan` (graph `fluxor-route-compiler.yaml`) turns `/routes/` +
-`/route-status/` + `/endpointslices/` into one row per route at
+`/route-status/` + `/endpoint-rows/` into one row per route at
 `/dataplane/edge/`, which the `http` edge SUBSCRIBEs for its DynRoute table. It
 takes three passes, because the cardinality changes twice and the VM has no
 iteration — each change of shape is a store round trip whose fan-out a SOURCE
@@ -292,13 +365,13 @@ performs:
 | pass | from | to |
 | --- | --- | --- |
 | A | `/routes/` | `/route-be/<ns>/<svc>` — rekeyed BY SERVICE |
-| B | `/route-be/` JOIN `/endpointslices/<ns>/<svc>/<pod>` | `/edge-be/<ns>/<svc>/<pod>` |
+| B | `/route-be/` JOIN `/endpoint-rows/<ns>/<svc>/<pod>` | `/edge-be/<ns>/<svc>/<pod>` |
 | C | `/route-be/` + `list_children` over `/edge-be/` | `/dataplane/edge/<ns>/<route>` |
 
 The rekey in pass A is what makes it work: keying by service lets pass B scope
 its join to the object (`join_scoped: 1`) and get one record per backend without
 matching a middle key segment, which a decision cannot do. Reading the per-backend
-`/endpointslices/` rather than the folded `/endpoints/` document is what makes
+`/endpoint-rows/` rather than the folded `/endpoint-lists/` document is what makes
 the per-element work a JOIN rather than a map over a list.
 
 ## 4. The node plane
@@ -371,18 +444,16 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | Module | Seam | Role |
 | ------ | ---- | ---- |
 | `store_source` | `storage.namespace`, `timer` | subscription-driven entry into a chain: a prefix's changes and timer deadlines become record frames, optionally walking each object's children (`list_children`, `list_values`) and decorating them as it goes |
-| `store_effect` | `storage.object`, `storage.namespace` | the reads and writes a chain asks for — GET, CREATE, guarded PUT, PATCH, MERGE (conditional on a revision when one is given), REPLACE, APPEND, DELETE, LIST, COUNT (optionally of the children a `count_where` decision keeps), EXISTS and `EXISTS_ANY` — over a key assembled from record fields; a fused decision builds the request from the arriving record, given the wall clock when `wall` is set |
+| `store_effect` | `storage.object`, `storage.namespace` | the reads and writes a chain asks for — GET, CREATE, guarded PUT, PATCH, MERGE (conditional on a revision when one is given), REPLACE, APPEND, DELETE, LIST, COUNT (optionally of the children a `count_where` decision keeps), EXISTS and `EXISTS_ANY`, and `EP_DOCS` (a Service's EndpointSlice and Endpoints rendered from its rows, `_shared/epdoc.rs`) — over a key assembled from record fields; a fused decision builds the request from the arriving record, given the wall clock when `wall` is set |
 | `workload_effect` | `workload` (`0x1A`) | op records (create/start/destroy/signal/pause/resume/exec/pty) → the workload contract; lifecycle, output, exec and pty events back. Six request inputs, so the runtime's chains feed it without a merge |
 | `net_apply` | `net_policy` (`0x1E`) | rows under a prefix → one `net.policy` table, replaced whole (a row set that does not fit is not applied); the platform's ENFORCED bit and the generation at `/np-status/<table>` |
-| `cluster_dns` | the net pair (datagram) | the cluster's DNS: `<svc>.<ns>.svc.cluster.local` answered from the store as the API keeps it — a Service's ClusterIP, a headless one's ready backends (its `/endpoints/` document, `ready` slices only), an ExternalName's CNAME, a named port's SRV, NXDOMAIN for no such Service — and every other name forwarded to the node's resolver |
-| `svc_alloc` | `storage.object`, `storage.namespace` | NodePort and LoadBalancer allocation: node ports and a pool address claimed create-only, the node ports written into the Service conditional on its revision and the address recorded at `/lb-addr/<ns>/<svc>` (a Service of another `loadBalancerClass` gets none), released when no longer held (one module rather than two `is_`-shaped chains: a chain per allocator costs ~3.5 KiB of the runtime's config arena, this ~50 bytes); and every Node's Pod CIDR, a /24 of the cluster CIDR claimed at `/ipam/podcidr/<index>` and written into `spec.podCIDR`/`podCIDRs` |
+| `cluster_dns` | the net pair (datagram) | the cluster's DNS: `<svc>.<ns>.svc.cluster.local` answered from the store as the API keeps it — a Service's ClusterIP, a headless one's ready backends (its `/endpoint-rows/<ns>/<svc>/` rows, a paged walk, `ready` rows only: the first 32 in an answer, a backend's `<a-b-c-d>` name found among all of them), an ExternalName's CNAME, a named port's SRV, NXDOMAIN for no such Service — and every other name forwarded to the node's resolver |
+| `svc_alloc` | `storage.object`, `storage.namespace` | NodePort and LoadBalancer allocation: node ports and a pool address claimed create-only, the node ports written into the Service conditional on its revision and the address recorded at `/lb-addr/<ns>/<svc>` and said in the Service's `status.loadBalancer` (the cell is the load balancer of a Service of no `loadBalancerClass`; one of any class gets node ports only, its address and status its class's external controller's, written through the API), released when no longer held (one module rather than two `is_`-shaped chains: a chain per allocator costs ~3.5 KiB of the runtime's config arena, this ~50 bytes); and every Node's Pod CIDR, a /24 of the cluster CIDR claimed at `/ipam/podcidr/<index>` and written into `spec.podCIDR`/`podCIDRs` |
 | `node_net` | `net_route` (`0x20`), `storage.object`, `storage.namespace` | a node's one `net_route` writer: its segment from its Node's podCIDR (gateway the CIDR's first address, cluster prefixes the Pod and Service ranges), a peer route to every other node's podCIDR via its InternalIP, and the LoadBalancer addresses it holds the claim of (svc_alloc's `/lb-addr/`; `/net-hold/<u32>`, one node each, taken over from a node out of service; `Local` only where a ready endpoint is); what took effect (READ) at `/node-net/<node>` and `/sandbox-net`; its graph-backed Pods' address requests (`graph_pods`, bare metal) and the release of its Pods' leases once Pod and sandbox are gone |
-| `wormhole_emit` | `storage.object`, `storage.namespace` | the Wormhole projection's writer (`/wh/<t>/<s>/gen/`, `…/active`, `/wh-status/`): the intent rows → Wormhole's own v1 records (its codecs, `wormhole-common` via `_shared/wormhole_traffic.rs`): EndpointRecords, EndpointManifests, a policy and an admission record, RouteRecords and a seal, in the §9.5 order, a generation at a time, the active pointer advanced by compare-and-swap; earlier generations collected; a removed Service withdrawn |
-| `wormhole_status` | `storage.object`, `storage.namespace` | Wormhole's VIP bindings (`/wh/<t>/<s>/vip/<4\|6>`, WHR1 kind 5, Wormhole's to write) decoded strictly → `/wh-vip/<ns>/<svc>` = `p4=<phase>;a4=<addr>;p6=…;a6=…`, for the Services declared; the VM cannot read a binary record |
 | `http_fetch` | net pair, `fs` | one GET at a time (behind `tls`, or plaintext); the answer comes back as the JSON members the record asked for (`a[].b` collect, `a[k=v].b` select), or lands as a sha256-verified file (optionally in Range chunks); a request whose result already exists is answered 304 without a byte on the wire |
 | `http_chain` | Wave's `http` (an exchange PROVIDER on an application route) | each exchange → one request envelope for a chain, a large body staged in the store; the chain's reply envelopes → the exchange's response, a watch held open, within the server's credit |
 | `http_effect` | an HTTP endpoint, in the graph or through Wave's `http` client (an exchange REQUESTER) | a record → one exchange (kagi's `certificate_endpoint`) → the answer, with chosen top-level JSON members lifted, as a record |
-| `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the verification key from `/authn-keys/sa` |
+| `kagi_verify` | kagi's `token_verify` (an exchange REQUESTER of the typed operation) | a record's bearer credential → a typed identity record; loads the key sets named by `key_paths` (default `/authn-keys/sa`) and forwards them as ONE keyset (`MSG_KEYSET_SNAPSHOT`); `issuer` one or several |
 | `kagi_mint` | kagi's `token_mint` (an exchange REQUESTER of the typed operation) | a record → the signed token as a record; names the signing key by vault label and stores the public half the mint announces at `/authn-keys/sa` |
 | `store_doc` | `storage.object` | the API writer's record adapter in front of lattice's JSON document dialect: each write leaves as one document request, and an object too large for the reply record is sent empty so the answer becomes a GET the watch chain serves |
 | `store_stamped` | `storage.object`, `storage.namespace` | `store_effect`'s source built with a small heap, for a controller's writer: whole-object writes that follow a document `schema` are stamped with a uid and creationTimestamp, kept when rewritten, as an object the API created; and a controller's reader or deleter of objects past a record (its projections, its COUNT predicates, a delete's tomb read whole) |
@@ -392,6 +463,7 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `loam_effect` | Loam's admin wire, `fs` | a volume effect in, admin-wire jobs out, the typed outcome back as a record |
 | `volume_relay` | `storage.object`, `storage.namespace` | carries the encrypted-volume effects between the control plane and a node over the replicated store, so neither addresses the other |
 | `mount_effect` | `host_mount`, `proc` | the claim chain's mount actuator: a `Mnt` record in, the raw facts of what ran back |
+| `volume_files` | `host_mount`, `fs`, `storage.object` | a Pod's own volumes on its node (emptyDir, ConfigMap, Secret, projected, downwardAPI): made, projected and removed with the Pod. Projections are upstream's AtomicWriter layout (a `..data` link swapped, the whole set atomic for a reader), for a container and a graph-backed Pod alike (the runtime follows a link that stays beneath the volume) |
 | `volume_host` | `workload`, `proc` | a node's volume effector: the volume's subgraph staged, unlocked through Kagi, published over NBD, and torn down |
 | `node_pki` | kagi's `certificate_endpoint`, `tls`'s identity ports | the node's certificate: tls's identity request answered by the authority; with `join: 1`, the operator's first credential minted behind a one-time join secret, and the bootstrap objects it needs |
 | `nanocloud_cli` | the host's argv and stdio | a cli-applet: argv in, the store read and written directly, bytes to stdout and a latched exit code — so the CLI works with no HTTP edge running |
@@ -444,9 +516,9 @@ Reconcile:   ep_ chain: /services JOIN /pods → per-pod slices (ready,
              serving, terminating; drained for their grace) → the folded
              /endpoints document, which cluster_dns answers headless names
              from; px_ rows → each node's net_apply → its `proxy`
-             net.policy table; wh_ intent rows → wormhole_emit → Wormhole's
-             records, its VIP binding → wormhole_status → wh_status →
-             status.loadBalancer
+             net.policy table; svc_alloc → /lb-addr/ and the
+             status.loadBalancer of a Service of no class; zn_/zs_ → each
+             zone's ZoneSummary
 
 Pod start:   apps/v1 PUT → dp_ → rs_ → Pods → sc_ binds → pj_/pl_ project
              /sandboxes/ → the im_ chains over http_fetch materialise the

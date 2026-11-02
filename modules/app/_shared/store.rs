@@ -1843,12 +1843,19 @@ unsafe fn take_nonce(sys: &SyscallTable, salt: u64) -> [u8; 16] {
 /// revision read — cannot tell its own lost delete from another take's,
 /// and answers a secret it spent as missing.
 ///
+/// With `keep` the claim is not deleted: the record STAYS, spent — every
+/// later take answers it absent, and a create of the key is refused because
+/// it exists — so a single-use offer that its maker would otherwise make
+/// again (it cannot tell "spent" from "never made") is spent for good in the
+/// same one step (an enrollment grant's offer, management.plan).
+///
 /// `scratch` holds each read (at least as large as `dst`). Outside a serve
 /// the caller asks again on [`Took::Waiting`] with the same nonce.
 unsafe fn take_value(
     sys: &Store,
     key: &[u8],
     nonce: &[u8; 16],
+    keep: bool,
     dst: &mut [u8],
     scratch: &mut [u8],
 ) -> Took {
@@ -1882,6 +1889,7 @@ unsafe fn take_value(
         if v == mark.as_slice() {
             // Our claim stands: what it replaced was read before it.
             return match have {
+                Some(len) if keep => Took::Taken(len),
                 Some(len) => take_finish(sys, key, len),
                 None => Took::Failed,
             };
@@ -1906,6 +1914,7 @@ unsafe fn take_value(
             }
         }
         match put_cond(sys, key, &mark, PRE_ETAG, rev) {
+            WriteAnswer::Decided(0) if keep => return Took::Taken(n),
             WriteAnswer::Decided(0) => return take_finish(sys, key, n),
             WriteAnswer::Pending => return Took::Waiting,
             // Moved since it was read (or our own claim, its answer lost):

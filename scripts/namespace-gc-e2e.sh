@@ -87,6 +87,11 @@ store_put "/pods/doomed/p1"                 "image=x"
 store_put "/deployments.apps/doomed/d1"     "replicas=1;image=x"
 store_put "/configmaps/doomed/c1"           "k=v"
 store_put "/services/doomed/s1"             "sel=app=x"
+# A user's EndpointSlice, and objects of the trees past the first ~96
+# bytes of the prefix list (the count once read only that far).
+store_put "/endpointslices/doomed/s1-user"  '{"kind":"EndpointSlice","metadata":{"name":"s1-user","namespace":"doomed"},"addressType":"IPv4","endpoints":[]}'
+store_put "/networkpolicies/doomed/np1"     '{"kind":"NetworkPolicy","metadata":{"name":"np1","namespace":"doomed"}}'
+store_put "/endpointslices/default/keep3"   '{"kind":"EndpointSlice","metadata":{"name":"keep3","namespace":"default"}}'
 # objects in the default namespace — must be untouched
 store_put "/pods/default/keep1"             "image=y"
 store_put "/configmaps/default/keep2"       "k=w"
@@ -96,7 +101,7 @@ FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 2.5 "$FLUXOR_RUNTIME"
   --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify the doomed namespace was swept + finalized =="
-for k in /pods/doomed/p1 /deployments.apps/doomed/d1 /configmaps/doomed/c1 /services/doomed/s1; do
+for k in /pods/doomed/p1 /deployments.apps/doomed/d1 /configmaps/doomed/c1 /services/doomed/s1 /endpointslices/doomed/s1-user /networkpolicies/doomed/np1; do
   absent "$k" || fail "$k should be deleted (namespace terminating)"
 done
 absent /namespaces/doomed || fail "the namespace record should be finalized (removed)"
@@ -106,6 +111,7 @@ echo "== 5. verify the default namespace is untouched =="
 present /namespaces/default   || fail "default namespace must remain"
 present /pods/default/keep1    || fail "default pod must remain"
 present /configmaps/default/keep2 || fail "default configmap must remain"
+present /endpointslices/default/keep3 || fail "default EndpointSlice must remain"
 echo "   default: namespace + objects intact"
 
 echo "== E2E green: namespaced teardown + finalize, other namespaces isolated =="

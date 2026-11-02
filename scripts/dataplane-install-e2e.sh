@@ -270,9 +270,9 @@ o = json.loads(sys.stdin.read().split("|", 1)[1])
 print(next((p["metadata"]["name"] for p in o.get("items", []) if p["metadata"]["name"].startswith("web-")
             and p.get("status", {}).get("phase") == "Running"), ""))')"; [ -n "$POD" ]; }
 wait_for 90 "the Deployment's Pod never ran" podname
-eps() { case "$(sget /endpoints/default/web)" in *"=$NODE_IP"*) return 0 ;; *) return 1 ;; esac; }
-wait_for 60 "web's Endpoints never held the Pod ($(sget /endpoints/default/web))" eps
-echo "   $POD Running; /endpoints/default/web = $(sget /endpoints/default/web)"
+eps() { case "$(sget /endpoint-lists/default/web)" in *"=$NODE_IP"*) return 0 ;; *) return 1 ;; esac; }
+wait_for 60 "web's Endpoints never held the Pod ($(sget /endpoint-lists/default/web))" eps
+echo "   $POD Running; /endpoint-lists/default/web = $(sget /endpoint-lists/default/web)"
 
 echo "== 5. by name, through the ClusterIP: DNS, then DNAT in the kernel =="
 R="$($NSX dig +short +time=2 +tries=2 "@$NODE_IP" web.default.svc.cluster.local A)"
@@ -309,8 +309,7 @@ r="$(svct web-lb LoadBalancer 83)"; case "$r" in 20[01]\|*) ;; *) fail "POST web
 nodeport() { api GET "/api/v1/namespaces/default/services/$1" | python3 -c 'import json,sys
 o = json.loads(sys.stdin.read().split("|", 1)[1])
 print((o.get("spec", {}).get("ports") or [{}])[0].get("nodePort", ""))'; }
-# The address svc_alloc gave it (/lb-addr/): its status.loadBalancer is
-# Wormhole's VIP readiness to say, and no Wormhole VIP controller runs here.
+# The address svc_alloc gave it (/lb-addr/), held by node_net.
 lbip() { v="$(sget /lb-addr/default/web-lb)"; printf '%s' "${v#ip=}"; }
 NPORT=""; LPORT=""; LBIP=""
 for _ in $(seq 30); do NPORT="$(nodeport web-np)"; LPORT="$(nodeport web-lb)"; LBIP="$(lbip)"
@@ -324,14 +323,14 @@ answered "http://$NODE_IP:$LPORT/" || fail "web-lb's own nodePort $LPORT was not
 echo "   web-np: $NODE_IP:$NPORT -> the Pod; web-lb: $LBIP:83 (/lb-addr/) and $NODE_IP:$LPORT -> the Pod"
 
 echo "== 5c. a Service deleted: its Endpoints and slices go with it =="
-[ -n "$(sget /endpoints/default/web-named)" ] || fail "web-named has no Endpoints before its delete"
+[ -n "$(sget /endpoint-lists/default/web-named)" ] || fail "web-named has no Endpoints before its delete"
 r="$(api DELETE /api/v1/namespaces/default/services/web-named)"
 case "$r" in 200\|*|202\|*) ;; *) fail "DELETE web-named: ${r:0:200}" ;; esac
-gone() { [ -z "$(sget /endpoints/default/web-named)" ] && [ -z "$(sget "/endpointslices/default/web-named/$POD")" ]; }
+gone() { [ -z "$(sget /endpoint-lists/default/web-named)" ] && [ -z "$(sget "/endpoint-rows/default/web-named/$POD")" ]; }
 wait_for 30 "web-named's Endpoints or slice was left behind" gone
 r="$(api GET /api/v1/namespaces/default/endpoints/web-named)"
 case "$r" in 404\|*) ;; *) fail "GET endpoints/web-named after its Service's delete: ${r:0:120}" ;; esac
-echo "   /endpoints/default/web-named and its slice removed; GET endpoints/web-named -> 404"
+echo "   /endpoint-lists/default/web-named and its row removed; GET endpoints/web-named -> 404"
 
 echo "== 6. kubectl logs of the Pod: its node's record of what it wrote =="
 r="$(api GET "/api/v1/namespaces/default/pods/$POD/log")"

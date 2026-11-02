@@ -27,7 +27,9 @@
 //        answer a challenge (`reg`) and the pull whose Pods' imagePullSecrets
 //        are offered (`auth`, image_auth.plan); the manifest record keeps
 //        them for its config and layer rows
-//   qc   a manifest whose config is not recorded -> the config row
+//   qc   a manifest whose config is not recorded -> the config row (`wl=1`
+//        for a fluxor workload image's: its config is the image's env
+//        bindings, application/vnd.nanocloud.fluxor.workload-image.config.v1+json)
 //   lm,le,lr each layer of a manifest (the flat list, expanded), the manifest
 //        still there (image GC removes it first): present in the blob cache
 //        -> /image-layer-ok/<m>-<i> (hex=<hex>); absent -> the layer row
@@ -40,7 +42,12 @@
 //        configsize, n; kind=workload for a fluxor workload image),
 //        /image-index/<rk> (an index: the entry for the node's platform —
 //        none for it is the pull's failure, "no matching manifest for …"),
-//        /image-config/<hex> (the runtime contract, escaped lists),
+//        — a manifest past the node's layer bound (65 for a workload
+//        image, 48 for a rootfs) is the pull's failure, its count named —
+//        /image-config/<hex> (the runtime contract, escaped lists; a
+//        workload image's `kind=workload;names=;required=;modules=;params=`,
+//        its env bindings as aligned lists — what pod_resolve refuses a Pod
+//        that does not set a required name by, before its node runs it),
 //        /image-blobs/<hex>; a 304 deletes the row
 //   tg   a manifest recorded -> /image-digests/<rk> digest=<hex>: the
 //        request resolved, after what it names exists; a dropped blob's row
@@ -176,12 +183,20 @@ plan nanocloud.image {
     host: string = 7;
     reg: string = 8;
     auth: string = 9;
+    kind: string = 10;     // `workload`: a fluxor workload image's manifest
   }
   decision qc(m: Man) -> Row {
     when m.config == "" ->
       Row { cid: m.seq, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "",
             v11: "", v12: "", v13: "", v14: "", v15: "", v16: "" };
+    // A workload image's config is its env bindings, not a runtime contract.
+    when has(m.kind) && m.kind == "workload" ->
+      Row { cid: m.seq, op: MERGE, key: "/image-fetch-q/c-", k2: m.key,
+            v1: "kind=c;wl=1;name=", v2: m.key, v3: ";path=/v2/", v4: m.repo,
+            v5: "/blobs/sha256:", v6: m.config, v7: ";digest=", v8: m.config,
+            v9: ";size=", v10: m.csize, v11: ";host=", v12: m.host, v13: ";reg=", v14: m.reg,
+            v15: ";auth=", v16: m.auth };
     default ->
       Row { cid: m.seq, op: MERGE, key: "/image-fetch-q/c-", k2: m.key,
             v1: "kind=c;name=", v2: m.key, v3: ";path=/v2/", v4: m.repo,
@@ -273,6 +288,7 @@ plan nanocloud.image {
     host: string = 11;     // the registry dialled ("": this node's)
     reg: string = 12;      // the registry's name, for its credentials
     auth: string = 13;     // the pull whose Pods' imagePullSecrets apply
+    wl: string = 14;       // "1": a workload image's config
     facts: string = 49;    // the node's labels (`"kubernetes.io/arch":"arm64",…`)
     size: int = 50;
     fails: int = 51;       // failures so far (0: none)
@@ -328,6 +344,14 @@ plan nanocloud.image {
             q5: "layers[]#", q6: "artifactType", q7: "manifests[]#", host: q.host, reg: q.reg, auth: q.auth,
             ctx: Ctx2 { q: q.key, kind: q.kind, name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
                         plat: "linux/arm64/v8", host: q.host, reg: q.reg, auth: q.auth } };
+    // A workload image's config: its env bindings, as aligned lists.
+    when q.kind == "c" && has(q.wl) && q.wl == "1" ->
+      Get { cid: q.seq, sink: REPLY, path: q.path, accept: "",
+            file: "", sha: q.digest, skip: "/image-config/", skip2: q.name, size: q.size,
+            q0: "env[].name", q1: "env[].required", q2: "env[].module",
+            q3: "env[].param", q4: "", q5: "", q6: "", q7: "", host: q.host, reg: q.reg, auth: q.auth,
+            ctx: Ctx2 { q: q.key, kind: "w", name: q.name, repo: q.repo, size: q.ssize, fails: q.fails, now: q.now, of: q.of,
+                        plat: "", host: q.host, reg: q.reg, auth: q.auth } };
     when q.kind == "c" ->
       Get { cid: q.seq, sink: REPLY, path: q.path, accept: "",
             file: "", sha: q.digest, skip: "/image-config/", skip2: q.name, size: q.size,
@@ -392,6 +416,39 @@ plan nanocloud.image {
       Put { cid: a.cid, op: DELETE, key: "/image-fetch-q/", k2: a.ctx.q,
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
             ctx: Ctx3 { rk: "", dig: "", q: "", pull: "", bad: "", ok: "", st: a.status, fails: 0, now: 0, why: "" } };
+    // A manifest past the layers the node carries is refused with its
+    // count, and the pull says so (bf: the Pod's ErrImagePull, then
+    // ImagePullBackOff) — never recorded cut, never asked again silently.
+    // A workload image is its graph and at most 64 modules (Fluxor's
+    // MAX_ADD_MODULES): 65 layers, what every hop its list rides is sized
+    // for (http_fetch's answer, the store's values, workload_effect). An
+    // image assembled into a rootfs: 48 — its assembly job's command names
+    // every layer, inside the 4 KiB a host process's command is. The count
+    // (a5) is answered whole even when the list is past http_fetch's bound
+    // (its 413), so the refusal names it either way.
+    when (a.status == 200 || a.status == 413) && a.ctx.kind == "m" && a.ctx.q != ""
+         && a.a6 == "application/vnd.nanocloud.fluxor.workload-image.v1" && int("0" + a.a5) > 65 ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: 0, fails: a.ctx.fails + 1, now: a.ctx.now,
+                        why: "the workload image has " + a.a5 + " layers, at most 65 (its graph and 64 modules)" } };
+    when (a.status == 200 || a.status == 413) && a.ctx.kind == "m" && a.ctx.q != ""
+         && a.a6 != "application/vnd.nanocloud.fluxor.workload-image.v1" && int("0" + a.a5) > 48 ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: 0, fails: a.ctx.fails + 1, now: a.ctx.now,
+                        why: "the image has " + a.a5 + " layers, at most 48" } };
+    // Any other answer past what http_fetch carries (413): said as such.
+    when a.status == 413 && a.ctx.kind == "m" && a.ctx.q != "" ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: 0, fails: a.ctx.fails + 1, now: a.ctx.now,
+                        why: "the manifest is larger than the node carries" } };
+    when a.status == 413 && (a.ctx.kind == "c" || a.ctx.kind == "w") && a.ctx.q != "" ->
+      Put { cid: a.cid, op: NOOP, key: "", k2: "",
+            v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: 0, fails: a.ctx.fails + 1, now: a.ctx.now,
+                        why: "the image config is larger than the node carries" } };
     // A fluxor workload image (its FLXA, then a `.fmod` per module): marked,
     // so it is staged as a pack rather than assembled into a rootfs.
     when a.status == 200 && a.ctx.kind == "m" && a.a0 != "" && a.sha.size() == 64
@@ -415,6 +472,11 @@ plan nanocloud.image {
       Put { cid: a.cid, op: PUT, key: "/image-config/", k2: a.ctx.name,
             v1: "entrypoint=", v2: a.a0, v3: ";cmd=", v4: a.a1, v5: ";env=", v6: a.a2,
             v7: ";workdir=", v8: a.a3, v9: ";user=", v10: a.a4, v11: "", v12: "",
+            ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
+    when a.status == 200 && a.ctx.kind == "w" ->
+      Put { cid: a.cid, op: PUT, key: "/image-config/", k2: a.ctx.name,
+            v1: "kind=workload;names=", v2: a.a0, v3: ";required=", v4: a.a1, v5: ";modules=", v6: a.a2,
+            v7: ";params=", v8: a.a3, v9: "", v10: "", v11: "", v12: "",
             ctx: Ctx3 { rk: "", dig: "", q: "", pull: a.ctx.name, bad: "", ok: "1", st: a.status, fails: 0, now: 0, why: "" } };
     when a.status == 200 && a.ctx.kind == "l" ->
       Put { cid: a.cid, op: PUT, key: "/image-blobs/", k2: a.ctx.name,
@@ -443,7 +505,7 @@ plan nanocloud.image {
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
             ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now, why: "" } };
-    when a.ctx.q != "" && a.ctx.kind == "c" ->
+    when a.ctx.q != "" && (a.ctx.kind == "c" || a.ctx.kind == "w") ->
       Put { cid: a.cid, op: NOOP, key: "", k2: "",
             v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", v7: "", v8: "", v9: "", v10: "", v11: "", v12: "",
             ctx: Ctx3 { rk: "", dig: "", q: a.ctx.q, pull: a.ctx.name, bad: "1", ok: "", st: a.status, fails: a.ctx.fails + 1, now: a.ctx.now, why: "" } };
@@ -485,7 +547,7 @@ plan nanocloud.image {
     Req { seq: r.seq, key: r.key, reg: r.reg, repo: r.repo, tag: r.tag, pin: r.pin, lbl: r.lbl, digest: r.digest }
   }
   transformation t_man(m: Man) -> Man {
-    Man { seq: m.seq, key: m.key, repo: m.repo, config: m.config, csize: m.csize, host: m.host, reg: m.reg, auth: m.auth }
+    Man { seq: m.seq, key: m.key, repo: m.repo, config: m.config, csize: m.csize, host: m.host, reg: m.reg, auth: m.auth, kind: m.kind }
   }
   transformation t_lay(l: Lay) -> Lay {
     Lay { seq: l.seq, key: l.key, repo: l.repo, hex: l.hex, size: l.size, host: l.host, reg: l.reg, auth: l.auth, at: l.at }
@@ -495,7 +557,7 @@ plan nanocloud.image {
   }
   transformation t_q(q: Q) -> Q {
     Q { seq: q.seq, key: q.key, kind: q.kind, name: q.name, path: q.path, digest: q.digest,
-        repo: q.repo, ssize: q.ssize, of: q.of, host: q.host, reg: q.reg, auth: q.auth, facts: q.facts,
+        repo: q.repo, ssize: q.ssize, of: q.of, host: q.host, reg: q.reg, auth: q.auth, wl: q.wl, facts: q.facts,
         size: q.size, fails: q.fails, due: q.due, now: q.now }
   }
   transformation t_ans(a: Ans) -> Ans {

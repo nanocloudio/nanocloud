@@ -24,17 +24,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/cores/datagram_endpoint.rs");
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
-include!("../_shared/wormhole_portfolio.rs");
-include!("../_shared/whemit.rs");
-/// Kagi's `KSDN` codec: the signed `service_dns` projection.
-#[path = "../../../target/fluxor/kagi-common/service_dns.rs"]
-mod ksdn;
-include!("../_shared/whdns.rs");
 
 const OBJ_PUT: u32 = 0x1420;
 const OBJ_GET: u32 = 0x1421;
@@ -51,7 +40,7 @@ const CLUSTER_DNS_KEY: &[u8] = b"/cluster-dns";
 /// The Service fronting it (`service_ip`), as Kubernetes names it.
 const DNS_NS_KEY: &[u8] = b"/namespaces/kube-system";
 const DNS_SVC_KEY: &[u8] = b"/services/kube-system/kube-dns";
-const DNS_SLICE_PREFIX: &[u8] = b"/endpointslices/kube-system/kube-dns/cluster-dns-";
+const DNS_SLICE_PREFIX: &[u8] = b"/endpoint-rows/kube-system/kube-dns/cluster-dns-";
 const DNS_CLAIM_PREFIX: &[u8] = b"/ipam/svc/";
 const DNS_OWNER: &[u8] = b"owner=kube-system/kube-dns;ip=";
 /// The classic UDP ceiling: a query or an answer past it is not served.
@@ -59,7 +48,7 @@ const DNS_MAX: usize = 512;
 const DNS_HDR: usize = 12;
 /// Framing scratch: a datagram, its address prefix and the frame header.
 const NET_BUF: usize = DNS_MAX + 64;
-/// A Service object or an Endpoints document, read whole.
+/// A Service object, read whole.
 const DOC_MAX: usize = 16 * 1024;
 /// Queries held while the store answers EAGAIN.
 const HELD: usize = 8;
@@ -86,15 +75,6 @@ const RC_FORMERR: u8 = 1;
 const RC_SERVFAIL: u8 = 2;
 const RC_NXDOMAIN: u8 = 3;
 const RC_REFUSED: u8 = 5;
-/// A Service's signed `service_dns` projection (Kagi's `KSDN` over the
-/// region controller's 224 bytes): `/wh-dns/<service hex>`.
-const WH_DNS: &[u8] = b"/wh-dns/";
-/// The global generations seen, per Service: the floor no older projection
-/// is answered below.
-const DNS_FLOORS: usize = 16;
-/// The `SERVICE_DNS` key's identity and public half (Ed25519, suite 2).
-const DNS_ID_MAX: usize = 32;
-
 #[derive(Clone, Copy)]
 struct Held {
     used: u8,
@@ -214,21 +194,6 @@ struct State {
     service_ip_len: u8,
     /// How far the Service's publication has come (`PUB_*`).
     publish: u8,
-    /// The `SERVICE_DNS` verifying key (`dns_issuer`, `dns_kid`,
-    /// `dns_public`): with it, a Service whose signed projection is stored
-    /// is answered from the projection.
-    dns_issuer: [u8; DNS_ID_MAX],
-    dns_issuer_len: u8,
-    dns_kid: [u8; DNS_ID_MAX],
-    dns_kid_len: u8,
-    dns_public: [u8; 32],
-    dns_public_ok: u8,
-    floors: [([u8; 16], u64); DNS_FLOORS],
-    /// Answered from a projection; projections refused (another
-    /// service's, stale, expired, unsigned, no healthy region).
-    pub projected: u32,
-    pub projection_refused: u32,
-    ksdn: [u8; 512],
 }
 
 /// The Service's publication, in order: each step a write asked until the
@@ -292,139 +257,6 @@ mod params_def {
                 s.service_ip_len = n as u8;
                 if n > 0 { ptr_copy(s.service_ip.as_mut_ptr(), d, n); }
             };
-
-        8, dns_issuer, str, 0
-            => |s, d, len| {
-                let n = if len > super::DNS_ID_MAX { 0 } else { len };
-                s.dns_issuer_len = n as u8;
-                if n > 0 { ptr_copy(s.dns_issuer.as_mut_ptr(), d, n); }
-            };
-
-        9, dns_kid, str, 0
-            => |s, d, len| {
-                let n = if len > super::DNS_ID_MAX { 0 } else { len };
-                s.dns_kid_len = n as u8;
-                if n > 0 { ptr_copy(s.dns_kid.as_mut_ptr(), d, n); }
-            };
-
-        10, dns_public, str, 0
-            => |s, d, len| {
-                s.dns_public_ok = u8::from(super::hex32(core::slice::from_raw_parts(d, len), &mut s.dns_public));
-            };
-    }
-}
-
-/// 64 hex digits into 32 bytes.
-fn hex32(t: &[u8], out: &mut [u8; 32]) -> bool {
-    if t.len() != 64 {
-        return false;
-    }
-    let nib = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    };
-    for i in 0..32 {
-        match (nib(t[2 * i]), nib(t[2 * i + 1])) {
-            (Some(h), Some(l)) => out[i] = (h << 4) | l,
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Kagi's `SERVICE_DNS` suite 2: Ed25519.
-fn ksdn_verify(suite: u16, public: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    match (
-        suite,
-        <&[u8; 32]>::try_from(public),
-        <&[u8; 64]>::try_from(signature),
-    ) {
-        (2, Ok(p), Ok(sig)) => ed25519_verify(p, message, sig),
-        _ => false,
-    }
-}
-
-/// What a Service's signed projection says to a query.
-enum Projected {
-    /// The store has not answered yet.
-    Wait,
-    /// No projection is stored (or no key is configured): answer as ever.
-    Absent,
-    /// The projection's IPv4 answers, in preference order, and its TTL.
-    Answers(usize, u32),
-    /// A projection is stored and refused: answered SERVFAIL, never from
-    /// the store's own records (a stale global answer is not served).
-    Refused,
-}
-
-/// The Service `ns/svc`'s projection, opened with Kagi's codec under the
-/// configured key and checked by Wormhole's `dns_answers`, into `s.addrs`.
-unsafe fn projected(s: &mut State, svc: &[u8], ns: &[u8]) -> Projected {
-    if s.dns_public_ok == 0 || s.dns_issuer_len == 0 || s.dns_kid_len == 0 {
-        return Projected::Absent;
-    }
-    let sys = &*s.syscalls;
-    let service = wh_service_id(ns, svc);
-    let mut key = [0u8; MAX_KEY];
-    let mut p = append(&mut key, 0, WH_DNS);
-    for v in service {
-        const H: &[u8; 16] = b"0123456789abcdef";
-        p = append(
-            &mut key,
-            p,
-            &[H[usize::from(v >> 4)], H[usize::from(v & 15)]],
-        );
-    }
-    let n = match get_value_live(sys, &s.nag, &key[..p], &mut s.ksdn) {
-        Got::Pending => return Projected::Wait,
-        Got::Refused(_) => return Projected::Refused,
-        Got::Absent => return Projected::Absent,
-        Got::Found(n) => n,
-    };
-    let floor_at = s.floors.iter().position(|f| f.0 == service);
-    let floor = floor_at.map_or(0, |i| s.floors[i].1);
-    let keys = [DnsKey {
-        issuer: &s.dns_issuer[..s.dns_issuer_len as usize],
-        kid: &s.dns_kid[..s.dns_kid_len as usize],
-        suite: 2,
-        public: &s.dns_public,
-    }];
-    let signed = s.ksdn;
-    // The projection's window is wall-clock time (Kagi signs it so), not
-    // this runtime's uptime.
-    let now = dev_unix_millis(sys);
-    match service_dns_answer(
-        &signed[..n],
-        &keys,
-        ksdn_verify,
-        &service,
-        floor,
-        now,
-        u32::MAX,
-    ) {
-        Ok(set) => {
-            let mut k = 0;
-            for a in &set.answers[..set.n] {
-                if a.address.family == traffic::AF_INET && k < s.addrs.len() {
-                    let b = &a.address.bytes[12..16];
-                    s.addrs[k] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-                    k += 1;
-                }
-            }
-            // The newest global generation seen is the next query's floor.
-            let at = floor_at.or_else(|| s.floors.iter().position(|f| f.1 == 0));
-            if let Some(i) = at {
-                s.floors[i] = (service, set.global_generation.max(floor));
-            }
-            s.projected = s.projected.wrapping_add(1);
-            Projected::Answers(k, set.ttl_s)
-        }
-        Err(_) => {
-            s.projection_refused = s.projection_refused.wrapping_add(1);
-            Projected::Refused
-        }
     }
 }
 
@@ -745,45 +577,84 @@ fn slice_field<'a>(value: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
         .map(|seg| &seg[tag.len()..])
 }
 
-/// A headless Service's ready backends, from its Endpoints document, into
-/// `s.addrs`.
-unsafe fn backends(s: &mut State, svc: &[u8], ns: &[u8]) -> Lookup {
+/// One endpoint row, `ip=…;state=…;zone=…;node=…;gen=…;af=…;uid=…`: well
+/// under this.
+const ROW_MAX: usize = 512;
+
+/// A headless Service's ready backends, walked from its endpoint ROWS
+/// (`/endpoint-rows/<ns>/<svc>/<pod>`, a paged listing: every row, however
+/// many) into `s.addrs` — the first `s.addrs.len()` ready ones, which is more
+/// than one 512-byte answer carries. With `want`, the one ready backend at
+/// that address (a `<a-b-c-d>.<svc>` name), wherever it is in the listing.
+///
+/// Not the endpoints chain's `/endpoint-lists/` fold: that is ONE value of
+/// every row joined, which a store_source list builds into one record and
+/// cuts past about a hundred rows — the backends past the cut never resolved.
+#[allow(
+    clippy::manual_contains,
+    reason = "`<[u8]>::contains` lowers to memchr, which the PIC link cannot resolve"
+)]
+unsafe fn backends(s: &mut State, svc: &[u8], ns: &[u8], want: Option<u32>) -> Lookup {
     let sys = &*s.syscalls;
-    let mut key = [0u8; MAX_KEY];
-    let Some(p) = put(&mut key, 0, b"/endpoints/")
-        .and_then(|p| put(&mut key, p, ns))
-        .and_then(|p| put(&mut key, p, b"/"))
-        .and_then(|p| put(&mut key, p, svc))
+    let mut prefix = [0u8; MAX_KEY];
+    let Some(pl) = put(&mut prefix, 0, b"/endpoint-rows/")
+        .and_then(|p| put(&mut prefix, p, ns))
+        .and_then(|p| put(&mut prefix, p, b"/"))
+        .and_then(|p| put(&mut prefix, p, svc))
+        .and_then(|p| put(&mut prefix, p, b"/"))
     else {
         return Lookup::Addrs(0);
     };
-    let n = match get_value_live(sys, &s.nag, &key[..p], &mut s.doc) {
-        Got::Pending => return Lookup::Wait,
-        Got::Refused(_) => return Lookup::Failed,
-        Got::Absent => return Lookup::Addrs(0),
-        Got::Found(n) => n,
-    };
+    let store = Store::plain(sys, &s.nag);
+    let mut walk = ListWalk::new(&prefix[..pl]);
+    let mut kb = [0u8; MAX_KEY];
+    let mut row = [0u8; ROW_MAX];
     let mut k = 0usize;
-    for item in s.doc[..n].split(|&c| c == b',') {
-        // `<pod>=<slice value>`: the slice is `ip=…;state=…;…` (the
-        // endpoints chain's), and only a READY endpoint is a backend — one
-        // serving or terminating is draining and takes no new flows.
-        let value = match item.iter().position(|&c| c == b'=') {
-            Some(i) => &item[i + 1..],
-            None => item,
+    while let Some(one) = walk.next(&store) {
+        let kl = one.len().min(MAX_KEY);
+        kb[..kl].copy_from_slice(&one[..kl]);
+        let pod = kb.get(pl..kl).unwrap_or(&[]);
+        if pod.is_empty() || pod.iter().any(|&c| c == b'/') {
+            continue;
+        }
+        let Some(n) = get_value(&store, &kb[..kl], &mut row) else {
+            if store.waiting() || store.refusal().is_some() {
+                break;
+            }
+            continue; // gone since it was listed
         };
+        // Only a READY endpoint is a backend — one serving or terminating
+        // is draining and takes no new flows.
+        let value = &row[..n];
         if slice_field(value, b"state=") != Some(&b"ready"[..]) {
             continue;
         }
-        let Some(ip) = slice_field(value, b"ip=") else {
+        let Some(a) = slice_field(value, b"ip=").and_then(parse_ip4) else {
             continue;
         };
-        if let Some(a) = parse_ip4(ip) {
-            if k < s.addrs.len() && s.addrs[..k].iter().all(|&x| x != a) {
-                s.addrs[k] = a;
-                k += 1;
+        match want {
+            Some(w) if a == w => {
+                s.addrs[0] = a;
+                k = 1;
+                break;
+            }
+            Some(_) => {}
+            None => {
+                if s.addrs[..k].iter().all(|&x| x != a) {
+                    s.addrs[k] = a;
+                    k += 1;
+                    if k == s.addrs.len() {
+                        break;
+                    }
+                }
             }
         }
+    }
+    if walk.pending || store.waiting() {
+        return Lookup::Wait;
+    }
+    if walk.failed || store.refusal().is_some() {
+        return Lookup::Failed;
     }
     Lookup::Addrs(k)
 }
@@ -965,8 +836,13 @@ unsafe fn query(s: &mut State, ip: u32, port: u16, pkt: &[u8]) -> bool {
     }
     let kind = s.svc.kind;
     let mut k = 0usize;
-    if kind == K_HEADLESS && (pod || srv || qt == T_A || qt == T_ANY) {
-        match backends(s, sv, nv) {
+    // A backend's name asks for that one address (a name that spells none
+    // is NXDOMAIN below, with nothing walked).
+    let want = if pod { parse_dashed(parts[0]) } else { None };
+    if kind == K_HEADLESS
+        && (srv || ((pod && want.is_some()) || (!pod && (qt == T_A || qt == T_ANY))))
+    {
+        match backends(s, sv, nv, want) {
             Lookup::Wait => return false,
             Lookup::Failed => {
                 let n = answer(&mut s.out, pkt, qend, RC_SERVFAIL, false, &[], 0);
@@ -1068,26 +944,6 @@ unsafe fn query(s: &mut State, ip: u32, port: u16, pkt: &[u8]) -> bool {
                 }
             }
         } else if at > 0 && a_type && kind != K_EXTERNAL {
-            // A Service with a signed `service_dns` projection is answered
-            // from it: the healthy regions' addresses the client may reach,
-            // in the projection's preference order, at its TTL.
-            match projected(s, sv, nv) {
-                Projected::Wait => return false,
-                Projected::Refused => {
-                    let n = answer(&mut s.out, pkt, qend, RC_SERVFAIL, false, &[], 0);
-                    reply(s, ip, port, n);
-                    return true;
-                }
-                Projected::Answers(n, pttl) => {
-                    for t in 0..n {
-                        let a = s.addrs[t];
-                        at = record(&mut s.out, at, T_A, pttl, &a.to_be_bytes());
-                    }
-                    reply(s, ip, port, at);
-                    return true;
-                }
-                Projected::Absent => {}
-            }
             if kind == K_CLUSTER {
                 let a = s.svc.cip;
                 at = record(&mut s.out, at, T_A, ttl, &a.to_be_bytes());
@@ -1357,12 +1213,6 @@ pub unsafe extern "C" fn module_new(
         s.address_len = 0;
         s.service_ip_len = 0;
         s.publish = PUB_DONE;
-        s.dns_issuer_len = 0;
-        s.dns_kid_len = 0;
-        s.dns_public_ok = 0;
-        s.floors = [([0; 16], 0); DNS_FLOORS];
-        s.projected = 0;
-        s.projection_refused = 0;
         s.svc = SvcInfo {
             kind: 0,
             cip: 0,

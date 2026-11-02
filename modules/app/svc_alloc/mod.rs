@@ -49,14 +49,11 @@ const NP_CLAIMS: &[u8] = b"/ipam/nodeport/";
 const LB_CLAIMS: &[u8] = b"/ipam/lb/";
 /// The address a LoadBalancer Service was given, by Service:
 /// `/lb-addr/<ns>/<name>` = `ip=<a.b.c.d>` — this module's, and what the
-/// proxy, node_net and the Wormhole projection read. NOT its status: a
-/// Service's `status.loadBalancer` says the address is reachable, which only
-/// the VIP's readiness can (wormhole.plan `wh_status`).
+/// proxy and node_net read. Its status says it too (`status.loadBalancer`,
+/// written here: the cell is its own load balancer for the Services of no
+/// loadBalancerClass; a class names an external controller, which writes
+/// its own).
 const LB_ADDRS: &[u8] = b"/lb-addr/";
-/// The loadBalancerClass that names Wormhole (nanocloud's load balancer;
-/// unset is Wormhole too). Another class is another controller's: its
-/// Service is given node ports, never an address of this pool.
-const WH_CLASS: &[u8] = b"wormhole.nanocloud.io/lb";
 const NODES: &[u8] = b"/nodes/";
 /// A node's Pod CIDR is held by `/ipam/podcidr/<index>`: its position in the
 /// cluster CIDR, counted in node-sized blocks.
@@ -258,8 +255,11 @@ fn claim_key(k: &mut [u8; MAX_KEY], prefix: &[u8], n: u64) -> usize {
 struct Svc {
     /// NodePort or LoadBalancer: owed node ports.
     node: bool,
-    /// LoadBalancer.
+    /// LoadBalancer of no loadBalancerClass: given an address of the pool,
+    /// and its status is this module's. A class names another controller.
     lb: bool,
+    /// Its `status.loadBalancer` names an ingress.
+    status_set: bool,
     /// Its ports' nodePorts, 0 where none.
     ports: [u16; MAX_PORTS],
     nports: usize,
@@ -278,7 +278,8 @@ fn read_svc(doc: &[u8]) -> Svc {
     let typed_lb = t == b"LoadBalancer";
     let mut s = Svc {
         node: typed_lb || t == b"NodePort",
-        lb: typed_lb && (class.is_empty() || class == WH_CLASS),
+        lb: typed_lb && class.is_empty(),
+        status_set: false,
         ports: [0; MAX_PORTS],
         nports: 0,
         lb_ip: 0,
@@ -302,8 +303,36 @@ fn read_svc(doc: &[u8]) -> Svc {
             .and_then(|e| j_get1(e, b"ip"))
             .and_then(parse_ip4)
             .unwrap_or(0);
+        s.status_set = j_idx(ing, 0).is_some();
     }
     s
+}
+
+/// `status.loadBalancer` as this module states it: the address recorded
+/// for the Service, `{}` while it has none. Its length in `out`.
+fn lb_status_json(out: &mut [u8], svc: &Svc) -> Option<usize> {
+    if svc.recorded && svc.lb_ip != 0 {
+        put(out, 0, b"{\"ingress\":[{\"ip\":\"")
+            .and_then(|e| put_ip(out, e, svc.lb_ip))
+            .and_then(|e| put(out, e, b"\"}]}"))
+    } else {
+        put(out, 0, b"{}")
+    }
+}
+
+/// Whether the raw JSON `have` says `want` (whitespace aside: neither holds
+/// a string with a blank in it).
+fn same_json(have: &[u8], want: &[u8]) -> bool {
+    let mut w = want.iter();
+    for &c in have.iter() {
+        if j_is_ws(c) {
+            continue;
+        }
+        if w.next() != Some(&c) {
+            return false;
+        }
+    }
+    w.next().is_none()
 }
 
 /// `/lb-addr/<owner>` into `k`; its length.
@@ -315,7 +344,7 @@ fn addr_key(k: &mut [u8; MAX_KEY], owner: &[u8]) -> usize {
 
 /// The Service's load-balancer address: its `/lb-addr/` record, else the
 /// address its status already names (a cluster that wrote it there, before
-/// the status was the VIP's to say), which is then recorded and claimed.
+/// the address was recorded here), which is then recorded and claimed.
 unsafe fn resolve_lb(store: &Store, owner: &[u8], svc: &mut Svc) {
     if !svc.lb {
         return;
@@ -607,8 +636,8 @@ unsafe fn allocate(s: &mut State, store: &Store, key: &[u8]) -> bool {
         return false;
     }
     if picks.iter().all(|&p| p == 0) {
-        // The address alone: recorded by Service, never in its status (the
-        // VIP's to say), and claimed by the next pass.
+        // The address alone: recorded by Service, claimed by the next pass,
+        // and said in its status by the pass after (`status_pass`).
         let mut k = [0u8; MAX_KEY];
         let kl = addr_key(&mut k, &ob[..owner_len]);
         let Some(vl) = put(&mut s.out, 0, b"ip=").and_then(|e| put_ip(&mut s.out, e, lb_ip)) else {
@@ -890,6 +919,67 @@ unsafe fn nodes_pass(s: &mut State, store: &Store) -> Pass {
     Pass::Again
 }
 
+/// The status of the first Service whose `status.loadBalancer` is not what
+/// this module says: a LoadBalancer Service of no class its
+/// recorded address (`{}` while it has none); one that is no longer a
+/// LoadBalancer Service (and names no class) `{}`. A Service of any class is
+/// another controller's and never touched. Written conditional on the
+/// revision read. True when it acted or must look again.
+unsafe fn status_pass(s: &mut State, store: &Store) -> bool {
+    let mut walk = ListWalk::new(SERVICES);
+    while let Some(key) = walk.next(store) {
+        let mut k = [0u8; MAX_KEY];
+        let kl = key.len().min(MAX_KEY);
+        k[..kl].copy_from_slice(&key[..kl]);
+        let Some((dl, rev)) = get_value_rev(store, &k[..kl], &mut s.doc) else {
+            if store.stopped() {
+                return store.waiting();
+            }
+            continue;
+        };
+        let doc = &s.doc[..dl];
+        let mut svc = read_svc(doc);
+        let classless = j_get2(doc, b"spec", b"loadBalancerClass").is_none_or(|c| c.is_empty());
+        // Ours: a LoadBalancer of no class, or a Service of no class that
+        // still names an ingress it no longer has.
+        let stale = classless && svc.status_set;
+        if !(svc.lb || stale) {
+            continue;
+        }
+        if svc.lb {
+            resolve_lb(store, &k[SERVICES.len()..kl], &mut svc);
+            if store.stopped() {
+                return store.waiting();
+            }
+        }
+        let mut want = [0u8; 64];
+        let Some(wl) = (if svc.lb {
+            lb_status_json(&mut want, &svc)
+        } else {
+            put(&mut want, 0, b"{}")
+        }) else {
+            continue;
+        };
+        let have = j_sub2(&s.doc[..dl], b"status", b"loadBalancer").unwrap_or(b"{}");
+        if same_json(have, &want[..wl]) {
+            continue;
+        }
+        let ol = j_set2(
+            &s.doc[..dl],
+            b"status",
+            b"loadBalancer",
+            &want[..wl],
+            &mut s.out,
+        );
+        if ol == 0 || ol >= s.out.len() {
+            continue;
+        }
+        act(s, &k[..kl], ol, false, PRE_ETAG, rev);
+        return true;
+    }
+    false
+}
+
 /// One pass: the first action owed, in the manifest's order.
 unsafe fn pass(s: &mut State) -> Pass {
     let sys = &*s.syscalls;
@@ -944,6 +1034,16 @@ unsafe fn pass(s: &mut State) -> Pass {
     }
     // allocate
     if owed_len > 0 && allocate(s, &store, &owed[..owed_len]) {
+        return Pass::Again;
+    }
+    if store.refusal().is_some() {
+        return Pass::Failed;
+    }
+    if store.waiting() {
+        return Pass::Again;
+    }
+    // the status of the Services whose load balancer this is
+    if status_pass(s, &store) {
         return Pass::Again;
     }
     if store.refusal().is_some() {

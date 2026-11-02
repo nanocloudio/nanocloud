@@ -59,9 +59,10 @@ plan nanocloud.nodelease {
   // facts (arch, os, the fluxor ABI) carries them as its labels — what a
   // Pod's nodeSelector is matched against — and renews at once when the
   // stored labels are not them (a node upgraded to another ABI). The labels
-  // are compared as views (`{`, the facts, `}`), never by building
-  // "{" + facts + "}": every arm's condition is evaluated up to the one that
-  // matches, and a concatenation per arm overflows the decision's scratch.
+  // are compared as views (`{`, the facts, `}`): nothing is built to compare
+  // them, so the condition costs no string scratch on any engine (a 32-bit
+  // one's arena is 512 bytes; on 64-bit, where each arm's strings are handed
+  // back once it has answered, "{" + facts + "}" would cost one copy).
   //
   // A node whose render knows its address advertises it, as a kubelet does:
   // status.addresses InternalIP (then its Hostname) — the hostIP of every

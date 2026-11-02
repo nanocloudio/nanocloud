@@ -20,6 +20,8 @@ load 0 ; field 10 ; set 10
 load 0 ; field 11 ; set 11
 load 0 ; field 15 ; set 15
 load 0 ; field 16 ; set 16
+load 0 ; field 18 ; set 18
+load 0 ; field 19 ; set 19
 load 0 ; field 12 ; set 12
 load 0 ; field 41 ; set 41
 load 0 ; field 42 ; set 42
@@ -33,6 +35,9 @@ load 0 ; field 51 ; set 51
 load 0 ; field 52 ; set 52
 load 0 ; field 53 ; set 53
 load 0 ; field 54 ; set 54
+load 0 ; field 55 ; set 55
+load 0 ; field 56 ; set 56
+load 0 ; field 20 ; set 20
 str "&" ; load 0 ; field 10 ; cat 2 ; after "&labelSelector=" ; before "&" ; pctdec ; store 7
 str "["
 # requirement 0

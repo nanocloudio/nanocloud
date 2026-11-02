@@ -1,0 +1,188 @@
+// ZoneSummary (nanocloud.io/v1, cluster-scoped, read-only to clients): a
+// cell's facts for one zone, kept at /zonesummaries.nanocloud.io/<zone> from
+// the per-Node rows zone_node.plan keeps (/zone-node/<node>) — a zone's
+// Nodes, capacity and store voters at a glance, for any API client
+// (docs/architecture/zone-summary.md):
+//
+//   status.readinessGeneration   the store revision the zone's Nodes'
+//                                readiness was last written at (/zone-list/
+//                                <zone> rg, zone_node.plan `mark`)
+//   status.nodes{total,ready,schedulable}
+//   status.cpuMilli{allocatableSchedulable,allocatableReady,requested}
+//   status.memoryBytes{allocatableSchedulable,allocatableReady,requested}
+//   status.voters{inside,outside,outsideReady}   Nodes labelled
+//                                nanocloud.io/store-voter "true": in the
+//                                zone; in any other zone or none; of those,
+//                                ready
+//   status.observedAtMs          when these figures were computed (Unix ms)
+//
+//   zl_src   /zone-list/ (and any row changing) -> each zone
+//   zc_n     COUNT the rows (`weigh`, a sum): node and voter counts packed
+//            ten bits apiece (a zone of 1023 Nodes at most)
+//   zc_c     cpu allocatable on ready (low 31 bits) and on schedulable Nodes
+//   zc_cr    cpu requested; zc_ma, zc_mr memory allocatable on schedulable
+//            and on ready Nodes; zc_mq memory requested — one `next`
+//            decision drives all six, by the mode it carries
+//   zs_fig   MERGE /zone-list/<zone> f=<the figures>: 200 when they moved,
+//            204 when not (so a summary is rewritten, and observedAtMs
+//            moves, only when a figure does); a zone with no Node left:
+//            DELETE the marker
+//   zs_put   PUT the ZoneSummary when its figures moved; DELETE it when the
+//            zone has no Node left
+plan nanocloud.zone_summary {
+
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum MERGE = 6;
+  enum COUNT = 12;
+
+  // carried by every stage after the source (254)
+  message ZCtx {
+    zone: string = 1;
+    rg: int = 2;          // the readiness generation (/zone-list/<zone> rg)
+    mode: string = 3;     // the figure being counted: n c cr ma mr mq; put, gone, x
+    n: int = 4;           // node and voter counts, packed (zc_n)
+    c: int = 5;           // cpu allocatable, ready | schedulable << 31
+    cr: int = 6;
+    ma: int = 7;
+    mr: int = 8;
+    mq: int = 9;
+  }
+  message zs.Zone {
+    seq: int = 1;
+    zone: string = 29;
+    rg: int = 50;
+  }
+  message zs.Cnt {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: ZCtx = 254;
+  }
+  decision first(z: zs.Zone) -> zs.Cnt {
+    default ->
+      zs.Cnt { cid: z.seq, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: z.zone, rg: z.rg, mode: "n", n: 0, c: 0, cr: 0, ma: 0, mr: 0, mq: 0 } };
+  }
+  // One row, and what it weighs for the figure counted.
+  message zs.Row {
+    zone: string = 40;
+    ready: int = 50; sched: int = 51; voter: int = 52;
+    ca: int = 53; ma: int = 54; cr: int = 55; mr: int = 56;
+    ctx: ZCtx = 254;
+  }
+  message zs.Keep {
+    k: int = 1;
+  }
+  decision weigh(r: zs.Row) -> zs.Keep {
+    when r.ctx.mode == "n" && r.zone == r.ctx.zone ->
+      zs.Keep { k: 1 + r.ready * 1024 + r.sched * 1048576 + r.voter * 1073741824 };
+    when r.ctx.mode == "n" ->
+      zs.Keep { k: r.voter * 1099511627776 + r.voter * r.ready * 1125899906842624 };
+    when r.zone != r.ctx.zone -> zs.Keep { k: 0 };
+    when r.ctx.mode == "c" -> zs.Keep { k: r.ready * r.ca + r.sched * r.ca * 2147483648 };
+    when r.ctx.mode == "cr" -> zs.Keep { k: r.cr };
+    when r.ctx.mode == "ma" -> zs.Keep { k: r.sched * r.ma };
+    when r.ctx.mode == "mr" -> zs.Keep { k: r.ready * r.ma };
+    when r.ctx.mode == "mq" -> zs.Keep { k: r.mr };
+    default -> zs.Keep { k: 0 };
+  }
+  message zs.Got {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: ZCtx = 254;
+  }
+  // The count answered, kept, and the next one asked. A count that failed
+  // stops the zone's pass ("x"): a short sum is never written.
+  decision next(g: zs.Got) -> zs.Cnt {
+    when g.status == 200 && g.ctx.mode == "n" ->
+      zs.Cnt { cid: g.cid, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "c", n: g.n, c: 0, cr: 0, ma: 0, mr: 0, mq: 0 } };
+    when g.status == 200 && g.ctx.mode == "c" ->
+      zs.Cnt { cid: g.cid, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "cr", n: g.ctx.n, c: g.n, cr: 0, ma: 0, mr: 0, mq: 0 } };
+    when g.status == 200 && g.ctx.mode == "cr" ->
+      zs.Cnt { cid: g.cid, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "ma", n: g.ctx.n, c: g.ctx.c, cr: g.n, ma: 0, mr: 0, mq: 0 } };
+    when g.status == 200 && g.ctx.mode == "ma" ->
+      zs.Cnt { cid: g.cid, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "mr", n: g.ctx.n, c: g.ctx.c, cr: g.ctx.cr, ma: g.n, mr: 0, mq: 0 } };
+    when g.status == 200 && g.ctx.mode == "mr" ->
+      zs.Cnt { cid: g.cid, op: COUNT, key: "zone-node/",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "mq", n: g.ctx.n, c: g.ctx.c, cr: g.ctx.cr, ma: g.ctx.ma, mr: g.n, mq: 0 } };
+    default ->
+      zs.Cnt { cid: g.cid, op: NOOP, key: "",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "x", n: 0, c: 0, cr: 0, ma: 0, mr: 0, mq: 0 } };
+  }
+  message zs.Fig {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: int = 9;
+    v7: string = 10; v8: int = 11; v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16; v14: int = 80;
+    ctx: ZCtx = 254;
+  }
+  decision fig(g: zs.Got) -> zs.Fig {
+    when g.status == 200 && g.ctx.mode == "mq" && g.ctx.n % 1024 == 0 ->
+      zs.Fig { cid: g.cid, op: DELETE, key: g.ctx.zone,
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "gone", n: 0, c: 0, cr: 0, ma: 0, mr: 0, mq: 0 } };
+    when g.status == 200 && g.ctx.mode == "mq" ->
+      zs.Fig { cid: g.cid, op: MERGE, key: g.ctx.zone,
+               v1: "f=", v2: g.ctx.n, v3: ".", v4: g.ctx.c, v5: ".", v6: g.ctx.cr, v7: ".", v8: g.ctx.ma,
+               v9: ".", v10: g.ctx.mr, v11: ".", v12: g.n, v13: ".", v14: g.ctx.rg,
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "put", n: g.ctx.n, c: g.ctx.c, cr: g.ctx.cr, ma: g.ctx.ma, mr: g.ctx.mr, mq: g.n } };
+    default ->
+      zs.Fig { cid: g.cid, op: NOOP, key: "",
+               ctx: ZCtx { zone: g.ctx.zone, rg: g.ctx.rg, mode: "x", n: 0, c: 0, cr: 0, ma: 0, mr: 0, mq: 0 } };
+  }
+  message zs.Figd {
+    cid: int = 1;
+    status: int = 2;
+    now: int = 60;        // the wall clock, Unix ms (`wall = 1`)
+    ctx: ZCtx = 254;
+  }
+  message zs.Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4; v2: int = 5; v3: string = 6; v4: int = 7; v5: string = 8; v6: int = 9;
+    v7: string = 10; v8: int = 11; v9: string = 12; v10: int = 13; v11: string = 14; v12: int = 15;
+    v13: string = 16; v14: int = 80; v15: string = 81; v16: int = 82; v17: string = 83; v18: int = 84;
+    v19: string = 85; v20: int = 86; v21: string = 87; v22: int = 88; v23: string = 89; v24: int = 90;
+    v25: string = 91; v26: int = 92; v27: string = 93; v28: int = 94; v29: string = 95;
+  }
+  // The object, as the API serves it: the packed figures unpacked.
+  decision sput(f: zs.Figd) -> zs.Put {
+    when f.ctx.mode == "gone" ->
+      zs.Put { cid: f.cid, op: DELETE, key: f.ctx.zone };
+    when f.ctx.mode == "put" && f.status == 200 ->
+      zs.Put { cid: f.cid, op: PUT, key: f.ctx.zone,
+               v1: "{\"apiVersion\":\"nanocloud.io/v1\",\"kind\":\"ZoneSummary\",\"metadata\":{\"name\":\"" + f.ctx.zone + "\"},\"status\":{\"readinessGeneration\":",
+               v2: f.ctx.rg,
+               v3: ",\"nodes\":{\"total\":", v4: f.ctx.n % 1024,
+               v5: ",\"ready\":", v6: f.ctx.n / 1024 % 1024,
+               v7: ",\"schedulable\":", v8: f.ctx.n / 1048576 % 1024,
+               v9: "},\"cpuMilli\":{\"allocatableSchedulable\":", v10: f.ctx.c / 2147483648,
+               v11: ",\"allocatableReady\":", v12: f.ctx.c % 2147483648,
+               v13: ",\"requested\":", v14: f.ctx.cr,
+               v15: "},\"memoryBytes\":{\"allocatableSchedulable\":", v16: f.ctx.ma,
+               v17: ",\"allocatableReady\":", v18: f.ctx.mr,
+               v19: ",\"requested\":", v20: f.ctx.mq,
+               v21: "},\"voters\":{\"inside\":", v22: f.ctx.n / 1073741824 % 1024,
+               v23: ",\"outside\":", v24: f.ctx.n / 1099511627776 % 1024,
+               v25: ",\"outsideReady\":", v26: f.ctx.n / 1125899906842624 % 1024,
+               v27: "},\"observedAtMs\":", v28: f.now, v29: "}}" };
+    default ->
+      zs.Put { cid: f.cid, op: NOOP, key: "" };
+  }
+
+  pipeline first_p(z: zs.Zone) -> zs.Cnt { call x = first(z); return x; }
+  pipeline weigh_p(r: zs.Row) -> zs.Keep { call x = weigh(r); return x; }
+  pipeline next_p(g: zs.Got) -> zs.Cnt { call x = next(g); return x; }
+  pipeline fig_p(g: zs.Got) -> zs.Fig { call x = fig(g); return x; }
+  pipeline sput_p(f: zs.Figd) -> zs.Put { call x = sput(f); return x; }
+  provenance revision "zone-summary" toolchain "chronicle-authoring";
+}

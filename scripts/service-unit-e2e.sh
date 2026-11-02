@@ -151,24 +151,36 @@ rc=0; out="$(reclaim 2>&1)" || rc=$?
 [ "$rc" = 2 ] || fail "reclaim of a live instance exited $rc, not 2: $out"
 echo "   live: $(printf '%s\n' "$out" | grep '^reclaim:')"
 stop
-# Unprivileged, its packet-policy tables cannot even be listed: the reclaim
-# stays pending (exit 1), which is why the unit runs it with `+`.
+# Whether the reclaim can finish is whether it may list its packet-policy
+# tables: CAP_NET_ADMIN over the network namespace it runs in — asked of
+# this process (CapEff bit 12), not of `id -u`. Without it the reclaim stays
+# pending (exit 1), which is why the unit runs it with `+`; with it (root on
+# the host, or root in a user namespace that owns its own network namespace,
+# as `unshare -Urn` gives) the stopped instance is reclaimed (exit 0).
+CAPEFF="$(awk '/^CapEff:/ {print $2}' /proc/self/status)"
 rc=0; out="$(reclaim 2>&1)" || rc=$?
-[ "$rc" = 1 ] || fail "an unprivileged reclaim after stop exited $rc, not 1 (pending): $out"
-echo "   stopped, unprivileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
-if sudo -n true 2>/dev/null; then
-  # On a node the runtime and its reclaim are both root, so the host
-  # registry is root's; this test's runtime ran as its user. Hand the
-  # registry to root, as a node holds it: a privileged reclaim refuses one
-  # another user owns.
-  sudo -n chown -R root:root "$D/run"
-  sudo -n chmod 0755 "$D/run"
-  rc=0; out="$(reclaim privileged 2>&1)" || rc=$?
-  [ "$rc" = 0 ] || fail "a privileged reclaim after stop exited $rc, not 0: $out"
+if (( 0x${CAPEFF:-0} & (1 << 12) )); then
+  [ "$rc" = 0 ] || fail "a reclaim holding CAP_NET_ADMIN after stop exited $rc, not 0: $out"
   case "$out" in *"reclaimed"*) ;; *) fail "reclaim after stop named no instance: $out" ;; esac
-  echo "   stopped, privileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
+  echo "   stopped, with CAP_NET_ADMIN here (uid $(id -u), CapEff $CAPEFF): $(printf '%s\n' "$out" | grep '^reclaim:')"
+  echo "   (the reclaim was privileged already: the sudo leg is not needed)"
 else
-  echo "   (no passwordless sudo: the privileged reclaim is not exercised)"
+  [ "$rc" = 1 ] || fail "an unprivileged reclaim after stop exited $rc, not 1 (pending): $out"
+  echo "   stopped, unprivileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
+  if sudo -n true 2>/dev/null; then
+    # On a node the runtime and its reclaim are both root, so the host
+    # registry is root's; this test's runtime ran as its user. Hand the
+    # registry to root, as a node holds it: a privileged reclaim refuses one
+    # another user owns.
+    sudo -n chown -R root:root "$D/run"
+    sudo -n chmod 0755 "$D/run"
+    rc=0; out="$(reclaim privileged 2>&1)" || rc=$?
+    [ "$rc" = 0 ] || fail "a privileged reclaim after stop exited $rc, not 0: $out"
+    case "$out" in *"reclaimed"*) ;; *) fail "reclaim after stop named no instance: $out" ;; esac
+    echo "   stopped, privileged: $(printf '%s\n' "$out" | grep '^reclaim:')"
+  else
+    echo "   SKIP the privileged reclaim: no CAP_NET_ADMIN here (CapEff ${CAPEFF:-?}) and no passwordless sudo"
+  fi
 fi
 
 echo "== E2E green: the installed control plane keeps its store in lattice, and an upgraded node's objects come with it =="

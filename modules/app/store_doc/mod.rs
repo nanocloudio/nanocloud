@@ -28,6 +28,8 @@ include!("../_shared/json.rs");
 include!("../_shared/moment.rs");
 include!("../_shared/tomb.rs");
 include!("../_shared/podlive.rs");
+include!("../_shared/jsonpatch.rs");
+include!("../_shared/strdata.rs");
 
 // lattice's JSON document wire, from its published source — the channel
 // contract its dialect reads, not restated here.
@@ -95,6 +97,9 @@ const OP_APPLY: i64 = 16;
 /// store_effect's TAKE: the value answered and deleted in one step,
 /// conditional on the revision read — a single-use claim (a join secret).
 const OP_TAKE: i64 = 17;
+/// store_effect's CLAIM: a take that leaves its claim, the record spent for
+/// good (an enrollment grant's offer, never offered again).
+const OP_CLAIM: i64 = 22;
 
 /// One record frame.
 const BUF: usize = 8192;
@@ -113,8 +118,11 @@ const DOC_MAX: usize = 3 << 20;
 /// an answer (the object as stored, rendered), each on the heap.
 const MSG_CAP: usize = DOC_MAX + 65536;
 /// The heap: the two message buffers, a staged body read beside them
-/// (read_whole grows to DOC_MAX), and the allocator's rounding.
-const ARENA: usize = 2 * MSG_CAP + DOC_MAX + (1 << 20);
+/// (read_whole grows to DOC_MAX), a `fold`'s output and scratch for a body
+/// of upstream's largest Secret (1 MiB of data, its `stringData` folded:
+/// FOLD_MAX), and the allocator's rounding.
+const FOLD_MAX: usize = 4 << 20;
+const ARENA: usize = 2 * MSG_CAP + DOC_MAX + FOLD_MAX + (1 << 20);
 /// A lost answer is a 503, never a writer stalled for good: how long the
 /// dialect may take (`answer_ms`, default). A write it has not answered by
 /// then may still land; the 503 says so, and the client retries.
@@ -166,6 +174,12 @@ struct State {
     /// `blob = <prefix>`: a body `sha256:<hex>` is the staged body there.
     blob: [u8; 48],
     blob_len: u8,
+    /// `fold = <key prefix>|<from>><to>[,…]` (_shared/strdata.rs): a
+    /// write-only member folded into the stored one before the write leaves
+    /// — a Secret's `stringData` into `data`, base64-encoded, as upstream's
+    /// Secret strategy does on create and update.
+    fold: [u8; 64],
+    fold_len: u8,
     /// The decision container, a `blob` param arriving straight into
     /// `dec_cont`.
     dec_in: dec::BlobIn,
@@ -579,7 +593,7 @@ impl State {
                     None => self.reply(404, &[]),
                 };
             }
-            OP_TAKE => {
+            OP_TAKE | OP_CLAIM => {
                 // 200 with the value, taken by this request alone; 404 only
                 // when it is not there. A take not decided this step holds
                 // the request (the journal), and one that could not be
@@ -600,7 +614,8 @@ impl State {
                 let st = self.store();
                 let mut got = [0u8; BUF];
                 // SAFETY: storage.object through the loader's table.
-                let took = unsafe { take_value(&st, key, &nonce, &mut got, scratch) };
+                let took =
+                    unsafe { take_value(&st, key, &nonce, op == OP_CLAIM, &mut got, scratch) };
                 return match took {
                     Took::Taken(n) => self.reply(200, got.get(..n).unwrap_or(&[])),
                     Took::Absent => self.reply(404, &[]),
@@ -647,6 +662,16 @@ impl State {
             && ns == 3
             && view.is_empty()
             && self.boot == BOOT_NONE;
+        // A Namespace's DELETE is upstream's too: the namespace is MARKED —
+        // deletionTimestamp and `status.phase: Terminating` — and stays
+        // until its teardown (namespace.plan: sweep, then finalize) has
+        // removed everything in it and deletes it. Deleting the record
+        // outright would orphan every object it held.
+        let ns_delete = op == OP_DELETE
+            && coll == b"namespaces"
+            && ns == 2
+            && view.is_empty()
+            && self.boot == BOOT_NONE;
         // A delete leaves the object's last state for the watch chain's
         // DELETED event BEFORE the delete: the chain reads the tomb when it
         // meets the delete in the change feed, which can be before this
@@ -654,8 +679,21 @@ impl State {
         // a finalizer, leaves a tomb nothing reads; it expires.
         // Left once: a delete asked again after its collection bootstrap
         // has its tomb already.
+        // The namespaces upstream never deletes (its NamespaceLifecycle
+        // admission): refused, as it refuses them.
+        if ns_delete
+            && (segs[1] == b"default" || segs[1] == b"kube-system" || segs[1] == b"kube-public")
+        {
+            let mut m = [0u8; 320];
+            let mut l = append(&mut m, 0, b"{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"namespaces \\\"");
+            l = append(&mut m, l, segs[1]);
+            l = append(&mut m, l, b"\\\" is forbidden: this namespace may not be deleted\",\"reason\":\"Forbidden\",\"details\":{\"name\":\"");
+            l = append(&mut m, l, segs[1]);
+            l = append(&mut m, l, b"\",\"kind\":\"namespaces\"},\"code\":403}");
+            return self.reply(403, m.get(..l).unwrap_or(&[]));
+        }
         if op == OP_DELETE
-            && (self.tomb_len > 0 || pod_delete)
+            && (self.tomb_len > 0 || pod_delete || ns_delete)
             && view.is_empty()
             && self.boot == BOOT_NONE
         {
@@ -668,6 +706,9 @@ impl State {
                     // SAFETY: storage reads and the clock through the
                     // loader's table.
                     unsafe { pod_delete_how(&st, obj, &value[..vl]) }
+                } else if ns_delete {
+                    // SAFETY: the clock through the loader's table.
+                    unsafe { ns_delete_how(&st, obj) }
                 } else {
                     PodDel::Outright(None)
                 };
@@ -678,6 +719,7 @@ impl State {
                         }
                     }
                     PodDel::Mark(g, until) => mark_len = mark_patch(g, until, &mut mark),
+                    PodDel::Terminate(now) => mark_len = terminate_patch(now, &mut mark),
                     PodDel::Already | PodDel::Wait => {}
                 }
                 // SAFETY: read_whole's allocation, no longer read.
@@ -743,6 +785,25 @@ impl State {
             }
         } else {
             &value[..vl]
+        };
+        // `fold` (_shared/strdata.rs): a write-only member — a Secret's
+        // `stringData` — folded into the stored one on the heap, so what
+        // the dialect writes (and every reader reads) is `data` alone.
+        let mut folded: *mut u8 = core::ptr::null_mut();
+        let body: &[u8] = match self.fold_body(op, key, body) {
+            Ok(Some((p, n))) => {
+                folded = p;
+                // SAFETY: `n` bytes fold_body wrote at `p`, freed below.
+                unsafe { core::slice::from_raw_parts(p, n) }
+            }
+            Ok(None) => body,
+            Err(st) => {
+                if !staged.is_null() {
+                    // SAFETY: read_whole's allocation, no longer read.
+                    unsafe { heap_free(self.sys(), staged) };
+                }
+                return self.reply(st, &[]);
+            }
         };
         let (dop, body_tag) = match op {
             // A graceful Pod delete: the mark, a merge patch.
@@ -810,6 +871,10 @@ impl State {
             // SAFETY: read_whole's allocation, no longer read.
             unsafe { heap_free(self.sys(), staged) };
         }
+        if !folded.is_null() {
+            // SAFETY: fold_body's allocation, no longer read.
+            unsafe { heap_free(self.sys(), folded) };
+        }
         let Some(n) = n else {
             return self.reply(413, &[]);
         };
@@ -819,6 +884,107 @@ impl State {
         // SAFETY: the clock through the loader's table.
         self.sent_ms = unsafe { dev_millis(self.sys()) };
         self.phase = PHASE_SEND;
+    }
+
+    /// The body with the `fold` rule for `key` applied, on the heap —
+    /// `Ok(None)` when no rule names the key or the body carries nothing to
+    /// fold; `Err(status)` for a body the rule refuses (400: a member that
+    /// is not a string) or one past the heap (413).
+    fn fold_body(
+        &mut self,
+        op: i64,
+        key: &[u8],
+        body: &[u8],
+    ) -> Result<Option<(*mut u8, usize)>, i64> {
+        // A copy: the store read below borrows `self`.
+        let fold = self.fold;
+        let rule = fold.get(..self.fold_len as usize).unwrap_or(&[]);
+        let Some((from, to)) = sd_rule(rule, key) else {
+            return Ok(None);
+        };
+        let patch = match op {
+            OP_CREATE | OP_REPLACE | OP_APPLY => false,
+            OP_PATCH_MERGE | OP_PATCH_SMP | OP_PATCH_JSON => true,
+            _ => return Ok(None),
+        };
+        // Nothing names the member: nothing to fold, and no heap spent.
+        let mut quoted = [0u8; 66];
+        let Some(q) = quoted.get_mut(..from.len() + 2) else {
+            return Ok(None);
+        };
+        q[0] = b'"';
+        q[1..from.len() + 1].copy_from_slice(from);
+        q[from.len() + 1] = b'"';
+        let q = &quoted[..from.len() + 2];
+        if !body.windows(q.len()).any(|w| w == q) && op != OP_PATCH_JSON {
+            return Ok(None);
+        }
+        if op == OP_PATCH_JSON {
+            let mut slash = [0u8; 65];
+            let Some(sl) = slash.get_mut(..from.len() + 1) else {
+                return Ok(None);
+            };
+            sl[0] = b'/';
+            sl[1..].copy_from_slice(from);
+            if !body.windows(sl.len()).any(|w| w == &*sl) {
+                return Ok(None);
+            }
+        }
+        // The output: base64 is 4/3 of what it encodes, and a member's
+        // bytes never outnumber its literal; the scratch holds one value.
+        let out_n = body.len().saturating_mul(2).saturating_add(256);
+        let scratch_n = body.len().saturating_add(16);
+        if out_n + scratch_n > FOLD_MAX {
+            return Err(413);
+        }
+        // SAFETY: this module's heap, through the loader's table.
+        let p = unsafe { heap_alloc(self.sys(), (out_n + scratch_n) as u32) };
+        if p.is_null() {
+            return Err(413);
+        }
+        // SAFETY: `out_n + scratch_n` bytes just allocated, disjoint halves.
+        let (out, scratch) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(p, out_n),
+                core::slice::from_raw_parts_mut(p.add(out_n), scratch_n),
+            )
+        };
+        let mut o = JpOut::new(out);
+        let r = if op == OP_PATCH_JSON {
+            // Whether the stored object has `to`: an add below it needs it.
+            let st = self.store();
+            // SAFETY: storage.object reads through the loader's table.
+            let has_to = match unsafe { read_whole(&st, key, DOC_MAX) } {
+                Some((sp, sn)) => {
+                    // SAFETY: `sn` bytes read_whole filled at `sp`.
+                    let doc = unsafe { core::slice::from_raw_parts(sp, sn) };
+                    let has = jp_get(doc, to).is_some_and(|v| jp_kind(v) == b'{');
+                    // SAFETY: read_whole's allocation, no longer read.
+                    unsafe { heap_free(self.sys(), sp) };
+                    has
+                }
+                None => false,
+            };
+            sd_fold_json_patch(body, from, to, has_to, &mut o, scratch)
+        } else {
+            sd_fold(body, from, to, patch, &mut o, scratch)
+        };
+        match r {
+            Ok(true) => Ok(Some((p, o.n))),
+            Ok(false) => {
+                // SAFETY: the allocation above, unused.
+                unsafe { heap_free(self.sys(), p) };
+                Ok(None)
+            }
+            Err(e) => {
+                // SAFETY: the allocation above, no longer read.
+                unsafe { heap_free(self.sys(), p) };
+                Err(match e {
+                    JpErr::Full => 413,
+                    _ => 400,
+                })
+            }
+        }
     }
 
     /// Send what is left of the request: `true` once all of it has gone.
@@ -1058,6 +1224,9 @@ enum PodDel {
     Outright(Option<u64>),
     /// Marked: this grace, ending at this moment (Unix ms).
     Mark(u64, u64),
+    /// A Namespace marked Terminating (deletionTimestamp: now, when the
+    /// clock is trusted), its teardown to finish the delete.
+    Terminate(Option<u64>),
     /// Marked already: the delete is where it was.
     Already,
     /// A read not answered yet: asked again.
@@ -1092,6 +1261,31 @@ unsafe fn pod_delete_how(st: &Store, pod: &[u8], opts: &[u8]) -> PodDel {
 }
 
 /// The mark of a graceful delete, a merge patch:
+/// What a DELETE does to the Namespace `obj`: marked Terminating, or
+/// already so.
+unsafe fn ns_delete_how(st: &Store, obj: &[u8]) -> PodDel {
+    if j_get2(obj, b"status", b"phase") == Some(&b"Terminating"[..]) {
+        return PodDel::Already;
+    }
+    PodDel::Terminate(mo_trusted_ms(st.table()))
+}
+
+/// `{"metadata":{"deletionTimestamp":"<now>"},"status":{"phase":"Terminating"}}`
+/// (no deletionTimestamp from a clock not trusted yet).
+fn terminate_patch(now: Option<u64>, out: &mut [u8; 160]) -> usize {
+    let mut l = 0usize;
+    if let Some(now) = now {
+        let mut ts = [0u8; 20];
+        pl_rfc3339(now, &mut ts);
+        l = append(out, 0, b"{\"metadata\":{\"deletionTimestamp\":\"");
+        l = append(out, l, &ts);
+        l = append(out, l, b"\"},");
+    } else {
+        l = append(out, l, b"{");
+    }
+    append(out, l, b"\"status\":{\"phase\":\"Terminating\"}}")
+}
+
 /// `{"metadata":{"deletionTimestamp":"<until>","deletionGracePeriodSeconds":<grace>}}`.
 /// Its length.
 fn mark_patch(grace: u64, until: u64, out: &mut [u8; 160]) -> usize {
@@ -1185,6 +1379,13 @@ mod params_def {
                 if n > 0 { ptr_copy(s.blob.as_mut_ptr(), d, n); }
             };
 
+        6, fold, str, 0
+            => |s, d, len| {
+                let n = if len > 64 { 64 } else { len };
+                s.fold_len = n as u8;
+                if n > 0 { ptr_copy(s.fold.as_mut_ptr(), d, n); }
+            };
+
         // `blob`: the container's own bytes, in chunks of at most 255, the
         // first led by its whole length (chronicle blob_core). One cut short
         // or past its buffer is a fault, never a truncation.
@@ -1251,6 +1452,7 @@ pub unsafe extern "C" fn module_new(
         s.boot = BOOT_NONE;
         s.redo = 0;
         s.blob_len = 0;
+        s.fold_len = 0;
         s.parts = wire::PartWriter::new(0, 0, 0);
         s.reasm = wire::Reassembly::new();
         params_def::set_defaults(s);

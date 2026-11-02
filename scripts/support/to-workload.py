@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """A base graph as a workload image's graph.
 
-A workload's `wiring:` names ports by index within their direction, and the
-node's network as `net:<key>` lanes (fluxor `--emit=workload`); a base graph
-names them `module.port`, and the network as the platform's `linux_net` (or
-`ip`). This rewrites one into the other, reading each module's port order
-from its manifest:
+A workload's `wiring:` is written as a base graph's — `module.port` ends, and
+the node's network as the platform's `linux_net` (or `ip`), each module wired
+to it a lane of its own (fluxor `--emit=workload`) — so this moves the graph's
+modules and wiring under `workloads:` as they are, but for what a workload
+cannot hold:
 
     to-workload.py <graph.yaml> <out.yaml> [--variant <module>=<variant>]... [--drop <module>]... [--param <module>.<key>=<value>]... <module-dir>...
 
-Each module wired to the platform network gets a lane of its own: its edge
-from `linux_net.net_out` becomes `from: "net:<k>"` and its edge to
-`linux_net.net_in` becomes `to: "net:<k>"`, one key per module, in order.
+The platform's own entry (`linux_net` / `ip`, when the graph declares one) is
+left out: the node's network is not a workload module.
 Module params, variants and edge buffer sizes carry over as written.
 `--variant` selects a module's variant, and an edge to a port that variant
-omits (its manifest's `omit_ports`) is dropped, on stderr. Ports keep their
-indices either way: an omitted port leaves a hole, as fluxor builds it.
+omits (its manifest's `omit_ports`) is dropped, on stderr.
 `--drop` leaves a module out, and every edge to or from it (on stderr):
 what a tenant may not hold — a module with a node privilege, which the
 kernel refuses in a workload — or does not need.
@@ -54,23 +52,6 @@ def omitted(text, variant):
     sys.exit(f"to-workload: no variant `{variant}`")
 
 
-def parse_ports(text):
-    ports, counters = {}, {"input": 0, "output": 0, "ctrl_input": 0}
-    for block in re.split(r"(?m)^\[\[ports\]\]\s*$", text)[1:]:
-        block = re.split(r"(?m)^\[", block)[0]
-        f = dict(re.findall(r'(?m)^\s*(\w+)\s*=\s*"?([^"\n]*)"?\s*$', block))
-        direction = f.get("direction", "").strip()
-        if direction not in counters:
-            continue
-        if "index" in f:
-            idx = int(f["index"])
-        else:
-            idx = counters[direction]
-        counters[direction] = max(counters[direction], idx + 1)
-        ports[(direction, f["name"].strip())] = idx
-    return ports
-
-
 def main():
     args = sys.argv[1:]
     variants = {}
@@ -96,7 +77,8 @@ def main():
     for k in ("platform", "scheduler", "continuity"):
         if k in g:
             print(f"to-workload: dropped graph-level `{k}`", file=sys.stderr)
-    mods = [m for m in (g.get("modules") or []) if m["name"] not in drops]
+    mods = [m for m in (g.get("modules") or [])
+            if m["name"] not in drops and m["name"] not in PLATFORM_NET]
     for d in sorted(drops):
         print(f"to-workload: dropped module `{d}`", file=sys.stderr)
     for m in mods:
@@ -109,44 +91,21 @@ def main():
         # Params as the graph wrote them: under `params:` when it has one.
         (mod.setdefault("params", {}) if "params" in mod else mod)[k] = v
     types = {m["name"]: m.get("type", m["name"]) for m in mods}
-    texts = {n: manifest(dirs, t) for n, t in types.items()}
-    ports = {n: parse_ports(t) for n, t in texts.items()}
-    gone = {n: omitted(texts[n], v) for n, v in variants.items()}
-    lanes = {}
+    gone = {n: omitted(manifest(dirs, types[n]), v) for n, v in variants.items()}
+    lanes = []
     wiring = []
     for e in g.get("wiring") or []:
-        (fm, fp), (tm, tp) = e["from"].split(".", 1), e["to"].split(".", 1)
+        (fm, fp), (tm, tp) = (e["from"].split(".", 1) + [""])[:2], (e["to"].split(".", 1) + [""])[:2]
         if fm in drops or tm in drops:
             print(f"to-workload: dropped {e['from']} -> {e['to']} (a dropped module's)", file=sys.stderr)
             continue
         if fp in gone.get(fm, ()) or tp in gone.get(tm, ()):
             print(f"to-workload: dropped {e['from']} -> {e['to']} (the variant omits it)", file=sys.stderr)
             continue
-        w = {}
-        if fm in PLATFORM_NET:
-            key = lanes.setdefault(tm, len(lanes))
-            w["from"] = f"net:{key}"
-        else:
-            w["from"] = fm
-            idx = ports[fm].get(("output", fp))
-            if idx is None:
-                sys.exit(f"to-workload: {fm} ({types[fm]}) has no output `{fp}`")
-            if idx:
-                w["from_port"] = idx
-        if tm in PLATFORM_NET:
-            key = lanes.setdefault(fm, len(lanes))
-            w["to"] = f"net:{key}"
-        else:
-            w["to"] = tm
-            idx = ports[tm].get(("input", tp))
-            if idx is None:
-                sys.exit(f"to-workload: {tm} ({types[tm]}) has no input `{tp}`")
-            if idx:
-                w["to_port"] = idx
-        for k in ("buffer_bytes",):
-            if k in e:
-                w[k] = e[k]
-        wiring.append(w)
+        for end, other in ((fm, tm), (tm, fm)):
+            if end in PLATFORM_NET and other not in lanes:
+                lanes.append(other)
+        wiring.append(dict(e))
     work = []
     for m in mods:
         m = dict(m)
@@ -159,7 +118,7 @@ def main():
            "workloads": [{"modules": work, "wiring": wiring}]})
     with open(out, "w") as f:
         f.write(f"# Derived from {os.path.basename(src)} by scripts/support/to-workload.py;"
-                f" lanes: {', '.join(f'{m}=net:{k}' for m, k in lanes.items())}\n")
+                f" lanes: {', '.join(lanes)}\n")
         yaml.safe_dump(doc, f, sort_keys=False)
 
 

@@ -277,11 +277,13 @@ pub fn encode(g: &VolumeGraph<'_>, out: &mut [u8]) -> Option<usize> {
         p.u8(1, 0); // mode: client
         p.u8(11, 2); // peer_auth: ca_dns
         p.u8(12, u8::from(g.clock_unchecked));
+        if !g.verify_hostname.is_empty() {
+            p.entry(24, g.verify_hostname); // verify_hostname
+        }
         p.end();
         p.ext(10, g.cert_der);
         p.ext(11, g.key_der);
         p.ext(12, g.trust_der);
-        p.ext(13, g.verify_hostname);
     });
     module(&mut o, b"loam_volume", |o| {
         let mut p = Params::begin(o);

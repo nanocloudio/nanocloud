@@ -1,0 +1,248 @@
+// CustomResourceDefinitions' GROUPS for discovery (crd.plan's file head),
+// and a served version's status and scale subresources:
+// one /discovery-gv/<group>/<rank>~<version> row per served group-version,
+// ranked as upstream prefers a group's versions; a group's
+// /discovery-groups/<group> row, made by its first CRD and composed from
+// every gv row under it — ONE APIGroup per group, every version it serves,
+// its preferredVersion the first in rank order; and the gv rows pruned when
+// no /discovery-res/ row is left under their group-version. A plan of its
+// own only for the per-module declaration limit; one design with crd.plan.
+plan nanocloud.crd_groups {
+  enum NOOP = 0;
+  enum PUT = 3;
+  enum DELETE = 4;
+  enum CREATE = 8;
+  enum COUNT = 12;
+
+  message CrdVer {
+    seq: int = 1;
+    key: string = 3;
+    name: string = 4;      // metadata.name
+    group: string = 5;     // spec.group
+    scope: string = 6;     // spec.scope
+    plural: string = 7;    // spec.names.plural
+    singular: string = 8;  // spec.names.singular
+    kind: string = 9;      // spec.names.kind
+    version: string = 10;  // spec.versions.#.name
+    served: string = 11;   // spec.versions.#.served
+    shorts: string = 12;   // spec.names.shortNames, JSON array text
+    status: string = 13;   // spec.versions.#.subresources.status, JSON text ("" absent)
+    scale: string = 14;    // spec.versions.#.subresources.scale
+    g: string = 27;        // the CRD's digest
+  }
+  message Put {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+    v8: string = 11;
+    v9: string = 12;
+    v10: string = 13;
+    v11: string = 14;
+  }
+  // A served group-version, ranked (the file head): GA `v<N>` 0, `v<N>beta<M>`
+  // 1, `v<N>alpha<M>` 2, each `999 - N` then `999 - M` (rendered as the
+  // integer key parts they are), anything else 3; `~<version>` after it.
+  message GvPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    k17: int = 17;
+    k18: int = 18;
+    k25: string = 25;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+  }
+  decision gv_row(v: CrdVer) -> GvPut {
+    when !(v.served == "true" && v.version != "" && v.kind != "" && v.plural != ""
+           && v.group.contains(".") && v.name == v.plural + "." + v.group
+           && (v.scope == "Cluster" || v.scope == "Namespaced")
+           && !v.name.contains("\"") && !v.version.contains("\"") && !v.name.contains("\\") && !v.version.contains("\\")
+           && !v.name.contains("/") && !v.version.contains("/") && !v.version.contains("~")) ->
+      GvPut { cid: v.seq, op: NOOP, key: "", k17: 0, k18: 0, k25: "" };
+    when v.version.startsWith("v") && v.version.indexOf("beta") > 1
+         && v.version.substring(1, v.version.indexOf("beta")).replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") == ""
+         && v.version.substring(v.version.indexOf("beta") + 4).replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") == "" ->
+      GvPut { cid: v.seq, op: PUT, key: v.group + "/1",
+              k17: 999 - int("0" + v.version.substring(1, v.version.indexOf("beta"))),
+              k18: 999 - int("0" + v.version.substring(v.version.indexOf("beta") + 4)),
+              k25: "~" + v.version,
+              v1: "{\"groupVersion\":\"", v2: v.group + "/" + v.version, v3: "\",\"version\":\"", v4: v.version, v5: "\"}" };
+    when v.version.startsWith("v") && v.version.indexOf("alpha") > 1
+         && v.version.substring(1, v.version.indexOf("alpha")).replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") == ""
+         && v.version.substring(v.version.indexOf("alpha") + 5).replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") == "" ->
+      GvPut { cid: v.seq, op: PUT, key: v.group + "/2",
+              k17: 999 - int("0" + v.version.substring(1, v.version.indexOf("alpha"))),
+              k18: 999 - int("0" + v.version.substring(v.version.indexOf("alpha") + 5)),
+              k25: "~" + v.version,
+              v1: "{\"groupVersion\":\"", v2: v.group + "/" + v.version, v3: "\",\"version\":\"", v4: v.version, v5: "\"}" };
+    when v.version.startsWith("v") && v.version.size() > 1
+         && v.version.substring(1).replace("0", "").replace("1", "").replace("2", "").replace("3", "").replace("4", "").replace("5", "").replace("6", "").replace("7", "").replace("8", "").replace("9", "") == "" ->
+      GvPut { cid: v.seq, op: PUT, key: v.group + "/0",
+              k17: 999 - int("0" + v.version.substring(1)), k18: 999,
+              k25: "~" + v.version,
+              v1: "{\"groupVersion\":\"", v2: v.group + "/" + v.version, v3: "\",\"version\":\"", v4: v.version, v5: "\"}" };
+    default ->
+      GvPut { cid: v.seq, op: PUT, key: v.group + "/3",
+              k17: 0, k18: 0,
+              k25: "~" + v.version,
+              v1: "{\"groupVersion\":\"", v2: v.group + "/" + v.version, v3: "\",\"version\":\"", v4: v.version, v5: "\"}" };
+  }
+  // A served version's status and scale subresources, as /discovery-res/
+  // rows of their own beside the kind's (`<plural>~status`, `<plural>~scale`;
+  // crd.plan `res_get` prunes them with the kind's): each element its parts,
+  // no concatenation, so a decision's small string arena holds them.
+  message SubPut {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    v1: string = 4;
+    v2: string = 5;
+    v3: string = 6;
+    v4: string = 7;
+    v5: string = 8;
+    v6: string = 9;
+    v7: string = 10;
+  }
+  decision res_status(v: CrdVer) -> SubPut {
+    when !(v.served == "true" && v.version != "" && v.kind != "" && v.plural != ""
+           && v.group.contains(".") && v.name == v.plural + "." + v.group
+           && (v.scope == "Cluster" || v.scope == "Namespaced")
+           && !v.name.contains("\"") && !v.version.contains("\"") && !v.kind.contains("\"") && !v.name.contains("\\") && !v.version.contains("\\") && !v.kind.contains("\\")
+           && !v.name.contains("/") && !v.version.contains("/") && !v.version.contains("~")) || !has(v.status) || v.status == "" ->
+      SubPut { cid: v.seq, op: NOOP, key: "" };
+    default ->
+      SubPut { cid: v.seq, op: PUT,
+               key: v.group + "/" + v.version + "/" + v.plural + "~status/" + v.g,
+               v1: "{\"name\":\"", v2: v.plural, v3: "/status\",\"singularName\":\"\",\"namespaced\":",
+               v4: "falsetrue".substring(5 * math.least(1, v.scope.size() - 7), 5 + 4 * math.least(1, v.scope.size() - 7)),
+               v5: ",\"kind\":\"", v6: v.kind, v7: "\",\"verbs\":[\"get\",\"patch\",\"update\"]}" };
+  }
+  decision res_scale(v: CrdVer) -> SubPut {
+    when !(v.served == "true" && v.version != "" && v.kind != "" && v.plural != ""
+           && v.group.contains(".") && v.name == v.plural + "." + v.group
+           && (v.scope == "Cluster" || v.scope == "Namespaced")
+           && !v.name.contains("\"") && !v.version.contains("\"") && !v.kind.contains("\"") && !v.name.contains("\\") && !v.version.contains("\\") && !v.kind.contains("\\")
+           && !v.name.contains("/") && !v.version.contains("/") && !v.version.contains("~")) || !has(v.scale) || v.scale == "" ->
+      SubPut { cid: v.seq, op: NOOP, key: "" };
+    default ->
+      SubPut { cid: v.seq, op: PUT,
+               key: v.group + "/" + v.version + "/" + v.plural + "~scale/" + v.g,
+               v1: "{\"name\":\"", v2: v.plural, v3: "/scale\",\"singularName\":\"\",\"namespaced\":",
+               v4: "falsetrue".substring(5 * math.least(1, v.scope.size() - 7), 5 + 4 * math.least(1, v.scope.size() - 7)),
+               v5: ",\"group\":\"autoscaling\",\"version\":\"v1\",\"kind\":\"Scale\",\"verbs\":[\"get\",\"patch\",\"update\"]}" };
+  }
+
+  // The group's /discovery-groups/ row, made by the first CRD of it (a
+  // put-if-absent: CREATE answers 409 for one there): that CRD's version,
+  // until `group_compose` writes every version.
+  decision gname_row(v: CrdVer) -> Put {
+    when !(v.served == "true" && v.version != "" && v.kind != "" && v.plural != ""
+           && v.group.contains(".") && v.name == v.plural + "." + v.group
+           && (v.scope == "Cluster" || v.scope == "Namespaced")
+           && !v.name.contains("\"") && !v.version.contains("\"") && !v.name.contains("\\") && !v.version.contains("\\")
+           && !v.name.contains("/") && !v.version.contains("/") && !v.version.contains("~")) ->
+      Put { cid: v.seq, op: NOOP, key: "" };
+    default ->
+      Put { cid: v.seq, op: CREATE, key: v.group,
+            v1: "{\"name\":\"" + v.group + "\",\"versions\":[{\"groupVersion\":\"",
+            v2: v.group + "/" + v.version + "\",\"version\":\"" + v.version,
+            v3: "\"}],\"preferredVersion\":{\"groupVersion\":\"",
+            v4: v.group + "/" + v.version + "\",\"version\":\"" + v.version,
+            v5: "\"}}" };
+  }
+  // A group's row, composed: every /discovery-gv/ row under it, in rank
+  // order (store_source `list_children`, values `,`-joined), and the first
+  // of them its preferredVersion (a version entry holds no `}` before its
+  // own end).
+  message GroupList {
+    seq: int = 1;
+    key: string = 3;       // <group>
+    list: string = 56;
+  }
+  decision group_compose(g: GroupList) -> Put {
+    when g.key == "" || g.key == "~builtin" || g.key.contains("/") || g.list == "" || g.list.indexOf("}") < 0 ->
+      Put { cid: g.seq, op: NOOP, key: "" };
+    default ->
+      Put { cid: g.seq, op: PUT, key: g.key,
+            v1: "{\"name\":\"", v2: g.key, v3: "\",\"versions\":[", v4: g.list,
+            v5: "],\"preferredVersion\":", v6: g.list.substring(0, g.list.indexOf("}") + 1), v7: "}" };
+  }
+
+  message Ctx {
+    row: string = 30;
+    g: string = 31;
+  }
+  message Drop {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    rev: int = 28;         // DELETE only at this revision (0: unconditional)
+  }
+  // A group-version row: the /discovery-res/ rows under its group-version,
+  // counted now; none left, it goes.
+  message GvRow {
+    seq: int = 1;
+    key: string = 3;       // <group>/<rank>~<version>
+  }
+  message GvCount {
+    cid: int = 1;
+    op: int = 2;
+    key: string = 3;
+    ctx: Ctx = 254;
+  }
+  message GvLeft {
+    cid: int = 1;
+    status: int = 2;
+    n: int = 45;
+    ctx: Ctx = 254;
+  }
+  decision gv_count(r: GvRow) -> GvCount {
+    when r.key.indexOf("/") <= 0 || r.key.indexOf("~") <= r.key.indexOf("/") ->
+      GvCount { cid: r.seq, op: NOOP, key: "", ctx: Ctx { row: r.key, g: "" } };
+    default ->
+      GvCount { cid: r.seq, op: COUNT,
+                key: "/discovery-res/" + r.key.substring(0, r.key.indexOf("/")) + "/" + r.key.substring(r.key.indexOf("~") + 1) + "/",
+                ctx: Ctx { row: r.key, g: "" } };
+  }
+  decision gv_drop(l: GvLeft) -> Drop {
+    when l.status == 200 && l.n == 0 && l.ctx.row != "" -> Drop { cid: l.cid, op: DELETE, key: l.ctx.row, rev: 0 };
+    default -> Drop { cid: l.cid, op: NOOP, key: "", rev: 0 };
+  }
+
+  transformation p_ver(v: CrdVer) -> CrdVer {
+    CrdVer { seq: v.seq, key: v.key, name: v.name, group: v.group, scope: v.scope, plural: v.plural,
+             singular: v.singular, kind: v.kind, version: v.version, served: v.served,
+             shorts: v.shorts, status: v.status, scale: v.scale, g: v.g }
+  }
+  transformation p_glist(g: GroupList) -> GroupList { GroupList { seq: g.seq, key: g.key, list: g.list } }
+  transformation p_gvrow(r: GvRow) -> GvRow { GvRow { seq: r.seq, key: r.key } }
+  transformation p_gvleft(l: GvLeft) -> GvLeft { GvLeft { cid: l.cid, status: l.status, n: l.n, ctx: l.ctx } }
+
+  pipeline cr_rstat(v: CrdVer) -> SubPut { call x = p_ver(v); call y = res_status(x); return y; }
+  pipeline cr_rscale(v: CrdVer) -> SubPut { call x = p_ver(v); call y = res_scale(x); return y; }
+  pipeline cr_gv(v: CrdVer) -> GvPut { call x = p_ver(v); call y = gv_row(x); return y; }
+  pipeline cr_gname(v: CrdVer) -> Put { call x = p_ver(v); call y = gname_row(x); return y; }
+  pipeline cr_gcomp(g: GroupList) -> Put { call x = p_glist(g); call y = group_compose(x); return y; }
+  pipeline cgv_count(r: GvRow) -> GvCount { call x = p_gvrow(r); call y = gv_count(x); return y; }
+  pipeline cgv_drop(l: GvLeft) -> Drop { call x = p_gvleft(l); call y = gv_drop(x); return y; }
+
+  entry cr_rstat = cr_rstat;
+  entry cr_rscale = cr_rscale;
+  entry cr_gv = cr_gv;
+  entry cr_gname = cr_gname;
+  entry cr_gcomp = cr_gcomp;
+  entry cgv_count = cgv_count;
+  entry cgv_drop = cgv_drop;
+
+  provenance revision "crd-groups" toolchain "chronicle-authoring";
+}

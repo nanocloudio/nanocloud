@@ -276,6 +276,10 @@ fn j_insert(obj: &[u8], key: &[u8], field: &[u8], out: &mut [u8]) -> usize {
     if v >= obj.len() || obj[v] != b'{' {
         return 0;
     }
+    // A result that does not fit `out` is no result (0), never a cut one.
+    if obj.len() + field.len() + 1 > out.len() {
+        return 0;
+    }
     let after = j_ws(obj, v + 1);
     let empty = after < obj.len() && obj[after] == b'}';
     let mut p = j_cp(out, 0, &obj[..=v]);
@@ -288,11 +292,15 @@ fn j_insert(obj: &[u8], key: &[u8], field: &[u8], out: &mut [u8]) -> usize {
 
 /// Set a top-level scalar `key` to `val` (raw JSON token — number/bool, or quote
 /// it yourself for a string): replace it in place if present, else insert it.
-/// Returns the length written to `out`.
+/// Returns the length written to `out` — 0 when the result does not fit it:
+/// a cut document is another (unterminated) one, so it is never returned.
 fn j_set_top(obj: &[u8], key: &[u8], val: &[u8], out: &mut [u8]) -> usize {
     if let Some(vstart) = j_obj_get(obj, 0, key) {
         // Replace the existing value token with `val`.
         let vend = j_skip(obj, vstart);
+        if vstart + val.len() + obj.len().saturating_sub(vend) > out.len() {
+            return 0;
+        }
         let mut p = j_cp(out, 0, &obj[..vstart]);
         p = j_cp(out, p, val);
         j_cp(out, p, &obj[vend..])
@@ -300,7 +308,13 @@ fn j_set_top(obj: &[u8], key: &[u8], val: &[u8], out: &mut [u8]) -> usize {
         // Insert `"key":val` at the front of the root object.
         let root = j_ws(obj, 0);
         if root >= obj.len() || obj[root] != b'{' {
+            if obj.len() > out.len() {
+                return 0;
+            }
             return j_cp(out, 0, obj);
+        }
+        if obj.len() + key.len() + val.len() + 4 > out.len() {
+            return 0;
         }
         let after = j_ws(obj, root + 1);
         let empty = after < obj.len() && obj[after] == b'}';
@@ -376,12 +390,17 @@ fn j_set2(obj: &[u8], k1: &[u8], k2: &[u8], val: &[u8], out: &mut [u8]) -> usize
         return 0;
     }
     let e = j_skip(obj, s); // end of k1's object value
-                            // Rewrite the sub-object with k2 set, into a scratch, then splice.
-    let mut sub = [0u8; 4096];
-    let sl = j_set_top(&obj[s..e], k2, val, &mut sub);
-    let mut p = j_cp(out, 0, &obj[..s]);
-    p = j_cp(out, p, &sub[..sl]);
-    j_cp(out, p, &obj[e..])
+                            // The sub-object with k2 set, written in place after what precedes it
+                            // (no scratch of its own to be cut by), then what follows it.
+    if s > out.len() {
+        return 0;
+    }
+    let p = j_cp(out, 0, &obj[..s]);
+    let sl = j_set_top(&obj[s..e], k2, val, &mut out[p..]);
+    if sl == 0 || p + sl + (obj.len() - e) > out.len() {
+        return 0;
+    }
+    j_cp(out, p + sl, &obj[e..])
 }
 
 /// True iff every key:scalar in `sub` (a JSON object) is present in `sup` (a JSON
