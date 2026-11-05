@@ -114,7 +114,8 @@ hardware_targets = ["bcm2712", "linux"]
 # describes a workload that no longer exists (the node restarted), which is
 # how the chain knows to create it again.
 # Param `blobs`: the node's blob cache (the directory a pulled image's layers
-# land in, named by sha256). Without it a pack CREATE fails -22.
+# land in, named by sha256). Without it a pack CREATE fails -22. A path past 96
+# bytes refuses the module at construction, with a log line saying so.
 timer_class = "agnostic"
 permissions = ["platform_raw"]
 

@@ -322,13 +322,32 @@ for line in sys.stdin.buffer.read().split(b"\n"):
 ' "$2"
 }
 
+# nc_store_scan <redis-cli command...>
+#   Every key a RESP store holds, one per line: its SCAN pages, walked until
+#   the cursor comes back 0. A reply that is not a page fails: a listing cut
+#   short must not read as a store with fewer keys.
+nc_store_scan() {
+  local cursor=0 page
+  while :; do
+    page="$("$@" --raw SCAN "$cursor" COUNT 1000 2>/dev/null)" || return 1
+    cursor="${page%%$'\n'*}"
+    case "$cursor" in
+      "" | *[!0-9]*)
+        echo "nc_store_scan: SCAN answered: ${page:0:120}" >&2
+        return 1
+        ;;
+    esac
+    case "$page" in *$'\n'*) printf '%s\n' "${page#*$'\n'}" ;; esac
+    [ "$cursor" != 0 ] || return 0
+  done
+}
+
 # nc_store_keys <dir> [prefix]
 #   Every live key in the lattice store in <dir>, one per line.
 nc_store_keys() {
   if [ -f "$1/read.port" ]; then
-    # lattice answers KEYS as one SCAN of everything, `[cursor, keys]`: the
-    # cursor dropped, the prefix applied here.
-    redis-cli -p "$(cat "$1/read.port")" --raw KEYS "*" 2>/dev/null | sed 1d \
+    # The prefix applied here: a SCAN walks every key.
+    nc_store_scan redis-cli -p "$(cat "$1/read.port")" \
       | awk -v p="${2:-}" 'index($0, p) == 1' | sort
     return 0
   fi

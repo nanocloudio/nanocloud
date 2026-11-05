@@ -365,6 +365,11 @@ struct State {
     /// of the timer keeps it.
     retry_at: i64,
     scan_now: i64,
+    /// The reading of the clocks `scan_now` came from: every deadline moment
+    /// of a scan is said from it, so the record's `now >= deadline` and the
+    /// timer's `deadline > now` are one answer. Past for the one and ahead for
+    /// the other, a record would be neither decided nor armed.
+    scan_clock: MoClock,
     /// Earliest deadline ahead of `scan_now` seen this scan; i64::MAX = none.
     next_due: i64,
     /// Deadlines `!due` re-based to this boot (another boot's, or a wall
@@ -4443,6 +4448,10 @@ pub unsafe extern "C" fn module_new(
         s.timer_fd = -1;
         s.retry_at = 0;
         s.scan_now = 0;
+        s.scan_clock = MoClock {
+            mono: 0,
+            wall: None,
+        };
         s.next_due = i64::MAX;
         s.rebased = core::cell::Cell::new(0);
         s.child_sep = b'-';
@@ -4741,7 +4750,8 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 s.sch_zero = 0;
                 s.sch_pre = 0;
                 s.counting = if s.count != 0 { 1 } else { 0 };
-                s.scan_now = dev_millis(sys) as i64;
+                s.scan_clock = mo_clock(sys);
+                s.scan_now = s.scan_clock.mono as i64;
                 s.next_due = i64::MAX;
                 s.unresolved.set(0);
             }
@@ -6591,7 +6601,8 @@ unsafe fn events_step(s: &mut State) {
             return;
         }
         s.dirty = 0;
-        s.scan_now = dev_millis(sys) as i64;
+        s.scan_clock = mo_clock(sys);
+        s.scan_now = s.scan_clock.mono as i64;
         ev_sync(s, s.scan_now);
         // A sync a read was not answered for has re-armed `dirty`.
         s.waited.set(false);
@@ -7155,7 +7166,8 @@ unsafe fn moment_mod(s: &State, m: &[u8], got: &[u8], out: &mut [u8]) -> Option<
 
 /// `<path>!due:<ttl path>` — the deadline at `<path>` is a MOMENT
 /// (`_shared/moment.rs`; a tomb's, `_shared/tomb.rs`): read as THIS boot's
-/// monotonic ms, the clock `now` (58) and the `due` timer run on. A moment
+/// monotonic ms, the clock `now` (58) and the `due` timer run on, from the
+/// scan's one reading of the clocks (`scan_clock`). A moment
 /// this boot cannot say (another boot's monotonic time, a wall time while
 /// the clock is untrusted) is re-based to `<ttl path>` ms past this boot's
 /// origin — it ends within its ttl of a restart, never lives for ever — and
@@ -7182,9 +7194,9 @@ unsafe fn due_moment(s: &State, value: &[u8], raw: &[u8], m: &[u8]) -> Option<i6
     };
     let sys = &*s.syscalls;
     let (d, rebased) = if after {
-        mo_due_after(sys, raw, ms)
+        mo_due_after(sys, s.scan_clock, raw, ms)
     } else {
-        mo_due(sys, raw, ms)
+        mo_due(sys, s.scan_clock, raw, ms)
     };
     if rebased {
         let n = s.rebased.get().wrapping_add(1);

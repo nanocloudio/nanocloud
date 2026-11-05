@@ -249,10 +249,11 @@ unsafe fn head_rev(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<u64> {
     if 2 + key.len() + 8 + 4 + 8 + 2 > arg.len() {
         return Got::Absent;
     }
-    // `[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]` — sized for a
-    // content type as long as the u8 prefix allows, so a provider that tags
-    // its objects cannot push the etag off the end.
-    let mut rec = [0u8; 8 + 8 + 1 + 255 + 1 + 32];
+    // `[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]` and the Kept
+    // block — sized for a content type as long as the u8 prefix allows and the
+    // longest key reference, so a provider that keeps them still fits.
+    use abi::contracts::storage::object::{range, KEPT_FIXED_LEN, KEY_REF_MAX};
+    let mut rec = [0u8; 8 + 8 + 1 + 255 + 1 + 32 + KEPT_FIXED_LEN + KEY_REF_MAX];
     let mut fence = [0u8; 62];
     let mut p = 0;
     arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
@@ -271,16 +272,14 @@ unsafe fn head_rev(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<u64> {
     if n < 0 {
         return refusal(sys, nag, b"HEAD", key, n);
     }
-    if n < 18 {
-        return Got::Absent; // a malformed record: decided, not worth asking again
-    }
-    let n = n as usize;
-    let ct = rec[16] as usize;
-    let at = 17 + ct;
-    if at + 1 > n || (rec[at] as usize) < 8 || at + 1 + 8 > n {
+    // A malformed record is decided, not worth asking again.
+    let Some((_, _, etag, _)) = rec.get(..n as usize).and_then(range::decode_head) else {
+        return Got::Absent;
+    };
+    if etag.len() < 8 {
         return Got::Absent;
     }
     let mut b = [0u8; 8];
-    b.copy_from_slice(&rec[at + 1..at + 9]);
+    b.copy_from_slice(&etag[..8]);
     Got::Found(u64::from_le_bytes(b))
 }

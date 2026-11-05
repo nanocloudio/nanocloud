@@ -90,7 +90,7 @@ fail() {
   echo "FAIL: $1"
   if [ -n "$RUNTIME_PID" ]; then
     local k
-    for k in $($NSX redis-cli -p "$RPORT" --raw KEYS '*' 2>/dev/null | sed 1d | grep -a "/web\|/~node/node-a/\(pod-\|sandbox\)" | sort | head -40); do
+    for k in $(nc_store_scan $NSX redis-cli -p "$RPORT" | grep -a "/web\|/~node/node-a/\(pod-\|sandbox\)" | sort | head -40); do
       printf '   %-64s %s\n' "$k" "$($NSX redis-cli -p "$RPORT" --raw GET "$k" 2>/dev/null | head -c 160)"
     done
   fi

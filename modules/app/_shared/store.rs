@@ -1724,9 +1724,10 @@ unsafe fn write_live(
     let mut arg = [0u8; MAX_KEY + 96];
     let etag_len = if pre == PRE_ETAG { 32 } else { 0 };
     // `1 + 1` is the precondition PAIR — `[precondition][etag_len]`. The bound
-    // counts both bytes: the buffer's slack would otherwise hide an undercount
-    // until a long key made it overflow.
-    if 2 + key.len() + 1 + 8 + 8 + 1 + 1 + etag_len + 8 + 2 > arg.len() {
+    // counts both bytes and the PUT's Kept block: the buffer's slack would
+    // otherwise hide an undercount until a long key made it overflow.
+    let kept = abi::contracts::storage::object::Kept::none();
+    if 2 + key.len() + 1 + 8 + 8 + 1 + 1 + etag_len + kept.wire_len() + 8 + 2 > arg.len() {
         return WriteAnswer::Decided(-22);
     }
     let mut fence = [0u8; 62];
@@ -1754,6 +1755,14 @@ unsafe fn write_live(
     if etag_len > 0 {
         arg[p..p + 32].copy_from_slice(&etag_of(rev));
         p += 32;
+    }
+    if value.is_some() {
+        // A control-plane record keeps nothing besides its bytes. A DELETE
+        // carries no such block.
+        match kept.encode(&mut arg[p..]) {
+            Some(n) => p += n,
+            None => return WriteAnswer::Decided(-22),
+        }
     }
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;

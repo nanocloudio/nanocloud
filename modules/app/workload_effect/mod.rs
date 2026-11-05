@@ -362,6 +362,9 @@ struct State {
     /// by their sha256.
     blobs: [u8; MAX_DIR],
     blobs_len: u8,
+    /// The `blobs` param as given when it is past [`MAX_DIR`]: refused at
+    /// construction, never run with no blob cache.
+    blobs_over: usize,
     asm: Asm,
     creating: Pend,
     /// A failed pack's cached layers, as the record its status event carries
@@ -388,9 +391,12 @@ mod params_def {
 
         1, blobs, str, 0
             => |s, d, len| {
-                let n = if len > MAX_DIR { 0 } else { len };
-                s.blobs_len = n as u8;
-                if n > 0 { core::ptr::copy_nonoverlapping(d, s.blobs.as_mut_ptr(), n); }
+                if len > MAX_DIR {
+                    s.blobs_over = len;
+                    return;
+                }
+                s.blobs_len = len as u8;
+                if len > 0 { core::ptr::copy_nonoverlapping(d, s.blobs.as_mut_ptr(), len); }
             };
     }
 }
@@ -2405,6 +2411,35 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// Say why this module refuses to start: every pack CREATE would otherwise fail
+/// -22 with nothing to read.
+unsafe fn log_blobs_over(sys: &SyscallTable, len: usize) {
+    let mut d = [0u8; 20];
+    let mut k = 0;
+    let mut v = len;
+    while k < d.len() {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut m = [0u8; 96];
+    let mut n = 0;
+    for &c in b"[workload_effect] refused: blobs param is "
+        .iter()
+        .chain(d[..k].iter().rev())
+        .chain(b" bytes, past the 96 it holds".iter())
+    {
+        if let Some(o) = m.get_mut(n) {
+            *o = c;
+            n += 1;
+        }
+    }
+    dev_log(sys, 1, m.as_ptr(), n);
+}
+
 /// # Safety
 /// Kernel module-ABI entry point: `state`/`syscalls` are the loader-owned
 /// instance arena and syscall table; `params` is the config TLV blob (may be
@@ -2449,6 +2484,7 @@ pub unsafe extern "C" fn module_new(
         s.pend_at = 0;
         s.pend_len = 0;
         s.blobs_len = 0;
+        s.blobs_over = 0;
         s.asm.active = false;
         s.asm.buf = core::ptr::null_mut();
         s.asm.fd = -1;
@@ -2457,6 +2493,10 @@ pub unsafe extern "C" fn module_new(
         s.creating.active = false;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
+        if s.blobs_over > 0 {
+            log_blobs_over(&*s.syscalls, s.blobs_over);
+            return -22;
+        }
         0
     }
 }

@@ -151,4 +151,18 @@ SEAM="$(printf '%s\n' "$KEYS" | grep -c '^/api-req/\|^/api-resp/' || true)"
 [ "$SEAM" = 0 ] || fail "$SEAM store-as-IPC seam record(s) — the request bus is back"
 echo "   $TOTAL store record(s), 0 request-bus records: the chain answered over CHANNELS"
 
+echo "== 6. a listing of the store walks every page =="
+# 300 keys of 80 bytes pass any one reply's page, so a reader that keeps the
+# first page, or drops the cursor, finds fewer than were written.
+PAGED="/nc-store-keys-paged/$(printf 'k%.0s' $(seq 1 56))"
+for i in $(seq 1 300); do printf 'SET %s-%04d 1\n' "$PAGED" "$i"; done \
+  | redis-cli -p "$(cat "$STORE/read.port")" >/dev/null || fail "the paged keys were not written"
+FOUND="$(nc_store_keys "$STORE" /nc-store-keys-paged/)" || fail "the store's keys could not be listed"
+[ "$(printf '%s\n' "$FOUND" | grep -c .)" = 300 ] \
+  || fail "$(printf '%s\n' "$FOUND" | grep -c .) of 300 keys listed: a page was dropped"
+[ "$(printf '%s\n' "$FOUND" | sort -u | grep -c .)" = 300 ] || fail "a key was listed twice"
+FIRST="$(redis-cli -p "$(cat "$STORE/read.port")" --raw SCAN 0 COUNT 1000 | sed 1d | grep -c .)"
+[ "$FIRST" -lt 300 ] || fail "one SCAN page held all $FIRST keys: this listing proves nothing about pages"
+echo "   300 of 300 keys listed across pages (the first page held $FIRST)"
+
 echo "== E2E green: the bootstrap's control-plane graph serves the API as Chronicle params, over channels =="

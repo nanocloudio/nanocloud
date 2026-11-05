@@ -407,8 +407,16 @@ def flat(k):
 
 def relayed():
     """The relay's records still standing: `key out=<answered?>`."""
-    r = subprocess.run(["redis-cli", "-p", read, "--raw", "KEYS", "*"], capture_output=True, text=True)
-    keys = [k for k in r.stdout.split("\n") if "/volume-asks/" in k or "/volume-ops/" in k]
+    keys, cursor = [], "0"
+    while True:
+        r = subprocess.run(["redis-cli", "-p", read, "--raw", "SCAN", cursor, "COUNT", "1000"],
+                           capture_output=True, text=True, check=True)
+        cursor, *page = r.stdout.split("\n")
+        if not cursor.isdigit():
+            raise RuntimeError(f"SCAN answered: {r.stdout[:120]}")
+        keys += [k for k in page if "/volume-asks/" in k or "/volume-ops/" in k]
+        if cursor == "0":
+            break
     return [f"{k} answered={';out=' in get(k)}" for k in keys]
 
 def until(what, f, secs):
@@ -494,7 +502,7 @@ PY
 # ── 4. what crossed: through the store, and nothing left behind ──
 grep -q "QUARANTINE\|scope refused\|REFUSED" "$D/plane/run.log" && fail "the plane refused to serve"
 on_node "grep -q 'QUARANTINE\|scope refused\|REFUSED' $D/node-a/run.log" && fail "the node refused to serve"
-[ -z "$(redis-cli -p "$READ_PORT" --raw KEYS '*' | grep '/volume-asks/\|/volume-ops/' || true)" ] \
+[ -z "$(nc_store_scan redis-cli -p "$READ_PORT" | grep '/volume-asks/\|/volume-ops/' || true)" ] \
   || fail "a relayed request was left behind"
 stop_node
 stop_plane

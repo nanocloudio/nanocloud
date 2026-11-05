@@ -163,11 +163,34 @@ unsafe fn mo_after(sys: &SyscallTable, ms: u64, out: &mut [u8; 64]) -> usize {
     }
 }
 
+/// One reading of the two clocks a deadline moment is said against: this
+/// boot's monotonic ms and, when trusted, the wall clock in Unix ms. A moment
+/// said from one reading is one number however often it is said. Time passes
+/// between any two calls, so two readings are two answers near a deadline,
+/// and whoever compares `now >= deadline` and whoever arms a timer for it must
+/// not get different ones: read as past by one and ahead by the other, the
+/// deadline is neither decided nor armed. The wall clock is read first: the
+/// time between the two puts a deadline later, never earlier.
+#[derive(Clone, Copy)]
+struct MoClock {
+    mono: u64,
+    wall: Option<u64>,
+}
+
+unsafe fn mo_clock(sys: &SyscallTable) -> MoClock {
+    let wall = mo_trusted_ms(sys);
+    MoClock {
+        mono: dev_millis(sys),
+        wall,
+    }
+}
+
 /// A recorded deadline moment as THIS boot's monotonic ms (the clock a
-/// source's `now` and its timer run on), and whether it had to be re-based.
+/// source's `now` and its timer run on) at the reading `at`, and whether it
+/// had to be re-based.
 ///
-///   <unix ms>          the clock trusted now: now, plus how far ahead it is
-///                      (a deadline passed is due now)
+///   <unix ms>          the clock trusted at `at`: its `mono`, plus how far
+///                      ahead the deadline is (a deadline passed is due then)
 ///   m<mono>@<boot>     this boot's: as it is
 ///
 /// A deadline that cannot be said on this boot — another boot's monotonic
@@ -177,7 +200,7 @@ unsafe fn mo_after(sys: &SyscallTable, ms: u64, out: &mut [u8; 64]) -> usize {
 /// here. The re-base is the same on every read of this boot (it moves with
 /// nothing), so the deadline is deterministic. An empty or malformed
 /// deadline is 0 (none).
-unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
+unsafe fn mo_due(sys: &SyscallTable, at: MoClock, src: &[u8], ttl: u64) -> (i64, bool) {
     if src.is_empty() {
         return (0, false);
     }
@@ -186,9 +209,9 @@ unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
         for &c in src.iter().take(19) {
             wall = wall.saturating_mul(10).saturating_add(u64::from(c - b'0'));
         }
-        return match mo_trusted_ms(sys) {
+        return match at.wall {
             Some(now_wall) => {
-                let now = dev_millis(sys);
+                let now = at.mono;
                 let d = if wall <= now_wall {
                     now
                 } else {
@@ -223,16 +246,14 @@ unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
     (ttl.max(1).min(i64::MAX as u64) as i64, true)
 }
 
-/// A recorded moment PLUS `off` ms, as THIS boot's monotonic ms — a deadline
-/// measured from a moment a record kept (a Job's start plus its
-/// activeDeadlineSeconds, a failure plus its backoff), and whether it had to
-/// be re-based.
+/// A recorded moment PLUS `off` ms, as THIS boot's monotonic ms at the reading
+/// `at` — a deadline measured from a moment a record kept (a Job's start plus
+/// its activeDeadlineSeconds, a failure plus its backoff), and whether it had
+/// to be re-based.
 ///
-///   <unix ms>          the clock trusted now: the deadline on this boot's
-///                      monotonic clock — now, plus how far ahead it is, or
-///                      less how long ago it passed (never past now, so a
-///                      record read at `now` compares `now >= deadline`
-///                      truly however many ms the read took)
+///   <unix ms>          the clock trusted at `at`: the deadline on this boot's
+///                      monotonic clock — its `mono`, plus how far ahead the
+///                      deadline is, or less how long ago it passed
 ///   m<mono>@<boot>     this boot's: `mono + off`
 ///
 /// A moment this boot cannot say (another boot's monotonic time, a wall
@@ -240,7 +261,7 @@ unsafe fn mo_due(sys: &SyscallTable, src: &[u8], ttl: u64) -> (i64, bool) {
 /// origin, as [`mo_due`] re-bases to its ttl: the wait runs again from the
 /// restart, never for ever and never cut short by a clock that means
 /// nothing here. An empty or malformed moment is 0 (none).
-unsafe fn mo_due_after(sys: &SyscallTable, src: &[u8], off: u64) -> (i64, bool) {
+unsafe fn mo_due_after(sys: &SyscallTable, at: MoClock, src: &[u8], off: u64) -> (i64, bool) {
     if src.is_empty() {
         return (0, false);
     }
@@ -250,9 +271,9 @@ unsafe fn mo_due_after(sys: &SyscallTable, src: &[u8], off: u64) -> (i64, bool) 
             wall = wall.saturating_mul(10).saturating_add(u64::from(c - b'0'));
         }
         let wall = wall.saturating_add(off);
-        return match mo_trusted_ms(sys) {
+        return match at.wall {
             Some(now_wall) => {
-                let now = dev_millis(sys);
+                let now = at.mono;
                 let d = if wall <= now_wall {
                     now.saturating_sub(now_wall - wall)
                 } else {
