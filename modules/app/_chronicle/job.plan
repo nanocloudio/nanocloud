@@ -314,6 +314,22 @@ plan nanocloud.job {
     v1: string = 4; v2: string = 5; v3: string = 6; v4: string = 7;
   }
   decision w2(w: jb.Wrote) -> jb.Stamp {
+    // A write the store could not do decides nothing — and the pass is asked
+    // again in a second, the same retry moment a refused count records
+    // (`cfa`, the file head). Without it a refusal at a deadline's pass was
+    // that deadline's only pass: the deadline is behind, so it arms nothing,
+    // and nothing else wakes a Job whose Pod is quietly running.
+    // 5xx ONLY. A 4xx is a definite answer about the request — 404 the key is
+    // not there, 413 it is past this node's record, 409 another writer landed
+    // — and asking again cannot change it: 404 and 413 would retry at 1 Hz
+    // for as long as the record lives, and a 409 needs no retry at all, since
+    // the write that caused it is itself a change to a prefix this source
+    // subscribes to, which brings the record round again.
+    // Never onto a record already gone: a merge into an absent key creates
+    // it, and a Job's state must not outlive the Job.
+    when w.ctx.gone == "" && w.status >= 500 && w.ctx.now >= w.ctx.dcf ->
+      jb.Stamp { cid: w.cid, op: MERGE, key: "job-ctl/" + w.ctx.key,
+                 v1: "cfa=", v2: w.moment, v3: ";cfw=1000" };
     when w.ctx.gone != "" || w.ctx.fin != "" ->
       jb.Stamp { cid: w.cid, op: NOOP, key: "" };
     when w.ctx.sus == "true" && w.ctx.sp != "1" ->

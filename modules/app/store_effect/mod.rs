@@ -447,11 +447,11 @@ struct State {
     /// `wall = 1`: the fused decision reads the wall clock at [`WALL_FIELD`];
     /// `wall = 2` also the recordable moment at [`MOMENT_FIELD`].
     wall: u32,
-    /// `merge_existing = 1`: a MERGE only ever edits a record that exists — 404
-    /// when the key is absent, and conditional on the revision it read (409
-    /// when the record moved meanwhile), as a MERGE with field 28 is. A chain
-    /// that adds one field to a record another chain owns cannot then bring
-    /// back a record that chain removed.
+    /// `merge_existing = 1`: a MERGE only ever EDITS — 404 when the key is
+    /// absent, rather than creating it. A chain that adds one field to a
+    /// record another chain owns cannot then bring back a record that chain
+    /// removed. It says nothing about conditionality: every MERGE is
+    /// conditional on the revision it read, with or without this.
     merge_existing: u32,
     in_buf: [u8; BUF],
     out_buf: [u8; BUF],
@@ -4518,20 +4518,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     reply_projected(&mut out, cid, status, body, carry, &proj)
                 }
                 OP_MERGE => {
-                    // With an expected revision in field 28 the merge is into
-                    // THAT record: 409 when it moved or is gone, so a merge
-                    // never recreates a record another writer removed.
-                    // `merge_existing` takes the revision from the store,
-                    // read BEFORE the value: a write between the two then
-                    // fails the condition rather than being overwritten.
+                    // EVERY merge is conditional. A merge reads the record,
+                    // edits it and writes it back, so an unconditional write
+                    // would overwrite whatever landed between the read and
+                    // the write — and a journaled merge served again after a
+                    // stall would re-read, re-merge and lose the update that
+                    // landed meanwhile. The revision is field 28 when the
+                    // caller states one (the merge is into THAT record: 409
+                    // when it moved or is gone, so a merge never recreates a
+                    // record another writer removed), else the store's own,
+                    // read BEFORE the value so a write between the two fails
+                    // the condition rather than being overwritten. An absent
+                    // key is written create-only, which is the same condition
+                    // said of nothing.
                     let stated = match frame_i64(req, 28) {
                         Some(r) if r > 0 => r as u64,
                         _ => 0,
                     };
-                    let (want, absent) = if stated == 0 && s.merge_existing != 0 {
+                    let (want, absent) = if stated == 0 {
                         match head(sys, key) {
                             Some(r) if r > 0 => (r, false),
-                            _ => (0, true),
+                            // Absent: 404 where the caller asked to edit only
+                            // what exists, else a create-only write below.
+                            _ => (0, s.merge_existing != 0),
                         }
                     } else {
                         (stated, false)
@@ -4547,10 +4556,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     } else if absent {
                         404
                     } else if want == 0 {
-                        match put_guarded(sys, key, &merged[..ml]) {
-                            (false, _) => 500,
-                            (true, true) => 200,
-                            (true, false) => 204,
+                        // Nothing there to merge into: create-only, so a
+                        // record that appeared since the read is not lost.
+                        match code(put_cond(sys, key, &merged[..ml], PRE_ABSENT, 0)) {
+                            0 => 200,
+                            ERR_EAGAIN | ERR_EEXIST => 409,
+                            _ => 500,
                         }
                     } else if got.is_none() {
                         if exists(sys, key) {
