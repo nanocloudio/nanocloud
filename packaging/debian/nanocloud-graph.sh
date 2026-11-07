@@ -68,6 +68,11 @@
 #                         keys as …/replica-<id>.<role>; no PKI directory)
 #   NANOCLOUD_TRUST_DOMAIN  the SPIFFE trust domain under `authority`
 #                         (default: nanocloud.local)
+#   NANOCLOUD_CLIENT_CA   another authority whose client certificates the
+#                         API accepts beside bearer tokens, a DER bundle
+#                         (default: /etc/nanocloud.io/certs/client-ca.der
+#                         when present): a management plane's, whose
+#                         customers reach this cell with kubectl directly
 #
 # Under `authority` a control plane also holds no API key: its API's TLS
 # key is born in the vault too and certified by the same authority, and
@@ -616,6 +621,37 @@ PEER_PKI_MODULES="${PEER_PKI_MODULES#
 }"
 PEER_PKI_WIRING="${PEER_PKI_WIRING#
 }"
+
+# Client certificates at the API, beside bearer tokens on the same listener
+# (`verify_peer: 2`: a certificate is asked for, a client without one is
+# served as before, one presented is verified, and its identity is
+# `peer:<sha256 of its raw public key>` for RBAC). The anchors: under
+# `authority` the cluster's own (`trust_issuer`, the issuer of the API's
+# certificate), and any authority named by NANOCLOUD_CLIENT_CA — a DER bundle,
+# one or more certificates end to end, such as a management plane's (Acorn)
+# whose customers' certificates kubectl presents here directly. With no
+# anchor at all a certificate could be verified against nothing, so none is
+# asked for (`verify_peer: 0`).
+CLIENT_CA="${NANOCLOUD_CLIENT_CA:-/etc/nanocloud.io/certs/client-ca.der}"
+[ -n "${NANOCLOUD_CLIENT_CA:-}" ] && [ ! -r "$CLIENT_CA" ] \
+    && fail "NANOCLOUD_CLIENT_CA names $CLIENT_CA, which is not readable"
+API_CLIENT=""
+case "$API_IDENTITY" in
+    *identity_label*) API_CLIENT='    peer_auth: 2
+    trust_issuer: 1' ;;
+esac
+if [ -r "$CLIENT_CA" ]; then
+    API_CLIENT="${API_CLIENT:-    peer_auth: 2}
+    trust: \"$CLIENT_CA\""
+fi
+if [ -n "$API_CLIENT" ]; then
+    API_IDENTITY="    verify_peer: 2
+$API_CLIENT
+$API_IDENTITY"
+else
+    API_IDENTITY="    verify_peer: 0
+$API_IDENTITY"
+fi
 
 # operations: the keys wire admin is judged by.
 ADMIN_LINES=""

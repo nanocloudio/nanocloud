@@ -155,7 +155,8 @@ plan nanocloud.crd {
             v5: ",{\"name\":\"policy\",\"versions\":[{\"groupVersion\":\"policy/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"policy/v1\",\"version\":\"v1\"}}",
             v6: ",{\"name\":\"networking.k8s.io\",\"versions\":[{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"networking.k8s.io/v1\",\"version\":\"v1\"}}",
             v7: ",{\"name\":\"discovery.k8s.io\",\"versions\":[{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"discovery.k8s.io/v1\",\"version\":\"v1\"}}",
-            v8: ",{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}}" };
+            v8: ",{\"name\":\"nanocloud.io\",\"versions\":[{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"nanocloud.io/v1\",\"version\":\"v1\"}}",
+            v9: ",{\"name\":\"certificates.k8s.io\",\"versions\":[{\"groupVersion\":\"certificates.k8s.io/v1\",\"version\":\"v1\"}],\"preferredVersion\":{\"groupVersion\":\"certificates.k8s.io/v1\",\"version\":\"v1\"}}" };
   }
 
   // ---- pruning ----

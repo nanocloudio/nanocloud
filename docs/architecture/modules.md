@@ -13,13 +13,16 @@ only through fluxor **capability surfaces**: kernel providers addressed by
 contract class, which admission can gate.
 
 Between the two sit the `.fmod` modules, and the control plane has
-twenty-two of them. Twenty are **connectors**: each crosses one seam a rules VM
+twenty-three of them. Twenty are **connectors**: each crosses one seam a rules VM
 cannot — the store, a socket, a container, the packet filter, a mount, a key
 service — and decides nothing, performing the key, field and op it is told
-and reporting what happened. The other two are the CLI, an operator's entry
-point rather than part of any chain, and `node_pki`, the node's certificate
+and reporting what happened. The other three are the CLI, an operator's entry
+point rather than part of any chain; `node_pki`, the node's certificate
 and join service, which writes the bootstrap objects a joining operator needs
-(its Namespace, the `cluster-admin` ClusterRole and binding, its Device). No
+(its Namespace, the `cluster-admin` ClusterRole and binding, its Device); and
+`device_pki`, a customer Device's claim token and the `nanocloud.io/device`
+signer that redeems it, whose decisions are a credential's (a token's hash, a
+request's signature, which key a token is bound to). No
 `.fmod` in this tree holds what a Deployment is, what `/api/v1` names, or
 when a Pod may restart.
 
@@ -337,7 +340,7 @@ to the hex params a graph carries.
 | `pb_` | `probe.plan`, `probe_collect.plan` | liveness/readiness probes: per-probe state at `/probe-rt-<l\|r>/<uid>` whose `due`/`deadline` arm the kernel timer, exec attempts over the `/sandbox-exec/` seam, verdicts at `/probe-status/` (the lifecycle chain folds `live=0` into restart+backoff; the endpoints chain gates on `ready`) |
 | `pi_` | `pod_image.plan` | an `image=` spec resolved to a rootfs and an argv: the pull trigger, the two gates, the answer |
 | `sn_` | `snapshot.plan` | VolumeSnapshot → a bound VolumeSnapshotContent, marked ready |
-| `dv_` | `device.plan` | a Device naming its public key → certified once by kagi's `certificate_endpoint` (via `http_effect`) → `/deviceidentities…/` and `/ca-cert` |
+| `dv_` | `device.plan` | a node's link-end Device (namespace `nanocloud-peers`) naming its public key → certified once by kagi's `certificate_endpoint` (via `http_effect`) → `/deviceidentities…/` and `/ca-cert`; a Device elsewhere proves its key through `device_pki` instead |
 | `mb_` | `management.plan`, `management_sweep.plan` | a ManagementBinding (a managed cell's record of one management plane) → the Namespace `nanocloud-management`, the plane's ServiceAccount, its ClusterRole (its own rules + `spec.rules`, spliced) and ClusterRoleBinding, `spec.authorityEpoch` committed (`/authority-epochs/`), and the enrollment offer `/enrollment-offers/<b>/<grant>/<cell UID>/<digest>`, made once per grant, ever (CREATED only when a COUNT of the grant's offers, live or spent, is 0 — one write; an enrollment CLAIMS it, store_effect op 22, leaving it spent); an offer the binding no longer states (another grant, UID or digest; deleting; gone) claimed — withdrawn (`mb_wd`); a gone binding's ClusterRoleBinding, ClusterRole and ServiceAccount collected, its committed epochs and spent offers kept (a credential names the subject, so a binding made again under the name must fence its predecessor's) |
 | `tk_` | `sa_token.plan` | a `/token-req/` → kagi's `token_mint` (via `kagi_mint`) → `/token-resp/` `token=<JWT>` |
 | `is_` | `ipam_svc.plan` | ClusterIPs from 10.96.0.0/16: next-fit over a cursor, each address claimed create-only at `/ipam/svc/<u32>` (409 = taken, skip), PATCHed into `spec.clusterIP`; held addresses are claimed before allocation starts; a deleted Service's claim is released |
@@ -465,6 +468,7 @@ thing; `docs/design/encrypted-volumes.md` sets out the pipelines they serve.
 | `mount_effect` | `host_mount`, `proc` | the claim chain's mount actuator: a `Mnt` record in, the raw facts of what ran back |
 | `volume_files` | `host_mount`, `fs`, `storage.object` | a Pod's own volumes on its node (emptyDir, ConfigMap, Secret, projected, downwardAPI): made, projected and removed with the Pod. Projections are upstream's AtomicWriter layout (a `..data` link swapped, the whole set atomic for a reader), for a container and a graph-backed Pod alike (the runtime follows a link that stays beneath the volume) |
 | `volume_host` | `workload`, `proc` | a node's volume effector: the volume's subgraph staged, unlocked through Kagi, published over NBD, and torn down |
+| `device_pki` | the API chain after `admit`, kagi's `certificate_endpoint`, the store | a customer Device's claim token minted, and redeemed by one `nanocloud.io/device` CSR (docs/design/devices.md) |
 | `node_pki` | kagi's `certificate_endpoint`, `tls`'s identity ports | the node's certificate: tls's identity request answered by the authority; with `join: 1`, the operator's first credential minted behind a one-time join secret, and the bootstrap objects it needs |
 | `nanocloud_cli` | the host's argv and stdio | a cli-applet: argv in, the store read and written directly, bytes to stdout and a latched exit code — so the CLI works with no HTTP edge running |
 

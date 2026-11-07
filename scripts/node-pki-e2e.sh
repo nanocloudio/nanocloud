@@ -92,13 +92,29 @@ with os.fdopen(fd, "r+b") as f:
 PY
 
 echo "== 2. render the control plane as the board's: vault identities, node_pki, no keys at all =="
-NANOCLOUD_PEER_TRUST=authority nc_controlplane_graph "$STORE" "$D/graph.yaml" \
+# A management plane's authority (Acorn's, here openssl's) whose customers'
+# certificates the API takes beside the operator's bearer token, on one
+# listener: NANOCLOUD_CLIENT_CA. Only its certificate is rendered.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout "$D/acorn.key.pem" -out "$D/acorn.pem" -days 1 -subj "/CN=acorn-customer-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+openssl x509 -in "$D/acorn.pem" -outform DER -out "$D/acorn.der"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout "$D/customer.key.pem" -out "$D/customer.csr" -subj "/CN=account:ab12cd" 2>/dev/null
+printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' >"$D/customer.ext"
+openssl x509 -req -in "$D/customer.csr" -CA "$D/acorn.pem" -CAkey "$D/acorn.key.pem" -CAcreateserial \
+  -out "$D/customer.pem" -days 1 -extfile "$D/customer.ext" 2>/dev/null
+CU="peer:$(openssl x509 -in "$D/customer.pem" -noout -pubkey \
+  | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 65 | sha256sum | cut -d' ' -f1)"
+NANOCLOUD_PEER_TRUST=authority NANOCLOUD_CLIENT_CA="$D/acorn.der" nc_controlplane_graph "$STORE" "$D/graph.yaml" \
   || fail "the control plane did not render"
 python3 - "$D/graph.yaml" <<'PY' || fail "the render carries key material"
 import sys
 g = "\n".join(l for l in open(sys.argv[1]).read().splitlines() if not l.lstrip().startswith("#"))
 if 'identity_label: "nanocloud.api"' not in g or "join: 1" not in g:
     sys.exit("the API's identity is not the vault's, or nothing mints the join")
+if "verify_peer: 2" not in g or "trust_issuer: 1" not in g or "acorn.der" not in g:
+    sys.exit("the API does not ask for client certificates under both authorities")
 for leftover in ("cert_file", "key_file", "trust.pem", "_key:"):
     if leftover in g:
         sys.exit(f"the graph still renders key material ({leftover})")
@@ -167,6 +183,25 @@ PY
 )"
 [ "$SUB" = "system:serviceaccount:kube-system:admin 2592000" ] || fail "the joined credential is '$SUB'"
 echo "   the credential: $SUB s"
+
+echo "== 5b. on the same listener, a customer's certificate from the other authority =="
+CKC="$D/customer.kubeconfig"
+kubectl config view --raw --minify --kubeconfig "$KC" >"$CKC"
+KUBECONFIG="$CKC" kubectl config set-credentials customer \
+  --client-certificate "$D/customer.pem" --client-key "$D/customer.key.pem" >/dev/null
+KUBECONFIG="$CKC" kubectl config set-context --current --user customer >/dev/null
+c() { kubectl --kubeconfig "$CKC" --request-timeout=20s "$@"; }
+if c get namespaces >"$D/cu.out" 2>&1; then fail "an unbound customer certificate was served"; fi
+grep -qi forbidden "$D/cu.out" || { cat "$D/cu.out"; fail "an unbound customer was not answered Forbidden"; }
+k create clusterrole ns-read --verb=get,list --resource=namespaces >/dev/null || fail "create clusterrole"
+k create clusterrolebinding customer --clusterrole=ns-read --user="$CU" >/dev/null || fail "bind $CU"
+for _ in $(seq 120); do c get namespaces >/dev/null 2>&1 && break; sleep 0.25; done
+c get namespaces >/dev/null || fail "the bound customer was not served within 30 s"
+k delete clusterrolebinding customer >/dev/null || fail "unbind"
+for _ in $(seq 120); do c get namespaces >/dev/null 2>&1 || break; sleep 0.25; done
+c get namespaces >/dev/null 2>&1 && fail "the unbound customer was still served after 30 s"
+k get namespaces >/dev/null || fail "the operator's token stopped working beside the certificates"
+echo "   the customer: Forbidden, served once bound, Forbidden once unbound; the operator's token throughout"
 
 echo "== 6. the secret answers once =="
 bash "$ROOT/scripts/rig-join.sh" "$SECRET" "$CA_SHA" "127.0.0.1:$PORT" "$D/kc2" 2>"$D/join.err" \

@@ -6,8 +6,9 @@ of generic engines carrying compiled rules. The `no_std` position-independent
 modules (`.fmod`) in the tree hold almost no Kubernetes meaning: nearly every
 one is a connector, moving bytes across one seam — the store, a socket, an
 HTTP route, a container, the packet filter, a volume. The exceptions are the
-CLI and `node_pki`, which writes the Kubernetes objects of a node's join (its
-Devices and the slot's ServiceAccount). There is no host binary and
+CLI, `node_pki`, which writes the Kubernetes objects of a node's join (its
+Devices and the slot's ServiceAccount), and `device_pki`, which mints a
+Device's claim token and signs the certificate it is redeemed for. There is no host binary and
 no separate database: install the package, start one systemd unit, and the
 node serves the Kubernetes API.
 

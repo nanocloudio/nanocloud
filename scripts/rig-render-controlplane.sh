@@ -222,6 +222,20 @@ lease = (m.group(1).replace("__NODE_NAME__", node).replace("__NODE_FACTS__", fac
 disk = ("  # ── Metal: the board's disk under the store and the log ──────────────\n"
         "  - name: nvme\n    bind: m2_primary\n    namespace: 1\n    queue_depth: 32\n"
         "  - name: fat32\n    path: /\n    init_free_hint: 20000\n    clear_free_region: 4096\n")
+# The vault's records (the authority's key, the API's, the link ends'): a
+# vault_store over a file on that FAT32, two 16 KiB slots. Not over
+# nvme.blocks: fat32 holds that channel, and a storage.block source answers
+# on one channel only (a second edge from it composes as a tee, which carries
+# no requests). `seal: hardware` seals under the board's OTP device key and,
+# on a board without one, persists nothing (a new authority every boot, as
+# before); NANOCLOUD_RIG_VAULT_SEAL=none keeps the keys readable on the disk
+# instead, for a development board.
+vault_seal = os.environ.get("NANOCLOUD_RIG_VAULT_SEAL", "hardware")
+if vault_seal not in ("hardware", "none"):
+    sys.exit(f"render: NANOCLOUD_RIG_VAULT_SEAL must be hardware or none, not {vault_seal!r}")
+disk += ("  - name: vault_file\n    type: file_block\n    path: /vault.img\n"
+         "    block_size: 512\n    blocks: 64\n"
+         f"  - name: vault_store\n    image: 16384\n    seal: {vault_seal}\n")
 # The node's IP stack, declared here so it takes the params below (the net
 # stack's own `ip` would carry its defaults only; the stack keeps its
 # rp1_gem -> conn_guard -> ip wiring for a module of this name). Its
@@ -369,6 +383,7 @@ if images:
 
 edges = [kube_edges,
          "  - from: nvme.blocks\n    to: fat32.blocks\n",
+         "  - from: vault_file.blocks\n    to: vault_store.blocks\n",
          "  - from: sntp.net_out\n    to: ip.net_in\n",
          "  - from: ip.net_out\n    to: sntp.net_in\n"]
 for name, *_ in seeds:
@@ -388,6 +403,8 @@ consumers.update({"http"})
 # answers every FS call ENOSYS (the store quarantines). NOT nvme: with a
 # budget and `tolerate` on it the board boots dark.
 consumers.update({"fat32"})
+# The vault file: each of its requests is an FS call into fat32.
+consumers.update({"file_block"})
 edges.append("  - from: nl_self.record_out\n    to: nl_renew.request_in\n")
 
 mods, wiring = g.split("\nwiring:\n", 1)

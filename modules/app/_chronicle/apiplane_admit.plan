@@ -195,6 +195,44 @@ plan nanocloud.apiplane_admit {
                    c_key: "/enrollment-offers/" + r.name + "/" + r.credential + "/" + r.enrol,
                    c_resource: r.resource, c_name: r.name, c_body: "", c_namespace: "",
                    c_verdict: ENROLL, c_answer: "", c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    // A Device's certificate signing request (`device_pki`): the bearer
+    // credential is the Device's claim token, not a token kagi verifies, so
+    // it rides in `c_key` and `credential` is emptied. The request goes on
+    // with the verdict a graph that has no `device_pki` answers; one that has
+    // it answers instead (the token checked, the request's signature proved,
+    // the key certified). A GET names the CSR in the target (`c_name`).
+    when r.target == "/apis/certificates.k8s.io/v1/certificatesigningrequests" && r.method == M_POST ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: r.credential,
+                   c_resource: "certificatesigningrequests", c_name: r.target, c_body: r.body, c_namespace: "",
+                   c_verdict: 501,
+                   c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotImplemented\",\"code\":501,\"message\":\"this API signs no certificate requests\"}",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target.startsWith("/apis/certificates.k8s.io/v1/certificatesigningrequests/") && r.method == 1 ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: r.credential,
+                   c_resource: "certificatesigningrequests", c_name: r.target, c_body: "", c_namespace: "",
+                   c_verdict: 501,
+                   c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotImplemented\",\"code\":501,\"message\":\"this API signs no certificate requests\"}",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    when r.target == "/apis/certificates.k8s.io/v1" ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 200,
+                   c_answer: "{\"kind\":\"APIResourceList\",\"groupVersion\":\"certificates.k8s.io/v1\",\"resources\":[{\"name\":\"certificatesigningrequests\",\"singularName\":\"certificatesigningrequest\",\"namespaced\":false,\"shortNames\":[\"csr\"],\"kind\":\"CertificateSigningRequest\",\"verbs\":[\"create\",\"get\"]}]}",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
+    // A Device's firmware (`devices/<name>/firmware`): the contract is fixed
+    // (the class's signed image and a config block with the WiFi settings,
+    // the claim token, the enrollment URL, the cell CA and the broker), the
+    // image is not: fluxor's tls asks for its vault key's certificate with
+    // the bare public key (`identity_req`), and the key is the tls module's
+    // alone, so nothing on the device can sign the PKCS#10 this signer takes
+    // as proof of possession. Said, rather than answered 404.
+    when r.target.startsWith("/apis/nanocloud.io/v1/namespaces/") && r.target.indexOf("/devices/") > 0
+         && r.target.indexOf("/firmware") > 0 && r.method == 1 ->
+      VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
+                   c_resource: "", c_name: "", c_body: "", c_namespace: "",
+                   c_verdict: 501,
+                   c_answer: "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"reason\":\"NotImplemented\",\"code\":501,\"message\":\"no firmware image is built for this Device's class yet: the pico2w image needs fluxor's tls to sign a certificate request with its vault key\"}",
+                   c_watch: 0, ctx: ApiCtx { group: r.group, nonres: "" } };
     when r.target == "/healthz" ->
       VerifyCall { credential: "", c_cid: r.cid, c_method: r.method, c_key: "",
                    c_resource: "", c_name: "", c_body: "", c_namespace: "",

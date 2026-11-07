@@ -15,7 +15,11 @@
 //         {"status":{"spiffe","publicKey","certificate","ca"}} — what a client
 //         reading its Device through the API (a node certifying its peer
 //         keys) is answered; `publicKey` is the key certified
-// A Device without a key is not certified: there is nothing to certify. One
+// Only in namespace `nanocloud-peers`, a node's own link ends (node_pki): a
+// customer's Device proves its key with a claim token and a certificate
+// signing request instead (modules/app/device_pki), and naming a key there
+// certifies nothing. A Device without a key is not certified: there is
+// nothing to certify. One
 // whose spec names a key other than status.publicKey is certified (again):
 // the holder re-keyed.
 plan nanocloud.device {
@@ -87,7 +91,11 @@ plan nanocloud.device {
   }
 
   decision cert(d: dv.Dev) -> dv.Call {
-    when d.pk == "" ->
+    // Only a node's own link keys (namespace nanocloud-peers, which node_pki
+    // declares and binds per worker slot) are certified by naming them: a
+    // key named is not a key proved. Every other Device proves its key with
+    // a claim token and a CSR (device_pki).
+    when d.pk == "" || d.ns != "nanocloud-peers" ->
       dv.Call { cid: d.seq, method: NOOP, path: "",
                 b1: "", b2: "", b3: "", b4: "", b5: "", b6: "", b7: "", b8: "", b9: "", ctx: Ctx { key: d.key, pk: "" } };
     default ->

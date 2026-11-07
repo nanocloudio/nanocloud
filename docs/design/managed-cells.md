@@ -197,6 +197,40 @@ replayed request — lowers it.
    one — before any write under it — and use the token it answers.
 5. Renew by re-posting the current epoch to the same path.
 
+## Customers' kubectl, by client certificate
+
+A management plane that issues its customers' certificates can send their
+kubectl straight to the cell. The API's `tls` asks for a client certificate
+without requiring one (`verify_peer: 2`), so bearer tokens (the operator's
+join, ServiceAccounts) and certificates share its listener. A presented
+certificate must chain to the cluster's own authority (`trust_issuer`, under
+`NANOCLOUD_PEER_TRUST=authority`) or to the bundle `NANOCLOUD_CLIENT_CA` names
+(DER, one or more certificates end to end; default
+`/etc/nanocloud.io/certs/client-ca.der` when present): the management
+plane's. With neither, `nanocloud-graph.sh` renders `verify_peer: 0`.
+
+- **Subject.** A verified certificate authenticates as the User
+  `peer:<hex>`, the SHA-256 of the leaf's raw subjectPublicKey: for P-256 the
+  65-byte uncompressed point, for RSA the `RSAPublicKey` DER. Not the SPKI
+  DER, and nothing the issuer writes in the subject or SANs: the binding names
+  the key.
+- **Access.** One RoleBinding (or ClusterRoleBinding) per credential, subject
+  `{kind: User, name: peer:<hex>}`, written through the API like any other.
+  The management plane needs `bind` (or the granted permissions) for that.
+- **Revocation.** Deleting the binding: the next requests are `403`. The grant
+  index follows in well under a second on one node; a cell the management
+  plane cannot reach keeps serving the key until it can, or until the
+  certificate expires.
+`scripts/kubectl-client-cert-e2e.sh` proves it with real kubectl and an
+openssl authority standing in for the management plane's: an operator by
+certificate alone, a customer's genuine certificate granted nothing until
+bound, served once bound, refused within moments of the binding's deletion,
+a certificate from neither authority refused at the handshake, and a client
+with no certificate answered by the API itself. `scripts/node-pki-e2e.sh`
+renders the shipped control plane with `NANOCLOUD_CLIENT_CA`: the operator's
+bearer token and a customer's certificate on one listener, the customer
+bound and unbound.
+
 ## Proven by
 
 `scripts/management-binding-e2e.sh` (the shipped control plane, live):

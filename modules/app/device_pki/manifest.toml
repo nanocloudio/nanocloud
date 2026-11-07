@@ -1,0 +1,128 @@
+name = "device_pki"
+version = "0.1.0"
+description = "A Device's claim token, and the nanocloud.io/device signer that redeems it for a certificate"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+timer_class = "wall_clock"
+
+# The PKI half of a customer's Device (one with `spec.class`), with
+# `node_pki` the other module here that writes Kubernetes objects: what it
+# writes is a credential's, and the cryptography behind it is no chain's.
+#
+# MINT. Every second it walks /devices.nanocloud.io/ and, for each Device with
+# a `spec.class` and no claim for its `metadata.uid`, mints a claim token in
+# the bootstrap-token format, `<id>.<secret>` (`[a-z0-9]{6}.[a-z0-9]{16}`,
+# from the CSPRNG), good for `claim_ttl_s`:
+#   /device-claim-of/<ns>/<name> = {"uid","id","token","prefix"}
+#        the token itself, for the Device's firmware (below); written first,
+#        so the token is never lost between writes, and emptied once redeemed
+#   /device-claims/<id> = {"ns","name","uid","secret":<sha256 hex>,"exp",
+#        "prefix","key":""}
+#        the offer a redemption is checked against: the secret only as a hash
+#   status = {"phase":"Claimable","identity":{"spiffeId"},"mqtt":{"broker",
+#        "topicPrefix"},"conditions":[]}
+# `prefix` is `t/<opaque>/devices/<name>/`, `<opaque>` 16 hex digits of the
+# SHA-256 of the namespace's `metadata.uid`: unique across cells and
+# namespaces, and naming neither. A Device recreated under its name (another
+# uid) is minted again and its earlier offer deleted.
+#
+# REDEEM. On `record_in`, the API chain's record after `admit`
+# (apiplane_admit.plan): a record whose `c_resource` (33) is
+# `certificatesigningrequests` and whose `c_verdict` (37) is 501 is this
+# module's, the bearer credential in `c_key` (32); every other record goes on
+# to `result_out` untouched. The record goes on with `c_verdict` the answer's
+# status and `c_answer` (38) its body, which the chain answers as it is.
+#
+#   POST /apis/certificates.k8s.io/v1/certificatesigningrequests
+#        a CSR named `device-<token id>`, `spec.signerName`
+#        `nanocloud.io/device`, `spec.request` a PEM PKCS#10 (base64) for a
+#        P-256 key, signed by it; the token as the Bearer credential.
+#   1. the offer is read and the secret's hash compared (401 otherwise); the
+#      request is parsed and its signature checked (400, 403 for a signer
+#      or name not the token's);
+#   2. the Device must still be the one the token was minted for (its uid;
+#      403);
+#   3. the offer is bound to the key (`key`, the SHA-256 of the 65-byte
+#      point, hex), compared against its revision: the token's expiry
+#      decides only this step, and from here another key is refused (403);
+#   4. a CSR already issued under the token answers 409 AlreadyExists, and a
+#      GET of it under the same token answers it (below);
+#   5. the authority certifies the key under `spiffe://<td>/device/<ns>/
+#      <name>`, from the offer and never from the request, over `request_out`
+#      (kagi's certificate_endpoint, `POST /pki/certificate`); the answer
+#      must certify the point that was proved;
+#   6. /device-csrs/device-<id> = the CSR, `status.certificate` the PEM leaf
+#      (base64) and an `Approved` condition; then the Device's status
+#      (`Enrolled`, the key's fingerprint, the certificate's `notAfter`);
+#      then the token emptied from /device-claim-of/; then 201 with the CSR.
+#   A failure answers 503 and the same request is the remedy: every step
+#   reads before it writes and goes past what is already done.
+#
+#   GET  /apis/certificates.k8s.io/v1/certificatesigningrequests/device-<id>
+#        under the same token, spent or not (until the token expires and
+#        is unbound): 200 and the CSR, or 404. Another name: 403.
+#
+# RE-ENROLL. A POST with no bearer credential is a re-enrollment: the CSR,
+# named `device-<first 16 hex of the key's SHA-256>`, must prove the key the
+# Device records (/device-keys/<fp> = {"ns","name"}, written at redemption;
+# the claim's `fp`), the Device must be the same uid and not `spec.revoked`,
+# and with `spec.certificate.maxOffline` set, not that long past its last
+# certificate's expiry. No token and no valid certificate is needed: whoever
+# holds the key could renew while it was valid. 201 and the CSR; nothing is
+# kept but the claim's facts.
+#
+# LIFETIME. Asked of the authority (`lifetime_s`) from the Device's
+# `spec.certificate.lifetime` (a day when unset), clamped to
+# `min_lifetime_s`/`max_lifetime_s`; the claim and the Device's status record
+# what the certificate issued lasts (`certificateLifetime`), and an authority
+# that issued another lifetime is said in the log.
+#
+# NOT YET, and said where it would be: renewal under the device's own
+# certificate needs the API to take client certificates beside bearer tokens
+# (fluxor `tls` cannot ask for an optional one yet); the token is kept in the clear in the control-plane store
+# (as an enrollment grant is) rather than sealed, until the firmware
+# subresource that reads it exists; a deleted Device's offer is not swept.
+
+[[ports]]
+name = "record_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+framed = true
+
+[[ports]]
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "result_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
+required = true
+
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[observability]
+metrics = ["minted", "redeemed", "refused"]
