@@ -49,11 +49,11 @@ const FILT_STAGES: usize = 8;
 /// object, so a Chronicle record's ceiling bounds it.
 const FILT_FRAME: usize = 4096;
 
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_CLOSE: u32 = 0x1425;
-const OBJ_DELETE: u32 = 0x1424;
-const NS_LIST: u32 = 0x1302;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -7128,10 +7128,10 @@ mod arena {
     }
 }
 
-const TIMER_CONTRACT: u32 = 0x0006;
-const TIMER_CREATE: u32 = 0x0604;
-const TIMER_SET: u32 = 0x0605;
-const TIMER_CANCEL: u32 = 0x0606;
+const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
+const TIMER_CREATE: u32 = abi::registry::timer::CREATE;
+const TIMER_SET: u32 = abi::registry::timer::SET;
+const TIMER_CANCEL: u32 = abi::registry::timer::CANCEL;
 
 /// Arm the kernel timer for the earliest deadline ahead (or cancel it when
 /// none is), at the end of a scan. The kernel wakes this module when it

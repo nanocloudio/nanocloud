@@ -244,7 +244,7 @@ fn nag_digits(mut v: u64, d: &mut [u8; 20]) -> &[u8] {
 /// conditional writer needs it, and the fragment's contract is that an
 /// including module names only the opcodes every module shares.
 unsafe fn head_rev(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<u64> {
-    const OBJ_HEAD: u32 = 0x1422;
+    const OBJ_HEAD: u32 = abi::registry::storage_object::HEAD;
     let mut arg = [0u8; MAX_KEY + 32];
     if 2 + key.len() + 8 + 4 + 8 + 2 > arg.len() {
         return Got::Absent;

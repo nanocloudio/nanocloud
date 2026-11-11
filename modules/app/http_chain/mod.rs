@@ -59,12 +59,12 @@ const SLOW_STAGE_MS: u64 = 2_000;
 
 // storage.object, for staging (`_shared/store.rs` takes its opcodes from
 // whoever mounts it).
-const OBJ_PUT: u32 = 0x1420;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_DELETE: u32 = 0x1424;
-const OBJ_CLOSE: u32 = 0x1425;
-const NS_LIST: u32 = 0x1302;
+const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const MAX_KEY: usize = 160;
 
 #[repr(C)]

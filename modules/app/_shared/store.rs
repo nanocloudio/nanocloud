@@ -1823,7 +1823,7 @@ fn take_mark(nonce: &[u8; 16]) -> [u8; TAKE_MARK_LEN] {
 /// first serve, and kept while the record is held: every serve of one take
 /// must write and recognise the same claim.
 unsafe fn take_nonce(sys: &SyscallTable, salt: u64) -> [u8; 16] {
-    const CSPRNG_FILL: u32 = 0x0C3C;
+    const CSPRNG_FILL: u32 = abi::registry::kernel::RANDOM_FILL;
     let mut n = [0u8; 16];
     if (sys.provider_call)(-1, CSPRNG_FILL, n.as_mut_ptr(), n.len()) >= 0 && n != [0u8; 16] {
         return n;

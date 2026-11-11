@@ -32,8 +32,7 @@ include!("../_shared/exchange_call.rs");
 mod auth_wire;
 #[path = "../../../target/fluxor/kagi-common/chan.rs"]
 mod chan;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../../target/fluxor/kagi-common/state_wire.rs"]
 mod state_wire;
 #[path = "../../../target/fluxor/kagi-common/storage_key.rs"]

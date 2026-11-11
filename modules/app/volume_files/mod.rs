@@ -17,13 +17,13 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-const OBJ_PUT: u32 = 0x1420;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_HEAD: u32 = 0x1422;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_DELETE: u32 = 0x1424;
-const OBJ_CLOSE: u32 = 0x1425;
-const NS_LIST: u32 = 0x1302;
+const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_HEAD: u32 = abi::registry::storage_object::HEAD;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 4096;
 
@@ -33,11 +33,11 @@ include!("../_shared/pathmod.rs");
 include!("../_shared/poddns.rs");
 include!("../_shared/podres.rs");
 
-const FS_CLOSE: u32 = 0x0903;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
-const FS_MKDIR: u32 = 0x090B;
-const FS_READLINK: u32 = 0x0914;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = abi::registry::fs::READDIR;
+const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
+const FS_READLINK: u32 = abi::registry::fs::READLINK;
 const EAGAIN: i32 = -11;
 const EINPROGRESS: i32 = -36;
 const ENOENT: i32 = -2;

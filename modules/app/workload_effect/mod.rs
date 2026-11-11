@@ -33,19 +33,19 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 // The moment a run starts, as a record keeps one (`mo_now`).
 include!("../_shared/moment.rs");
 
-const WL_CREATE: u32 = 0x1A00;
-const WL_START: u32 = 0x1A01;
-const WL_WAIT: u32 = 0x1A02;
-const WL_SIGNAL: u32 = 0x1A03;
-const WL_DESTROY: u32 = 0x1A04;
-const WL_PAUSE: u32 = 0x1A0B;
-const WL_RESUME: u32 = 0x1A0C;
-const WL_CAPS: u32 = 0x1AFF;
-const WL_READ: u32 = 0x1B01;
-const WL_EXEC: u32 = 0x1B02;
-const WL_TTY_OPEN: u32 = 0x1B03;
-const WL_TTY_STEP: u32 = 0x1B04;
-const WL_TTY_CLOSE: u32 = 0x1B06;
+const WL_CREATE: u32 = abi::registry::workload::CREATE;
+const WL_START: u32 = abi::registry::workload::START;
+const WL_WAIT: u32 = abi::registry::workload::WAIT;
+const WL_SIGNAL: u32 = abi::registry::workload::SIGNAL;
+const WL_DESTROY: u32 = abi::registry::workload::DESTROY;
+const WL_PAUSE: u32 = abi::registry::workload::PAUSE;
+const WL_RESUME: u32 = abi::registry::workload::RESUME;
+const WL_CAPS: u32 = abi::registry::workload::CAPS;
+const WL_READ: u32 = abi::registry::host_process::READ;
+const WL_EXEC: u32 = abi::registry::host_process::EXEC;
+const WL_TTY_OPEN: u32 = abi::registry::host_process::TTY_OPEN;
+const WL_TTY_STEP: u32 = abi::registry::host_process::TTY_STEP;
+const WL_TTY_CLOSE: u32 = abi::registry::host_process::TTY_CLOSE;
 
 const CAPS_OP_SIGNAL: u16 = 1 << 3;
 const CAPS_OP_PAUSE: u16 = 1 << 4;
@@ -57,7 +57,7 @@ const WL_CREATE_HEADER: usize = 76;
 /// own files and store, rooted apart from every other owner's); 0 = none set.
 const STORAGE_BYTES_AT: usize = 68;
 /// The workload an identity names (a caller that lost its handle).
-const WL_LOOKUP: u32 = 0x1A12;
+const WL_LOOKUP: u32 = abi::registry::workload::LOOKUP;
 const WL_EINPROGRESS: i32 = -36;
 const WL_EEXIST: i32 = -17;
 const WL_ENOENT: i32 = -2;
@@ -100,7 +100,7 @@ const MAX_LAYERS: usize = 65;
 /// by one, so the node pays only when it runs a workload image, and only
 /// for the largest. A grant grows by doubling (the smaller one is not
 /// returned), so what it holds stays under twice the largest pack.
-const ELASTIC_ALLOC: u32 = 0x0C3F;
+const ELASTIC_ALLOC: u32 = abi::registry::resource::ELASTIC_ALLOC;
 const PACK_MIN: usize = 1 << 20;
 /// The kernel's pack pool: no larger pack could be staged.
 const PACK_MAX: usize = 16 << 20;
@@ -111,9 +111,9 @@ const MANIFESTS_PREFIX: &[u8] = b"/image-manifests/";
 /// bound (`MAX_VALUE`, 6144 B — 4224 B of digests, the sizes, the names).
 const MAX_MANIFEST: usize = 6144;
 const MAX_DIR: usize = 96;
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
 /// The fs provider never waits on its device inside a call: `EAGAIN` is
 /// "not now, nothing moved" and `EINPROGRESS` "taken, ask again"; neither is
 /// a failure or the end of a layer. The read resumes on a later step from
@@ -124,9 +124,9 @@ const EINPROGRESS: i32 = -36;
 /// the Graph object (`graphs.nanocloud.io/v1`, `kubectl apply`'d to the
 /// plane and replicated to every node) at `/graphs.nanocloud.io/<name>`,
 /// whose `spec.flxa` carries it as hex.
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_CLOSE: u32 = 0x1425;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 const GRAPHS_PREFIX: &[u8] = b"/graphs.nanocloud.io/";
 const MAX_GRAPH: usize = 64;
 const FLXA_FIELD: &[u8] = b"\"flxa\":\"";

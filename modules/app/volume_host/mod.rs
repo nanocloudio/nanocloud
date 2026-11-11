@@ -33,12 +33,10 @@ include!("../_shared/exchange_call.rs");
 
 #[path = "../../../target/fluxor/kagi-common/auth_wire.rs"]
 mod auth_wire;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/platform/linux/host_process.rs"]
-mod hp;
+use abi::platform::linux::host_process as hp;
 #[path = "../../../target/fluxor/kagi-common/issuer_key.rs"]
 mod issuer_key;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../../target/fluxor/kagi-common/state_wire.rs"]
 mod state_wire;
 #[path = "../../../target/fluxor/kagi-common/storage_key.rs"]
@@ -47,8 +45,7 @@ mod storage_key;
 mod storage_key_service;
 #[path = "../../../target/fluxor/kagi-common/time_policy.rs"]
 mod time_policy;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/workload.rs"]
-mod wl;
+use abi::contracts::workload as wl;
 
 use storage_key as sk;
 use storage_key_service as svc;
@@ -89,9 +86,9 @@ const RD_KEY: u8 = 2;
 const RD_TRUST: u8 = 3;
 const RD_DONE: u8 = 4;
 
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
 const FS_EAGAIN: i32 = -11;
 const FS_EINPROGRESS: i32 = -36;
 const WL_EINPROGRESS: i32 = -36;

@@ -71,11 +71,11 @@ const MOMENT_FIELD: u8 = 62;
 /// `channel_peek` on a mailbox channel, which has no byte stream to peek.
 const CHAN_EINVAL: i32 = -22;
 
-const OBJ_PUT: u32 = 0x1420;
-const OBJ_DELETE: u32 = 0x1424;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_CLOSE: u32 = 0x1425;
+const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -257,7 +257,7 @@ const ECHO_MAX: usize = 8;
 const MAX_KEY: usize = 256;
 // Contracts the shared store fragment dispatches on; it takes its opcodes from
 // whoever mounts it.
-const NS_LIST: u32 = 0x1302;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const MAX_PREFIX: usize = 64;
 const MAX_PATHS_SPEC: usize = 192;
 /// The largest value read or written in place. Sized for the longest

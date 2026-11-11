@@ -35,21 +35,21 @@ include!("../_shared/fetch_answer.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
 include!("../_shared/regcred.rs");
 
-const OBJ_PUT: u32 = 0x1420;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_CLOSE: u32 = 0x1425;
-const OBJ_DELETE: u32 = 0x1424;
-const NS_LIST: u32 = 0x1302;
+const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const MAX_KEY: usize = 256;
 const MAX_VALUE: usize = 256;
 
-const FS_CLOSE: u32 = 0x0903;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
-const FS_UNLINK: u32 = 0x090A;
-const FS_MKDIR: u32 = 0x090B;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
+const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
+const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
 
 const NET_MSG_DATA: u8 = 0x02;
 const NET_MSG_CLOSED: u8 = 0x03;

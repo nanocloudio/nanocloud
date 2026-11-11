@@ -30,13 +30,13 @@ const CHAN_EINVAL: i32 = -22;
 
 const REC: usize = 8192;
 
-const FS_CLOSE: u32 = 0x0903;
-const FS_OPENDIR: u32 = 0x0907;
-const FS_READDIR: u32 = 0x0908;
-const FS_UNLINK: u32 = 0x090A;
-const FS_RENAME: u32 = 0x090D;
-const FS_READLINK: u32 = 0x0914;
-const FS_RMDIR: u32 = 0x0915;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_OPENDIR: u32 = abi::registry::fs::OPENDIR;
+const FS_READDIR: u32 = abi::registry::fs::READDIR;
+const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
+const FS_RENAME: u32 = abi::registry::fs::RENAME;
+const FS_READLINK: u32 = abi::registry::fs::READLINK;
+const FS_RMDIR: u32 = abi::registry::fs::RMDIR;
 
 const ENOENT: i32 = -2;
 const EAGAIN: i32 = -11;

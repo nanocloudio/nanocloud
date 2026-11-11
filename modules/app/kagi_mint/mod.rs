@@ -73,12 +73,12 @@ const CARRY_HI: u8 = 39;
 /// message, echoed unchanged beside the legacy 30..=39 range.
 const CARRY_FIELD: u8 = 254;
 
-const OBJ_PUT: u32 = 0x1420;
-const OBJ_GET: u32 = 0x1421;
-const OBJ_RANGE_GET: u32 = 0x1423;
-const OBJ_DELETE: u32 = 0x1424;
-const OBJ_CLOSE: u32 = 0x1425;
-const NS_LIST: u32 = 0x1302;
+const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJ_GET: u32 = abi::registry::storage_object::GET;
+const OBJ_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJ_DELETE: u32 = abi::registry::storage_object::DELETE;
+const OBJ_CLOSE: u32 = abi::registry::storage_object::CLOSE;
+const NS_LIST: u32 = abi::registry::storage_namespace::LIST;
 const MAX_KEY: usize = 160;
 const MAX_VALUE: usize = 4096;
 
