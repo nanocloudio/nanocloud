@@ -81,8 +81,10 @@ ip_boot
 ip_wait 60 eval '[ "$(field "$(rootfs "$M1")" fails)" = 1 ]' || fail "no failed assembly recorded: '$(rootfs "$M1")'"
 t1=$SECONDS
 R="$(rootfs "$M1")"
-[ "$(field "$R" state)" = failed ] || [ "$(field "$R" state)" = retry ] || [ "$(field "$R" state)" = assembling ] \
-  || fail "rootfs after a failure: '$R'"
+case "$(field "$R" state)" in
+  failed|retry|assembling|backoff) ;;
+  *) fail "rootfs after a failure: '$R'" ;;
+esac
 echo "   /image-rootfs/${M1:0:12}… = $R"
 ip_wait 30 eval '[ -n "$(event u-asm ErrImagePull)" ]' || fail "no ErrImagePull event: '$(ip_get "/image-pull-failed/$M1")'"
 E="$(msg "$(event u-asm ErrImagePull)")"

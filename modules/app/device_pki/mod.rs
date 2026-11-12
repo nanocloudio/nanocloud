@@ -1795,10 +1795,24 @@ unsafe fn sweep(s: &mut State, sys: &SyscallTable) {
                         .unwrap_or(0)
                 }
             }
-            None => return,
+            None => {
+                if walk.pending {
+                    // The listing was not answered yet. A fresh walk a whole
+                    // sweep later starts at the beginning and is answered
+                    // "not yet" again, so no Device is ever tended: ask again
+                    // on the next step instead.
+                    s.sweep_at = now;
+                }
+                return;
+            }
         };
         seen += 1;
-        if seen > SWEEP_MAX || st.waiting() || st.refusal().is_some() {
+        if seen > SWEEP_MAX || st.refusal().is_some() {
+            return;
+        }
+        if st.waiting() {
+            // A read of this Device is outstanding: the same prompt re-ask.
+            s.sweep_at = now;
             return;
         }
         if kl == 0 {

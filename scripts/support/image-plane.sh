@@ -84,12 +84,35 @@ PY
 
 # ip_registry <port> <log> [stub args…]: scripts/support/registry-stub.py over
 # $D/reg, its pid appended to IP_PIDS, up before this returns.
+#
+# Every image E2E names a fixed port, and the stub takes it with SO_REUSEADDR
+# alone, so a second run of the same script cannot bind it: that stub dies of
+# EADDRINUSE. A readiness probe that only asks whether SOMETHING answers on the
+# port is then answered by the FIRST run's registry — and this run spends its
+# whole length pulling another run's $D/reg, which does not hold the manifests
+# it just pushed. Every assembly fails, `fails` climbs, and nothing says why.
+# So the port is claimed before the stub is started, and the stub is confirmed
+# to be ours and alive: a collision is named here instead of being diagnosed
+# twenty minutes later as a backoff bug.
 IP_PIDS=""
 ip_registry() {
   local port="$1" log="$2"; shift 2
+  python3 -c "
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(('127.0.0.1', $port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+" 2>/dev/null || fail "port :$port is already served: another run of this E2E is live (gates run one at a time)"
   python3 "$ROOT/scripts/support/registry-stub.py" "$D/reg" "$port" "$@" >>"$log" 2>&1 &
-  IP_PIDS="$IP_PIDS $!"
+  local pid=$!
+  IP_PIDS="$IP_PIDS $pid"
   for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null \
+      || fail "the registry on :$port died at once: $(tail -3 "$log" 2>/dev/null | tr '\n' ' ')"
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$port),timeout=0.2).close()" 2>/dev/null && return 0
     sleep 0.1
   done

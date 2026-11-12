@@ -16,20 +16,30 @@
 //                    rootfs record, so the pull fetches them again and the
 //                    assembly runs again once they are back
 //            else    (the node: a rootfs it cannot write, a tar it cannot
-//                    run, a layer that is not a tar) -> `state=failed;
-//                    code=<exit>`, retried with a growing delay
+//                    run, a layer that is not a tar) -> `state=backoff;
+//                    code=<exit>` MERGEd, retried with a growing delay.
+//                    MERGEd, not PUT: a PUT would replace the record, and
+//                    with it the `fails=`/`due=` the retry reads. And
+//                    `backoff`, not `failed`: as3 turns it to `failed` in
+//                    the same write that sets the deadline, because a
+//                    record that says `failed` with no deadline yet is one
+//                    `ar` reads as due now
 //   as2  -> the job rewritten `phase=delete` after any verdict; after a
 //        start, /image-rootfs/<n> MERGEd `state=assembling` (its failures
 //        kept, for the next delay)
-//   as3  after a failure -> `fails=<n>;due=<when>` merged into the rootfs
-//        record: the next attempt not before 10 s x 2^(n-1), at most 300 s —
-//        the kubelet's image pull backoff, the one image_back.plan keeps;
+//   as3  after a failure -> `state=failed;fails=<n>;due=<when>` merged into
+//        the rootfs record — ONE write, so the failure and its deadline are
+//        never visible apart: the next attempt not before 10 s x 2^(n-1), at
+//        most 300 s — the kubelet's image pull backoff, the one
+//        image_back.plan keeps;
 //        after a success -> /image-pull-failed/<n> removed
 //   as4  after a failure -> /image-pull-failed/<n> (fails, code, why): the
 //        Pods waiting on the image are told — ErrImagePull, then
 //        ImagePullBackOff with the count (pod_image.plan), as for a pull
 //   ar   (its own source, /image-rootfs/ with the `due` timer) a failed
-//        record whose time has come -> `state=retry`, which as1 starts
+//        record whose time has come -> `state=retry`, which as1 starts.
+//        Only `failed` is its own, so it never reads a deadline that the
+//        failure it belongs to has not written yet
 //
 // A workload image (`kind=workload`) is not assembled: once every layer is
 // cached, /image-rootfs/<n> is `path=pack:<n>;state=ready` at once.
@@ -150,14 +160,14 @@ plan nanocloud.image_asm {
             v6: "", v7: "", v8: "", v9: "", v10: "", v11: "",
             ctx: Ctx { next: "bad", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: 1, now: a.now } };
     when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") && a.script != "" ->
-      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
-            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=failed;code=", v6: a.jc,
+      Job { cid: a.seq, op: MERGE, key: "/image-rootfs/", k2: a.key,
+            v1: "path=", v2: a.root, v3: "/", v4: a.key, v5: ";state=backoff;code=", v6: a.jc,
             v7: "", v8: "", v9: "", v10: "", v11: "",
             ctx: Ctx { next: "fail", name: a.key, root: a.root, script: a.script, blobs: a.blobs, layers: a.layers, code: a.jc, fails: a.fails + 1, now: a.now } };
     when a.st == "assembling" && (a.js == "exited" || a.js == "failed" || a.js == "killed") ->
-      Job { cid: a.seq, op: PUT, key: "/image-rootfs/", k2: a.key,
+      Job { cid: a.seq, op: MERGE, key: "/image-rootfs/", k2: a.key,
             v1: "path=", v2: "/var/lib/nanocloud.io/image/rootfs", v3: "/", v4: a.key,
-            v5: ";state=failed;code=", v6: a.jc, v7: "", v8: "", v9: "", v10: "", v11: "",
+            v5: ";state=backoff;code=", v6: a.jc, v7: "", v8: "", v9: "", v10: "", v11: "",
             ctx: Ctx { next: "fail", name: a.key, root: "/var/lib/nanocloud.io/image/rootfs", script: "/usr/lib/nanocloud/assemble-image.sh", blobs: "/var/lib/nanocloud.io/image/blobs", layers: a.layers, code: a.jc, fails: a.fails + 1, now: a.now } };
     default ->
       Job { cid: a.seq, op: NOOP, key: "", k2: "",
@@ -197,22 +207,22 @@ plan nanocloud.image_asm {
   decision as3(d: Did) -> Back {
     when d.ctx.next == "fail" && d.ctx.fails <= 1 ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 10000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 10000, ctx: d.ctx };
     when d.ctx.next == "fail" && d.ctx.fails == 2 ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 20000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 20000, ctx: d.ctx };
     when d.ctx.next == "fail" && d.ctx.fails == 3 ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 40000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 40000, ctx: d.ctx };
     when d.ctx.next == "fail" && d.ctx.fails == 4 ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 80000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 80000, ctx: d.ctx };
     when d.ctx.next == "fail" && d.ctx.fails == 5 ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 160000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 160000, ctx: d.ctx };
     when d.ctx.next == "fail" ->
       Back { cid: d.cid, op: MERGE, key: "/image-rootfs/", k2: d.ctx.name,
-             v1: "fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 300000, ctx: d.ctx };
+             v1: "state=failed;fails=", v2: d.ctx.fails, v3: ";due=", v4: d.ctx.now + 300000, ctx: d.ctx };
     when d.ctx.next == "ready" ->
       Back { cid: d.cid, op: DELETE, key: "/image-pull-failed/", k2: d.ctx.name, ctx: d.ctx };
     default ->

@@ -48,9 +48,15 @@ cron() { # cron <name> <schedule> <policy> [extra spec members]
 
 echo "== 0. the control plane, joined; six CronJobs =="
 kplane_up
+# Every CronJob has to be created inside ONE minute: only then is their
+# first boundary the same, and every count below rests on that. :40 left
+# twenty seconds for six applies — bigc is 12 KiB, and each goes through the
+# whole plane — which a loaded gate does not fit in, and the assumption was
+# never checked, so it failed later as a miscount. Minute 59 is skipped too:
+# the hour `tz` names is read here and must not roll under the run.
+while s="$(date +%-S)"; [ "$s" -gt 15 ] || [ "$(date -u +%-M)" = 59 ]; do sleep 1; done
 H=$(( ($(date -u +%-H) + 2) % 24 ))
-# Created well inside a minute, so the first boundary is the same for all.
-while [ "$(date +%-S)" -gt 40 ]; do sleep 1; done
+M0="$(date -u +%-M)"
 cron tick "* * * * *" Allow ',"successfulJobsHistoryLimit":1'
 cron forbid "* * * * *" Forbid
 cron repl "* * * * *" Replace
@@ -77,6 +83,8 @@ PYB
 k apply -f "$D/bigc.json" >/dev/null || fail "apply cronjob bigc ($(wc -c <"$D/bigc.json") bytes)"
 k get cronjobs --no-headers >"$D/get.out" || fail "kubectl get cronjobs"
 grep -q "^tz .*Etc/GMT-2" "$D/get.out" && grep -q "^sus .*true" "$D/get.out" || fail "kubectl get cronjobs: $(cat "$D/get.out")"
+[ "$(date -u +%-M)" = "$M0" ] \
+  || fail "the six CronJobs did not fit inside minute :$M0 (it is now :$(date -u +%-M)), so their first boundary differs"
 echo "   tick, forbid, repl, tz (* $H * * * in Etc/GMT-2), sus (suspended)"
 
 echo "== 1. the first minute: a Job each (not sus), owned, annotated =="
@@ -135,7 +143,7 @@ kplane_until 20 "repl's second Job" has_jobs repl 1
 [ "$(jobs_of repl)" != "$R1" ] || fail "repl still has only $R1"
 kplane_until 20 "sus runs once resumed" has_jobs sus 1
 [ "$(njobs forbid)" = 1 ] && [ "$(jobs_of forbid)" = "$F1" ] || fail "forbid ran a second Job beside an active one: $(jobs_of forbid)"
-echo "   tick: $T2; repl: $R1 replaced by $(jobs_of repl); forbid: still only $F1; sus: $(jobs_of sus)"
+echo "   tick: $T2; repl: $R1 replaced by $(jobs_of repl | paste -sd,); forbid: still only $F1; sus: $(jobs_of sus | paste -sd,)"
 
 echo "== 4. history: successfulJobsHistoryLimit 1 keeps the newest =="
 succeed_job "$T2"

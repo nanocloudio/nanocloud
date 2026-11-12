@@ -695,11 +695,19 @@ unsafe fn get_value_rev(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<(usiz
 
 /// The revision a read handle observed (its `ViewConsistent` /
 /// `RevisionMonotone` fence), 0 when the provider gives none.
+///
+/// `storage.object` requires a fence on a GET handle, so 0 here means the
+/// provider is not keeping the contract — and 0 is a revision no PRE_ETAG
+/// write can ever match, which turns the violation into a controller that
+/// re-asserts a refused write forever and says nothing. So the refusal is
+/// said out loud, and 0 is never a precondition.
 unsafe fn handle_rev(sys: &SyscallTable, h: i32) -> u64 {
     use abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
     let mut f = [0u8; WIRE_MAX_LEN];
     let n = (sys.provider_call)(h, QUERY_OP, f.as_mut_ptr(), f.len());
     if n <= 0 {
+        let m = b"[store] ERROR the store answered no fence on a read handle: storage.object requires one, and no conditional write can be made without it";
+        dev_log(sys, 1, m.as_ptr(), m.len());
         return 0;
     }
     match Fence::decode(f.get(..n as usize).unwrap_or(&[])) {
