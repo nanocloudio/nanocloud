@@ -7,19 +7,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/store.rs");
 include!("../_shared/field.rs");
 
@@ -56,8 +53,8 @@ const EAGAIN: i32 = -11;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// The kernel event every subscription rings (`store_event`), or -1.
-    event: i32,
+    /// Each prefix's store subscription handle (`store_subscribe`), or -1.
+    subs: [StoreSub; MAX_PREFIXES],
     resolved: u32,
     subscribed: u32,
     /// An apply is owed: set by a ring (and at start), cleared only when
@@ -107,9 +104,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PARAM;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, prefix, str, 0
@@ -653,7 +649,15 @@ enum Applied {
 /// The provider's CAPS (0 when it does not answer).
 unsafe fn provider_caps(sys: &SyscallTable) -> u32 {
     let mut caps = [0u8; 4];
-    if (sys.provider_call)(-1, wire::CAPS, caps.as_mut_ptr(), 4) == 0 {
+    let rc = (sys.provider_call)(
+        -1,
+        wire::CAPS,
+        caps.as_mut_ptr(),
+        caps.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc == 0 {
         u32::from_le_bytes(caps)
     } else {
         0
@@ -664,31 +668,23 @@ unsafe fn provider_caps(sys: &SyscallTable) -> u32 {
 /// provider: `None` when it did not answer this time (`EAGAIN`, no table).
 unsafe fn table_flags(s: &State, sys: &SyscallTable) -> Option<u32> {
     let name_len = (s.table_len as usize).min(wire::MAX_TABLE_NAME);
-    let mut st = [0u8; wire::state::BYTES];
-    let mut arg = [0u8; 1 + wire::MAX_TABLE_NAME + 20];
-    arg[0] = name_len as u8;
-    for (d, &c) in arg[1..].iter_mut().zip(s.table[..name_len].iter()) {
-        *d = c;
-    }
-    let mut p = 1 + name_len;
-    // No rules are asked for (`out_cap` 0): the state alone, which READ
-    // writes whatever the rules' size (`ERANGE` then).
-    for (i, b) in 0u64.to_le_bytes().iter().enumerate() {
-        arg[p + i] = *b;
-    }
-    p += 8;
-    for (i, b) in 0u32.to_le_bytes().iter().enumerate() {
-        arg[p + i] = *b;
-    }
-    p += 4;
-    for (i, b) in (st.as_mut_ptr() as u64).to_le_bytes().iter().enumerate() {
-        arg[p + i] = *b;
-    }
-    p += 8;
-    let r = (sys.provider_call)(-1, wire::READ, arg.as_mut_ptr(), p);
+    let mut arg = [0u8; wire::name::ARG_MAX];
+    let n = wire::name::encode(&s.table[..name_len], &mut arg)?;
+    let len = wire::name::arg_len(n - 1);
+    // No rules are asked for (no `data`): the state alone, which READ writes
+    // whatever the rules' size (`ERANGE` then).
+    let r = (sys.provider_call)(
+        -1,
+        wire::READ,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    );
     if r < 0 && r != -34 {
         return None; // EAGAIN (a writer kept it moving), ENOENT, …
     }
+    let st = &arg;
     let f = wire::state::FLAGS;
     Some(u32::from_le_bytes([st[f], st[f + 1], st[f + 2], st[f + 3]]))
 }
@@ -822,30 +818,22 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> Applied {
     }
 
     let name_len = (s.table_len as usize).min(wire::MAX_TABLE_NAME);
-    let mut gen = 0u64;
-    let mut arg = [0u8; 1 + wire::MAX_TABLE_NAME + 20];
-    arg[0] = name_len as u8;
-    for (d, &c) in arg[1..].iter_mut().zip(s.table[..name_len].iter()) {
-        *d = c;
-    }
-    let mut p = 1 + name_len;
-    for (i, b) in (rules.as_ptr() as u64).to_le_bytes().iter().enumerate() {
-        arg[p + i] = *b;
-    }
-    p += 8;
-    for (i, b) in (len as u32).to_le_bytes().iter().enumerate() {
-        arg[p + i] = *b;
-    }
-    p += 4;
-    for (i, b) in (&mut gen as *mut u64 as u64)
-        .to_le_bytes()
-        .iter()
-        .enumerate()
-    {
-        arg[p + i] = *b;
-    }
-    p += 8;
-    let r = (sys.provider_call)(-1, wire::REPLACE, arg.as_mut_ptr(), p);
+    let mut arg = [0u8; wire::name::ARG_MAX];
+    let Some(n) = wire::name::encode(&s.table[..name_len], &mut arg) else {
+        return Applied::Failed;
+    };
+    let alen = wire::name::arg_len(n - 1);
+    let r = (sys.provider_call)(
+        -1,
+        wire::REPLACE,
+        arg.as_mut_ptr(),
+        alen,
+        rules.as_ptr() as *mut u8,
+        len,
+    );
+    let gen = u64::from_le_bytes([
+        arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7],
+    ]);
     if r == EAGAIN {
         // Another writer kept the tables moving for every bounded retry:
         // nothing was replaced, and it is asked again next step.
@@ -875,11 +863,7 @@ unsafe fn apply(s: &mut State, sys: &SyscallTable) -> Applied {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -911,7 +895,7 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.event = -1;
+        s.subs = [StoreSub::NONE; MAX_PREFIXES];
         s.resolved = 0;
         s.subscribed = 0;
         s.dirty = 1;
@@ -944,52 +928,45 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         // One subscription per prefix, in order: `subscribed` counts those
         // made, and one not made yet is asked again next step.
         if (s.subscribed as usize) < MAX_PREFIXES + 1 {
-            // One kernel event for all of them.
-            if s.event < 0 && s.subscribed == 0 {
-                s.event = store_event(sys);
-                if s.event < 0 {
-                    let m =
-                        b"[net_apply] ERROR no kernel event - changes will NOT wake this module";
-                    dev_log(sys, 1, m.as_ptr(), m.len());
-                }
-            }
             let pl = (s.prefix_len as usize).min(MAX_PARAM);
             let mut p = [0u8; MAX_PARAM];
             for (d, &c) in p.iter_mut().zip(s.prefix[..pl].iter()) {
                 *d = c;
             }
-            if s.event >= 0 {
-                let mut i = 0u32;
-                for one in p[..pl].split(|&c| c == b',').take(MAX_PREFIXES) {
-                    if one.is_empty() {
-                        continue;
-                    }
-                    if i >= s.subscribed {
-                        if not_yet(store_subscribe(sys, one, s.event, 0)) {
-                            // Not yet: no subscription was made; asked next step.
-                            return 0;
-                        }
-                        s.subscribed = i + 1;
-                    }
-                    i += 1;
+            let mut i = 0u32;
+            for one in p[..pl].split(|&c| c == b',').take(MAX_PREFIXES) {
+                if one.is_empty() {
+                    continue;
                 }
+                if i >= s.subscribed {
+                    let rc = store_subscribe(sys, one, 0);
+                    if not_yet(rc) {
+                        // Not yet: no subscription was made; asked next step.
+                        return StepReturn::Continue;
+                    }
+                    if let (Some(h), true) = (s.subs.get_mut(i as usize), rc >= 0) {
+                        *h = StoreSub::new(rc, one);
+                    }
+                    s.subscribed = i + 1;
+                }
+                i += 1;
             }
             s.subscribed = MAX_PREFIXES as u32 + 1;
         }
-        if store_take(sys, s.event, |_| {}) > 0 {
+        if store_rang(sys, &mut s.subs) > 0 {
             s.dirty = 1;
         }
         if s.status_owed != 0 {
@@ -1015,6 +992,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 say_applied(s, sys);
             }
         }
-        0
+        StepReturn::Continue
     }
 }

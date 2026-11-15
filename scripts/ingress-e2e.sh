@@ -161,9 +161,9 @@ wal_put "/dataplane/edge/default/web" \
   "host=${ROUTE_HOST};path=${ROUTE_PATH};be=${BACKEND_ADDR}:1:1"
 
 echo "== 5. build config + module table, start the edge =="
-nc_build_workload "$ROOT" "$D/edge.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/edge.yaml" "$D/graph.img"
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 
 echo "== 6. wait for the edge listener =="

@@ -145,11 +145,11 @@ for n in fence fenced mb_src mb_ask mb_offer mb_wd mb_gc_collect mb_gcr_collect 
   grep -q "^  - name: $n$" "$D/graph.yaml" || fail "the shipped plane has no $n"
 done
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 
 echo "== 2. run it; wait for the API =="
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 
@@ -416,7 +416,7 @@ r="$(api "$D/tok.admin" - POST /apis/nanocloud.io/v1/managementbindings "$MB3")"
 want 201 "a third ManagementBinding" "$r"
 kill -9 "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered after the restart"
 until_has 90 "/enrollment-offers/third/third-grant-0123456789abcdef/$CELL/$DIGEST" || fail "the stopped binding was never offered"

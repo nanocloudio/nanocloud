@@ -148,11 +148,11 @@ echo "== 2. render the SHIPPED control plane for this node, build it =="
 nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 grep -q 'name: zs_put' "$D/graph.yaml" || fail "the rendered control plane has no ZoneSummary chain"
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 3. run it; wait for the API over TLS =="
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 

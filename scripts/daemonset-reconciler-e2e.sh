@@ -84,9 +84,9 @@ PY
 }
 
 run_runtime() { # run_runtime — boot the runtime over the seeded log for one window
-  nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+  nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
   FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 2.5 "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 }
 
 echo "== phase A: seed a DaemonSet and 3 nodes (2 ready, 1 not); one pod per ready node =="

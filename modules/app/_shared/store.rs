@@ -14,7 +14,7 @@
 // The including module must define the opcodes and bounds these helpers name:
 // `MAX_KEY`, `MAX_VALUE`, `OBJ_GET`, `OBJ_PUT`, `OBJ_RANGE_GET`, `OBJ_CLOSE`,
 // `OBJ_DELETE` and `NS_LIST`. The subscription helpers take their opcodes and
-// layouts from the SDK (`namespace::{subscribe, take, changes}`).
+// layouts from the SDK (`namespace::{subscribe, changes}`).
 //
 // The object and namespace helpers reach the store through a [`Store`]: the
 // syscall table, and — while a module serves a record — that record's
@@ -568,18 +568,44 @@ unsafe fn exists(sys: &Store, key: &[u8]) -> bool {
 }
 
 unsafe fn exists_live(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<()> {
-    let mut garg = [0u8; MAX_KEY];
-    if key.len() > garg.len() {
+    if key.len() > MAX_KEY {
         return Got::Absent;
     }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
+    let h = obj_get(sys, key);
     if h < 0 {
         return refusal(sys, nag, b"GET", key, h);
     }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    obj_close(sys, h);
     Got::Found(())
+}
+
+/// storage.object GET of `key` (`object::key` is its record): the read
+/// handle, or the provider's errno.
+unsafe fn obj_get(sys: &SyscallTable, key: &[u8]) -> i32 {
+    let mut arg = [0u8; MAX_KEY + 2];
+    let Some(n) = abi::contracts::storage::object::key::encode(&mut arg, key) else {
+        return abi::kernel_abi::errno::EINVAL;
+    };
+    (sys.provider_call)(-1, OBJ_GET, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
+}
+
+/// storage.object RANGE_GET on read handle `h`: up to `len` bytes from
+/// `offset` into `dst`. The bytes read, or the provider's errno.
+unsafe fn obj_range(sys: &SyscallTable, h: i32, offset: u64, dst: *mut u8, len: usize) -> i32 {
+    let mut arg = abi::contracts::storage::object::range_get::encode(offset);
+    (sys.provider_call)(h, OBJ_RANGE_GET, arg.as_mut_ptr(), arg.len(), dst, len)
+}
+
+/// storage.object CLOSE of read handle `h`.
+unsafe fn obj_close(sys: &SyscallTable, h: i32) {
+    (sys.provider_call)(
+        h,
+        OBJ_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// storage.object GET+RANGE_GET+CLOSE — read `key` into `dst`. Returns
@@ -704,7 +730,14 @@ unsafe fn get_value_rev(sys: &Store, key: &[u8], dst: &mut [u8]) -> Option<(usiz
 unsafe fn handle_rev(sys: &SyscallTable, h: i32) -> u64 {
     use abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
     let mut f = [0u8; WIRE_MAX_LEN];
-    let n = (sys.provider_call)(h, QUERY_OP, f.as_mut_ptr(), f.len());
+    let n = (sys.provider_call)(
+        h,
+        QUERY_OP,
+        f.as_mut_ptr(),
+        f.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if n <= 0 {
         let m = b"[store] ERROR the store answered no fence on a read handle: storage.object requires one, and no conditional write can be made without it";
         dev_log(sys, 1, m.as_ptr(), m.len());
@@ -726,20 +759,15 @@ unsafe fn get_live(
     dst: &mut [u8],
     want_rev: bool,
 ) -> Got<(usize, u64)> {
-    let mut garg = [0u8; MAX_KEY];
-    if key.len() > garg.len() {
+    if key.len() > MAX_KEY {
         return Got::Absent;
     }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
+    let h = obj_get(sys, key);
     if h < 0 {
         return refusal(sys, nag, b"GET", key, h);
     }
     let rev = if want_rev { handle_rev(sys, h) } else { 0 };
-    let mut rarg = [0u8; 20];
-    rarg[8..12].copy_from_slice(&(dst.len() as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
+    let n = obj_range(sys, h, 0, dst.as_mut_ptr(), dst.len());
     // A value the caller's buffer cannot hold is REFUSED, not returned as a
     // prefix of itself. `RANGE_GET` reports bytes copied, so a full buffer is
     // ambiguous; one more byte past it settles it. A truncated read of a
@@ -755,11 +783,7 @@ unsafe fn get_live(
     let mut rc = n;
     if n >= 0 && n as usize == dst.len() {
         let mut probe = [0u8; 1];
-        let mut parg = [0u8; 20];
-        parg[0..8].copy_from_slice(&(dst.len() as u64).to_le_bytes());
-        parg[8..12].copy_from_slice(&1u32.to_le_bytes());
-        parg[12..20].copy_from_slice(&(probe.as_mut_ptr() as u64).to_le_bytes());
-        let pr = (sys.provider_call)(h, OBJ_RANGE_GET, parg.as_mut_ptr(), 20);
+        let pr = obj_range(sys, h, dst.len() as u64, probe.as_mut_ptr(), probe.len());
         if pr > 0 {
             truncated = true;
         }
@@ -768,8 +792,7 @@ unsafe fn get_live(
             rc = pr;
         }
     }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    obj_close(sys, h);
     if wait {
         return range_refused(sys, nag, key, rc);
     }
@@ -942,12 +965,10 @@ unsafe fn read_whole_rev_live(
     key: &[u8],
     max: usize,
 ) -> Got<(*mut u8, usize, u64)> {
-    let mut garg = [0u8; MAX_KEY];
-    if key.len() > garg.len() {
+    if key.len() > MAX_KEY {
         return Got::Absent;
     }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
+    let h = obj_get(sys, key);
     if h < 0 {
         return refusal(sys, nag, b"GET", key, h);
     }
@@ -959,11 +980,7 @@ unsafe fn read_whole_rev_live(
         if p.is_null() {
             break Got::Absent;
         }
-        let mut rarg = [0u8; 20];
-        rarg[0..8].copy_from_slice(&(len as u64).to_le_bytes());
-        rarg[8..12].copy_from_slice(&((cap - len) as u32).to_le_bytes());
-        rarg[12..20].copy_from_slice(&(p.add(len) as u64).to_le_bytes());
-        let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
+        let n = obj_range(sys, h, len as u64, p.add(len), cap - len);
         if n < 0 {
             heap_free(sys, p);
             // Not yet: closed, and the whole read asked again later. A
@@ -982,8 +999,7 @@ unsafe fn read_whole_rev_live(
         cap = (cap * 2).min(max);
         p = heap_realloc(sys, p, cap as u32);
     };
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    obj_close(sys, h);
     out
 }
 
@@ -1029,16 +1045,16 @@ unsafe fn head(sys: &Store, key: &[u8]) -> Option<u64> {
     got
 }
 
-// ── Store subscriptions: one kernel event, rung bits, a read owed ──────────
+// ── Store subscriptions: one handle per prefix, polled, a read owed ────────
 //
-// `storage.namespace` SUBSCRIBE names a kernel event the module owns, not a
-// channel: the store signals it when a watched prefix changes and writes no
-// byte anywhere. A module creates ONE event ([`store_event`]) for every
-// prefix it watches and subscribes each with it ([`store_subscribe`]). Each
-// step it asks [`store_take`], which polls the event and, when it fired, asks
-// `TAKE_RUNG` which of its subscriptions rang — the store keeps one rung bit
-// per subscription and signals only when the bit was clear, so a burst of
-// changes is one ring.
+// `storage.namespace` SUBSCRIBE answers a subscription handle: the store
+// rings it when a watched prefix changes and writes no byte anywhere, and
+// the kernel wakes the module. A module subscribes each prefix it watches
+// ([`store_subscribe`]) and keeps them ([`StoreSub`]). Each step it asks
+// [`store_rang`], which polls each handle (`HANDLE_POLL`, which takes the
+// kernel's ring) and reads each that rang through it (`CHANGES`, which takes
+// the store's: the store rings a subscription once until it is read): a
+// burst of changes is one ring.
 //
 // What a ring owes is a READ that starts after it: a rescan, or a `CHANGES`
 // read of the subscription. The module keeps that read owed (`dirty`,
@@ -1046,37 +1062,32 @@ unsafe fn head(sys: &Store, key: &[u8]) -> Option<u64> {
 // the store answered "not yet" (`EAGAIN`), `ENOMEM`, LOST or a refusal leaves
 // it owed and is run again on the module's timer: a coalesced ring is not
 // repeated, so a read dropped on a failure would wait for a change that may
-// never come. A `CHANGES` read that names its subscription (`sub`) and is
+// never come. A `CHANGES` read made through its subscription's handle and
 // answered `EAGAIN` is rung again by the store once it can answer.
 
-/// Create the module's subscription event (`kernel_abi::event::CREATE`): the
-/// event fd, or a negative errno. Once per module; every subscription names
-/// it.
-unsafe fn store_event(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
-}
-
-/// storage.namespace SUBSCRIBE — ring `event` (the caller's, from
-/// [`store_event`]) on every change under `prefix`. `flags` bit 0
+/// storage.namespace SUBSCRIBE on `prefix`. `flags` bit 0
 /// (`subscribe::FLAG_RING_NOW`) rings it once at once. Returns the provider
-/// rc: a subscription handle (idempotent — subscribing the same prefix with
-/// the same event again answers the same handle), or the contract's "not
-/// yet" ([`not_yet`]) — no subscription was made, and the caller subscribes
-/// again on a later step — or a refusal (`ENOMEM`: the store's subscription
-/// capacity or this module's quota is spent; `EINVAL`: the event is not the
-/// caller's), said at ERROR here; the caller then rescans on its timer.
-unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32, flags: u8) -> i32 {
+/// rc: a subscription handle, which the caller keeps and polls
+/// ([`store_rang`]); or the contract's "not yet" ([`not_yet`]) — no
+/// subscription was made, and the caller subscribes again on a later step —
+/// or a refusal (`ENOMEM`: the store's subscription capacity or this
+/// module's quota is spent), said at ERROR here; the caller then rescans on
+/// its timer.
+unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], flags: u8) -> i32 {
     use abi::contracts::storage::namespace as ns;
-    let mut arg = [0u8; MAX_KEY + 16];
-    let req = ns::subscribe::Request {
-        prefix,
-        event,
-        flags,
-    };
+    let mut arg = [0u8; ns::subscribe::ARG_MAX];
+    let req = ns::subscribe::Request { prefix, flags };
     let Some(len) = ns::subscribe::encode(&mut arg, &req) else {
         return abi::kernel_abi::errno::EINVAL;
     };
-    let rc = (sys.provider_call)(-1, ns::SUBSCRIBE, arg.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        ns::SUBSCRIBE,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 && !not_yet(rc) {
         // A change under it will never wake this module: said at ERROR,
         // naming the module (its scheduler index) and the prefix.
@@ -1125,90 +1136,133 @@ unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32, flags: 
     rc
 }
 
-/// Handles one `TAKE_RUNG` answer holds; more are taken in the same call.
-const TAKE_BATCH: usize = 16;
-/// `TAKE_RUNG` calls one [`store_take`] makes at most: a module with more
-/// rung subscriptions than this takes the rest on its next step (the store
-/// signals the event again when they did not fit).
-const TAKE_CALLS: usize = 4;
+/// One store subscription a module holds: its handle (-1: none), the prefix
+/// it watches, and the revision its feed rests at — where the read that
+/// takes its next ring starts.
+#[derive(Clone, Copy)]
+struct StoreSub {
+    h: i32,
+    at: u64,
+    plen: u16,
+    prefix: [u8; MAX_KEY],
+}
 
-/// `event::POLL` the module's subscription event and, when it fired, ask
-/// `TAKE_RUNG` which of the caller's subscriptions on it rang — clearing
-/// their rung bits — calling `rung` with each handle named. Returns how many
-/// were named: non-zero means a read is owed. A store that cannot answer the
-/// take (`EAGAIN`) answers 0 here; it signals the event again.
-unsafe fn store_take(sys: &SyscallTable, event: i32, mut rung: impl FnMut(i32)) -> u32 {
-    use abi::contracts::storage::namespace as ns;
-    if event < 0 {
-        return 0;
+impl StoreSub {
+    const NONE: StoreSub = StoreSub {
+        h: -1,
+        at: 0,
+        plen: 0,
+        prefix: [0; MAX_KEY],
+    };
+
+    /// The subscription `store_subscribe` answered `h` for on `prefix`.
+    fn new(h: i32, prefix: &[u8]) -> StoreSub {
+        let mut s = StoreSub::NONE;
+        let n = prefix.len().min(MAX_KEY);
+        s.prefix[..n].copy_from_slice(&prefix[..n]);
+        s.plen = n as u16;
+        s.h = h;
+        s
     }
-    let fired = (sys.provider_call)(
-        event,
-        abi::kernel_abi::event::POLL,
-        core::ptr::null_mut(),
-        0,
-    );
-    if fired <= 0 {
-        return 0;
+
+    fn prefix(&self) -> &[u8] {
+        self.prefix.get(..self.plen as usize).unwrap_or(&[])
     }
-    let mut named = 0u32;
-    for _ in 0..TAKE_CALLS {
-        let mut out = [0u8; ns::take::HEAD_LEN + 4 * TAKE_BATCH];
-        let req = ns::take::Request {
-            event,
-            out_ptr: out.as_mut_ptr() as u64,
-            out_cap: out.len() as u32,
-        };
-        let mut arg = [0u8; ns::take::REQUEST_LEN];
-        let Some(len) = ns::take::encode(&mut arg, &req) else {
-            break;
-        };
-        let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
-        if n < 0 {
-            break;
+}
+
+/// `HANDLE_POLL` each subscription in `subs` for `POLL_IN`, which takes its
+/// ring, and read each that rang through its handle ([`store_take_ring`]):
+/// the store rings a subscription once until it is read, so a ring not read
+/// would be the last. Returns how many rang: non-zero means a pass is owed,
+/// and it starts after the read.
+unsafe fn store_rang(sys: &SyscallTable, subs: &mut [StoreSub]) -> u32 {
+    let mut rang = 0u32;
+    for s in subs.iter_mut() {
+        if s.h < 0 {
+            continue;
         }
-        let Some((more, handles)) = ns::take::decode(out.get(..n as usize).unwrap_or(&[])) else {
-            break;
-        };
-        for h in handles {
-            named += 1;
-            rung(h);
-        }
-        if !more {
-            break;
+        let mut events = [abi::kernel_abi::poll::IN as u8];
+        let rc = (sys.provider_call)(
+            s.h,
+            abi::kernel_abi::HANDLE_POLL,
+            events.as_mut_ptr(),
+            events.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        if rc > 0 && rc as u32 & abi::kernel_abi::poll::IN != 0 {
+            rang += 1;
+            store_take_ring(sys, s);
         }
     }
-    named
+    rang
+}
+
+/// One `CHANGES` page of `s`'s prefix, read through its handle from where
+/// its feed rests: the read the store takes the ring by, so the next change
+/// rings again. The records are not this subscriber's business — its pass
+/// reads the prefix itself — only where the feed now rests: the page's
+/// `safe_rev`, or, on a page that says LOST (the rest point is one the store
+/// cannot answer from), the revision the page was read at. A read the store
+/// answers `EAGAIN` it rings again once it can answer.
+unsafe fn store_take_ring(sys: &SyscallTable, s: &mut StoreSub) {
+    use abi::contracts::storage::namespace::changes;
+    let token = changes::revision_token(s.at);
+    let mut page = [0u8; 512];
+    let mut fence = None;
+    let prefix = s.prefix;
+    let plen = s.plen as usize;
+    let rc = store_changes_page(sys, &prefix[..plen], s.h, &token, &mut page, &mut fence);
+    let Some(p) = page
+        .get(..rc.max(0) as usize)
+        .and_then(changes::decode_page)
+    else {
+        return;
+    };
+    let read_at = match fence {
+        Some(abi::fence::Fence::ViewConsistent { revision, .. }) => revision,
+        _ => 0,
+    };
+    if p.lost {
+        s.at = read_at;
+    } else if p.safe_rev > s.at {
+        s.at = p.safe_rev;
+    }
 }
 
 /// One `CHANGES` page read of `prefix` from `token` into `out`
-/// (`namespace::changes`): `sub` is the subscription the read serves (the
-/// store rings it again after an `EAGAIN`), or -1. The byte count written,
-/// or a negative errno; `fence` receives the encoded fence (at least
-/// `fence::WIRE_MAX_LEN` bytes).
+/// (`namespace::changes`) through `sub`: the subscription the read serves
+/// (the store rings it again after an `EAGAIN`), or -1. The byte count
+/// written, or a negative errno; `fence` receives the page's fence when the
+/// read answered one.
 unsafe fn store_changes_page(
     sys: &SyscallTable,
     prefix: &[u8],
     sub: i32,
     token: &[u8],
     out: &mut [u8],
-    fence: &mut [u8],
+    fence: &mut Option<abi::fence::Fence>,
 ) -> i32 {
     use abi::contracts::storage::namespace as ns;
-    let mut arg = [0u8; MAX_KEY + ns::changes::TOKEN_MAX + ns::changes::REQUEST_FIXED_LEN];
-    let req = ns::changes::Request {
-        prefix,
-        sub,
-        token,
-        out_ptr: out.as_mut_ptr() as u64,
-        out_cap: out.len().min(u32::MAX as usize) as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: fence.len().min(u16::MAX as usize) as u16,
-    };
+    let mut arg = [0u8; ns::changes::ARG_MAX];
+    let req = ns::changes::Request { prefix, token };
     let Some(len) = ns::changes::encode_request(&mut arg, &req) else {
         return abi::kernel_abi::errno::EINVAL;
     };
-    (sys.provider_call)(-1, ns::CHANGES, arg.as_mut_ptr(), len)
+    let rc = (sys.provider_call)(
+        if sub < 0 { -1 } else { sub },
+        ns::CHANGES,
+        arg.as_mut_ptr(),
+        len,
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    *fence = if rc >= 0 {
+        abi::fence::trailer::get(&arg[..len])
+    } else {
+        None
+    };
+    rc
 }
 
 /// A paged walk over every key under `prefix`, in key order.
@@ -1385,26 +1439,23 @@ impl ListWalk {
 
     /// One LIST call into `self.page`: the provider's answer.
     unsafe fn fetch_live(&mut self, sys: &SyscallTable) -> i32 {
-        let mut larg = [0u8; MAX_KEY + LIST_CURSOR + 32];
-        let mut p = 0;
-        larg[p..p + 2].copy_from_slice(&(self.plen as u16).to_le_bytes());
-        p += 2;
-        larg[p..p + self.plen].copy_from_slice(&self.prefix[..self.plen]);
-        p += self.plen;
-        larg[p..p + 2].copy_from_slice(&(self.clen as u16).to_le_bytes());
-        p += 2;
-        larg[p..p + self.clen].copy_from_slice(&self.cursor[..self.clen]);
-        p += self.clen;
-        larg[p..p + 8].copy_from_slice(&(self.page.as_mut_ptr() as u64).to_le_bytes());
-        p += 8;
-        larg[p..p + 4].copy_from_slice(&(LIST_PAGE as u32).to_le_bytes());
-        p += 4;
-        let mut fence = [0u8; 62];
-        larg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-        p += 8;
-        larg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-        p += 2;
-        (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p)
+        use abi::contracts::storage::namespace::list;
+        let mut larg = [0u8; list::arg_len(MAX_KEY, LIST_CURSOR)];
+        let req = list::Request {
+            prefix: &self.prefix[..self.plen],
+            cursor: &self.cursor[..self.clen],
+        };
+        let Some(p) = list::encode_request(&mut larg, &req) else {
+            return abi::kernel_abi::errno::EINVAL;
+        };
+        (sys.provider_call)(
+            -1,
+            NS_LIST,
+            larg.as_mut_ptr(),
+            p,
+            self.page.as_mut_ptr(),
+            LIST_PAGE,
+        )
     }
 
     /// The next key, or None at the end of the listing.
@@ -1725,61 +1776,51 @@ unsafe fn write_live(
     pre: u8,
     rev: u64,
 ) -> WriteAnswer {
-    // The value goes by POINTER, so this buffer holds only the key plus the
-    // fixed fields and the etag — never the value. Sizing it for the value
-    // would put several KB of dead stack under every write, in a no_std
-    // environment that counts it.
-    let mut arg = [0u8; MAX_KEY + 96];
-    let etag_len = if pre == PRE_ETAG { 32 } else { 0 };
-    // `1 + 1` is the precondition PAIR — `[precondition][etag_len]`. The bound
-    // counts both bytes and the PUT's Kept block: the buffer's slack would
-    // otherwise hide an undercount until a long key made it overflow.
-    let kept = abi::contracts::storage::object::Kept::none();
-    if 2 + key.len() + 1 + 8 + 8 + 1 + 1 + etag_len + kept.wire_len() + 8 + 2 > arg.len() {
-        return WriteAnswer::Decided(-22);
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
+    use abi::contracts::storage::object::{delete, put, Kept};
+    // The value travels in `data`, so this buffer holds only the key, the
+    // precondition and its etag, and the fence trailer — never the value.
+    // Sizing it for the value would put several KB of dead stack under every
+    // write, in a no_std environment that counts it.
+    let mut arg = [0u8; put::arg_len(MAX_KEY, 0, 32, 0)];
+    let etag = etag_of(rev);
+    let etag: &[u8] = if pre == PRE_ETAG { &etag } else { &[] };
     if let Some(value) = value {
-        arg[p] = 0; // content_type_len
-        p += 1;
-        arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-        p += 8;
-    }
-    // Every field after the precondition pair (including `fence_out_ptr`) is
-    // positioned off its width; get it wrong and the provider reads a
-    // misaligned pointer and the write is silently lost. `ANY` is the
-    // explicit "apply unconditionally".
-    arg[p] = pre;
-    p += 1;
-    arg[p] = etag_len as u8;
-    p += 1;
-    if etag_len > 0 {
-        arg[p..p + 32].copy_from_slice(&etag_of(rev));
-        p += 32;
-    }
-    if value.is_some() {
-        // A control-plane record keeps nothing besides its bytes. A DELETE
-        // carries no such block.
-        match kept.encode(&mut arg[p..]) {
-            Some(n) => p += n,
-            None => return WriteAnswer::Decided(-22),
-        }
-    }
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    if value.is_some() {
-        write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p))
+        // A control-plane record keeps nothing besides its bytes.
+        let req = put::Request {
+            key,
+            content_type: &[],
+            precondition: pre,
+            etag,
+            kept: Kept::none(),
+        };
+        let Some(n) = put::encode(&mut arg, &req) else {
+            return WriteAnswer::Decided(-22);
+        };
+        write_answer((sys.provider_call)(
+            -1,
+            OBJ_PUT,
+            arg.as_mut_ptr(),
+            n,
+            value.as_ptr() as *mut u8,
+            value.len(),
+        ))
     } else {
-        write_answer((sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p))
+        let req = delete::Request {
+            key,
+            precondition: pre,
+            etag,
+        };
+        let Some(n) = delete::encode_request(&mut arg, &req) else {
+            return WriteAnswer::Decided(-22);
+        };
+        write_answer((sys.provider_call)(
+            -1,
+            OBJ_DELETE,
+            arg.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        ))
     }
 }
 
@@ -1833,7 +1874,15 @@ fn take_mark(nonce: &[u8; 16]) -> [u8; TAKE_MARK_LEN] {
 unsafe fn take_nonce(sys: &SyscallTable, salt: u64) -> [u8; 16] {
     const CSPRNG_FILL: u32 = abi::registry::kernel::RANDOM_FILL;
     let mut n = [0u8; 16];
-    if (sys.provider_call)(-1, CSPRNG_FILL, n.as_mut_ptr(), n.len()) >= 0 && n != [0u8; 16] {
+    let rc = (sys.provider_call)(
+        -1,
+        CSPRNG_FILL,
+        core::ptr::null_mut(),
+        0,
+        n.as_mut_ptr(),
+        n.len(),
+    );
+    if rc >= 0 && n != [0u8; 16] {
         return n;
     }
     let t = dev_unix_millis(sys) ^ salt.rotate_left(29) ^ (sys as *const SyscallTable as u64);

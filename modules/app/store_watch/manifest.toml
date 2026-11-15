@@ -61,11 +61,6 @@ access = "write"
 requires_contract = "timer"
 access = "write"
 
-# Every subscription rings the module's one kernel event: the store writes
-# no channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"
@@ -73,7 +68,9 @@ exempt = "a read-only projection at the graph edge — observed through the stor
 # Store subscriptions an instance opens: its registrations' prefix and its
 # `watch` entries no other covers (store_source's subscribe, made once at
 # start; every client's watch is served from them) — counted per instance
-# from `prefix` (tag 1) and `watch` (tag 7). One kernel event carries them.
+# from `prefix` (tag 1) and `watch` (tag 7).
 [capacities]
-demand_from_params = { pool = "store_subs", tags = [1, 7] }
-store_subscribers = 1
+demand_from_params = [
+    { pool = "store_subs", tags = [1, 7] },
+    { pool = "events", tags = [1, 7] },
+]

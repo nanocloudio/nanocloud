@@ -232,12 +232,12 @@ settle() { # settle <rk> <seconds> — resolved, every layer cached and marked
   done
   return 1
 }
-run_until() { # run_until <config> <modules> "<name>…" <seconds>
-  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$1" --modules "$2" >>"$D/run.log" 2>&1 &
+run_until() { # run_until <image> "<name>…" <seconds>
+  FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --image "$1" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   local n
-  for n in $3; do
-    settle "$n" "$4" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$n never settled: digest '$(wal_last "/image-digests/$n")'"; }
+  for n in $2; do
+    settle "$n" "$3" || { kill "$RUNTIME_PID" 2>/dev/null; RUNTIME_PID=""; fail "$n never settled: digest '$(wal_last "/image-digests/$n")'"; }
   done
   sleep 1
   kill "$RUNTIME_PID" 2>/dev/null || true
@@ -246,11 +246,11 @@ run_until() { # run_until <config> <modules> "<name>…" <seconds>
 }
 
 echo "== 4. build config + module table; seed the image request =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
 
 echo "== 5. run the graph until every layer is cached =="
-run_until "$D/config.bin" "$D/modules.bin" testapp+latest 20
+run_until "$D/graph.img" testapp+latest 20
 
 echo "== 6. verify the settled state =="
 MD="$(cat "$D/reg/mdigest.txt")"
@@ -290,7 +290,7 @@ wal_put "/image-requests/testapp@$MD" "reg=;repo=testapp;tag=;pin=sha256:$MD"
 # Another registry than this node's: asked of THAT registry, by its name —
 # never of this one instead.
 wal_put "/image-requests/localhost+$OTHER_PORT~testapp+latest" "reg=localhost:$OTHER_PORT;repo=testapp;tag=latest;pin="
-run_until "$D/config.bin" "$D/modules.bin" "testapp+multi localhost+$OTHER_PORT~testapp+latest" 20
+run_until "$D/graph.img" "testapp+multi localhost+$OTHER_PORT~testapp+latest" 20
 [ "$(wal_last /image-index/testapp+multi)" = "digest=sha256:$MD" ] || fail "index: '$(wal_last /image-index/testapp+multi)'"
 [ "$(dig_of testapp+multi)" = "$MD" ] || fail "multi resolved to '$(wal_last /image-digests/testapp+multi)'"
 [ "$(dig_of "testapp@$MD")" = "$MD" ] || fail "pinned digest: '$(wal_last "/image-digests/testapp@$MD")'"
@@ -325,9 +325,9 @@ echo "   index -> sha256:${MD:0:12}…; layers shared, fetched once; queue drain
 echo "== 8. chunked-Range pass (chunk_bytes=4096 — the constrained-bearer posture) =="
 rm -f "$D/store.log" "$D/blobcache/"*
 sed 's/chunk_bytes: 0/chunk_bytes: 4096/' "$D/graph.yaml" >"$D/graph2.yaml"
-nc_build_workload "$ROOT" "$D/graph2.yaml" "$D/config2.bin" "$D/modules2.bin"
+nc_build_workload "$ROOT" "$D/graph2.yaml" "$D/graph2.img"
 wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
-run_until "$D/config2.bin" "$D/modules2.bin" testapp+latest 30
+run_until "$D/graph2.img" testapp+latest 30
 for dg in "$D1" "$D2"; do
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "chunked blob mismatch for $dg (sha=$got)"
@@ -427,10 +427,10 @@ rm -f "$D/store.log" "$D/blobcache/"*
 sed -e "s#localhost:$PORT#localhost:$AUTH_PORT#" \
     -e 's#credentials: "/registry-auth/registry.nanocloud.io"#credentials: "/registry-auth/stub"#' "$D/graph2.yaml" >"$D/graph3.yaml"
 grep -q 'credentials: "/registry-auth/stub"' "$D/graph3.yaml" || fail "the credentials splice did not apply"
-nc_build_workload "$ROOT" "$D/graph3.yaml" "$D/config3.bin" "$D/modules3.bin"
+nc_build_workload "$ROOT" "$D/graph3.yaml" "$D/graph3.img"
 wal_put "/registry-auth/stub" "puller:s3cret"
 wal_put "/image-requests/testapp+latest" "reg=;repo=testapp;tag=latest;pin="
-run_until "$D/config3.bin" "$D/modules3.bin" testapp+latest 60
+run_until "$D/graph3.img" testapp+latest 60
 for dg in "$D1" "$D2"; do
   got="$(sha256sum "$D/blobcache/$dg" | cut -d' ' -f1)"
   [ "$got" = "$dg" ] || fail "authenticated blob mismatch for $dg (sha=$got)"

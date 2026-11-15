@@ -119,7 +119,7 @@ PY
 
 run_graph() { # run_graph <seconds> <logname>
   FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout "$1" "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/$2" 2>&1 || true
+    --image "$D/graph.img" >"$D/$2" 2>&1 || true
 }
 
 FULL=0
@@ -129,7 +129,7 @@ if [ -z "$NO_FREEZE" ]; then
 fi
 
 echo "== 1. build the config + module table from the graph (3 modules) =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. a long-running pod with a resource envelope (tasks= → cgroup) =="
 mkdir -p "$D/pz"

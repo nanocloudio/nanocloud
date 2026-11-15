@@ -51,13 +51,13 @@ echo "== 2. build both graphs (control plane + cli), rendered as this node's rep
 # what postinst provisions on a node.
 nc_controlplane_graph "$D" "$D/cp-graph.yaml" || fail "the control plane did not render"
 nc_render_graph "$D" "$CLI_GRAPH" "$D/cli-graph.yaml" || fail "the CLI did not render"
-nc_build_workload "$ROOT" "$D/cp-graph.yaml" "$D/cp.bin" "$D/cp.mods"
-nc_build_workload "$ROOT" "$D/cli-graph.yaml" "$D/cli.bin" "$D/cli.mods"
+nc_build_workload "$ROOT" "$D/cp-graph.yaml" "$D/cp.img"
+nc_build_workload "$ROOT" "$D/cli-graph.yaml" "$D/cli.img"
 
 # cp_until <pods>: run the control plane until it reconciles to <pods>, then
 # stop it (the CLI holds the replica next).
 cp_until() {
-  env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$D/cp.bin" --modules "$D/cp.mods" >>"$D/cp.log" 2>&1 &
+  env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --image "$D/cp.img" >>"$D/cp.log" 2>&1 &
   RUNTIME_PID=$!
   nc_store_ready "$D" || fail "the store never answered"
   # Up to 180 s: a whole control plane boots and reconciles here, and on a
@@ -71,7 +71,7 @@ cp_until() {
   kill "$RUNTIME_PID"; wait "$RUNTIME_PID" 2>/dev/null || true
   RUNTIME_PID=""
 }
-cli()     { env -C "$D"           "$FLUXOR_RUNTIME" --config "$D/cli.bin" --modules "$D/cli.mods" -- "$@" 2>/dev/null; }
+cli()     { env -C "$D"           "$FLUXOR_RUNTIME" --image "$D/cli.img" -- "$@" 2>/dev/null; }
 
 echo "== 3. control plane reconciles the Deployment → pods =="
 cp_until 2

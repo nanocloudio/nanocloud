@@ -57,7 +57,7 @@ node() { # node <arch>: a fresh store and blob cache, the graph for that arch
   mkdir -p "$D/blobs"
   ip_graph "$D/graph.yaml" "localhost:$PORT" "$D/blobs" \
     "\"kubernetes.io/arch\":\"$1\",\"kubernetes.io/os\":\"linux\",\"kubernetes.io/hostname\":\"node-1\""
-  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 }
 resolved() { [ -n "$(ip_get "/image-layer-ok/$1-0")" ] && [ -n "$(ip_get "/image-config/$1")" ]; }
 

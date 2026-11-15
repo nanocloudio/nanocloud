@@ -4,20 +4,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 // The store fragment, not a local copy. store_effect carried its own
 // `get_value` that returned a TRUNCATED value when the object exceeded the
 // buffer instead of refusing — the silent-truncation class this repo has been
@@ -3273,30 +3270,24 @@ fn same_identity(a: &[u8], b: &[u8], sch: &[u8]) -> bool {
 /// whole to be projected, or a template spliced into a controller's write.
 /// store_stamped (`stamp_heap`) takes a smaller one: one controller object
 /// read whole, or stamped. store_effect takes none.
+///
+/// store_stamped's is ONE controller object on the heap at a time — read
+/// whole to be projected (a Pod's hash, a ReplicaSet's spec digest), or
+/// stamped and kept from the stored one: an object up to `DOC_MAX`, the
+/// API's largest (a whole read grows in place on a fresh heap). A write
+/// that SPLICES a template (`splice_value`) holds its source, the value
+/// and the stamp's copies at once, and is store_big's.
 #[allow(
     unexpected_cfgs,
     reason = "`big` and `stamp_heap` are store_big's and store_stamped's features; this file is also store_effect, whose build declares neither"
 )]
-mod arena {
-    #[cfg(feature = "big")]
-    #[no_mangle]
-    #[link_section = ".text.module_arena_size"]
-    pub extern "C" fn module_arena_size() -> u32 {
-        16 << 20
-    }
-    /// store_stamped: ONE controller object on the heap at a time — read
-    /// whole to be projected (a Pod's hash, a ReplicaSet's spec digest), or
-    /// stamped and kept from the stored one: an object up to `DOC_MAX`, the
-    /// API's largest (a whole read grows in place on a fresh heap). A write
-    /// that SPLICES a template (`splice_value`) holds its source, the value
-    /// and the stamp's copies at once, and is store_big's.
-    #[cfg(feature = "stamp_heap")]
-    #[no_mangle]
-    #[link_section = ".text.module_arena_size"]
-    pub extern "C" fn module_arena_size() -> u32 {
-        4 << 20
-    }
-}
+const ARENA_BYTES: usize = if cfg!(feature = "big") {
+    16 << 20
+} else if cfg!(feature = "stamp_heap") {
+    4 << 20
+} else {
+    0
+};
 
 /// How long a deleted object's last state stays for a watch to carry
 /// (`tomb_ms`, default).
@@ -3374,9 +3365,8 @@ mod params_def {
     use super::State;
     use super::MAX_PATHS_SPEC;
     use super::MAX_PREFIX;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         8, list_values, u32, 0
@@ -3580,11 +3570,7 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: ARENA_BYTES }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -3751,20 +3737,20 @@ unsafe fn flush_reply(s: &mut State) -> bool {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.request_in < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
 
         // What is owed goes first; nothing new is read until it has.
         if !flush_reply(s) {
-            return 0;
+            return StepReturn::Continue;
         }
         let waiting = s.journal.held();
         let n = if waiting {
@@ -3773,7 +3759,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         } else {
             match take_request(s, sys) {
                 Some(n) => n,
-                None => return 0,
+                None => return StepReturn::Continue,
             }
         };
         // The fused decision: the arriving record is ITS input, and the
@@ -3789,7 +3775,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.held_req = len as u32;
                         core::slice::from_raw_parts(s.dec_buf.as_ptr(), len)
                     }
-                    None => return 0,
+                    None => return StepReturn::Continue,
                 }
             }
         } else {
@@ -5011,7 +4997,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.journal.held() {
             // A write of this record is undecided: nothing is answered, and
             // the record is served again next step.
-            return 0;
+            return StepReturn::Continue;
         }
         // Answered: the pre-images kept for a replay are not needed.
         s.journal.settle();
@@ -5024,7 +5010,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             flen
         };
         if flen == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         // A TERMINAL writer leaves `response_out` unwired: the last node in a
         // chain has nobody to answer, and demanding a sink there would put a
@@ -5041,6 +5027,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // scheduler stops stepping the module. Returning 1 to mean "I did
         // work" retires it after its first record, which presents as a
         // downstream stall rather than as the module being finished.
-        0
+        StepReturn::Continue
     }
 }

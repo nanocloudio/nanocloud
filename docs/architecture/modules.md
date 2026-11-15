@@ -49,7 +49,7 @@ fluxor contracts:
 | Contract | Class | What it gives |
 | -------- | ----- | ------------- |
 | `storage.object` | `0x14` | keyed byte values, compare-and-swap on a precondition, ranged reads, delete |
-| `storage.namespace` | `0x13` | prefix LIST with a cursor, SUBSCRIBE — a ring on the subscriber's own kernel event — and CHANGES, the paged change feed since a revision |
+| `storage.namespace` | `0x13` | prefix LIST with a cursor, SUBSCRIBE — a subscription handle that rings on a change — and CHANGES, the paged change feed since a revision |
 
 The Kubernetes object model rides on it as keys: `/pods/<ns>/<name>`,
 `/services/<ns>/<name>`, `/deployments.apps/<ns>/<name>`, one prefix per
@@ -209,7 +209,9 @@ and written by the decode program; no decision parses it.
 streamed on the credit it grants, up to `max_body_kib` (413 past it) — and
 hands the chain ONE request envelope under a cid of its own:
 `[cid u32][method u8][flags u8][target_len u16][hdr_len u16][body_len u16]`
-then the target, headers and body, and the connection's verified mTLS peer as
+then the target, headers and body — the method is the request's HTTP verb
+(`exchange_http::method`), the headers its meta as `name: value` lines, names
+in lower case — and the connection's verified mTLS peer as
 a trailer behind flag `0x02`. A body past `body_inline_max` is staged in the
 store at `<body_ref_prefix>sha256/<hex>` (its expiry beside it, for
 `gc_blob`) and handed on as `sha256:<hex>` behind flag `0x04`. The chain
@@ -412,20 +414,21 @@ a container that ends before any pass sees it run still reports a terminated
 state with both its start and its finish. Nanocloud owns the image→rootfs and
 pod-spec→argv mapping, and the backend reads no OCI format.
 
-`platform_raw` is the tree's privileged grant, and exactly five modules carry
-it — each because its one effect rewrites the host, and each on a module that
-decides nothing:
+Six modules hold a grant that rewrites the host, each for the one effect it
+performs and each on a module that decides nothing. Each names only the ops
+it calls (fluxor's registry `[[grant]]`s):
 
-| Module | What it rewrites |
-| ------ | ---------------- |
-| `workload_effect` | namespaces, cgroups and the processes in them (`workload`) |
-| `net_apply` | the host's packet policy (`net_policy`) |
-| `node_net` | the node's segment, peer routes and held addresses (`net_route`) |
-| `mount_effect` | the mount table (`host_mount`, `proc`) |
-| `volume_host` | a node's block devices and their unlocked mappings (`workload`, `proc`) |
+| Module | Grants | What it rewrites |
+| ------ | ------ | ---------------- |
+| `workload_effect` | `workload.create`, `host_process.exec` | namespaces, cgroups and the processes in them |
+| `net_apply` | `net_policy.replace` | the host's packet policy |
+| `node_net` | `net_route.table` | the node's segment, peer routes and held addresses |
+| `mount_effect` | `host_mount.mount` | the mount table |
+| `volume_files` | `host_mount.mount` | the Pods' directories on the mount tree |
+| `volume_host` | `workload.create`, `key_vault` | a node's block devices and their unlocked mappings |
 
-The `workload` contract itself has two holders, `workload_effect` and
-`volume_host`, so namespace surgery stays a grant a graph asks for by name.
+`workload.create` has two holders, `workload_effect` and `volume_host`, so
+namespace surgery stays a grant a graph asks for by name.
 
 The image plane sits beside them, and is chains too: `image.plan` turns
 `/image-requests/` into one work queue `/fetch-q/`, then a manifest (through an
@@ -538,7 +541,7 @@ modules/app/<name>/             one module: mod.rs + manifest.toml
 modules/app/_shared/            include-only helpers: JSON walk, store ops,
                                 compact fields, events, key paths
 modules/app/_chronicle/         controller rules authored for Chronicle params
-target/fluxor/fluxor-abi/sdk/   the SDK the modules compile against
+target/fluxor/fluxor-{abi,rt,sdk}/  the SDK crates the modules link
 target/fluxor/aarch64/modules/  the built .fmod artefacts
 packaging/debian/               graphs, bundle sources and the .deb build
 scripts/*-e2e.sh                live graph E2Es — the behaviour gate
@@ -598,11 +601,11 @@ A new module is a directory under `modules/app/` with `mod.rs` and
   stays correct under an adaptive tick.
 - **Own your prefixes.** One writer per prefix, named in the manifest header.
   Two modules writing one key is a design error, not a race to fix.
-- **Subscribe on one kernel event, and keep a ring owed until a pass ends.**
-  The store writes no channel of a subscriber's: a module creates ONE event
-  (`_shared/store.rs` `store_event`, the manifest's `event` resource) and
-  names it in every SUBSCRIBE; each step `store_take` asks which
-  subscriptions rang. A ring is coalesced — one per burst — so the pass it
+- **Subscribe by handle, and keep a ring owed until a pass ends.**
+  The store writes no channel of a subscriber's: each SUBSCRIBE
+  (`_shared/store.rs` `store_subscribe`) answers a subscription handle the
+  module keeps, and each step `store_rang` polls them (`HANDLE_POLL`, which
+  takes a ring). A ring is coalesced — one per burst — so the pass it
   owes stays owed (`dirty`) until a pass COMPLETES: one the store answered
   `EAGAIN`, `ENOMEM` or a refusal is run again on the module's timer, never
   left for a next change that may not come. Declare the demand: a

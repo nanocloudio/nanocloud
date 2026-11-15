@@ -99,11 +99,11 @@ PY
 
 run_runtime() {
   FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 3 "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 || true
 }
 
 echo "== 1. build the config + module table from the 3-module lifecycle graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. create a Deployment (replicas=2) — the forward cascade =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'

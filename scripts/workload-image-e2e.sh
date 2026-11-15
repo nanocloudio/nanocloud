@@ -111,11 +111,11 @@ m = json.load(open(os.path.join(src, "manifest.json")))
 fnv = lambda s: functools.reduce(lambda h, c: ((h ^ c) * 0x01000193) & 0xffffffff, s, 0x811c9dc5)
 have = {l["annotations"].get("io.fluxor.module.name") for l in m["layers"]}
 def manifest_of(b):
-    # The fmod's manifest: past its header, code, data, exports and schema.
+    # The fmod's manifest: past its header (`wire::fmod::header`, 56 bytes),
+    # code, data, exports (8 bytes each) and schema.
     code, data = struct.unpack_from("<II", b, 8)
-    exports = struct.unpack_from("<H", b, 24)[0]
-    schema, size = struct.unpack_from("<HH", b, 62)
-    at = 80 + code + data + exports * 8 + schema
+    exports, schema, size = struct.unpack_from("<HHH", b, 16)
+    at = 56 + code + data + exports * 8 + schema
     return b[at:at + size]
 # What this runtime admits: a module built for it (the linux runtime's bit
 # in its manifest) against its ABI surface (the attestation, the manifest's
@@ -127,7 +127,7 @@ for p in sorted(glob.glob(mods + "/*.fmod"), key=os.path.getsize):
     if len(m["layers"]) >= want:
         break
     b = open(p, "rb").read()
-    name = b[28:60].split(b"\0")[0].decode(errors="replace")
+    name = b[24:56].split(b"\0")[0].decode(errors="replace")
     mf = manifest_of(b)
     if not name or name in have or len(mf) < 49 or mf[-32:] != own[-32:] \
             or not struct.unpack_from("<H", mf, 10)[0] & LINUX:
@@ -156,20 +156,24 @@ echo "== 3. render the node: the plane + the kubelet's graph-pod slice + its ima
 nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
 wn_splice "$D/graph.yaml" node-1 "$D/blobs" "localhost:$REG_PORT" || fail "the splice did not apply"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
-python3 - "$D/modules.bin" <<'PY' || fail "the node's image holds program_probe: the test would prove nothing"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
+python3 - "$D/graph.img" <<'PY' || fail "the node's image holds program_probe: the test would prove nothing"
 import struct, sys
 b = open(sys.argv[1], "rb").read()
-n = b[5]
+# The image header records where the module table starts (u32 at 16).
+b = b[struct.unpack_from("<I", b, 16)[0]:]
+# `wire::fmod::table`: a 16-byte head ([magic u32][version u16][count u16]…),
+# then 12-byte entries ([name_hash u32][offset u32][size u32]).
+n = struct.unpack_from("<H", b, 6)[0]
 fnv = lambda s: __import__("functools").reduce(lambda h, c: ((h ^ c) * 0x01000193) & 0xffffffff, s, 0x811c9dc5)
-hashes = {struct.unpack_from("<I", b, 16 + 16 * i)[0] for i in range(n)}
+hashes = {struct.unpack_from("<I", b, 16 + 12 * i)[0] for i in range(n)}
 sys.exit(1 if fnv(b"program_probe") in hashes else 0)
 PY
 echo "   the node's image does not hold program_probe"
 
 echo "== 4. run it; wait for the API over TLS =="
 env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 for _ in $(seq 60); do

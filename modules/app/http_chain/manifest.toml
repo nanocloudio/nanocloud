@@ -22,7 +22,7 @@ hardware_targets = ["bcm2712", "linux"]
 #   [cid u32][method u8][flags u8][target_len u16][hdr_len u16][body_len u16]
 #   target | headers | body | peer trailer
 #   cid    this module's correlation for the exchange: never 0 or 0xFFFFFFFF
-#   method the exchange method byte (GET 1, POST 3, PUT 5, PATCH 6, DELETE 7)
+#   method the request's HTTP verb (GET 1, POST 3, PUT 4, PATCH 5, DELETE 6)
 #   flags  0x02 the connection's verified mutual-TLS peer follows the body as
 #          `[len u16][peer]`; 0x04 the body was staged and is `sha256:<hex>`
 # REPLY ENVELOPE (`reply_in`, one record, little-endian):
@@ -61,6 +61,8 @@ content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
 required = true
+[ports.facts]
+binding = ["http"]
 
 # From the chain's encoder: one envelope per record. Unwired, the chain never
 # answers here and the server answers each request 504 at its deadline — a
@@ -69,7 +71,7 @@ required = true
 name = "reply_in"
 direction = "input"
 content_type = "OctetStream"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 framed = true
 
@@ -86,7 +88,7 @@ required = true
 name = "record_out"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 required = true
 

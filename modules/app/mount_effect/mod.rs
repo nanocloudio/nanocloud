@@ -4,22 +4,19 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::platform::linux::host_mount as hm;
 use abi::platform::linux::host_process as hp;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -75,9 +72,8 @@ struct State {
 
 mod params_def {
     use super::State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
     }
 }
@@ -159,11 +155,7 @@ fn word(b: &[u8]) -> bool {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -202,37 +194,37 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.request_in < 0 || s.response_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.reply_len != 0 {
             flush_reply(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         match s.stage {
             ST_IDLE => {}
             ST_MOUNT => {
                 mount(s, sys);
-                return 0;
+                return StepReturn::Continue;
             }
             ST_UMOUNT => {
                 umount(s, sys);
-                return 0;
+                return StepReturn::Continue;
             }
             _ => {
                 poll_tool(s, sys);
-                return 0;
+                return StepReturn::Continue;
             }
         }
         admit(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 
@@ -250,9 +242,17 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
         return;
     }
     // Nothing runs without the privilege, and the answer says so.
-    // `PRIV` is a bit set: a root runtime answers SYS_ADMIN | CHOWN.
-    let held = (sys.provider_call)(-1, hm::PRIV, core::ptr::null_mut(), 0);
-    if held < 0 || held & hm::PRIV_SYS_ADMIN == 0 {
+    // `CAPS` is a bit set: a root runtime answers SYS_ADMIN | CHOWN.
+    let mut caps = [0u8; 4];
+    let rc = (sys.provider_call)(
+        -1,
+        hm::CAPS,
+        caps.as_mut_ptr(),
+        caps.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc != 0 || u32::from_le_bytes(caps) & hm::caps::SYS_ADMIN == 0 {
         answer(s, sys, 0, -1, 0);
         return;
     }
@@ -293,7 +293,14 @@ unsafe fn spawn(s: &mut State, sys: &SyscallTable, stage: u8, words: &[&[u8]]) {
         cmd[n..n + w.len()].copy_from_slice(w);
         n += w.len();
     }
-    let h = (sys.provider_call)(-1, hp::PROC_SPAWN, cmd.as_mut_ptr(), n);
+    let h = (sys.provider_call)(
+        -1,
+        hp::PROC_SPAWN,
+        core::ptr::null_mut(),
+        0,
+        cmd.as_mut_ptr(),
+        n,
+    );
     if h < 0 {
         // The tool could not start (off the node's allowlist, no slot): its
         // stage reports a failure of its own.
@@ -306,13 +313,35 @@ unsafe fn spawn(s: &mut State, sys: &SyscallTable, stage: u8, words: &[&[u8]]) {
 
 /// Drain the running tool's output; act on its exit once it has finished.
 unsafe fn poll_tool(s: &mut State, sys: &SyscallTable) {
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_READ, s.drain.as_mut_ptr(), s.drain.len());
-    let mut code = [0u8; 4];
-    let running = (sys.provider_call)(s.proc_h, hp::PROC_STATUS, code.as_mut_ptr(), 4);
+    let n = s.drain.len().min(hp::PROC_READ_MAX);
+    let _ = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_READ,
+        s.drain.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    );
+    let mut code = [0u8; hp::PROC_STATUS_ARG_LEN];
+    let running = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_STATUS,
+        code.as_mut_ptr(),
+        code.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if running == 1 {
         return;
     }
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
+    let _ = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.proc_h = -1;
     let stage = s.stage;
     s.stage = ST_IDLE;
@@ -385,7 +414,7 @@ unsafe fn mount(s: &mut State, sys: &SyscallTable) {
         arg[n..n + part.len()].copy_from_slice(part);
         n += part.len();
     }
-    let rc = (sys.provider_call)(-1, hm::MOUNT, arg.as_mut_ptr(), n);
+    let rc = (sys.provider_call)(-1, hm::MOUNT, core::ptr::null_mut(), 0, arg.as_mut_ptr(), n);
     if rc == EAGAIN {
         s.stage = ST_MOUNT;
         return;
@@ -400,7 +429,14 @@ unsafe fn umount(s: &mut State, sys: &SyscallTable) {
     let c = frame_bytes(rec, 3);
     let n = c.len().min(MAX_ARG);
     claim[..n].copy_from_slice(&c[..n]);
-    let rc = (sys.provider_call)(-1, hm::UMOUNT, claim.as_mut_ptr(), n);
+    let rc = (sys.provider_call)(
+        -1,
+        hm::UMOUNT,
+        core::ptr::null_mut(),
+        0,
+        claim.as_mut_ptr(),
+        n,
+    );
     if rc == EAGAIN {
         s.stage = ST_UMOUNT;
         return;
@@ -418,7 +454,14 @@ unsafe fn umount(s: &mut State, sys: &SyscallTable) {
 unsafe fn mount_dir(s: &State, sys: &SyscallTable, out: &mut [u8; 2 * MAX_ARG + 2]) -> usize {
     let rec = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
     let claim = frame_bytes(rec, 3);
-    let root = (sys.provider_call)(-1, hm::ROOT, out.as_mut_ptr(), MAX_ARG);
+    let root = (sys.provider_call)(
+        -1,
+        hm::ROOT,
+        core::ptr::null_mut(),
+        0,
+        out.as_mut_ptr(),
+        MAX_ARG,
+    );
     if root <= 0 || claim.is_empty() || claim.len() > MAX_ARG {
         return 0;
     }

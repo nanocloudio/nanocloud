@@ -20,7 +20,7 @@ hardware_targets = ["bcm2712", "linux"]
 # In:  a Chronicle record frame on `request_in` (a byte stream, self-framed, or
 #      a mailbox):
 #        1      = correlation (i64), echoed
-#        2      = method (i64): the exchange method byte (GET 1, POST 3 …).
+#        2      = method (i64): the request's HTTP verb (exchange_http::method: GET 1, POST 3 …).
 #                 0 = no request: the record is a decision's filter and nothing
 #                 is sent or answered
 #        3..6   = path, in parts joined in field order: the request target
@@ -58,16 +58,17 @@ required = true
 name = "response_in"
 direction = "input"
 content_type = "ExchangeResponse"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 
 [[ports]]
 name = "request_out"
 direction = "output"
 content_type = "ExchangeRequest"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
-
+[ports.facts]
+binding = ["http"]
 [[ports]]
 name = "response_out"
 direction = "output"

@@ -35,7 +35,9 @@ hardware_targets = ["bcm2712", "linux"]
 # and the platform's mount or unmount, runs across steps and is polled,
 # never waited on.
 timer_class = "agnostic"
-permissions = ["platform_raw"]
+# MOUNT and UMOUNT change the host's mounts. The tools run through the
+# claimed `proc` contract; ROOT and CAPS come with the claimed `host_mount`.
+grants = ["host_mount.mount"]
 
 [[ports]]
 name = "request_in"

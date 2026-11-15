@@ -171,19 +171,19 @@ if every != "0":
                   f"      fault_log_hold_steps: {os.environ.get('NC_FAULT_LOG_HOLD', '4')}\n")
 open(dst, "w").write(g)
 PORTS
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 if [ "$EVERY" != 0 ]; then
-  grep -aq "FAULT INJECTION ON" "$D/modules.bin" || fail "the built store does not know the fault knob"
+  grep -aq "FAULT INJECTION ON" "$D/graph.img" || fail "the built store does not know the fault knob"
   echo "   store fault knob on: one step in $EVERY busy"
 fi
 echo "   settling the RBAC grant index"
-rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present \
+rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present \
   '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*' \
   '/rbac-g/system:serviceaccount:default:lister/*|list|*|pods|*'
 
 echo "== 3. start ONE runtime and hold it for the whole test =="
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break
@@ -522,7 +522,7 @@ echo "   /~tomb-at/configmaps/default/big2: its end, indexed apart: $AT"
 kill "$RUNTIME_PID" 2>/dev/null || true
 wait "$RUNTIME_PID" 2>/dev/null || true
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 RESTARTED=$SECONDS
 echo "   runtime restarted with the tomb pending"

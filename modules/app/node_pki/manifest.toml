@@ -80,7 +80,7 @@ buffer_size = 1024
 name = "response_in"
 direction = "input"
 content_type = "ExchangeResponse"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 
 [[ports]]
@@ -93,8 +93,10 @@ buffer_size = 8192
 name = "request_out"
 direction = "output"
 content_type = "ExchangeRequest"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
+[ports.facts]
+binding = ["http"]
 
 # Extra local identities (`id2_*`, `id3_*`: subject, tenant, device, dns),
 # each on its own pair: a plane certifies its API and both peer link ends

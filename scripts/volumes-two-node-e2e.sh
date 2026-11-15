@@ -80,8 +80,8 @@ NBD_INDEX=""
 NBD_QUEUE=""
 stop_node() {
   [ -n "$NODE_PID" ] || return 0
-  # The runtime, by its own config path: nothing else names it.
-  on_node "pkill -TERM -f '^[^ ]*fluxor-linux --config $D/node-a/config.bin'" 2>/dev/null || true
+  # The runtime, by its own image path: nothing else names it.
+  on_node "pkill -TERM -f '^[^ ]*fluxor-linux --image $D/node-a/graph.img'" 2>/dev/null || true
   wait "$NODE_PID" 2>/dev/null || true
   NODE_PID=""
 }
@@ -275,7 +275,7 @@ if who == "plane":
 """
 open(out, "w").write(mods + "\nwiring:\n" + wiring)
 PY
-  nc_build_workload "$ROOT" "$D/$r/graph.yaml" "$D/$r/config.bin" "$D/$r/modules.bin" >/dev/null \
+  nc_build_workload "$ROOT" "$D/$r/graph.yaml" "$D/$r/graph.img" >/dev/null \
     || fail "the $r graph did not build"
 done
 
@@ -283,7 +283,7 @@ SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 run_plane() {
   env -C "$D/plane" FLUXOR_PROJECT_ROOT="$ROOT" FLUXOR_SEAL_KEY="$SEAL" \
     FLUXOR_VAULT_DIR="$D/plane/vault" RUST_LOG="${NC_LOG:-info}" \
-    "$FLUXOR_RUNTIME" --config "$D/plane/config.bin" --modules "$D/plane/modules.bin" \
+    "$FLUXOR_RUNTIME" --image "$D/plane/graph.img" \
     >> "$D/plane/run.log" 2>&1 < /dev/null &
   PLANE_PID=$!
 }
@@ -295,7 +295,7 @@ if [ -n "$NODE_HOST" ]; then
   # The capability is read at run time, where the node runs.
   ssh -o BatchMode=yes "$NODE_HOST" "mkdir -p $D/node-a/vault $D/node-a/lattice $D/mnt $D/pki" \
     && scp -q -o BatchMode=yes "$FLUXOR_RUNTIME" "$NODE_HOST:$NODE_RUNTIME" \
-    && scp -q -o BatchMode=yes "$D/node-a/config.bin" "$D/node-a/modules.bin" "$NODE_HOST:$D/node-a/" \
+    && scp -q -o BatchMode=yes "$D/node-a/graph.img" "$NODE_HOST:$D/node-a/" \
     && scp -q -o BatchMode=yes "$D/pki/node.cap" "$NODE_HOST:$D/pki/" \
     || fail "node-a's runtime and graph did not reach $NODE_HOST"
 fi
@@ -306,7 +306,7 @@ run_node() {
     FLUXOR_VAULT_DIR=$D/node-a/vault FLUXOR_MOUNT_ROOT=$D/mnt \
     SECTOR_PROC_ALLOW='blkid mkfs fsck nbd-client blockdev' \
     PATH=/usr/sbin:/sbin:/usr/bin:/bin RUST_LOG=${NC_LOG:-info} \
-    $NODE_RUNTIME --config $D/node-a/config.bin --modules $D/node-a/modules.bin \
+    $NODE_RUNTIME --image $D/node-a/graph.img \
     >> $D/node-a/run.log 2>&1 < /dev/null" < /dev/null &
   NODE_PID=$!
 }

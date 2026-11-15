@@ -79,7 +79,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 ip_u32() { python3 -c "import sys;a=[int(x) for x in sys.argv[1].split('.')];print((a[0]<<24)|(a[1]<<16)|(a[2]<<8)|a[3])" "$1"; }
 
@@ -87,7 +87,7 @@ RUNTIME_PID=""
 trap 'kill $RUNTIME_PID 2>/dev/null || true; rm -rf "$D"' EXIT
 start() {
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
 }
 stop() { kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""; }

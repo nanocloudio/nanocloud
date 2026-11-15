@@ -29,11 +29,11 @@ command -v fluxor >/dev/null || { echo "FAIL: fluxor CLI not on PATH"; exit 1; }
 D="$(mktemp -d /tmp/nc-rbac-e2e-XXXXXX)"
 trap 'rm -rf "$D"' EXIT
 L="$D/store.log"
-settle() { rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" "$@"; }
+settle() { rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" "$@"; }
 has() { rbac_keys "$L" | grep -qxF "$1"; }
 
 echo "== 1. build the extracted RBAC graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. seed: two ClusterRoles, a namespaced Role, three bindings =="
 rbac_clusterrole "$L" admin "*" "*"

@@ -60,7 +60,7 @@ echo "== 1. the kubelet graph, with churn_probe packed for workloads =="
 GRAPH="$D/graph.yaml"
 cp "$ROOT/packaging/debian/fluxor-podlifecycle.yaml" "$GRAPH"
 printf '\nworkload_modules:\n  - churn_probe\n' >> "$GRAPH"
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. the graph the node is given, and two pods: one naming it, one not =="
 FLXA="$(python3 "$ROOT/scripts/support/flxa.py" churn_probe:1=0)"
@@ -70,7 +70,7 @@ store_put "/pod-specs/pm-none" "graph=absent;desired=running;restart=never;grace
 
 echo "== 3. run =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 6 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify =="
 ms="$(store_last /metal-sandboxes/pm-ok)"

@@ -5,20 +5,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
@@ -101,9 +98,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::ROOT_MAX;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, root, str, 0
@@ -216,7 +212,7 @@ fn plain_name(n: &[u8]) -> bool {
 unsafe fn path_call(s: &mut State, op: u32) -> i32 {
     let sys = &*s.syscalls;
     let n = s.cur_len as usize;
-    (sys.provider_call)(-1, op, s.cur.as_mut_ptr(), n)
+    (sys.provider_call)(-1, op, s.cur.as_mut_ptr(), n, core::ptr::null_mut(), 0)
 }
 
 /// Answer the held request: its status and what was removed.
@@ -319,7 +315,7 @@ unsafe fn move_up(s: &mut State, name: &[u8]) -> i32 {
     if ok.is_none() {
         return EINVAL;
     }
-    let rc = (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), p);
+    let rc = (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), p, core::ptr::null_mut(), 0);
     if rc == 0 {
         s.moved = s.moved.wrapping_add(1);
     }
@@ -352,7 +348,14 @@ unsafe fn work(s: &mut State) {
             answer(s, 414);
             return;
         }
-        let rc = (sys.provider_call)(-1, FS_READLINK, buf.as_mut_ptr(), buf.len());
+        let rc = (sys.provider_call)(
+            -1,
+            FS_READLINK,
+            buf.as_mut_ptr(),
+            buf.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if pending(rc) {
             return;
         }
@@ -402,9 +405,16 @@ unsafe fn work(s: &mut State) {
             return;
         }
         calls += 1;
-        let got = (sys.provider_call)(h, FS_READDIR, s.list.as_mut_ptr(), LIST);
+        let got = (sys.provider_call)(
+            h,
+            FS_READDIR,
+            core::ptr::null_mut(),
+            0,
+            s.list.as_mut_ptr(),
+            LIST,
+        );
         let mut z = [0u8; 4];
-        (sys.provider_call)(h, FS_CLOSE, z.as_mut_ptr(), 0);
+        (sys.provider_call)(h, FS_CLOSE, z.as_mut_ptr(), 0, core::ptr::null_mut(), 0);
         if pending(got) {
             return;
         }
@@ -553,11 +563,7 @@ unsafe fn admit(s: &mut State) {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -605,24 +611,24 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() || s.request_in < 0 || s.response_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.reply_len != 0 {
             flush_reply(s);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.stage != ST_IDLE {
             work(s);
-            return 0;
+            return StepReturn::Continue;
         }
         admit(s);
-        0
+        StepReturn::Continue
     }
 }

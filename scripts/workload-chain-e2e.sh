@@ -71,14 +71,14 @@ PY
 }
 
 echo "== 1. build the config + module table from the 2-module workload graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. create ONE Deployment (replicas=2) — the only external write =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'
 
 echo "== 3. run the workload chain; the cascade settles over the store =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify the cascade: Deployment → ReplicaSet → Pods =="
 RS="$(store_last /replicasets.apps/default/web)"

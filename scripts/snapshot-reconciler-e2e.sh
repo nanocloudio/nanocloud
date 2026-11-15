@@ -59,7 +59,7 @@ PY
 }
 
 echo "== 1. build config + module table =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. create a VolumeSnapshot of PVC 'data' =="
 store_put "/volumesnapshots.snapshot.storage.k8s.io/default/snap1" \
@@ -67,7 +67,7 @@ store_put "/volumesnapshots.snapshot.storage.k8s.io/default/snap1" \
 
 echo "== 3. run snapshot_reconciler =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. the VolumeSnapshot is bound + ready =="
 VS="$(store_last /volumesnapshots.snapshot.storage.k8s.io/default/snap1)"

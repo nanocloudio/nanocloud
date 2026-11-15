@@ -245,35 +245,27 @@ fn nag_digits(mut v: u64, d: &mut [u8; 20]) -> &[u8] {
 /// including module names only the opcodes every module shares.
 unsafe fn head_rev(sys: &SyscallTable, nag: &ReadNag, key: &[u8]) -> Got<u64> {
     const OBJ_HEAD: u32 = abi::registry::storage_object::HEAD;
-    let mut arg = [0u8; MAX_KEY + 32];
-    if 2 + key.len() + 8 + 4 + 8 + 2 > arg.len() {
+    use abi::contracts::storage::object::{head, range};
+    // The answer — `[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]`
+    // and the Kept block — is written in place over the request, so the arg
+    // is sized for the longest record the provider may keep.
+    let mut arg = [0u8; head::ARG_LEN];
+    if key.len() > MAX_KEY || head::encode_request(&mut arg, key).is_none() {
         return Got::Absent;
     }
-    // `[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]` and the Kept
-    // block — sized for a content type as long as the u8 prefix allows and the
-    // longest key reference, so a provider that keeps them still fits.
-    use abi::contracts::storage::object::{range, KEPT_FIXED_LEN, KEY_REF_MAX};
-    let mut rec = [0u8; 8 + 8 + 1 + 255 + 1 + 32 + KEPT_FIXED_LEN + KEY_REF_MAX];
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p..p + 8].copy_from_slice(&(rec.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 4].copy_from_slice(&(rec.len() as u32).to_le_bytes());
-    p += 4;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, OBJ_HEAD, arg.as_mut_ptr(), p);
+    let n = (sys.provider_call)(
+        -1,
+        OBJ_HEAD,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if n < 0 {
         return refusal(sys, nag, b"HEAD", key, n);
     }
     // A malformed record is decided, not worth asking again.
-    let Some((_, _, etag, _)) = rec.get(..n as usize).and_then(range::decode_head) else {
+    let Some((_, _, etag, _)) = arg.get(..n as usize).and_then(range::decode_head) else {
         return Got::Absent;
     };
     if etag.len() < 8 {

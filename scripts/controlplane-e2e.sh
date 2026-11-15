@@ -60,7 +60,7 @@ echo "== 1. build config + module table from the control-plane graph =="
 # cert, and a reader — so this exercises the REAL production graph (TLS, the
 # replicated store).
 nc_controlplane_graph "$D" "$D/graph.yaml" || fail "the control plane did not render"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 2. project one Deployment (replicas=2) + a ready node (the API plane's role) =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'
@@ -71,7 +71,7 @@ echo "== 3. run the whole control plane; the cascade settles over the store =="
 # store (lattice/) and the seeded host log (store.log, imported) are in.
 nc_lattice_prepare "$D"
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$D" || fail "the store never answered"
 grep -q "store ready at construction" "$D/run.log" || fail "the lattice store never became ready"

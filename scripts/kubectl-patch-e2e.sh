@@ -133,15 +133,15 @@ g = g.replace("""  - from: linux_net.net_out
     to: tls.clear_in""")
 open(f"{d}/graph.yaml", "w").write(g)
 TLS
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 echo "   settling the RBAC grant index"
-rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present \
+rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present \
   '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*' \
   '/rbac-g/system:serviceaccount:default:lister/*|list|*|pods|*'
 
 echo "== 3. start ONE runtime and hold it for the whole test =="
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

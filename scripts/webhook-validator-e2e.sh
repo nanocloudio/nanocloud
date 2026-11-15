@@ -77,7 +77,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. project webhooks: valid, secret-valid, and three invalid cases =="
 store_put "/webhooks/default/ok"        "path=/hook;containers=1"
@@ -88,7 +88,7 @@ store_put "/webhooks/default/no-hmac"   "path=/hook;has_secret=1;secret_name=s;s
 
 echo "== 3. run the validator =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify each webhook's computed status =="
 expect() { # expect <name> <want>
@@ -135,7 +135,7 @@ with os.fdopen(fd, "r+b") as f:
     f.flush(); os.fsync(f.fileno())
 PY
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 6 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 || true
 missing=0
 for i in $(seq 0 $((N-1))); do
   printf -v nm "pg%03d" "$i"

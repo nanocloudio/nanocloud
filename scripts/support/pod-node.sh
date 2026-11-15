@@ -178,7 +178,7 @@ open(os.path.join(d, "manifest.json"), "w").write(json.dumps(manifest))
 PY
 }
 
-# pn_render: the node's graph at $D/graph.yaml (config $D/config.bin), its
+# pn_render: the node's graph at $D/graph.yaml (image $D/graph.img), its
 # API on $PORT, its Pods' own volumes under $D/mnt/pods (volume_files' root,
 # `pods`, under the platform's mount root: pn_run's FLUXOR_MOUNT_ROOT). PN_TOMB_MS: how long a
 # deleted Pod's tomb (and so its node's records) stays — the API's delete
@@ -264,9 +264,9 @@ g = (m2.rstrip("\n") + "\n  # ── The kubelet and its image plane ──\n" +
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules ({len(dropped)} controllers left out)")
 PY
-  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null \
+  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null \
     || fail "the node did not build"
-  echo "   config: $(stat -c %s "$D/config.bin") bytes"
+  echo "   image: $(stat -c %s "$D/graph.img") bytes"
 }
 
 # pn_run: the node, as root (pivot_root, setuid, cgroups, its Pods' volumes
@@ -278,7 +278,7 @@ pn_run() {
   sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef \
     FLUXOR_MOUNT_ROOT="$D/mnt" \
     FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_HOST_CGROUP_ROOT="$CG" RUST_LOG=info "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   nc_store_ready "$STORE" 90 || fail "the store never answered"
   local r=""
@@ -294,9 +294,9 @@ pn_run() {
 # cgroups, the work directory (KEEP=1 keeps it).
 pn_cleanup() {
   if [ -n "${RUNTIME_PID:-}" ]; then
-    sudo -n pkill -f "$D/[c]onfig.bin" 2>/dev/null || true
-    for _ in $(seq 20); do pgrep -f "$D/[c]onfig.bin" >/dev/null || break; sleep 0.5; done
-    sudo -n pkill -KILL -f "$D/[c]onfig.bin" 2>/dev/null || true
+    sudo -n pkill -f "$D/[g]raph.img" 2>/dev/null || true
+    for _ in $(seq 20); do pgrep -f "$D/[g]raph.img" >/dev/null || break; sleep 0.5; done
+    sudo -n pkill -KILL -f "$D/[g]raph.img" 2>/dev/null || true
   fi
   sudo -n pkill -f "$D/[r]ootfs" 2>/dev/null || true
   [ -n "${REG_PID:-}" ] && kill "$REG_PID" 2>/dev/null || true

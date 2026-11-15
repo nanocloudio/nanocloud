@@ -10,21 +10,18 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/exchange_call.rs");
 
 // Kagi owns the wire; compiled from its published tree.
@@ -123,9 +120,8 @@ struct State {
 mod params_def {
     use super::p_u32;
     use super::State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, timeout_ms, u32, 30000
@@ -257,40 +253,61 @@ struct SysVault<'a>(&'a SyscallTable);
 
 impl Vault for SysVault<'_> {
     fn generate(&mut self) -> i32 {
-        // [suite u16][usage u32][flags u8][pad u8][pub_out_ptr u64]
-        // [pub_out_cap u16][pub_len_out u16]: a KDF key has no public half.
-        let mut arg = [0u8; 20];
-        arg[0..2].copy_from_slice(&key_vault::suite::KDF_KEY.to_le_bytes());
-        arg[2..6].copy_from_slice(&key_vault::usage::WRAP.to_le_bytes());
-        unsafe { (self.0.provider_call)(-1, key_vault::GENERATE, arg.as_mut_ptr(), arg.len()) }
+        // A KDF key has no public half: no `data`.
+        let mut arg =
+            key_vault::generate::encode(key_vault::suite::KDF_KEY, key_vault::usage::WRAP, 0);
+        unsafe {
+            (self.0.provider_call)(
+                -1,
+                key_vault::GENERATE,
+                arg.as_mut_ptr(),
+                arg.len(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
     }
 
     fn split(
         &mut self,
         handle: i32,
-        arg: &mut [u8; key_vault::share::split::LEN],
+        arg: &mut [u8; key_vault::share::split::ARG_LEN],
         out: &mut [u8; ENVELOPES],
     ) -> i32 {
-        use key_vault::share::split as a;
-        arg[a::OUT_PTR..a::OUT_PTR + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-        arg[a::OUT_CAP..a::OUT_CAP + 4].copy_from_slice(&(ENVELOPES as u32).to_le_bytes());
-        unsafe { (self.0.provider_call)(handle, key_vault::SHARE_SPLIT, arg.as_mut_ptr(), a::LEN) }
+        let rc = unsafe {
+            (self.0.provider_call)(
+                handle,
+                key_vault::SHARE_SPLIT,
+                arg.as_mut_ptr(),
+                arg.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        match rc {
+            n if n == ENVELOPES as i32 => 0,
+            n if n < 0 => n,
+            _ => -5,
+        }
     }
 
     fn destroy(&mut self, handle: i32) {
         unsafe {
-            (self.0.provider_call)(handle, key_vault::DESTROY, core::ptr::null_mut(), 0);
+            (self.0.provider_call)(
+                handle,
+                key_vault::DESTROY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
     }
 }
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -337,14 +354,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -362,22 +379,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             configure(s, sys);
         }
         if s.configured != 1 {
-            return 0;
+            return StepReturn::Continue;
         }
         name_key(s, sys);
         if s.request_in < 0 || s.response_out < 0 || s.request_out < 0 || s.response_in < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.reply_len != 0 {
             flush_reply(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.busy != 0 {
             pump(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         admit(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 
@@ -631,7 +648,9 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) {
 /// again when the service was busy or gone, a failure otherwise.
 fn unanswered(status: u16) -> Code {
     match status {
-        exch::status::BUSY | exch::status::BAD_GATEWAY | exch::status::TIMEOUT => Code::Unavailable,
+        exh::status::SERVICE_UNAVAILABLE
+        | exh::status::BAD_GATEWAY
+        | exh::status::GATEWAY_TIMEOUT => Code::Unavailable,
         _ => Code::Failed,
     }
 }
@@ -643,7 +662,7 @@ unsafe fn answered(s: &mut State, sys: &SyscallTable) {
     // Read through a raw place: the answer stays in the call while the
     // engine reads it and lays the next request in `out`.
     let body = core::slice::from_raw_parts(body.as_ptr(), body.len());
-    if status != exch::status::OK {
+    if status != exh::status::OK {
         answer(s, sys, unanswered(status));
         return;
     }

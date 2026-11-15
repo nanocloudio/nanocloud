@@ -187,12 +187,12 @@ plan nanocloud.kube {
   // write and stores nothing. A read (GET, method 1) carries no manager.
   //
   // A PATCH's meaning is its Content-Type, and the chain downstream carries a
-  // method, so the type is folded INTO the method: 6 merge patch (RFC 7386),
-  // 16 JSON Patch (RFC 6902), 26 strategic merge, 36 server-side apply. Any
-  // other method keeps its code (`is6` is 1 only for 6: 1 - min(1, |m - 6|)).
+  // method, so the type is folded INTO the method: 5 merge patch (RFC 7386),
+  // 15 JSON Patch (RFC 6902), 25 strategic merge, 35 server-side apply. Any
+  // other method keeps its code (`is5` is 1 only for 5: 1 - min(1, |m - 5|)).
   transformation mpatch(d: Dec) -> Dec {
     Dec { id: d.id,
-          method: d.method + (1 - math.least(1, math.greatest(d.method - 6, 6 - d.method)))
+          method: d.method + (1 - math.least(1, math.greatest(d.method - 5, 5 - d.method)))
                   * (10 * math.least(1, d.ctype.indexOf("json-patch") + 1)
                      + 20 * math.least(1, d.ctype.indexOf("strategic-merge") + 1)
                      + 30 * math.least(1, d.ctype.indexOf("apply-patch") + 1)),

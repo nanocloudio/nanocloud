@@ -35,8 +35,9 @@ trap cleanup EXIT
 jobs_of() { k get jobs -o jsonpath="{range .items[?(@.metadata.ownerReferences[0].name==\"$1\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null | sort; }
 njobs() { jobs_of "$1" | grep -c . || true; }
 has_jobs() { [ "$(njobs "$1")" -ge "$2" ]; }
-succeed_job() { # every Pod of the Job succeeds
+succeed_job() { # every Pod of the Job succeeds, once the Job has its Pod
   local p
+  kplane_until 20 "$1's Pod" sh -c "[ -n \"\$(kubectl --kubeconfig $KC get pods -l job-name=$1 -o name)\" ]"
   for p in $(k get pods -l "job-name=$1" -o jsonpath='{.items[*].metadata.name}'); do
     kplane_pod_phase "$p" Succeeded
   done

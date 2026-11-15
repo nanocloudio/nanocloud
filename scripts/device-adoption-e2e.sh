@@ -78,11 +78,11 @@ i = g.index("  - name: certificate_endpoint\n"); j = g.index(a, i) + len(a)
 g = g[:j] + "    min_lifetime_s: 60\n" + g[j:]
 open(p, "w").write(g)
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 SEAL="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 mkdir -p "$D/vault"
 env -C "$STORE" FLUXOR_SEAL_KEY="$SEAL" FLUXOR_VAULT_DIR="$D/vault" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 JOIN=""
 for _ in $(seq 240); do

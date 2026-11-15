@@ -8,31 +8,30 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::net::net_proto::{
-    connected_parts, error_parts, write_connect_to, Target, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
-    CONNECT_TO_MAX, REQUESTER_TAG_NONE,
+    close, connected_parts, error_parts, write_connect_to, ConnectTo, Target,
+    CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND,
+    CONNECT_TO_MAX, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE, SOCK_TYPE_STREAM,
 };
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonq.rs");
 include!("../_shared/fetch_answer.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
+use fluxor_sdk::crypto::b64::*;
 include!("../_shared/regcred.rs");
 
 const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
@@ -50,13 +49,6 @@ const FS_WRITE: u32 = abi::registry::fs::WRITE;
 const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
 const FS_UNLINK: u32 = abi::registry::fs::UNLINK;
 const FS_MKDIR: u32 = abi::registry::fs::MKDIR;
-
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
 
 const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
@@ -297,10 +289,9 @@ mod params_def {
     use super::p_u32;
     use super::ptr_copy;
     use super::State;
-    use super::SCHEMA_MAX;
     use super::{MAX_AUTHORITY, MAX_DIR, MAX_KEY, MAX_PULL_AUTH};
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, authority, str, 0
@@ -468,13 +459,13 @@ fn file_path(s: &State, out: &mut [u8]) -> usize {
 unsafe fn close_conn(s: &mut State) {
     if s.conn_present == 1 {
         let sys = &*s.syscalls;
-        let payload = s.conn_id.to_le_bytes();
+        let payload = close(s.conn_id, false);
         let _ = net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
             payload.as_ptr(),
-            2,
+            payload.len(),
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
@@ -490,7 +481,14 @@ unsafe fn close_file(s: &mut State) {
     let sys = &*s.syscalls;
     if s.file_fd >= 0 {
         let mut z = [0u8; 4];
-        (sys.provider_call)(s.file_fd, FS_CLOSE, z.as_mut_ptr(), 0);
+        (sys.provider_call)(
+            s.file_fd,
+            FS_CLOSE,
+            z.as_mut_ptr(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.file_fd = -1;
     }
     s.spill_off = 0;
@@ -504,7 +502,14 @@ unsafe fn write_some(s: &State, data: *const u8, len: usize) -> Option<usize> {
     let sys = &*s.syscalls;
     let mut off = 0usize;
     while off < len {
-        let wrote = (sys.provider_call)(s.file_fd, FS_WRITE, data.add(off) as *mut u8, len - off);
+        let wrote = (sys.provider_call)(
+            s.file_fd,
+            FS_WRITE,
+            core::ptr::null_mut(),
+            0,
+            data.add(off) as *mut u8,
+            len - off,
+        );
         if fs_pending(wrote) {
             break;
         }
@@ -561,7 +566,14 @@ unsafe fn discard_step(s: &mut State) {
     let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
     let n = file_path(s, &mut path);
     let rc = if n > 0 {
-        (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n)
+        (sys.provider_call)(
+            -1,
+            FS_UNLINK,
+            path.as_mut_ptr(),
+            n,
+            core::ptr::null_mut(),
+            0,
+        )
     } else {
         0
     };
@@ -585,7 +597,14 @@ unsafe fn fsync_step(s: &mut State) {
     }
     let sys = &*s.syscalls;
     let mut z = [0u8; 4];
-    let r = (sys.provider_call)(s.file_fd, FS_FSYNC, z.as_mut_ptr(), 0);
+    let r = (sys.provider_call)(
+        s.file_fd,
+        FS_FSYNC,
+        z.as_mut_ptr(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     if fs_pending(r) {
         return;
     }
@@ -692,7 +711,14 @@ unsafe fn open_file(s: &mut State) -> Option<bool> {
         let mut dir = [0u8; MAX_DIR];
         let dl = (s.dir_len as usize).min(MAX_DIR);
         dir[..dl].copy_from_slice(&s.dir[..dl]);
-        if fs_pending((sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dl)) {
+        if fs_pending((sys.provider_call)(
+            -1,
+            FS_MKDIR,
+            dir.as_mut_ptr(),
+            dl,
+            core::ptr::null_mut(),
+            0,
+        )) {
             return open_later(s);
         }
         // Made, or there already; a refusal is the create's to report.
@@ -702,13 +728,27 @@ unsafe fn open_file(s: &mut State) -> Option<bool> {
     let mut path = [0u8; MAX_DIR + 1 + MAX_FILE];
     let pl = file_path(s, &mut path);
     if s.file_step == FO_UNLINK {
-        if fs_pending((sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), pl)) {
+        if fs_pending((sys.provider_call)(
+            -1,
+            FS_UNLINK,
+            path.as_mut_ptr(),
+            pl,
+            core::ptr::null_mut(),
+            0,
+        )) {
             return open_later(s);
         }
         // Gone, or never there.
         s.file_step = FO_CREATE;
     }
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), pl);
+    let fd = (sys.provider_call)(
+        -1,
+        FS_OPEN_CREATE,
+        path.as_mut_ptr(),
+        pl,
+        core::ptr::null_mut(),
+        0,
+    );
     if fs_pending(fd) {
         return open_later(s);
     }
@@ -1461,26 +1501,29 @@ unsafe fn pump_net(s: &mut State) -> bool {
     let payload = core::slice::from_raw_parts(nbuf.add(3), payload_len);
     match msg_type {
         NET_MSG_CONNECTED => {
-            if s.phase == Phase::WaitConnect && payload_len >= 2 {
-                let (cid, tag) = connected_parts(payload);
-                if tag == REQUESTER_TAG_NONE || tag == dev_requester_tag(sys) {
-                    s.conn_id = cid;
-                    s.conn_present = 1;
-                    s.tx_len = build_request(s) as u16;
-                    s.tx_sent = 0;
-                    s.state_start_ms = dev_millis(sys);
-                    if s.tx_len == 0 {
-                        // The credentials' read was not answered yet: the
-                        // leg is asked again after a short backoff, which
-                        // spends no attempt.
-                        close_conn(s);
-                        s.backoff_ms = BACKOFF_INIT_MS;
-                        s.phase = Phase::Backoff;
-                        return true;
-                    }
-                    s.phase = Phase::RecvHeader;
-                    let _ = flush_tx(s);
+            let Some(c) = connected_parts(payload) else {
+                return true;
+            };
+            let (cid, tag) = (c.conn_id, c.requester_tag);
+            if s.phase == Phase::WaitConnect
+                && (tag == REQUESTER_TAG_NONE || tag == dev_requester_tag(sys))
+            {
+                s.conn_id = cid;
+                s.conn_present = 1;
+                s.tx_len = build_request(s) as u16;
+                s.tx_sent = 0;
+                s.state_start_ms = dev_millis(sys);
+                if s.tx_len == 0 {
+                    // The credentials' read was not answered yet: the
+                    // leg is asked again after a short backoff, which
+                    // spends no attempt.
+                    close_conn(s);
+                    s.backoff_ms = BACKOFF_INIT_MS;
+                    s.phase = Phase::Backoff;
+                    return true;
                 }
+                s.phase = Phase::RecvHeader;
+                let _ = flush_tx(s);
             }
         }
         NET_MSG_DATA => {
@@ -1536,13 +1579,12 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_ERROR => {
-            if payload_len < 3 {
-                return true;
-            }
             // A tagged error is a connect-phase failure, attributed by its
             // tag alone (its conn_id means nothing there); an untagged one
             // is an established connection's, by conn_id.
-            let (cid, _errno, tag) = error_parts(payload);
+            let Some((cid, _errno, tag)) = error_parts(payload) else {
+                return true;
+            };
             let ours = if tag != REQUESTER_TAG_NONE {
                 s.phase == Phase::WaitConnect && tag == dev_requester_tag(sys)
             } else {
@@ -1708,10 +1750,11 @@ unsafe fn start(s: &mut State) {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
+// `net_in` takes a frame of `NET_BUF_SIZE`; `net_out` writes a request in
+// `CMD_SEND`s of at most 1024 bytes.
+fluxor_rt::module_facts! {
+    state: State,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = 3 + 2 + 1024],
 }
 
 #[no_mangle]
@@ -1788,14 +1831,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -1804,7 +1847,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.net_in < 0 || s.net_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         // Body bytes the file provider had not taken go first; the wire is
         // not read again until they are written, and its timers do not run
@@ -1843,16 +1886,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let n = match Target::parse(dial) {
                     Some((target, _)) => write_connect_to(
                         &mut payload,
-                        SOCK_TYPE_STREAM,
-                        port,
-                        &target,
-                        Some(dev_requester_tag(sys)),
+                        &ConnectTo {
+                            sock_type: SOCK_TYPE_STREAM,
+                            flags: 0,
+                            port,
+                            target,
+                            requester_tag: dev_requester_tag(sys),
+                        },
                     ),
                     None => 0,
                 };
                 if n == 0 {
                     reply(s, 0);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // Each response's body starts where the object stands now.
                 s.resp_base = s.body_received;
@@ -1899,12 +1945,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.leg == LEG_TOKEN {
                         s.body_fill = 0;
                     } else if !restart(s) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     begin(s);
                 }
             }
         }
-        0
+        StepReturn::Continue
     }
 }

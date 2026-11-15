@@ -13,8 +13,9 @@ hardware_targets = ["bcm2712", "linux"]
 # This module performs the op and reports what happened, and it owns only what
 # cannot live in the store: the table of live workload HANDLES, and the
 # continuous observation of them (WAIT for state changes, READ for output, the
-# PTY pump). It is the only module holding `requires_contract = "workload"`
-# plus `platform_raw`, so namespace surgery stays one auditable grant.
+# PTY pump). It is one of two modules holding the `workload.create` grant
+# (volume_host is the other), so namespace surgery stays a grant a graph
+# names.
 #
 # In: six request inputs (so six chains feed it without a merge), each a
 # Chronicle record (a byte stream, self-framed, or a mailbox):
@@ -117,7 +118,9 @@ hardware_targets = ["bcm2712", "linux"]
 # land in, named by sha256). Without it a pack CREATE fails -22. A path past 96
 # bytes refuses the module at construction, with a log line saying so.
 timer_class = "agnostic"
-permissions = ["platform_raw"]
+# The Pod's workload (CREATE through DESTROY, SIGNAL, WAIT) and its host
+# process and pty (EXEC, READ, TTY_*).
+grants = ["workload.create", "host_process.exec"]
 
 [[ports]]
 name = "request_in"

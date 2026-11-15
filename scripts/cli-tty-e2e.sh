@@ -32,20 +32,20 @@ trap 'rm -rf "$D"' EXIT
 echo "== 1. build config + module table =="
 # The applet runs as this node's replica of the store, in its state directory.
 nc_cli_graph "$D" "$D/cli.yaml" || { echo "FAIL: the CLI did not render"; exit 1; }
-nc_build_workload "$ROOT" "$D/cli.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/graph.img"
 
 echo "== 2. run 'nanocloud help' under a pseudo-terminal =="
-RESULT="$(timeout 20 python3 - "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" <<'PY'
+RESULT="$(timeout 20 python3 - "$FLUXOR_RUNTIME" "$D/graph.img" <<'PY'
 import os, sys, pty, termios, select
-rt, cfg, mods = sys.argv[1:4]
+rt, img = sys.argv[1:3]
 mfd, sfd = pty.openpty()
 # start from a normal canonical + echo terminal.
 a = termios.tcgetattr(sfd); a[3] |= (termios.ICANON | termios.ECHO); termios.tcsetattr(sfd, termios.TCSANOW, a)
 pid = os.fork()
 if pid == 0:
     os.setsid(); os.dup2(sfd, 0); os.dup2(sfd, 1); os.dup2(sfd, 2)
-    os.chdir(os.path.dirname(cfg)); os.environ["RUST_LOG"] = "error"
-    os.execv(rt, [rt, "--config", cfg, "--modules", mods, "--", "help"])
+    os.chdir(os.path.dirname(img)); os.environ["RUST_LOG"] = "error"
+    os.execv(rt, [rt, "--image", img, "--", "help"])
 os.close(sfd)
 out = b""
 while True:

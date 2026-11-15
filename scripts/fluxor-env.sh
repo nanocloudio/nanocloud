@@ -10,11 +10,11 @@
 #
 #  2. Workload assembly — `fluxor build <app.fluxor.toml>` emits the
 #     workload bundle (workload.json + per-target graph.yaml,
-#     resources.json, config.bin, modules.bin) under
+#     resources.json, graph.img) under
 #     <project>/target/fluxor/<name>/. That flat triple is exactly what
 #     `fluxor publish bundle` publishes and `fluxor agent commit
-#     --bundle` commits, and its config.bin/modules.bin are what the
-#     runtime boots. The e2es boot the runtime off the bundle's blobs,
+#     --bundle` commits, and its graph.img is what the runtime boots.
+#     The e2es boot the runtime off the bundle's image,
 #     so the artifact set under test is the one production ships — not
 #     a hand-assembled pair of low-level blob commands.
 
@@ -37,17 +37,17 @@ nc_fluxor_runtime() {
   printf '%s\n' "$rt"
 }
 
-# nc_build_workload <project-root> <graph.yaml> <config.bin-out> <modules.bin-out>
+# nc_build_workload <project-root> <graph.yaml> <graph.img-out>
 #   Assemble the graph's runnable blobs through the production bundle
 #   path: write a minimal workload source manifest referencing the
 #   graph, run `fluxor build` on it (which emits the committed bundle —
 #   workload.json/resources.json/graph.yaml — and builds
-#   config.bin/modules.bin per target through the same cores), then
-#   stage the two blobs where the caller wants them. The throwaway
+#   graph.img per target through the same cores), then stage the image
+#   where the caller wants it. The throwaway
 #   bundle directory is removed afterwards so parallel e2e runs never
 #   collide under target/fluxor/.
 nc_build_workload() {
-  local root="$1" graph="$2" config_out="$3" modules_out="$4"
+  local root="$1" graph="$2" image_out="$3"
   local stem base mdir name
   base="$(basename "$graph")"
   stem="${base%.*}"
@@ -76,7 +76,7 @@ EOF
   fi
   rm -rf "$mdir"
   local tdir="$root/target/fluxor/$name/linux"
-  cp "$tdir/config.bin" "$config_out" && cp "$tdir/modules.bin" "$modules_out"
+  cp "$tdir/graph.img" "$image_out"
   local rc=$?
   rm -rf "$root/target/fluxor/$name"
   return $rc
@@ -219,7 +219,7 @@ nc_replica_get() {
   local dir="$1" key="$2" root port pid rc=0
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   port=$((23000 + ($$ % 500) * 2 + 1))
-  if [ ! -f "$dir/reader.bin" ]; then
+  if [ ! -f "$dir/reader.img" ]; then
     [ -f "$dir/pki/peer.der" ] || nc_node_pki "$dir" || return 1
     cat >"$dir/reader-template.yaml" <<YAML
 target: linux
@@ -262,12 +262,12 @@ __REPLICA_WIRING__
     to: kv_request_router.read_release
 YAML
     nc_render_graph "$dir" "$dir/reader-template.yaml" "$dir/reader.yaml" || return 1
-    nc_build_workload "${NC_BUILD_ROOT:-$root}" "$dir/reader.yaml" "$dir/reader.bin" "$dir/reader.mods" \
+    nc_build_workload "${NC_BUILD_ROOT:-$root}" "$dir/reader.yaml" "$dir/reader.img" \
       >/dev/null || return 1
   fi
   mkdir -p "$dir/lattice"
   env -C "$dir" RUST_LOG=warn "${FLUXOR_RUNTIME:-$(nc_fluxor_runtime "$root")}" \
-    --config "$dir/reader.bin" --modules "$dir/reader.mods" >>"$dir/reader.log" 2>&1 &
+    --image "$dir/reader.img" >>"$dir/reader.log" 2>&1 &
   pid=$!
   local end=$((SECONDS + 30))
   until [ "$(redis-cli -p "$port" PING 2>/dev/null)" = PONG ]; do

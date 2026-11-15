@@ -65,11 +65,14 @@ buffer_size = 65536
 max_record = 8192
 required = false
 
-# MSG_JSON_DOC_REQUEST (or its MSG_PART parts) to doc_json_dialect.req_in.
+# MSG_JSON_DOC_REQUEST (or its MSG_PART parts) to doc_json_dialect.req_in:
+# a frame of up to 8192 bytes, and the ring holds one with its length prefix.
 [[ports]]
 name = "doc_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16384
+max_record = 8192
 required = true
 
 # A flat PUT, a staged body's read and a tomb's write.

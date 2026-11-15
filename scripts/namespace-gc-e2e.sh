@@ -77,7 +77,7 @@ present() { [ -n "$(store_last "$1")" ]; }
 absent()  { [ -z "$(store_last "$1")" ]; }
 
 echo "== 1. build the config + module table from the packaged graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. two namespaces; 'doomed' is Terminating with objects, 'default' Active =="
 store_put "/namespaces/default" '{"metadata":{"name":"default"},"status":{"phase":"Active"}}'
@@ -98,7 +98,7 @@ store_put "/configmaps/default/keep2"       "k=w"
 
 echo "== 3. run the namespace GC =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify the doomed namespace was swept + finalized =="
 for k in /pods/doomed/p1 /deployments.apps/doomed/d1 /configmaps/doomed/c1 /services/doomed/s1 /endpointslices/doomed/s1-user /networkpolicies/doomed/np1; do

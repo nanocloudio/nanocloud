@@ -9,7 +9,7 @@
 #   rbac_crb         <log> <name> <clusterrole> <ServiceAccount|User|Group> <subject> [subject-ns]
 #   rbac_rb          <log> <ns> <name> <Role|ClusterRole> <role> <kind> <subject> [subject-ns]
 #   rbac_delete      <log> <key>
-#   rbac_settle      <runtime> <config> <modules> <store-dir> <present|absent> <key>…
+#   rbac_settle      <runtime> <image> <store-dir> <present|absent> <key>…
 #
 # A grant key is /rbac-g/<identity>/<scope>|<verb>|<resource>, `*` kept
 # literally (a ClusterRoleBinding's scope is `*`).
@@ -114,17 +114,17 @@ _rbac_live_keys() {
   fi
 }
 
-# rbac_settle <runtime> <config> <modules> <dir> <present|absent> <key>…
+# rbac_settle <runtime> <image> <dir> <present|absent> <key>…
 #   Run the graph over the store in <dir> (the seeded store.log is the host
 #   store's, or — a lattice graph — imported by lattice's) until the RBAC
 #   index holds (or no longer holds) every key.
 rbac_settle() {
-  local rt="$1" cfg="$2" mods="$3" dir="$4" want="$5"; shift 5
+  local rt="$1" img="$2" dir="$3" want="$4"; shift 4
   if [ -d "$dir/lattice" ]; then
     # The lattice store: run in its state directory, no host store.
-    (cd "$dir" && exec env RUST_LOG=warn "$rt" --config "$cfg" --modules "$mods" >"$dir/rbac-settle.log" 2>&1) &
+    (cd "$dir" && exec env RUST_LOG=warn "$rt" --image "$img" >"$dir/rbac-settle.log" 2>&1) &
   else
-    FLUXOR_STORE_DIR="$dir" RUST_LOG=warn "$rt" --config "$cfg" --modules "$mods" >"$dir/rbac-settle.log" 2>&1 &
+    FLUXOR_STORE_DIR="$dir" RUST_LOG=warn "$rt" --image "$img" >"$dir/rbac-settle.log" 2>&1 &
   fi
   local pid=$! ok=0
   # A lattice store is read by copying it (lattice-store-dump), which

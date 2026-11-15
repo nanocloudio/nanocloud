@@ -142,11 +142,11 @@ new = blk.replace(f'issuer: "{a}"', f'issuer: "{a},{b}"').replace(
 assert new.count(b) == 1 and "/authn-keys/extra" in new, blk
 open(path, "w").write(g[:at] + new + g[end:])
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 
 echo "== 3. run it; wait for the API =="
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 

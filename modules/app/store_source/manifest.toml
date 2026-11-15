@@ -163,10 +163,10 @@ hardware_targets = ["bcm2712", "linux"]
 # next minute arms the timer.
 timer_class = "wall_clock"
 
-# A change under the prefix (or an extra `watch`) rings the source's own
-# kernel event — the `event` resource — which it creates at its first step
-# and names in every subscription; the store writes no channel of the
-# source's, so no port receives it and no graph wires one.
+# A change under the prefix (or an extra `watch`) rings one of the source's
+# store subscriptions, made at its first step, and the kernel wakes it; the
+# store writes no channel of the source's, so no port receives it and no
+# graph wires one.
 # The watch connector's filter (`ir_stages`) runs Chronicle's stage executor
 # with the whole pinned CEL extension surface — the same `full` feature set
 # Chronicle's own `pipeline` module builds with, so a param that runs there
@@ -220,11 +220,6 @@ access = "read"
 requires_contract = "timer"
 access = "write"
 
-# Every subscription rings the module's one kernel event: the store writes
-# no channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 exempt = "a read-only projection at the graph edge — observed through the store it reads and the engine it feeds"
@@ -234,7 +229,10 @@ exempt = "a read-only projection at the graph edge — observed through the stor
 # `prefix` (tag 1) and `watch` (tag 7) params, which the composer counts per
 # instance (1..15 across the deb renders) and sums into the store's
 # subscription capacity, beside the reserve kept for the workloads a node
-# admits later. One kernel event per instance carries them all.
+# admits later. Each subscription's handle takes one kernel event, its
+# doorbell, so the same count is the instance's `events` demand.
 [capacities]
-demand_from_params = { pool = "store_subs", tags = [1, 7] }
-store_subscribers = 1
+demand_from_params = [
+    { pool = "store_subs", tags = [1, 7] },
+    { pool = "events", tags = [1, 7] },
+]

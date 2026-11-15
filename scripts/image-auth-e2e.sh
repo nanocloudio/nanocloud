@@ -56,7 +56,7 @@ ip_registry "$PORT2" "$D/reg2.log" --private private/ --auth bearer --user pulle
 echo "   private/app:1 -> sha256:${M:0:12}…"
 
 ip_graph "$D/graph.yaml" "localhost:$PORT" "$D/blobs" '"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux"'
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 # The Secrets and a ServiceAccount, as the API stores them.
 python3 - "$PORT" "$PORT2" >"$D/seed.txt" <<'PY'

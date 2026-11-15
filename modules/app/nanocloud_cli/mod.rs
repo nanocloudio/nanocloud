@@ -29,18 +29,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 
@@ -243,7 +241,7 @@ const FINISH_KEYS: usize = 3;
 /// what it would answer was built on reads that answered nothing. Said, exit
 /// 1, finished — never a command left asking again for an answer that will
 /// not come.
-unsafe fn refused_exit(s: &mut State, sys: &SyscallTable, rc: i32) -> i32 {
+unsafe fn refused_exit(s: &mut State, sys: &SyscallTable, rc: i32) -> StepReturn {
     let mut m = [0u8; 96];
     let mut p = append(&mut m, 0, b"error: the store refused a read (rc=-");
     p = append_u32(&mut m, p, rc.unsigned_abs());
@@ -257,7 +255,7 @@ unsafe fn refused_exit(s: &mut State, sys: &SyscallTable, rc: i32) -> i32 {
     }
     s.stream_mode = 0;
     s.done = 1;
-    STEP_DONE
+    StepReturn::Done
 }
 
 // ---- store ----
@@ -599,7 +597,7 @@ unsafe fn cmd_export(s: &mut State, sys: &Store) {
 /// One step of `watch <resource>`: re-list the resource and, when the listing
 /// changed, emit a fresh snapshot of names. Runs until the step backstop (or the
 /// process is killed) — `kubectl get -w` semantics.
-unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     s.stream_steps += 1;
     let reslen = s.stream_idlen as usize;
     let mut resbuf = [0u8; 96];
@@ -615,7 +613,7 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     };
     // The listing's hash over every page first: a page the store has not
     // answered yet (`EAGAIN`) says nothing this step, rather than a short
@@ -656,15 +654,15 @@ unsafe fn watch_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// One step of `bundle apply` / `restore`: accumulate the stdin bundle, and once
 /// stdin goes idle (EOF), parse each `<store-key>\t<json>` line and PUT the
 /// object. Emits a count and exits.
-unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     // Drain stdin into the bundle buffer.
     let mut got = false;
     if s.stdin_chan >= 0 && s.waiting == 0 {
@@ -680,12 +678,12 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
         }
     }
     if got {
-        return 0;
+        return StepReturn::Continue;
     }
     if s.waiting == 0 {
         s.stream_steps += 1;
         if s.stream_steps < BUNDLE_IDLE_EOF {
-            return 0; // wait for more stdin
+            return StepReturn::Continue; // wait for more stdin
         }
         s.journal.reset();
     } else {
@@ -736,7 +734,7 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
     }
     if s.journal.held() {
         s.waiting = 1;
-        return 0;
+        return StepReturn::Continue;
     }
     s.waiting = 0;
 
@@ -752,7 +750,7 @@ unsafe fn bundle_apply_step(s: &mut State, sys: &SyscallTable) -> i32 {
         let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
     }
     s.done = 1;
-    STEP_DONE
+    StepReturn::Done
 }
 
 /// `get <resource>` — one object name per line (the final key segment).
@@ -1056,7 +1054,7 @@ fn status_is_terminal(doc: &[u8]) -> bool {
 /// misread), then stop once
 /// the sandbox status is terminal (or the step backstop trips). Returns the
 /// module_step result (0 = keep streaming, STEP_DONE = finished).
-unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
@@ -1083,7 +1081,7 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
         let mut again = [0u8; MAX_VALUE];
         let n2 = get_value(&st, &key[..klen], &mut again).unwrap_or(0);
         if n2 != vlen {
-            return 0;
+            return StepReturn::Continue;
         }
         log_tally(&st, id)
     };
@@ -1092,7 +1090,7 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
     }
     if st.waiting() || t1 != t2 {
         // Not answered yet (`EAGAIN`), or written meanwhile: asked next step.
-        return 0;
+        return StepReturn::Continue;
     }
     // No tally (a log written before it was kept): the tail is the stream.
     let total = if t1 < vlen as u64 { vlen as u64 } else { t1 };
@@ -1123,9 +1121,9 @@ unsafe fn stream_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Build an exec seam key `<prefix><id>/cli` into `buf`; returns the length
@@ -1170,7 +1168,7 @@ fn parse_int(b: &[u8]) -> i32 {
 /// captured output, delete the request/result/output trio, latch the command's
 /// exit code, and finish. Times out (exit 1) if no runner answers — the node
 /// graph (with the sandbox runtime) probably isn't running.
-unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
@@ -1195,7 +1193,7 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
                 if st.waiting() {
                     // The output not answered yet: the result is read
                     // again next step, and nothing is removed unsaid.
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if let Some(olen) = got {
                     if olen > 0 && s.out_chan >= 0 {
@@ -1231,9 +1229,9 @@ unsafe fn exec_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// How long a command waits for the store to answer.
@@ -1245,11 +1243,9 @@ const STORE_READY_WAIT_MS: u64 = 30_000;
 /// for one, then says the store never came up. A refusal that is final
 /// (`Refused`) is the store's answer, and the command fails on it at once.
 unsafe fn store_answers(sys: &SyscallTable, nag: &ReadNag) -> Got<()> {
-    let mut key = *b"/";
-    let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), key.len());
+    let h = obj_get(sys, b"/");
     if h >= 0 {
-        let mut carg = [0u8; 4];
-        (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+        obj_close(sys, h);
         return Got::Found(());
     }
     match refusal::<()>(sys, nag, b"GET", b"/", h) {
@@ -1272,7 +1268,7 @@ fn owe_removal(s: &mut State, key: &[u8]) {
 
 /// A command that has answered: its owed removals asked again until the
 /// store decides each, then its exit code.
-unsafe fn finish_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn finish_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     let store = Store::plain(sys, &s.nag);
     for i in 0..FINISH_KEYS {
         if s.finishing & (1 << i) != 0 {
@@ -1283,14 +1279,14 @@ unsafe fn finish_step(s: &mut State, sys: &SyscallTable) -> i32 {
         }
     }
     if s.finishing != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
     if s.exit_chan >= 0 {
         let c = s.finish_code.to_le_bytes();
         let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
     }
     s.done = 1;
-    STEP_DONE
+    StepReturn::Done
 }
 
 /// Build a PTY session key `/tty/<id>/cli/<leaf>` into `buf`; length or 0.
@@ -1327,7 +1323,7 @@ fn status_code(v: &[u8]) -> i32 {
 /// stdin port (buffering until the runner consumes the last chunk), flushes it to
 /// `/tty/<id>/cli/in`, emits new PTY output from `/tty/<id>/cli/out`, and finishes
 /// when the session status is terminal (exiting with the shell's code).
-unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let idlen = s.stream_idlen as usize;
@@ -1377,7 +1373,7 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
         return refused_exit(s, sys, rc);
     }
     if st.waiting() {
-        return 0; // asked next step; the output is not empty
+        return StepReturn::Continue; // asked next step; the output is not empty
     }
     let off = (s.stream_off as usize).min(olen);
     if olen > off && s.out_chan >= 0 {
@@ -1407,15 +1403,15 @@ unsafe fn tty_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// One step of `token`: poll `/token-resp/cli` for the minted JWT. When it
 /// appears, emit the token, delete the request/response, and exit. Times out
 /// (exit 1) if no mint answers.
-unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> StepReturn {
     let st = Store::plain(sys, &s.nag);
     s.stream_steps += 1;
     let mut rval = [0u8; MAX_VALUE];
@@ -1444,9 +1440,9 @@ unsafe fn token_poll_step(s: &mut State, sys: &SyscallTable) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        return STEP_DONE;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// `ca` — print the cluster CA certificate (base64url DER, published by the
@@ -1656,11 +1652,7 @@ fn split_argv(rec: &[u8], out: &mut [(usize, usize); 16]) -> usize {
     n
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1712,18 +1704,18 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let sys = &*s.syscalls;
         if s.done != 0 {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         if s.exit_chan < 0 {
             s.exit_chan = dev_channel_port(sys, PORT_OUTPUT, 1);
@@ -1765,7 +1757,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.store_wait_from = now.max(1);
                 }
                 if now.wrapping_sub(s.store_wait_from) < STORE_READY_WAIT_MS {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let m = b"error: the store did not come up (run in its state directory, the service stopped)\n";
                 if s.out_chan >= 0 {
@@ -1776,7 +1768,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
                 }
                 s.done = 1;
-                return STEP_DONE;
+                return StepReturn::Done;
             }
             s.store_ready = 1;
         }
@@ -1796,7 +1788,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if an <= 0 {
                 s.waited += 1;
                 if s.waited < ARGV_WAIT {
-                    return 0; // keep waiting for argv
+                    return StepReturn::Continue; // keep waiting for argv
                 }
             }
             let alen = if an > 0 { an as usize } else { 0 };
@@ -2160,7 +2152,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // the command is served again next step.
             s.waiting = 1;
             s.stream_mode = 0;
-            return 0;
+            return StepReturn::Continue;
         }
         s.waiting = 0;
         if let Some(rc) = s.journal.refusal() {
@@ -2170,7 +2162,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // `logs -f` armed streaming instead of a one-shot answer: don't finalize
         // (no exit latch / Done yet) — subsequent steps stream via stream_step.
         if s.stream_mode != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         if s.out_chan >= 0 && olen > 0 {
@@ -2181,8 +2173,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        STEP_DONE
+        StepReturn::Done
     }
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -83,7 +83,9 @@ hardware_targets = ["bcm2712", "linux"]
 # One effect in flight; one unanswered for `timeout_ms` is `unavailable`, and
 # a storage-key exchange still open for it is aborted.
 timer_class = "wall_clock"
-permissions = ["platform_raw"]
+# CREATE, START and DESTROY of the volume's host workload; the storage key's
+# OPEN_OR_GENERATE, SIGN and DESTROY (`issuer_key`) are the key vault's.
+grants = ["workload.create", "key_vault"]
 
 [[ports]]
 name = "request_in"
@@ -99,7 +101,7 @@ name = "response_in"
 direction = "input"
 index = 1
 content_type = "ExchangeResponse"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 
 [[ports]]
@@ -115,9 +117,10 @@ name = "request_out"
 direction = "output"
 index = 1
 content_type = "ExchangeRequest"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
-
+[ports.facts]
+binding = ["http"]
 [[resources]]
 requires_contract = "workload"
 access = "write"

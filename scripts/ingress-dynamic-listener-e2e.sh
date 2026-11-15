@@ -133,10 +133,10 @@ wal_op 1 "/dataplane/edge/default/web" \
 wal_op 1 "/dataplane/edge-listeners/${DYN_PORT}" "proto=tcp;tls=0"
 
 echo "== 4. build config + module table, start the edge =="
-nc_build_workload "$ROOT" "$D/edge.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/edge.yaml" "$D/graph.img"
 start_edge() {
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
 }
 start_edge

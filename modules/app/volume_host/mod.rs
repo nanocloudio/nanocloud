@@ -14,21 +14,18 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/exchange_call.rs");
 
 #[path = "../../../target/fluxor/kagi-common/auth_wire.rs"]
@@ -356,9 +353,8 @@ mod params_def {
     use super::p_u32;
     use super::p_u8;
     use super::State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         // Loam's admin gate, `host:port`, which every volume's subgraph
@@ -477,7 +473,7 @@ unsafe fn read_whole(
             return CapRead::Bad;
         };
         d.copy_from_slice(src);
-        let h = (sys.provider_call)(-1, FS_OPEN, p.as_mut_ptr(), pl);
+        let h = (sys.provider_call)(-1, FS_OPEN, p.as_mut_ptr(), pl, core::ptr::null_mut(), 0);
         if h == FS_EAGAIN || h == FS_EINPROGRESS {
             return CapRead::Pending;
         }
@@ -492,7 +488,14 @@ unsafe fn read_whole(
     let mut eof = false;
     while got < cap {
         let room = cap - got;
-        let n = (sys.provider_call)(h, FS_READ, dst.as_mut_ptr().add(got), room);
+        let n = (sys.provider_call)(
+            h,
+            FS_READ,
+            core::ptr::null_mut(),
+            0,
+            dst.as_mut_ptr().add(got),
+            room,
+        );
         if n == FS_EAGAIN || n == FS_EINPROGRESS {
             *filled = got as u32;
             return CapRead::Pending;
@@ -511,7 +514,7 @@ unsafe fn read_whole(
     if !eof {
         // At the ceiling: one byte past it refuses the file, not cuts it.
         let mut probe = [0u8; 1];
-        let n = (sys.provider_call)(h, FS_READ, probe.as_mut_ptr(), 1);
+        let n = (sys.provider_call)(h, FS_READ, core::ptr::null_mut(), 0, probe.as_mut_ptr(), 1);
         if n == FS_EAGAIN || n == FS_EINPROGRESS {
             return CapRead::Pending;
         }
@@ -532,7 +535,7 @@ unsafe fn read_whole(
 unsafe fn close_fd(sys: &SyscallTable, fd: &mut i32, filled: &mut u32) {
     if *fd >= 0 {
         let mut z = [0u8; 4];
-        (sys.provider_call)(*fd, FS_CLOSE, z.as_mut_ptr(), 0);
+        (sys.provider_call)(*fd, FS_CLOSE, z.as_mut_ptr(), 0, core::ptr::null_mut(), 0);
     }
     *fd = -1;
     *filled = 0;
@@ -845,11 +848,7 @@ impl DeviceKey for Signer<'_> {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -909,14 +908,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -928,19 +927,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             configure(s, sys);
         }
         if s.configured != 1 || s.request_in < 0 || s.response_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         drain_lanes(s, sys);
         if s.reply_len != 0 {
             flush_reply(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.busy != 0 {
             pump(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         admit(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 
@@ -1336,14 +1335,28 @@ unsafe fn start_graph(s: &mut State, sys: &SyscallTable, rec: &[u8]) {
 /// by identity once and the spec asked again next step. Decided, the
 /// workload starts and its slot is seated.
 unsafe fn create_step(s: &mut State, sys: &SyscallTable) {
-    let handle = (sys.provider_call)(-1, wl::CREATE, s.flxa.as_mut_ptr(), s.c_len as usize);
+    let handle = (sys.provider_call)(
+        -1,
+        wl::CREATE,
+        s.flxa.as_mut_ptr(),
+        s.c_len as usize,
+        core::ptr::null_mut(),
+        0,
+    );
     if handle == WL_EINPROGRESS {
         return;
     }
     if handle == WL_EEXIST && !s.c_destroyed {
         let mut id = [0u8; 16];
         id.copy_from_slice(&s.flxa[0..16]);
-        (sys.provider_call)(-1, wl::DESTROY, id.as_mut_ptr(), id.len());
+        (sys.provider_call)(
+            -1,
+            wl::DESTROY,
+            id.as_mut_ptr(),
+            id.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         s.c_destroyed = true;
         return;
     }
@@ -1361,13 +1374,11 @@ unsafe fn create_step(s: &mut State, sys: &SyscallTable) {
     let gen = s.c_gen;
     let rec = core::slice::from_raw_parts(s.held.as_ptr(), s.held_len as usize);
     let claim = frame_bytes(rec, 3);
-    if (sys.provider_call)(handle, wl::START, core::ptr::null_mut(), 0) < 0 {
-        (sys.provider_call)(handle, wl::DESTROY, core::ptr::null_mut(), 0);
+    if wl_call(sys, handle, wl::START) < 0 {
+        wl_call(sys, handle, wl::DESTROY);
         answer(s, sys, Outcome::Failed);
         return;
     }
-    let mut lanes = [0u8; 1 + wl::MAX_CALLER_LANES * 9];
-    let ln = (sys.provider_call)(handle, wl::LANES, lanes.as_mut_ptr(), lanes.len());
     let mut inst = NO_INST;
     inst.used = true;
     inst.gen = gen;
@@ -1375,21 +1386,11 @@ unsafe fn create_step(s: &mut State, sys: &SyscallTable) {
     inst.claim_len = claim.len() as u8;
     inst.handle = handle;
     inst.nbd_index = (s.nbd_index_base as u8).wrapping_add(slot as u8);
-    if ln > 0 {
-        for i in 0..lanes[0] as usize {
-            let o = 1 + i * 9;
-            let to = i32::from_le_bytes(lanes[o + 1..o + 5].try_into().unwrap());
-            let from = i32::from_le_bytes(lanes[o + 5..o + 9].try_into().unwrap());
-            match lanes[o] {
-                CALLER_RECIPIENT => inst.recipient_in = to,
-                CALLER_STATUS => inst.status_in = to,
-                CALLER_BUNDLE => inst.ctrl_out = from,
-                _ => {}
-            }
-        }
-    }
+    inst.recipient_in = wl_lane(sys, handle, CALLER_RECIPIENT, wl::lane::TO_CALLER);
+    inst.status_in = wl_lane(sys, handle, CALLER_STATUS, wl::lane::TO_CALLER);
+    inst.ctrl_out = wl_lane(sys, handle, CALLER_BUNDLE, wl::lane::FROM_CALLER);
     if inst.recipient_in < 0 || inst.status_in < 0 || inst.ctrl_out < 0 {
-        (sys.provider_call)(handle, wl::DESTROY, core::ptr::null_mut(), 0);
+        wl_call(sys, handle, wl::DESTROY);
         log(
             sys,
             1,
@@ -1404,12 +1405,39 @@ unsafe fn create_step(s: &mut State, sys: &SyscallTable) {
     answer(s, sys, Outcome::Ok);
 }
 
+/// A workload op on `handle` that carries no `arg` or `data` (START,
+/// DESTROY): the provider's answer.
+unsafe fn wl_call(sys: &SyscallTable, handle: i32, op: u32) -> i32 {
+    (sys.provider_call)(
+        handle,
+        op,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
+/// The channel of this module's lane `key` into the workload `handle`
+/// (`wl::LANE`), in direction `dir`: its handle, or a negative errno.
+unsafe fn wl_lane(sys: &SyscallTable, handle: i32, key: u8, dir: u8) -> i32 {
+    let mut arg = [key, dir];
+    (sys.provider_call)(
+        handle,
+        wl::LANE,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
 /// `GRAPH_DESTROY`: the workload goes, and with it crypt_block's recipient
 /// and volume-key handles. What was released and not delivered is dropped.
 unsafe fn destroy(s: &mut State, sys: &SyscallTable, slot: usize) {
     let h = s.inst[slot].handle;
     if h >= 0 {
-        (sys.provider_call)(h, wl::DESTROY, core::ptr::null_mut(), 0);
+        wl_call(sys, h, wl::DESTROY);
     }
     s.inst[slot] = NO_INST;
 }
@@ -1508,7 +1536,7 @@ unsafe fn kagi_next(s: &mut State, sys: &SyscallTable, next: AttachNext) {
             // `POST /storage-key` on the client's pinned authority: the
             // REQUEST payload is the whole body, inline.
             let opened = s.call.begin(port, |id, out| {
-                call_head(id, exch::METHOD_POST, KAGI_PATH, b"", body, out)
+                call_head(id, exh::method::POST, KAGI_PATH, b"", body, out)
             });
             if !opened {
                 answer(s, sys, Outcome::Failed);
@@ -1565,7 +1593,7 @@ unsafe fn kagi_reply(s: &mut State, sys: &SyscallTable) {
         }
     }
     let (status, body) = s.call.answer();
-    if status != exch::status::OK || body.is_empty() {
+    if status != exh::status::OK || body.is_empty() {
         answer(s, sys, unanswered(status));
         return;
     }
@@ -1725,7 +1753,14 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) {
     }
     if s.busy != 0 && dev_millis(sys).saturating_sub(s.started) > u64::from(s.timeout_ms) {
         if s.proc_h >= 0 {
-            (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.proc_h,
+                hp::PROC_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.proc_h = -1;
         }
         answer(s, sys, Outcome::Unavailable);
@@ -1748,7 +1783,14 @@ unsafe fn spawn(s: &mut State, sys: &SyscallTable, words: &[&[u8]]) {
         cmd[n..n + w.len()].copy_from_slice(w);
         n += w.len();
     }
-    let h = (sys.provider_call)(-1, hp::PROC_SPAWN, cmd.as_mut_ptr(), n);
+    let h = (sys.provider_call)(
+        -1,
+        hp::PROC_SPAWN,
+        core::ptr::null_mut(),
+        0,
+        cmd.as_mut_ptr(),
+        n,
+    );
     if h < 0 {
         log(
             sys,
@@ -1763,18 +1805,46 @@ unsafe fn spawn(s: &mut State, sys: &SyscallTable, words: &[&[u8]]) {
 }
 
 unsafe fn poll_tool(s: &mut State, sys: &SyscallTable) {
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_READ, s.drain.as_mut_ptr(), s.drain.len());
+    let _ = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_READ,
+        s.drain.as_mut_ptr(),
+        s.drain.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     let mut code = [0u8; 4];
-    let running = (sys.provider_call)(s.proc_h, hp::PROC_STATUS, code.as_mut_ptr(), 4);
+    let running = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_STATUS,
+        code.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
     if running == 1 {
         if dev_millis(sys).saturating_sub(s.started) > u64::from(s.timeout_ms) {
-            (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.proc_h,
+                hp::PROC_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.proc_h = -1;
             answer(s, sys, Outcome::Unavailable);
         }
         return;
     }
-    let _ = (sys.provider_call)(s.proc_h, hp::PROC_CLOSE, core::ptr::null_mut(), 0);
+    let _ = (sys.provider_call)(
+        s.proc_h,
+        hp::PROC_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.proc_h = -1;
     let exit = if running == 0 {
         i32::from_le_bytes(code)

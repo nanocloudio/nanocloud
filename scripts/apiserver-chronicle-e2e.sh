@@ -140,7 +140,7 @@ wiring:
 YAML
 
 echo "== 3. build =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 # One request per boot. Even with the reply path wired, an `app: true` route services
 # exactly one request per run here; a fresh instance per case keeps each
@@ -149,7 +149,7 @@ nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 # cases pass when each is the first request.
 drive() { # drive <url> -> "<code>|<body>"
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

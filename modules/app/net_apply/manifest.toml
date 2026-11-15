@@ -76,7 +76,8 @@ hardware_targets = ["bcm2712", "linux"]
 # exists and is not enforced is a gap the cluster must be able to see.
 timer_class = "agnostic"
 # REPLACE rewrites the host's packet policy: privileged, as spawning is.
-permissions = ["platform_raw"]
+# READ and CAPS come with the claimed `net_policy`.
+grants = ["net_policy.replace"]
 
 [[ports]]
 name = "status"
@@ -95,17 +96,14 @@ access = "read"
 requires_contract = "storage.object"
 access = "write"
 
-# Every subscription rings the module's one kernel event: the store writes
-# no channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 metrics = ["np_applied", "np_refused", "np_skipped_rows"]
 
 # Store subscriptions an instance opens: one per prefix it lists (two at
-# most), counted from its `prefix` param (tag 1), all on one kernel event.
+# most), counted from its `prefix` param (tag 1).
 [capacities]
-demand_from_params = { pool = "store_subs", tags = [1] }
-store_subscribers = 1
+demand_from_params = [
+    { pool = "store_subs", tags = [1] },
+    { pool = "events", tags = [1] },
+]

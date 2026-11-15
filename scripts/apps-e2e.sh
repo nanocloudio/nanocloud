@@ -107,10 +107,10 @@ if [ -n "$REAL_REGISTRY" ]; then
 else
   wn_splice "$D/graph.yaml" node-1 "$D/blobs" "localhost:$REG_PORT" || fail "the splice did not apply"
 fi
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 boot() {
   env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" RUST_LOG=info "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   nc_store_ready "$STORE" 60 || fail "the store never answered"
   local r=""

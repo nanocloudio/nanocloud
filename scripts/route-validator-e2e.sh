@@ -78,7 +78,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. project routes: valid, valid-no-path, and four first-error cases =="
 store_put "/routes/default/ok"       '{"metadata":{"name":"ok"},"spec":{"host":"example.com","to":{"name":"web"},"port":80,"path":"/api"}}'
@@ -90,7 +90,7 @@ store_put "/routes/default/bad-path" '{"metadata":{"name":"bad-path"},"spec":{"h
 
 echo "== 3. run the validator =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify each route's computed status =="
 expect() { # expect <name> <want>

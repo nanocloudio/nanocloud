@@ -36,7 +36,7 @@ plan nanocloud.admissionk8s {
   enum GET = 1;
   enum COUNT = 12;
   enum PENDING = 0;
-  enum M_DELETE = 7;
+  enum M_DELETE = 6;
 
   // carried by: ak.Q, ak.QDone, ak.Get, ak.Got, ak.Cnt
   message QCtx {

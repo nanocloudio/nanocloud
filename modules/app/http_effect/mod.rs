@@ -7,20 +7,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/exchange_call.rs");
 
@@ -77,9 +74,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PATHS_SPEC;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, paths, str, 0
@@ -236,11 +232,7 @@ fn build_reply(out: &mut [u8], held: &[u8], status: i64, body: &[u8], paths: &[u
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -293,14 +285,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -309,18 +301,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.request_in < 0 || s.request_out < 0 || s.response_in < 0 || s.response_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         // A reply the chain has not taken goes first.
         if s.reply_len != 0 && !flush_reply(s, sys) {
-            return 0;
+            return StepReturn::Continue;
         }
         flush_call(s, sys);
         drain_answers(s, sys);
         if s.reply_len == 0 && s.call.idle() {
             admit(s, sys);
         }
-        0
+        StepReturn::Continue
     }
 }
 
@@ -440,11 +432,11 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
     let (Some(pl), Some(bl)) = (join(frame, 3, 6, &mut path), join(frame, 8, 19, &mut body)) else {
         // A path or body past this connector's bounds is refused, never cut:
         // answered 413 so the chain decides on it.
-        reply(s, sys, i64::from(exch::status::TOO_LARGE), &[]);
+        reply(s, sys, i64::from(exh::status::PAYLOAD_TOO_LARGE), &[]);
         return;
     };
     if pl == 0 {
-        reply(s, sys, i64::from(exch::status::BAD_REQUEST), &[]);
+        reply(s, sys, i64::from(exh::status::BAD_REQUEST), &[]);
         return;
     }
     let port = s.request_out;
@@ -452,7 +444,7 @@ unsafe fn admit(s: &mut State, sys: &SyscallTable) {
     if !s.call.begin(port, |id, out| {
         call_head(id, method as u8, path, b"", body, out)
     }) {
-        reply(s, sys, i64::from(exch::status::TOO_LARGE), &[]);
+        reply(s, sys, i64::from(exh::status::PAYLOAD_TOO_LARGE), &[]);
         return;
     }
     flush_call(s, sys);

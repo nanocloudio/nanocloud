@@ -103,7 +103,7 @@ wiring:
 YAML
 
 echo "== 2. build =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 # One request per graph instance, deliberately. An `app: true` route hands the
 # request to the graph and waits for the chain's answer; nothing here
@@ -113,7 +113,7 @@ nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
 drive() { # drive <log> <curl args...>
   local log="$1"; shift
   FLUXOR_STORE_DIR="$D" RUST_LOG=info "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$log" 2>&1 &
+    --image "$D/graph.img" >"$log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

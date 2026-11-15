@@ -87,17 +87,12 @@ access = "read"
 requires_contract = "storage.object"
 access = "write"
 
-# Both subscriptions ring the module's one kernel event: the store writes no
-# channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 exempt = "control-plane allocator — one store action per change, not a data path"
 
 # Store subscriptions an instance opens: /services/ and /nodes/ (the second
-# only while Pod CIDRs are allocated), on one kernel event.
+# only while Pod CIDRs are allocated).
 [capacities]
 store_subscriptions = 2
-store_subscribers = 1
+store_subscribers = 2

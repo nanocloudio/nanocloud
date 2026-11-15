@@ -100,11 +100,11 @@ rbac_clusterrole "$D/store.log" reader "get,list" "pods"
 rbac_crb "$D/store.log" anon reader User system:anonymous
 
 run_case() { # run_case <graph> -> "<code>|<body>"
-  nc_build_workload "$ROOT" "$1" "$D/config.bin" "$D/modules.bin" >/dev/null
-  rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present \
+  nc_build_workload "$ROOT" "$1" "$D/graph.img" >/dev/null
+  rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present \
     '/rbac-g/system:anonymous/*|get|*|pods|*' >&2
   env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break
@@ -160,9 +160,9 @@ g = open(p).read()
 # Same graph, no edit — the refusal must come from RBAC, not from the graph.
 open(p, "w").write(g)
 PY
-nc_build_workload "$ROOT" "$D/anon.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/anon.yaml" "$D/graph.img" >/dev/null
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

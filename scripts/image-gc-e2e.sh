@@ -73,7 +73,7 @@ ip_registry "$PORT" "$D/reg.log"
 cp "$ROOT/packaging/debian/assemble-image.sh" "$D/assemble-image.sh"
 chmod 755 "$D/assemble-image.sh"
 ip_graph "$D/graph.yaml" "localhost:$PORT" "$D/blobs" '"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux"' sandbox
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 done_ok() { case "$(ip_get "/pod-lifecycle-status/$1")" in *Succeeded*) return 0 ;; esac; return 1; }
 pod() { ip_put "/pod-specs/$1" "image=$2;pull=IfNotPresent;pod=default/$1;iso=1;desired=running;restart=never"; }

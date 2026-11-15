@@ -79,6 +79,8 @@ hardware_targets = ["bcm2712", "linux"]
 # One effect in flight; one unanswered for `timeout_ms` is `unavailable`, and
 # its exchange is aborted.
 timer_class = "wall_clock"
+# GENERATE, SHARE_SPLIT and DESTROY of the volume's storage key.
+grants = ["key_vault"]
 
 [[ports]]
 name = "request_in"
@@ -95,7 +97,7 @@ name = "response_in"
 direction = "input"
 index = 1
 content_type = "ExchangeResponse"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 required = true
 
@@ -120,9 +122,11 @@ name = "request_out"
 direction = "output"
 index = 1
 content_type = "ExchangeRequest"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 required = true
+[ports.facts]
+binding = ["http"]
 
 # To `storage_key.signing_key`.
 [[ports]]

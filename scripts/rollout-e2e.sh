@@ -49,7 +49,7 @@ PY
 store_last() { nc_replica_get "$D" "$1"; }
 
 run() { env -C "$D" RUST_LOG=warn timeout 5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true; }
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true; }
 
 echo "== 1. build config + module table =="
 # The reconcilers run as this node's replica of the store (the packaged
@@ -69,7 +69,7 @@ PY
 nc_node_pki "$D" || fail "no node PKI"
 mkdir -p "$D/lattice"
 nc_render_graph "$D" "$D/workload-template.yaml" "$D/workload.yaml" || fail "the workload graph did not render"
-nc_build_workload "$ROOT" "$D/workload.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/workload.yaml" "$D/graph.img"
 
 echo "== 2. rollout v1: Deployment web (replicas=2, image=nginx) =="
 store_put "/deployments.apps/default/web" '{"metadata":{"name":"web"},"spec":{"replicas":2,"template":{"spec":{"containers":[{"name":"web","image":"nginx"}]}}}}'
@@ -103,8 +103,8 @@ echo "   archived previous revision (nginx) at /controllerrevisions.apps/default
 
 # The CLI verbs run under the cli graph.
 nc_cli_graph "$D" "$D/cli.yaml" || fail "the CLI did not render"
-nc_build_workload "$ROOT" "$D/cli.yaml" "$D/cli-config.bin" "$D/cli-modules.bin"
-cli() { env -C "$D" "$FLUXOR_RUNTIME" --config "$D/cli-config.bin" --modules "$D/cli-modules.bin" -- "$@" </dev/null 2>/dev/null; }
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/cli-graph.img"
+cli() { env -C "$D" "$FLUXOR_RUNTIME" --image "$D/cli-graph.img" -- "$@" </dev/null 2>/dev/null; }
 
 echo "== 5. nanocloud rollout status default/web =="
 ST="$(cli rollout status default/web)"

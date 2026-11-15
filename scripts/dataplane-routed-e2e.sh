@@ -68,7 +68,7 @@ LAN="${P}l"; NA="${P}a"; NB="${P}b"; NC="${P}c"
 TAGA="a$$"; TAGB="b$$"
 PODS="a1 a2 b1 b2"
 cleanup() {
-  for d in "$DA" "$DB"; do sudo -n pkill -f "$d/[c]onfig.bin" 2>/dev/null || true; done
+  for d in "$DA" "$DB"; do sudo -n pkill -f "$d/[g]raph.img" 2>/dev/null || true; done
   sudo -n pkill -f "$D/[s]erve.py" 2>/dev/null || true
   for n in $PODS; do sudo -n ip netns del "${P}$n" 2>/dev/null || true; done
   for n in "$LAN" "$NA" "$NB" "$NC"; do sudo -n ip netns del "$n" 2>/dev/null || true; done
@@ -133,8 +133,8 @@ write(out_a, A, EA, True)
 write(out_b, B, EB, False)
 print("   A: %d modules; B: %d (%s)" % (len(A), len(B), ", ".join(name(b) for b in B)))
 PY
-nc_build_workload "$ROOT" "$D/a.yaml" "$DA/config.bin" "$DA/modules.bin" >/dev/null || fail "A's graph did not build"
-nc_build_workload "$ROOT" "$D/b.yaml" "$DB/config.bin" "$DB/modules.bin" >/dev/null || fail "B's graph did not build"
+nc_build_workload "$ROOT" "$D/a.yaml" "$DA/graph.img" >/dev/null || fail "A's graph did not build"
+nc_build_workload "$ROOT" "$D/b.yaml" "$DB/graph.img" >/dev/null || fail "B's graph did not build"
 
 echo "== 1. the network: a link, two nodes, four Pods routed by the test =="
 for n in "$LAN" "$NA" "$NB" "$NC"; do sudo -n ip netns add "$n"; in_ns "$n" ip link set lo up; done
@@ -222,12 +222,12 @@ on "$DA" seed
 # start <dir> <ns> <tag>: the node's runtime, as root in its namespace.
 start() {
   in_ns "$2" env FLUXOR_INSTANCE="$3" FLUXOR_RUN_DIR="$D/run" FLUXOR_STORE_DIR="$1" RUST_LOG="${NC_RUST_LOG:-warn}" \
-    "$FLUXOR_RUNTIME" --config "$1/config.bin" --modules "$1/modules.bin" >>"$1/run.log" 2>&1 &
+    "$FLUXOR_RUNTIME" --image "$1/graph.img" >>"$1/run.log" 2>&1 &
 }
 stop() { # stop <dir>
-  sudo -n pkill -f "$1/[c]onfig.bin" 2>/dev/null || true
-  for _ in $(seq 40); do pgrep -f "$1/[c]onfig.bin" >/dev/null || return 0; sleep 0.25; done
-  sudo -n pkill -KILL -f "$1/[c]onfig.bin" 2>/dev/null || true
+  sudo -n pkill -f "$1/[g]raph.img" 2>/dev/null || true
+  for _ in $(seq 40); do pgrep -f "$1/[g]raph.img" >/dev/null || return 0; sleep 0.25; done
+  sudo -n pkill -KILL -f "$1/[g]raph.img" 2>/dev/null || true
 }
 wait_for() { # wait_for <seconds> <what> <cmd...>
   local secs="$1" what="$2"; shift 2

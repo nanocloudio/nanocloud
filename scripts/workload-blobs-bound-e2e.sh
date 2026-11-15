@@ -29,9 +29,9 @@ modules:
     blobs: "$path"
 wiring: []
 YAML
-  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
   FLUXOR_STORE_DIR="$D" RUST_LOG=info timeout 3 "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 }
 
 echo "== 1. a path past the bound is refused, by name, with its length =="

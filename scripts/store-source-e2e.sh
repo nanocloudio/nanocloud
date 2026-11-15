@@ -89,9 +89,9 @@ wiring:
 YAML
 
 echo "== 3. build + run =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 FLUXOR_STORE_DIR="$D" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 2
 kill "$RUNTIME_PID" 2>/dev/null || true
@@ -192,7 +192,7 @@ with os.fdopen(fd, "r+b") as f:
     f.flush(); os.fsync(f.fileno())
 PY
 FLUXOR_STORE_DIR="$D" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/paged.log" 2>&1 &
+  --image "$D/graph.img" >"$D/paged.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 8
 kill "$RUNTIME_PID" 2>/dev/null || true
@@ -271,9 +271,9 @@ wiring:
     to: debug.data
     buffer_group: 1
 YAML
-nc_build_workload "$ROOT" "$D2/graph.yaml" "$D2/config.bin" "$D2/modules.bin"
+nc_build_workload "$ROOT" "$D2/graph.yaml" "$D2/graph.img"
 FLUXOR_STORE_DIR="$D2" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D2/config.bin" --modules "$D2/modules.bin" >"$D2/run.log" 2>&1 &
+  --image "$D2/graph.img" >"$D2/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 2
 kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""
@@ -367,9 +367,9 @@ wiring:
     to: dbg_l.data
     buffer_group: 3
 YAML
-nc_build_workload "$ROOT" "$D3/graph.yaml" "$D3/config.bin" "$D3/modules.bin"
+nc_build_workload "$ROOT" "$D3/graph.yaml" "$D3/graph.img"
 FLUXOR_STORE_DIR="$D3" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D3/config.bin" --modules "$D3/modules.bin" >"$D3/run.log" 2>&1 &
+  --image "$D3/graph.img" >"$D3/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 2
 kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; RUNTIME_PID=""

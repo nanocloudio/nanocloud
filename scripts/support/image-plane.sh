@@ -249,15 +249,15 @@ open(out, "w").write(g)
 PY
 }
 
-# ip_run <seconds> [sudo]: the graph built at $D/config.bin/$D/modules.bin, on
+# ip_run <seconds> [sudo]: the graph image built at $D/graph.img, on
 # the store in $D, for that long.
 ip_boot() {
   if [ "${IP_SUDO:-0}" = 1 ]; then
     sudo -n env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-      --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+      --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   else
     env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-      --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+      --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   fi
   IP_RUNTIME=$!
 }

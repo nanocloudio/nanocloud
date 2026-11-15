@@ -65,7 +65,7 @@ cp "$ROOT/packaging/debian/assemble-image.sh" "$D/assemble-image.sh"
 chmod 755 "$D/assemble-image.sh"
 
 ip_graph "$D/graph.yaml" "localhost:$PORT" "$D/blobs" '"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux"' sandbox
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 rootfs() { ip_get "/image-rootfs/$1"; }
 field() { tr ';' '\n' <<<"$1" | sed -n "s/^$2=//p"; }

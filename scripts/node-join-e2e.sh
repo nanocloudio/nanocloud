@@ -175,7 +175,7 @@ start() { # start <replica>: its vault sealed under its own device key
   local seal="SEAL_$1"
   mkdir -p "$D/$1/vault"
   env -C "$D/$1" FLUXOR_SEAL_KEY="${!seal}" FLUXOR_VAULT_DIR="$D/$1/vault" RUST_LOG="${NC_LOG:-warn}" \
-    "$FLUXOR_RUNTIME" --config "$D/$1/config.bin" --modules "$D/$1/modules.bin" >>"$D/$1/run.log" 2>&1 &
+    "$FLUXOR_RUNTIME" --image "$D/$1/graph.img" >>"$D/$1/run.log" 2>&1 &
   PID[$1]=$!
 }
 wait_for() { # wait_for <seconds> <what> <cmd...>
@@ -216,7 +216,7 @@ grep -q "^      voters: 1$" "$D/plane/graph.yaml" || fail "the plane admits no l
 for leftover in cert_file key_file trust.pem; do
   ! grep -v '^\s*#' "$D/plane/graph.yaml" | grep -q "$leftover" || fail "the plane renders key material ($leftover)"
 done
-nc_build_workload "$ROOT" "$D/plane/graph.yaml" "$D/plane/config.bin" "$D/plane/modules.bin" >/dev/null \
+nc_build_workload "$ROOT" "$D/plane/graph.yaml" "$D/plane/graph.img" >/dev/null \
   || fail "the plane did not build"
 
 
@@ -297,7 +297,7 @@ splice "$D/worker/graph.yaml" "$(reader 1 1)" "$(reader_wiring 1)"
 grep -q 'remote: "/apis/nanocloud.io/v1/namespaces/nanocloud-peers/devices/replica-1.server"' "$D/worker/graph.yaml" \
   || fail "the worker's server end is not certified through its slot's Device"
 ! grep -q "^      voters:" "$D/worker/graph.yaml" || fail "a worker admits learners"
-nc_build_workload "$ROOT" "$D/worker/graph.yaml" "$D/worker/config.bin" "$D/worker/modules.bin" >/dev/null \
+nc_build_workload "$ROOT" "$D/worker/graph.yaml" "$D/worker/graph.img" >/dev/null \
   || fail "the worker did not build"
 start worker
 

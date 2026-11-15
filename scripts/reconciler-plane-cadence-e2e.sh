@@ -85,7 +85,7 @@ PY
 
 echo "== 1. admissibility: build the 9-reconciler plane on a variable-cadence domain =="
 BUILD_DIR="$(mktemp -d /tmp/nc-recon-cad-XXXXXX)"
-if ! nc_build_workload "$ROOT" "$GRAPH_ADAPTIVE" "$BUILD_DIR/config.bin" "$BUILD_DIR/modules.bin" >"$BUILD_DIR/build.log" 2>&1; then
+if ! nc_build_workload "$ROOT" "$GRAPH_ADAPTIVE" "$BUILD_DIR/graph.img" >"$BUILD_DIR/build.log" 2>&1; then
   echo "FAIL: adaptive reconciler plane did not build (mechanism-(b) gate?):"; tail -20 "$BUILD_DIR/build.log"; rm -rf "$BUILD_DIR"; exit 1
 fi
 echo "   ok: all 9 agnostic reconcilers admitted on domain main (adaptive_flags=3)"
@@ -93,7 +93,7 @@ echo "   ok: all 9 agnostic reconcilers admitted on domain main (adaptive_flags=
 echo "== 2. relaxation: boot idle (empty store), measure voluntary context switches =="
 : > "$BUILD_DIR/store.log"
 FLUXOR_STORE_DIR="$BUILD_DIR" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$BUILD_DIR/config.bin" --modules "$BUILD_DIR/modules.bin" >"$BUILD_DIR/run.log" 2>&1 &
+  --image "$BUILD_DIR/graph.img" >"$BUILD_DIR/run.log" 2>&1 &
 PID=$!
 sleep "$WARMUP"
 if ! kill -0 "$PID" 2>/dev/null; then
@@ -116,13 +116,13 @@ echo "   ok: relaxed to ~$(( IDLE / WINDOW ))/s (vs ~1000/s at the 1ms floor)"
 
 echo "== 3. correctness under adaptive: seed nodes + unbound pods, expect bindings =="
 RD="$(mktemp -d /tmp/nc-recon-cad-run-XXXXXX)"
-nc_build_workload "$ROOT" "$GRAPH_ADAPTIVE" "$RD/config.bin" "$RD/modules.bin" >/dev/null 2>&1
+nc_build_workload "$ROOT" "$GRAPH_ADAPTIVE" "$RD/graph.img" >/dev/null 2>&1
 store_put "$RD/store.log" "/nodes/node-1" '{"metadata":{"name":"node-1"},"status":{"ready":true}}'
 store_put "$RD/store.log" "/nodes/node-2" '{"metadata":{"name":"node-2"},"status":{"ready":true}}'
 store_put "$RD/store.log" "/pods/default/pod-a" '{"metadata":{"name":"pod-a"},"spec":{"containers":[{"image":"x"}]}}'
 store_put "$RD/store.log" "/pods/default/pod-b" '{"metadata":{"name":"pod-b"},"spec":{"containers":[{"image":"x"}]}}'
 FLUXOR_STORE_DIR="$RD" RUST_LOG=warn timeout 4 "$FLUXOR_RUNTIME" \
-  --config "$RD/config.bin" --modules "$RD/modules.bin" >"$RD/run.log" 2>&1 || true
+  --image "$RD/graph.img" >"$RD/run.log" 2>&1 || true
 for pod in pod-a pod-b; do
   got="$(store_last "$RD/store.log" "/pods/default/$pod")"
   case "$got" in

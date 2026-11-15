@@ -53,13 +53,13 @@ PY
 }
 
 np_build() {
-  nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+  nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img" >/dev/null || fail "graph did not build"
 }
 
 np_run() { # np_run <seconds>
   mkdir -p "$D/np"
   FLUXOR_NET_POLICY_DRYRUN="$D/np" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout "$1" "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 || true
 }
 
 np_kernel_check() { # np_kernel_check <table> — the kernel accepts the rendered script

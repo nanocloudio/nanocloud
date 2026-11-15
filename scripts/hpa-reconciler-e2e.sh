@@ -85,9 +85,9 @@ PY
 }
 
 run_runtime() { # run_runtime — boot the runtime over the seeded log for one window
-  nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+  nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
   FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 3 "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 }
 present() { [ -n "$(store_last "$1")" ]; }
 absent()  { [ -z "$(store_last "$1")" ]; }

@@ -10,7 +10,7 @@
 //
 // Two network lanes (`Net` keys) and three lanes of the host's own
 // (`Caller` keys): the kernel opens every channel, and the host reads its
-// lanes back with `workload::LANES`. FLXA is big-endian; module parameters
+// lanes back, one per key, with `workload::LANE`. FLXA is big-endian; module parameters
 // are the SDK TLV (little-endian lengths), with `tls`'s credentials in the
 // extended entries after the end marker, as the config builder lays them.
 

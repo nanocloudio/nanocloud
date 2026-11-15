@@ -90,8 +90,9 @@ hardware_targets = ["bcm2712", "linux"]
 # | 4   | mtu          | str  | 1500           | the segment's MTU |
 # | 5   | graph_pods   | str  | (off)          | `1`: graph-backed Pods get addresses of their own (bare metal) |
 timer_class = "wall_clock"
-# SEGMENTS, ROUTES and HOLD rewrite the host's routing: privileged.
-permissions = ["platform_raw"]
+# SEGMENTS, ROUTES and HOLD (and READ) rewrite or read the host's routing
+# table: privileged. CAPS comes with the claimed `net_route`.
+grants = ["net_route.table"]
 
 [[ports]]
 name = "status"
@@ -117,12 +118,16 @@ name = "vip_ctl"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 4096
+# One `addr_ctl` frame (`module_facts!` VIP_CTL_ACCEPTS_RECORD).
+accepts_record = 64
 
 [[ports]]
 name = "vip_evt"
 direction = "output"
 content_type = "NetProto"
 buffer_size = 4096
+# One address event (`module_facts!` VIP_EVT_MAX_RECORD).
+max_record = 39
 
 [[resources]]
 requires_contract = "net_route"
@@ -136,11 +141,6 @@ access = "read"
 requires_contract = "storage.object"
 access = "write"
 
-# Every subscription rings the module's one kernel event: the store writes
-# no channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 exempt = "node agent — one table replace or store action per change, not a data path"
@@ -151,4 +151,4 @@ exempt = "node agent — one table replace or store action per change, not a dat
 # pass, every 5 s).
 [capacities]
 store_subscriptions = 5
-store_subscribers = 1
+store_subscribers = 5

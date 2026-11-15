@@ -73,7 +73,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. seed policies + live objects (for quota) + a request matrix =="
 # Policy fields are dotted JSON paths, so `spec.image` names the field one
@@ -98,7 +98,7 @@ wal_put "/admit-req/a6" '{"verb":"create","resource":"pods","ns":"default","obj"
 
 echo "== 3. run the admission controller =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify each admission decision =="
 expect() { # expect <reqid> <want>

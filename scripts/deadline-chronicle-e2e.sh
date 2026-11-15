@@ -106,7 +106,7 @@ wiring:
   - from: leases.record_out
     to: reap.request_in
 YAML
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 # The runtime's monotonic clock starts near 0 at boot; deadlines are relative
 # to it. Seed them as small absolute values: 1000 ms, 2500 ms, 60 s.
@@ -117,7 +117,7 @@ store_put "/leases/long"   "owner=c;deadline=60000"
 echo "== 1. run 1.4 s: only the 1 s lease has expired =="
 T0=$(python3 -c 'import time;print(time.monotonic())')
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 1.4
 [ -z "$(store_last /leases/short)" ]  || fail "short (1 s) should have expired by 1.4 s"

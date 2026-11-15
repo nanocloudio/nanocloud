@@ -73,9 +73,9 @@ if "join: 1" not in g:
     sys.exit("nothing mints the join")
 open(path, "w").write(g)
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 if [ "$EVERY" != 0 ]; then
-  grep -aq "FAULT INJECTION ON" "$D/modules.bin" || fail "the built store does not know the fault knob"
+  grep -aq "FAULT INJECTION ON" "$D/graph.img" || fail "the built store does not know the fault knob"
 fi
 
 # A device key, so the vault keeps the authority across restarts (as the
@@ -85,7 +85,7 @@ mkdir -p "$D/vault"
 boot() {
   : >"$D/run.log"
   env -C "$STORE" FLUXOR_SEAL_KEY="$SEAL" FLUXOR_VAULT_DIR="$D/vault" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   JOIN=""
   for _ in $(seq 400); do

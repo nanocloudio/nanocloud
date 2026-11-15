@@ -127,15 +127,15 @@ cp "$GRAPH" "$D/graph.yaml"
 echo "   $GRAPH"
 
 echo "== 3. build =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 echo "   settling the RBAC grant index"
-rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*' \
+rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*' \
   '/rbac-g/system:serviceaccount:default:reader/*|get|*|pods|*' '/rbac-g/system:serviceaccount:default:reader/~|get|~|/metrics|~'
 
 drive() { # drive <token-file|-> <curl args...> -> "<code>|<body>"
   local tok="$1"; shift
   env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

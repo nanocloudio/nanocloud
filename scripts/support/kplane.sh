@@ -30,13 +30,13 @@ kplane_up() {
   grep -q '^    port: 7443$' "$D/graph.yaml" || fail "the control plane's API port is not 7443"
   sed -i "s/^    port: 7443\$/    port: $KPLANE_PORT/" "$D/graph.yaml"
   if [ -n "${KPLANE_EDIT:-}" ]; then "$KPLANE_EDIT" "$D/graph.yaml"; fi
-  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null \
+  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null \
     || fail "graph did not build"
   local seal
   seal="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   mkdir -p "$D/vault"
   env -C "$STORE" FLUXOR_SEAL_KEY="$seal" FLUXOR_VAULT_DIR="$D/vault" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   local join="" secret ca
   for _ in $(seq 240); do

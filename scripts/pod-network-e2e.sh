@@ -200,7 +200,7 @@ start() { # start <replica>: as root in its node's domain, a host of its own
   sudo -n ip netns exec "${NS[$1]}" sh -c 'd="$1"; shift; echo $$ > "$d/pid"; cd "$d"; exec env "$@"' sh "$D/$1" \
     FLUXOR_SEAL_KEY="${!seal}" FLUXOR_VAULT_DIR="$D/$1/vault" \
     FLUXOR_STATE_DIR="$D/$1/state" FLUXOR_RUN_DIR="$D/$1/run" \
-    RUST_LOG="${NC_LOG:-warn}" "$FLUXOR_RUNTIME" --config "$D/$1/config.bin" --modules "$D/$1/modules.bin" \
+    RUST_LOG="${NC_LOG:-warn}" "$FLUXOR_RUNTIME" --image "$D/$1/graph.img" \
     >>"$D/$1/run.log" 2>&1 &
   for _ in $(seq 50); do [ -s "$D/$1/pid" ] && return 0; sleep 0.1; done
   fail "the $1 did not start"
@@ -223,7 +223,7 @@ render plane plane "$ROOT/packaging/debian/fluxor-controlplane.yaml" "$D/plane/g
   || fail "the plane did not render"
 grep -q "^    type: node_net$" "$D/plane/graph.yaml" || fail "the plane's render has no node_net"
 splice "$D/plane/graph.yaml" "$(reader 0)" "$(reader_wiring 0)"
-nc_build_workload "$ROOT" "$D/plane/graph.yaml" "$D/plane/config.bin" "$D/plane/modules.bin" >/dev/null \
+nc_build_workload "$ROOT" "$D/plane/graph.yaml" "$D/plane/graph.img" >/dev/null \
   || fail "the plane did not build"
 start plane
 wait_for 90 "the plane announced no join secret" grep -aq '\[join\] secret=' "$D/plane/run.log"
@@ -246,7 +246,7 @@ render worker node "$ROOT/packaging/debian/fluxor-worker.yaml" "$D/worker/graph.
   || fail "the worker did not render"
 grep -q "^    type: node_net$" "$D/worker/graph.yaml" || fail "the worker's render has no node_net"
 splice "$D/worker/graph.yaml" "$(reader 1)" "$(reader_wiring 1)"
-nc_build_workload "$ROOT" "$D/worker/graph.yaml" "$D/worker/config.bin" "$D/worker/modules.bin" >/dev/null \
+nc_build_workload "$ROOT" "$D/worker/graph.yaml" "$D/worker/graph.img" >/dev/null \
   || fail "the worker did not build"
 start worker
 LIVE="plane worker"

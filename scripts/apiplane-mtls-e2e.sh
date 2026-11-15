@@ -150,13 +150,13 @@ PYGEN
 
 
 echo "== 4. build config + module table =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 echo "   settling the RBAC grant index"
-rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present "/rbac-g/peer:$ALICE_SVID/*|*|*|*|*"
+rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present "/rbac-g/peer:$ALICE_SVID/*|*|*|*|*"
 
 echo "== 5. start the graph =="
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

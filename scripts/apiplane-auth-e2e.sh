@@ -217,14 +217,14 @@ wiring:
 YAML
 
 echo "== 3. build =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 # One request per boot, as in the read-path E2E: an `app: true` route services
 # exactly one request per run there too. A fresh instance per case keeps each
 # assertion unambiguous.
 drive() { # drive <auth-header-or-empty> -> "<code>|<body>"
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   for _ in $(seq 80); do
     python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break
@@ -280,10 +280,10 @@ echo "== 8. a token the LIVE issuer mints (sa_token chain -> kagi token_mint) is
 # stores its announced key at /authn-keys/sa (replacing the one seeded above)
 # and answers a /token-req/. The API graph, restarted, loads that key.
 store_put "/token-req/live" "$(printf 'ns=team;sa=deployer' | xxd -p | tr -d '\n')"
-nc_build_workload "$ROOT" "$ROOT/packaging/debian/fluxor-sa-token.yaml" "$D/sat-config.bin" "$D/sat-modules.bin"
+nc_build_workload "$ROOT" "$ROOT/packaging/debian/fluxor-sa-token.yaml" "$D/sat-graph.img"
 SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 FLUXOR_SEAL_KEY="$SEAL" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 4 "$FLUXOR_RUNTIME" \
-  --config "$D/sat-config.bin" --modules "$D/sat-modules.bin" >>"$D/run.log" 2>&1 || true
+  --image "$D/sat-graph.img" >>"$D/run.log" 2>&1 || true
 LIVE="$(python3 - "$D/store.log" <<'PY'
 import struct, sys
 data = open(sys.argv[1], "rb").read(); p = 0; out = b""

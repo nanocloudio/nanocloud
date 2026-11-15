@@ -9,20 +9,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/store.rs");
 include!("../_shared/exchange_call.rs");
 
@@ -138,9 +135,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PARAM;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, issuer, str, 0
@@ -501,11 +497,7 @@ fn build_reply(out: &mut [u8], held: &[u8], status: u8, token: &[u8]) -> usize {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -576,14 +568,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -598,18 +590,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         store_announcement(s, sys);
         if s.request_in < 0 || s.response_out < 0 || s.request_out < 0 || s.response_in < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         // A reply the chain has not taken goes first.
         if s.reply_len != 0 && !flush_reply(s, sys) {
-            return 0;
+            return StepReturn::Continue;
         }
         flush_call(s, sys);
         drain_answers(s, sys);
         if s.reply_len == 0 && s.call.idle() {
             admit(s, sys);
         }
-        0
+        StepReturn::Continue
     }
 }
 
@@ -746,7 +738,7 @@ unsafe fn answered(s: &mut State, sys: &SyscallTable) {
     // Read through a raw place: the answer stays in the call, which nothing
     // below touches, while the reply is built from it.
     let body = core::slice::from_raw_parts(body.as_ptr(), body.len());
-    if status == exch::status::OK {
+    if status == exh::status::OK {
         if let Some((auth_wire::MSG_MINT_RESP, payload)) = typed_exchange::message(body) {
             if let Ok(resp) = MintResponse::decode(payload) {
                 reply(s, sys, resp.status, resp.body);

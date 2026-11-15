@@ -87,7 +87,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. project a null-sandbox spec (explicit spawn params; no bundle dir) =="
 
@@ -96,7 +96,7 @@ wal_put "/sandboxes/test1" "cmd=/bin/echo hello-sandbox;phase=start"
 
 echo "== 4. run the runner; it drives oci CREATE -> START -> WAIT =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 5. verify terminal status written back to the store =="
 ST="$(wal_last /sandbox-status/test1)"
@@ -127,7 +127,7 @@ D="$D3" wal_put "/sandbox-exec/execbox/1"   "/bin/true"
 D="$D3" wal_put "/sandbox-exec/execbox/2"   "/bin/false"
 D="$D3" wal_put "/sandbox-exec/execbox/3"   "/bin/echo exec-output-here"
 FLUXOR_STORE_DIR="$D3" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-exec.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run-exec.log" 2>&1 || true
 
 R1="$(D="$D3" wal_last /sandbox-exec-result/execbox/1)"
 R2="$(D="$D3" wal_last /sandbox-exec-result/execbox/2)"
@@ -156,7 +156,7 @@ D="$D4" wal_put "/tty/ttybox/s2/ctl"    "open;cmd=/bin/cat"
 printf 'ping\n' > "$D4/pingfile"
 D="$D4" wal_put "/tty/ttybox/s2/in"     "$(cat "$D4/pingfile")"
 FLUXOR_STORE_DIR="$D4" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-tty.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run-tty.log" 2>&1 || true
 
 T1OUT="$(D="$D4" wal_last /tty/ttybox/s1/out)"
 T1ST="$(D="$D4" wal_last /tty/ttybox/s1/status)"
@@ -171,12 +171,12 @@ D6="$(mktemp -d /tmp/nc-sb-vol-XXXXXX)"; trap 'rm -rf "$D" "$D3" "$D4" "$D6"' EX
 D="$D6" wal_put "/pod-specs/volbox" "cmd=/bin/true;volumes=data:/data:ro"
 D="$D6" wal_put "/sandboxes/volbox"  "cmd=/bin/true;phase=start"
 FLUXOR_STORE_DIR="$D6" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-vol.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run-vol.log" 2>&1 || true
 [ -z "$(D="$D6" wal_last /sandbox-status/volbox)" ] || fail "a sandbox with an unbound volume was started: '$(D="$D6" wal_last /sandbox-status/volbox)'"
 echo "   unbound: not created"
 D="$D6" wal_put "/volumes/data" "path=$D6"
 FLUXOR_STORE_DIR="$D6" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run-vol.log" 2>&1 || true
+  --image "$D/graph.img" >>"$D/run-vol.log" 2>&1 || true
 [ "$(D="$D6" wal_last /volume-binds/volbox/0)" = "$D6:/data:ro" ] || fail "bind row: '$(D="$D6" wal_last /volume-binds/volbox/0)'"
 # The bind reached the workload: with no isolated rootfs to land in, the
 # backend refuses it (EINVAL) rather than run the sandbox without its volume.
@@ -208,7 +208,7 @@ D2="$(mktemp -d /tmp/nc-sb-iso-XXXXXX)"; trap 'rm -rf "$D" "$D2"' EXIT
 # raced the runtime's bounded 3s window on external WAL appends.
 D="$D2" wal_put "/sandboxes/iso1" "cmd=/usr/bin/readlink /proc/self/ns/uts /proc/self/ns/ipc /proc/self/ns/mnt /proc/self/ns/pid;iso=1;phase=start"
 FLUXOR_STORE_DIR="$D2" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" \
+  --image "$D/graph.img" \
   >"$D/run-iso.log" 2>&1 || true
 
 echo "== 7. verify the isolated sandbox ran in namespaces of its own =="
@@ -250,7 +250,7 @@ D="$D5" wal_put "/sandboxes/netbox2"   "cmd=$IPBIN addr;phase=start;net=own"   #
 # that wrote it would collide with whatever runtime the host runs — root in
 # a user namespace cannot write it at all (it answered EACCES, -13).
 FLUXOR_RUN_DIR="$D5/run" FLUXOR_STORE_DIR="$D5" RUST_LOG=warn timeout 3 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run-net.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run-net.log" 2>&1 || true
 
 NST="$(D="$D5" wal_last /sandbox-status/netbox1)"
 [[ "$NST" =~ ^state=exited\;code=0\;started=([0-9]+|m[0-9]+@([0-9a-f]{32}|-))$ ]] \

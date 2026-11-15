@@ -22,7 +22,7 @@ plan nanocloud.apiserver {
     key: string = 3;
   }
 
-  enum GET = 1;      // the exchange method byte
+  enum GET = 1;      // the request's HTTP verb (exchange_http::method)
   enum OP_GET = 1;   // store_effect
   enum OP_EXISTS = 2;
 

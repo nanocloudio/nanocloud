@@ -73,7 +73,7 @@ PY
 SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 run() { # run <seconds>
   FLUXOR_SEAL_KEY="$SEAL" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout "$1" "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 || true
 }
 count_puts() { # count_puts <key>
   python3 - "$D/store.log" "$1" <<'PY'
@@ -102,7 +102,7 @@ PY
 }
 
 echo "== 1. build the sa-token graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img" >/dev/null || fail "graph did not build"
 
 echo "== 2. four requests: explicit, with a lifetime, defaulted, and one naming no ServiceAccount =="
 store_put "/token-req/req1" "ns=default;sa=builder;aud=nanocloud"

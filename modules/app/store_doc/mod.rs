@@ -4,24 +4,21 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* and lattice's wire via include!/mod, so each module's compile sees the full surface; this module uses a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 #![allow(
     clippy::duplicate_mod,
-    reason = "the PIC build #[path]-remounts shared SDK and lattice wire source"
+    reason = "the PIC build #[path]-remounts shared lattice wire source"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/store.rs");
 include!("../_shared/views.rs");
 include!("../_shared/json.rs");
@@ -43,7 +40,7 @@ mod wire;
 use doc_exec::{
     FieldWriter, DIALECT_KUBERNETES, FLAG_DRY_RUN, FLAG_FORCE, OUT_BUSY, OUT_COMPACTED,
     OUT_CONFLICT, OUT_EXISTS, OUT_INVALID, OUT_MALFORMED, OUT_NOT_FOUND, OUT_NO_COLLECTION, OUT_OK,
-    OUT_OWNERSHIP, OUT_TIMEOUT, OUT_TOO_LARGE, OUT_UNAVAILABLE, RFLAG_CREATED, RFLAG_HELD,
+    OUT_OWNERSHIP, OUT_TIMEOUT, OUT_TOO_LARGE, OUT_UNAVAILABLE, RFLAG_CREATED,
 };
 use doc_json::{
     JsonResponse, JR_ERROR, JR_TEXT, J_COLLECTION, J_DOC, J_ID, J_ID_PREFIX, J_IF_REVISION,
@@ -1344,9 +1341,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PREFIX;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, key_prefix, str, 0
@@ -1394,17 +1390,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    ARENA as u32
-}
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: ARENA }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1485,18 +1471,18 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     // SAFETY: the loader's instance arena, constructed by module_new.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() || s.request_in < 0 || s.dec_fault != 0 {
-        return 0;
+        return StepReturn::Continue;
     }
     // What is owed goes first; nothing new is read until it has.
     if !s.flush_reply() {
-        return 0;
+        return StepReturn::Continue;
     }
     match s.phase {
         PHASE_SEND => {
@@ -1514,14 +1500,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.flush_reply();
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
         PHASE_WAIT => {
             s.receive();
             if s.out_len > 0 {
                 s.flush_reply();
             }
-            return 0;
+            return StepReturn::Continue;
         }
         _ => {}
     }
@@ -1537,7 +1523,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.journal.reset();
     } else if s.held == 0 {
         let Some(n) = s.read_request() else {
-            return 0;
+            return StepReturn::Continue;
         };
         let len = if s.dec_len > 0 {
             match s.decide(n) {
@@ -1546,7 +1532,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     r[..l].copy_from_slice(&d[..l]);
                     l
                 }
-                None => return 0,
+                None => return StepReturn::Continue,
             }
         } else {
             let (d, r) = (&s.in_buf, &mut s.req);
@@ -1566,7 +1552,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.out_len = 0;
         s.out_at = 0;
         s.phase = PHASE_IDLE;
-        return 0;
+        return StepReturn::Continue;
     }
     s.held = 0;
     if s.journal.refusal().is_some() {
@@ -1583,5 +1569,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.phase = PHASE_WAIT;
     }
     s.flush_reply();
-    0
+    StepReturn::Continue
 }

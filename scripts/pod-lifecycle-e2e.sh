@@ -79,7 +79,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph (3 modules) =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. materialize bundles (echo → exit 0, false → exit 1) + a restart matrix =="
 # pod1: succeeds, no restart -> Succeeded (terminal)
@@ -95,7 +95,7 @@ store_put "/pod-specs/pod-slp" "cmd=/bin/sleep 30;desired=running"
 
 echo "== 3. run the pipeline (pod_lifecycle -> the sandbox runtime -> oci) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 4 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify the lifecycle + restart-policy decisions =="
 SB="$(store_last /sandbox-status/pod1)"
@@ -152,7 +152,7 @@ store_put "/sandbox-boot-of/pod-stale" "a-boot-before-this-one"
 # the same chain as pod-slp's, and a wait that covered only one left the
 # other to a race.
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 120 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run2.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run2.log" 2>&1 &
 RUN2=$!
 settled() { # every assertion step 6 makes, as a predicate
   local uid
@@ -255,11 +255,11 @@ wiring = wiring.rstrip("\n") + """
 """
 open(dst, "w").write(mods + "\nwiring:\n" + wiring)
 PY2
-nc_build_workload "$ROOT" "$D/live.yaml" "$D/live.bin" "$D/live-modules.bin" >/dev/null \
+nc_build_workload "$ROOT" "$D/live.yaml" "$D/live.img" >/dev/null \
   || fail "the graph with the driver's channel did not build"
 store_put "/pod-specs/pod-grace" "cmd=/bin/sleep 30;desired=running;grace=5"
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 120 "$FLUXOR_RUNTIME" \
-  --config "$D/live.bin" --modules "$D/live-modules.bin" >"$D/run3.log" 2>&1 &
+  --image "$D/live.img" >"$D/run3.log" 2>&1 &
 RUN3=$!
 for _ in $(seq 150); do
   case "$(store_last /pod-lifecycle-status/pod-grace)" in phase=Running*) break ;; esac

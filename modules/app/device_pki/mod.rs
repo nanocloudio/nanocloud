@@ -6,24 +6,19 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::p256::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/store.rs");
 include!("../_shared/json.rs");
 include!("../_shared/exchange_call.rs");
@@ -178,7 +173,6 @@ struct State {
     owed_key_len: u8,
     owed_val: [u8; DOC_MAX],
     owed_len: u16,
-    owed_fence: [u8; 62],
 
     minted: u32,
     redeemed: u32,
@@ -189,10 +183,9 @@ struct State {
 }
 
 mod params_def {
+    use super::p_u32;
     use super::State;
     use super::PARAM_MAX;
-    use super::SCHEMA_MAX;
-    use super::{p_u32, p_u8};
 
     unsafe fn set(dst: &mut [u8; PARAM_MAX], dlen: &mut u8, d: *const u8, len: usize) {
         let n = if len > PARAM_MAX { 0 } else { len };
@@ -202,7 +195,7 @@ mod params_def {
         *dlen = n as u8;
     }
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, trust_domain, str, 0
@@ -657,11 +650,7 @@ fn validity_time(cert: &[u8], which: u8, out: &mut [u8; 20]) -> bool {
 
 // ── module ABI ─────────────────────────────────────────────────────────────
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -720,14 +709,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -738,7 +727,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.out_len != 0 {
             let n = s.out_len as usize;
             if (sys.channel_write)(s.result_out, s.out.as_ptr(), n) <= 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.out_len = 0;
         }
@@ -757,7 +746,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.phase == P_IDLE && s.out_len == 0 {
             sweep(s, sys);
         }
-        0
+        StepReturn::Continue
     }
 }
 
@@ -1091,7 +1080,7 @@ unsafe fn ask_authority(s: &mut State, sys: &SyscallTable) {
     }
     let cb = &cb[..at];
     if s.call.begin(port, |id, out| {
-        call_head(id, 3, b"/pki/certificate", b"", cb, out)
+        call_head(id, exh::method::POST, b"/pki/certificate", b"", cb, out)
     }) {
         s.phase = P_SIGN;
         flush_call(s, sys);
@@ -1678,46 +1667,16 @@ fn enrolled_status(claim: &[u8], broker: &[u8], out: &mut [u8]) -> Option<usize>
 
 // ── writes, under the pending rule ─────────────────────────────────────────
 
-/// Ask the owed write, from its own buffers: the request names them by
-/// address, so they are the same on every ask.
+/// Ask the owed write, from its own buffers, so it is byte-identical on
+/// every ask.
 unsafe fn ask_owed(s: &mut State, sys: &SyscallTable) -> WriteAnswer {
     let key = &s.owed_key[..s.owed_key_len as usize];
-    let mut arg = [0u8; MAX_KEY + 96];
-    let etag_len = if s.owed_pre == PRE_ETAG { 32 } else { 0 };
-    let kept = abi::contracts::storage::object::Kept::none();
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    cp(&mut arg[p..p + key.len()], key);
-    p += key.len();
-    if s.owed_put != 0 {
-        arg[p] = 0;
-        p += 1;
-        arg[p..p + 8].copy_from_slice(&(s.owed_val.as_ptr() as u64).to_le_bytes());
-        p += 8;
-        arg[p..p + 8].copy_from_slice(&(s.owed_len as u64).to_le_bytes());
-        p += 8;
-    }
-    arg[p] = s.owed_pre;
-    p += 1;
-    arg[p] = etag_len as u8;
-    p += 1;
-    if etag_len > 0 {
-        cp(&mut arg[p..p + 32], &etag_of(s.owed_rev));
-        p += 32;
-    }
-    if s.owed_put != 0 {
-        match kept.encode(&mut arg[p..]) {
-            Some(n) => p += n,
-            None => return WriteAnswer::Decided(-22),
-        }
-    }
-    arg[p..p + 8].copy_from_slice(&(s.owed_fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    let op = if s.owed_put != 0 { OBJ_PUT } else { OBJ_DELETE };
-    let a = write_answer((sys.provider_call)(-1, op, arg.as_mut_ptr(), p));
+    let value = if s.owed_put != 0 {
+        Some(&s.owed_val[..s.owed_len as usize])
+    } else {
+        None
+    };
+    let a = write_live(sys, key, value, s.owed_pre, s.owed_rev);
     if a != WriteAnswer::Pending {
         s.owed = 0;
     }

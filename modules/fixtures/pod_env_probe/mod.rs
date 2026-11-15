@@ -3,18 +3,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const FS_OPEN: u32 = abi::registry::fs::OPEN;
 const FS_READ: u32 = abi::registry::fs::READ;
@@ -81,8 +79,7 @@ fn keep(dst: &mut [u8; STR], n: &mut usize, d: *const u8, len: usize) {
 mod params_def {
     use super::keep;
     use super::State;
-    use super::SCHEMA_MAX;
-    define_params! {
+    fluxor_rt::define_params! {
         State;
         1, pod, str, 0 => |s, d, len| { keep(&mut s.name, &mut s.name_len, d, len); };
         2, node, str, 0 => |s, d, len| { keep(&mut s.node, &mut s.node_len, d, len); };
@@ -152,9 +149,14 @@ fn parse(buf: &[u8]) -> u32 {
     v
 }
 
-/// One fs call: `arg[..len]` (a path, a buffer).
+/// One fs call: `arg[..len]` (a path, a buffer); fs carries no `data`.
 unsafe fn fs(sys: &SyscallTable, h: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
-    (sys.provider_call)(h, op, arg, len)
+    (sys.provider_call)(h, op, arg, len, core::ptr::null_mut(), 0)
+}
+
+/// An fs READ or WRITE: the bytes travel in `data`, `arg` is empty.
+unsafe fn fs_data(sys: &SyscallTable, h: i32, op: u32, data: *mut u8, len: usize) -> i32 {
+    (sys.provider_call)(h, op, core::ptr::null_mut(), 0, data, len)
 }
 
 /// The path at `src[..n]` into `s.path`, its length.
@@ -166,11 +168,7 @@ fn path_of(path: &mut [u8; STR], src: &[u8]) -> usize {
     n
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -209,13 +207,13 @@ pub unsafe extern "C" fn module_new(
 /// Kernel module-ABI entry point: `state` is this module's instance block.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     let s = &mut *(state as *mut State);
     if s.syscalls.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     let sys = &*s.syscalls;
     match s.phase {
@@ -240,7 +238,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let n = path_of(&mut s.path, s.secret.get(..s.secret_len).unwrap_or(&[]));
             let rc = fs(sys, -1, FS_OPEN, s.path.as_mut_ptr(), n);
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 let mut l = Line::new();
@@ -255,9 +253,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         P_SECRET_READ => {
             let mut buf = [0u8; 128];
-            let rc = fs(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
+            let rc = fs_data(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             let mut l = Line::new();
             l.put(b"[envp] secret=");
@@ -293,7 +291,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             let rc = fs(sys, -1, FS_OPEN_CREATE, s.path.as_mut_ptr(), n);
             if rc == EAGAIN || rc == EINPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc >= 0 {
                 let mut z = [0u8; 1];
@@ -308,12 +306,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         P_STATE_OPEN => {
             if s.state_len == 0 {
                 s.phase = P_DONE;
-                return 0;
+                return StepReturn::Continue;
             }
             let n = path_of(&mut s.path, s.state.get(..s.state_len).unwrap_or(&[]));
             let rc = fs(sys, -1, FS_OPEN, s.path.as_mut_ptr(), n);
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc == ENOENT {
                 s.count = 0;
@@ -331,9 +329,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         P_STATE_READ => {
             let mut buf = [0u8; 32];
-            let rc = fs(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
+            let rc = fs_data(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             s.count = if rc > 0 {
                 parse(buf.get(..rc as usize).unwrap_or(&[]))
@@ -349,7 +347,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let n = path_of(&mut s.path, s.state.get(..s.state_len).unwrap_or(&[]));
             let rc = fs(sys, -1, FS_OPEN_CREATE, s.path.as_mut_ptr(), n);
             if rc == EAGAIN || rc == EINPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 let mut l = Line::new();
@@ -364,14 +362,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         P_STATE_WRITE => {
-            let mut off = [0u8; 4];
+            let mut off = abi::contracts::storage::fs::seek::encode(0);
             fs(sys, s.fd, FS_SEEK, off.as_mut_ptr(), off.len());
             let mut l = Line::new();
             l.int(i64::from(s.count));
             l.put(b"\n");
-            let rc = fs(sys, s.fd, FS_WRITE, l.b.as_mut_ptr(), l.n);
+            let rc = fs_data(sys, s.fd, FS_WRITE, l.b.as_mut_ptr(), l.n);
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = P_STATE_FSYNC;
         }
@@ -379,7 +377,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut z = [0u8; 1];
             let rc = fs(sys, s.fd, FS_FSYNC, z.as_mut_ptr(), 0);
             if rc == EAGAIN || rc == EINPROGRESS {
-                return 0;
+                return StepReturn::Continue;
             }
             fs(sys, s.fd, FS_CLOSE, z.as_mut_ptr(), 0);
             s.fd = -1;
@@ -393,7 +391,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // once (an update of the mounted Secret, seen by the graph).
         P_DONE => {
             if s.secret_len == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.idle = s.idle.wrapping_add(1);
             if s.idle >= WATCH_STEPS {
@@ -405,7 +403,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let n = path_of(&mut s.path, s.secret.get(..s.secret_len).unwrap_or(&[]));
             let rc = fs(sys, -1, FS_OPEN, s.path.as_mut_ptr(), n);
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             if rc < 0 {
                 s.phase = P_DONE;
@@ -416,16 +414,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         P_WATCH_READ => {
             let mut buf = [0u8; 128];
-            let rc = fs(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
+            let rc = fs_data(sys, s.fd, FS_READ, buf.as_mut_ptr(), buf.len());
             if rc == EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             }
             let mut z = [0u8; 1];
             fs(sys, s.fd, FS_CLOSE, z.as_mut_ptr(), 0);
             s.fd = -1;
             s.phase = P_DONE;
             if rc < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             let got = buf.get(..rc as usize).unwrap_or(&[]);
             let end = got.iter().position(|&c| c == b'\n').unwrap_or(got.len());
@@ -443,5 +441,5 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         _ => {}
     }
-    0
+    StepReturn::Continue
 }

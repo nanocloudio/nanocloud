@@ -8,19 +8,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 
@@ -80,8 +77,8 @@ enum Pass {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// The kernel event both subscriptions ring (`store_event`), or -1.
-    event: i32,
+    /// The two store subscriptions' handles (`store_subscribe`), or -1.
+    subs: [StoreSub; 2],
     subscribed: u32,
     /// A pass is owed: set by a ring, a refused subscription's poll or a
     /// failed pass's retry, cleared only when a pass runs.
@@ -140,9 +137,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PARAM;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, node_ports, str, 0
@@ -1058,11 +1054,7 @@ unsafe fn pass(s: &mut State) -> Pass {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1094,7 +1086,7 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.event = -1;
+        s.subs = [StoreSub::NONE; 2];
         s.subscribed = 0;
         s.dirty = 1;
         s.ports_len = 0;
@@ -1202,27 +1194,16 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
-        // One kernel event for both subscriptions: the store signals it, and
-        // `store_take` says which rang.
-        if s.event < 0 && s.subscribed == 0 {
-            s.event = store_event(sys);
-            if s.event < 0 {
-                let m = b"[svc_alloc] ERROR no kernel event - changes will NOT wake this module, it looks again every POLL_MS";
-                dev_log(sys, 1, m.as_ptr(), m.len());
-                s.poll = 1;
-                s.subscribed = 2;
-            }
-        }
         // /services/, then /nodes/ (where Pod CIDRs are allocated).
         while s.subscribed < 2 {
             let prefix = if s.subscribed == 0 { SERVICES } else { NODES };
@@ -1230,15 +1211,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.subscribed = 2;
                 break;
             }
-            let rc = store_subscribe(sys, prefix, s.event, 0);
+            let rc = store_subscribe(sys, prefix, 0);
             if not_yet(rc) {
-                return 0;
+                return StepReturn::Continue;
             }
             // Refused (the store's capacity spent, said at ERROR): a change
             // under it never wakes this module, so it looks again every
             // POLL_MS instead of never.
             if rc < 0 {
                 s.poll = 1;
+            }
+            if let (Some(h), true) = (s.subs.get_mut(s.subscribed as usize), rc >= 0) {
+                *h = StoreSub::new(rc, prefix);
             }
             s.subscribed += 1;
         }
@@ -1250,13 +1234,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.dirty = 1;
             }
         }
-        if store_take(sys, s.event, |_| {}) > 0 {
+        if store_rang(sys, &mut s.subs) > 0 {
             s.dirty = 1;
         }
         if s.owed != 0 {
             ask_owed(s);
             if s.owed != 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.dirty = 1;
         }
@@ -1275,6 +1259,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 Pass::Idle => {}
             }
         }
-        0
+        StepReturn::Continue
     }
 }

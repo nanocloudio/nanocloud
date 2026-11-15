@@ -48,7 +48,8 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
-max_record = 8600
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 8195
 required = true
 
 [[ports]]
@@ -56,7 +57,9 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 buffer_size = 4096
-max_record = 2560
+# The HTTP probe's request as one CMD_SEND (`module_facts!`
+# NET_OUT_MAX_RECORD).
+max_record = 2053
 required = true
 
 [[ports]]
@@ -72,7 +75,7 @@ name = "response_out"
 index = 1
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 8192
+buffer_size = 16384
 max_record = 8192
 
 [observability]

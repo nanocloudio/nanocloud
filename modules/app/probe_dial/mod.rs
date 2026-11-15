@@ -3,31 +3,29 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::net::net_proto::{
-    connected_parts, error_parts, write_connect_to, Target, CMD_CLOSE as NET_CMD_CLOSE,
-    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX,
-    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
-    MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE,
+    close, connected_parts, error_parts, write_connect_to, ConnectTo, Target,
+    CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND,
+    CONNECT_TO_MAX, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR, REQUESTER_TAG_NONE, SOCK_TYPE_STREAM,
 };
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/argv.rs");
 
 const CHAN_EINVAL: i32 = -22;
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
 const REC: usize = 8192;
+/// One frame read off `net_in`, header included.
 const NET_BUF: usize = 3 + 8192;
 /// The HTTP request (its frame stays under net_out's max_record).
 const REQ: usize = 2048;
@@ -77,17 +75,18 @@ struct State {
     last_hb_sum: u32,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, timeout_ms, u32, 10000
         => |s, d, len| { s.timeout_ms = p_u32(d, len, 0, 10_000); };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
+// `net_in` takes a frame of `NET_BUF`; `net_out` writes at most the HTTP
+// probe's request as one `CMD_SEND`.
+fluxor_rt::module_facts! {
+    state: State,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = 3 + 2 + REQ],
 }
 
 #[no_mangle]
@@ -135,14 +134,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         // Every frame on the shared channel, ours or not.
@@ -157,7 +156,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             {
                 s.out_len = 0;
             } else {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         let now = dev_millis(sys);
@@ -168,7 +167,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             next(s, sys, now);
         }
         heartbeat(s, sys, now);
-        0
+        StepReturn::Continue
     }
 }
 
@@ -278,12 +277,15 @@ unsafe fn next(s: &mut State, sys: &SyscallTable, now: u64) {
         let host = toks[0].get(..tl[0]).unwrap_or(&[]);
         let mut payload = [0u8; CONNECT_TO_MAX];
         let pl = match Target::parse(host) {
-            Some((t, _)) => write_connect_to(
+            Some((target, _)) => write_connect_to(
                 &mut payload,
-                SOCK_TYPE_STREAM,
-                port,
-                &t,
-                Some(dev_requester_tag(sys)),
+                &ConnectTo {
+                    sock_type: SOCK_TYPE_STREAM,
+                    flags: 0,
+                    port,
+                    target,
+                    requester_tag: dev_requester_tag(sys),
+                },
             ),
             None => 0,
         };
@@ -323,9 +325,12 @@ unsafe fn pump_net(s: &mut State, sys: &SyscallTable) -> bool {
     }
     let payload = core::slice::from_raw_parts(nb.add(3), plen);
     match msg {
-        NET_MSG_CONNECTED if s.phase == P_CONNECT && plen >= 2 => {
-            let (cid, tag) = connected_parts(payload);
-            if tag == dev_requester_tag(sys) {
+        NET_MSG_CONNECTED if s.phase == P_CONNECT => {
+            let Some(c) = connected_parts(payload) else {
+                return true;
+            };
+            let cid = c.conn_id;
+            if c.requester_tag == dev_requester_tag(sys) {
                 s.conn_id = cid;
                 s.conn_present = true;
                 if !s.http {
@@ -378,8 +383,10 @@ unsafe fn pump_net(s: &mut State, sys: &SyscallTable) -> bool {
                 finish(s, sys, false);
             }
         }
-        NET_MSG_ERROR if s.phase != P_IDLE && plen >= 3 => {
-            let (cid, _errno, tag) = error_parts(payload);
+        NET_MSG_ERROR if s.phase != P_IDLE => {
+            let Some((cid, _errno, tag)) = error_parts(payload) else {
+                return true;
+            };
             let ours = if tag != REQUESTER_TAG_NONE {
                 s.phase == P_CONNECT && tag == dev_requester_tag(sys)
             } else {
@@ -416,13 +423,13 @@ fn status_code(line: &[u8]) -> u16 {
 /// The attempt is over: its connection closed, its result written.
 unsafe fn finish(s: &mut State, sys: &SyscallTable, passed: bool) {
     if s.conn_present {
-        let cid = s.conn_id.to_le_bytes();
+        let rec = close(s.conn_id, false);
         let _ = net_write_frame(
             sys,
             s.net_out,
             NET_CMD_CLOSE,
-            cid.as_ptr(),
-            2,
+            rec.as_ptr(),
+            rec.len(),
             s.tx.as_mut_ptr(),
             NET_BUF,
         );

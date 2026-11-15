@@ -73,7 +73,8 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 65536
-max_record = 8600
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 8197
 required = true
 
 [[ports]]
@@ -81,7 +82,9 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 buffer_size = 16384
-max_record = 8600
+# A request in CMD_SENDs of at most 1024 bytes (`module_facts!`
+# NET_OUT_MAX_RECORD).
+max_record = 1029
 required = true
 
 [[ports]]

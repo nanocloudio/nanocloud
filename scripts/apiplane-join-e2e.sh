@@ -72,9 +72,9 @@ echo "== 1. a join secret, as the node stores it =="
 put_text "/join/$SECRET" "$ANSWER"
 
 sed 's/port: 7444/port: '"$PORT"'/' "$GRAPH" >"$D/shipped.yaml"
-nc_build_workload "$ROOT" "$D/shipped.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/shipped.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 80); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

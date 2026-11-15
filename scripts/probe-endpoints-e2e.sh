@@ -599,7 +599,7 @@ p, mods, wire = sys.argv[1:4]
 s = open(p).read().replace("${SANDBOX_MODS}", mods).replace("${SANDBOX_WIRE}", wire)
 open(p, "w").write(s)
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 2. materialize a sleeper bundle + seed the service, pods, and pod-specs =="
 mkdir -p "$D/slp"
@@ -621,7 +621,7 @@ store_put "/pod-probes/pod-fail" "rp_cmd=/bin/false;rp_period=1;rp_timeout=2;rp_
 
 echo "== 3. run the pipeline (sandbox launch + probe cadence ~1s) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 10 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. the probe chain produced a REAL readiness flip on web-ready =="
 PR="$(store_last /probe-status/pod-ready)"

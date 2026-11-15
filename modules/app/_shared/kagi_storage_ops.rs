@@ -106,20 +106,21 @@ pub trait Vault {
     /// A fresh 32-byte volume key that may be split: a handle, or a
     /// negative errno.
     fn generate(&mut self) -> i32;
-    /// `SHARE_SPLIT` of `handle` under `arg` (whose output pointer the
-    /// implementation sets), the three envelopes into `out`. 0, or a
-    /// negative errno.
+    /// `SHARE_SPLIT` of `handle` under `arg`, the three envelopes into
+    /// `out`. 0, or a negative errno.
     fn split(
         &mut self,
         handle: i32,
-        arg: &mut [u8; key_vault::share::split::LEN],
+        arg: &mut [u8; key_vault::share::split::ARG_LEN],
         out: &mut [u8; ENVELOPES],
     ) -> i32;
     fn destroy(&mut self, handle: i32);
 }
 
-/// The three custody envelopes, in share-index order.
-pub const ENVELOPES: usize = 3 * sk::ENVELOPE_LEN;
+/// The three custody envelopes, in share-index order: what `SHARE_SPLIT`
+/// writes.
+pub const ENVELOPES: usize = key_vault::share::split::OUT_LEN;
+const _: () = assert!(ENVELOPES == 3 * sk::ENVELOPE_LEN);
 /// The three custodians' recovery public keys, in share-index order.
 pub const CUSTODIANS: usize = 3 * sk::PUBLIC_LEN;
 /// Creations held between a create or rotation and its record set.
@@ -717,8 +718,8 @@ impl KagiStorage {
         let Ok(rec) = sk::Record::parse(&held.creation[..held.creation_len as usize]) else {
             return Code::Failed;
         };
-        let mut arg = [0u8; key_vault::share::split::LEN];
-        if sk::write_split_arg(&rec, 0, 0, &mut arg).is_err() {
+        let mut arg = [0u8; key_vault::share::split::ARG_LEN];
+        if sk::write_split_arg(&rec, &mut arg).is_err() {
             return Code::Failed;
         }
         if held.handle < 0 {

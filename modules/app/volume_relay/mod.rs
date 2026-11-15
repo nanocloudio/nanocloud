@@ -11,19 +11,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
 const OBJ_GET: u32 = abi::registry::storage_object::GET;
@@ -112,8 +109,8 @@ struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
     answer_in: i32,
-    /// The kernel event the subscription rings (`store_event`), or -1.
-    event: i32,
+    /// The store subscription (`store_subscribe`); none until made.
+    sub: StoreSub,
     response_out: i32,
     effect_out: i32,
     side: u8,
@@ -159,7 +156,7 @@ struct State {
     nag: ReadNag,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     // Comma-separated: the ops this graph's chains issue that only the
@@ -184,11 +181,7 @@ define_params! {
         => |s, d, len| { s.timeout_ms = p_u32(d, len, 0, 60_000); };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -220,7 +213,7 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = sys;
     s.request_in = in_chan;
     s.answer_in = dev_channel_port(sys, 0, 1);
-    s.event = -1;
+    s.sub = StoreSub::NONE;
     s.response_out = out_chan;
     s.effect_out = dev_channel_port(sys, 1, 1);
     s.issued = [SLOT_FREE; SLOTS];
@@ -243,7 +236,15 @@ pub unsafe extern "C" fn module_new(
         }
     }
     // Request keys are this incarnation's own: a nonce, then a sequence.
-    if (sys.provider_call)(-1, abi::kernel_abi::RANDOM_FILL, s.nonce.as_mut_ptr(), 8) != 0 {
+    let rc = (sys.provider_call)(
+        -1,
+        abi::kernel_abi::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
+        s.nonce.as_mut_ptr(),
+        8,
+    );
+    if rc != 0 {
         let m = b"[volume_relay] no random nonce - REFUSED";
         dev_log(sys, 1, m.as_ptr(), m.len());
         return -5;
@@ -253,38 +254,34 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
         if s.started == 0 {
             let prefix = if s.side == SIDE_NODE { NODE_OPS } else { ASKS };
-            // The subscription rings the relay's own kernel event. The
+            // The subscription's handle rings when the prefix changes. The
             // store's "not yet": no subscription was made, and it is asked
             // again next step (the sweep, `poll_ms`, wakes the relay
-            // meanwhile). A final refusal is said by `store_subscribe`, and
-            // a missing event here; the sweep is then all that wakes it.
-            if s.event < 0 {
-                s.event = store_event(sys);
-                if s.event < 0 {
-                    let m =
-                        b"[volume_relay] ERROR no kernel event - only the sweep wakes this relay";
-                    dev_log(sys, 1, m.as_ptr(), m.len());
-                }
-            }
-            if s.event < 0 || !not_yet(store_subscribe(sys, prefix, s.event, 0)) {
+            // meanwhile). A final refusal is said by `store_subscribe`; the
+            // sweep is then all that wakes it.
+            let rc = store_subscribe(sys, prefix, 0);
+            if !not_yet(rc) {
                 s.started = 1;
+                if rc >= 0 {
+                    s.sub = StoreSub::new(rc, prefix);
+                }
             }
             s.woken = 1;
         }
-        if store_take(sys, s.event, |_| {}) > 0 {
+        if store_rang(sys, core::slice::from_mut(&mut s.sub)) > 0 {
             s.woken = 1;
         }
         let swept = now.wrapping_sub(s.last_sweep_ms) >= u64::from(s.poll_ms.max(10));
@@ -292,10 +289,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.last_sweep_ms = now;
         }
         if s.reply_len != 0 && !flush(sys, s.response_out, &mut s.reply, &mut s.reply_len) {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.effect_len != 0 && !flush(sys, s.effect_out, &mut s.effect, &mut s.effect_len) {
-            return 0;
+            return StepReturn::Continue;
         }
         let waited = issue(s, sys, now, swept);
         let waited = serve(s, sys, now, swept) | waited;
@@ -314,7 +311,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.last_hb_sum = sum;
             heartbeat(s, sys);
         }
-        0
+        StepReturn::Continue
     }
 }
 

@@ -8,20 +8,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/cores/datagram_endpoint.rs");
+use fluxor_rt::datagram_endpoint::*;
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 
@@ -46,8 +43,10 @@ const DNS_OWNER: &[u8] = b"owner=kube-system/kube-dns;ip=";
 /// The classic UDP ceiling: a query or an answer past it is not served.
 const DNS_MAX: usize = 512;
 const DNS_HDR: usize = 12;
-/// Framing scratch: a datagram, its address prefix and the frame header.
-const NET_BUF: usize = DNS_MAX + 64;
+/// Framing scratch: the largest frame `net_in` accepts, which also holds
+/// every frame `net_out` writes (a datagram, its address prefix and the
+/// frame header).
+const NET_BUF: usize = NET_IN_ACCEPTS_RECORD;
 /// A Service object, read whole.
 const DOC_MAX: usize = 16 * 1024;
 /// Queries held while the store answers EAGAIN.
@@ -216,9 +215,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PARAM;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, port, u16, 53
@@ -1161,10 +1159,11 @@ unsafe fn publish(s: &mut State, sys: &SyscallTable) {
     // Past the endpoint (PUB_DONE): `/cluster-dns` next, as its ClusterIP.
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
+// `net_in` takes what the transports write (at most one transport record); `net_out`
+// writes a datagram of at most `DNS_MAX` with its address prefix and header.
+fluxor_rt::module_facts! {
+    state: State,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX, out 0 NET_OUT_MAX_RECORD = DNS_MAX + 64],
 }
 
 #[no_mangle]
@@ -1264,14 +1263,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         // The server first, then (forwarding) the ephemeral upstream: one
@@ -1380,9 +1379,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if did {
-            2
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

@@ -167,9 +167,9 @@ store_put "/deployments.apps/default/api" '{"metadata":{"name":"api"},"spec":{"r
 store_put "/hpa/default/api" '{"metadata":{"name":"api"},"spec":{"scaleTargetRef":{"name":"api"},"minReplicas":1,"maxReplicas":10,"targetCPUUtilizationPercentage":50}}'
 
 echo "== 2. one live run, polled =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 T0=$(date +%s%3N)
 TRACE=""

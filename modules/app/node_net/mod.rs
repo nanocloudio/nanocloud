@@ -9,19 +9,16 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/store.rs");
 include!("../_shared/field.rs");
@@ -97,8 +94,8 @@ enum Pass {
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// The kernel event every subscription rings (`store_event`), or -1.
-    event: i32,
+    /// Each prefix's store subscription handle, in [`SUBS`] order, or -1.
+    subs: [StoreSub; SUBS],
     /// Prefixes subscribed so far, in [`SUBS`] order.
     subscribed: u8,
     /// A pass is owed: set by a ring or the periodic pass, cleared only
@@ -201,7 +198,7 @@ struct State {
     /// `addr_evt` events out (out[1]), and the addresses it drives here.
     addr_ctl_in: i32,
     addr_evt_out: i32,
-    ctl_buf: [u8; 64],
+    ctl_buf: [u8; VIP_CTL_ACCEPTS_RECORD],
     vh: VipHold,
 }
 
@@ -211,7 +208,7 @@ struct State {
 /// sandbox going, is picked up by the periodic pass (`PASS_MS`): the store
 /// holds a bounded number of subscriptions for the whole node.
 const SUBS: usize = 5;
-name_table!(
+fluxor_rt::name_table!(
     SUB_PREFIXES = [
         b"/nodes/",
         b"/services/",
@@ -225,9 +222,8 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::MAX_PARAM;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, node_name, str, 0
@@ -407,8 +403,8 @@ fn cat(out: &mut [u8], parts: &[&[u8]]) -> usize {
 }
 
 // READ's states and reasons by their values (`wire::state`, `wire::reason`).
-name_table!(STATE_NAMES = [b"pending", b"realized", b"fenced", b"refused", b"unknown"]);
-name_table!(
+fluxor_rt::name_table!(STATE_NAMES = [b"pending", b"realized", b"fenced", b"refused", b"unknown"]);
+fluxor_rt::name_table!(
     REASON_NAMES = [
         b"",
         b"no_privilege",
@@ -541,7 +537,14 @@ unsafe fn apply_segment(s: &mut State, sys: &SyscallTable) {
     if s.seg_set && h == s.seg_hash && s.seg_rc == 0 {
         return;
     }
-    let rc = (sys.provider_call)(-1, wire::SEGMENTS, arg.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        wire::SEGMENTS,
+        core::ptr::null_mut(),
+        0,
+        arg.as_mut_ptr(),
+        len,
+    );
     s.seg_rc = rc;
     if rc == 0 {
         s.seg_hash = h;
@@ -599,7 +602,14 @@ unsafe fn apply_routes(s: &mut State, sys: &SyscallTable, store: &Store) -> Pass
     if s.route_set && h == s.route_hash && s.route_rc == 0 {
         return Pass::Idle;
     }
-    let rc = (sys.provider_call)(-1, wire::ROUTES, s.tbl.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        wire::ROUTES,
+        core::ptr::null_mut(),
+        0,
+        s.tbl.as_mut_ptr(),
+        len,
+    );
     s.route_rc = rc;
     if rc == 0 {
         s.route_hash = h;
@@ -937,7 +947,14 @@ unsafe fn apply_held(s: &mut State, sys: &SyscallTable) {
     if s.held_set && h == s.held_hash && s.held_rc == 0 {
         return;
     }
-    let rc = (sys.provider_call)(-1, wire::HOLD, arg.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        wire::HOLD,
+        core::ptr::null_mut(),
+        0,
+        arg.as_mut_ptr(),
+        len,
+    );
     s.held_rc = rc;
     if rc == 0 {
         s.held_hash = h;
@@ -1179,7 +1196,14 @@ unsafe fn release_pass(s: &mut State, store: &Store) -> Pass {
 /// READ, folded into the two status records; each written when it changed.
 /// True when it wrote (one write at a time).
 unsafe fn status(s: &mut State, sys: &SyscallTable) -> bool {
-    let rc = (sys.provider_call)(-1, wire::READ, s.rd.as_mut_ptr(), RD);
+    let rc = (sys.provider_call)(
+        -1,
+        wire::READ,
+        core::ptr::null_mut(),
+        0,
+        s.rd.as_mut_ptr(),
+        RD,
+    );
     let gen = wire::generation(&s.rd).unwrap_or(0);
     let mut seg_state = wire::state::UNKNOWN;
     let mut seg_reason = wire::reason::NONE;
@@ -1377,11 +1401,15 @@ unsafe fn pass(s: &mut State) -> Pass {
     let sys = &*s.syscalls;
     let store = Store::plain(sys, &s.nag);
     let mut caps = [0u8; 4];
-    s.caps = if (sys.provider_call)(-1, wire::CAPS, caps.as_mut_ptr(), 4) == 0 {
-        u32::from_le_bytes(caps)
-    } else {
-        0
-    };
+    let rc = (sys.provider_call)(
+        -1,
+        wire::CAPS,
+        caps.as_mut_ptr(),
+        caps.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    s.caps = if rc == 0 { u32::from_le_bytes(caps) } else { 0 };
     let me_len = s.node_len as usize;
     let mut k = [0u8; MAX_KEY];
     let kl = cat(&mut k, &[NODES, s.node.get(..me_len).unwrap_or(&[])]);
@@ -1461,10 +1489,11 @@ unsafe fn heartbeat(s: &mut State, sys: &SyscallTable, now: u64) {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
+// `vip_ctl` takes one `addr_ctl` frame of `ctl_buf`; `vip_evt` writes one
+// address event of at most `VH_EVT_MAX`.
+fluxor_rt::module_facts! {
+    state: State,
+    records: [in 0 VIP_CTL_ACCEPTS_RECORD = 64, out 1 VIP_EVT_MAX_RECORD = VH_EVT_MAX],
 }
 
 #[no_mangle]
@@ -1497,7 +1526,7 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.event = -1;
+        s.subs = [StoreSub::NONE; SUBS];
         s.subscribed = 0;
         s.dirty = 1;
         s.pass_ms = 0;
@@ -1664,38 +1693,30 @@ unsafe fn vip_ctl(s: &mut State, sys: &SyscallTable) -> bool {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
-        // One kernel event for every subscription. Without one (or with a
-        // subscription refused, said at ERROR) the periodic pass still runs.
-        if s.event < 0 && s.subscribed == 0 {
-            s.event = store_event(sys);
-            if s.event < 0 {
-                let m = b"[node_net] ERROR no kernel event - changes will NOT wake this module, only its periodic pass";
-                dev_log(sys, 1, m.as_ptr(), m.len());
-                s.subscribed = SUBS as u8;
-            }
-        }
+        // One subscription per prefix. With one refused (said at ERROR) the
+        // periodic pass still runs.
         while (s.subscribed as usize) < SUBS {
-            if not_yet(store_subscribe(
-                sys,
-                SUB_PREFIXES.get(s.subscribed as usize),
-                s.event,
-                0,
-            )) {
-                return 0;
+            let prefix = SUB_PREFIXES.get(s.subscribed as usize);
+            let rc = store_subscribe(sys, prefix, 0);
+            if not_yet(rc) {
+                return StepReturn::Continue;
+            }
+            if let (Some(h), true) = (s.subs.get_mut(s.subscribed as usize), rc >= 0) {
+                *h = StoreSub::new(rc, prefix);
             }
             s.subscribed += 1;
         }
-        if store_take(sys, s.event, |_| {}) > 0 {
+        if store_rang(sys, &mut s.subs) > 0 {
             s.dirty = 1;
         }
         if vip_ctl(s, sys) {
@@ -1704,7 +1725,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.owed != 0 {
             ask_owed(s);
             if s.owed != 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             s.dirty = 1;
         }
@@ -1730,7 +1751,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             if s.owed != 0 {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         heartbeat(s, sys, now);
@@ -1742,6 +1763,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.status_ms = now;
             }
         }
-        0
+        StepReturn::Continue
     }
 }

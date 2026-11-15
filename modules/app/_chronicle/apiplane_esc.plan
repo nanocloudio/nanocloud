@@ -31,11 +31,11 @@ plan nanocloud.apiplane_esc {
 
   enum M_GET = 1;
   enum M_POST = 3;
-  enum M_PUT = 5;
-  enum M_PATCH = 6;
-  enum M_PATCH_JSON = 16;
-  enum M_PATCH_SMP = 26;
-  enum M_PATCH_APPLY = 36;
+  enum M_PUT = 4;
+  enum M_PATCH = 5;
+  enum M_PATCH_JSON = 15;
+  enum M_PATCH_SMP = 25;
+  enum M_PATCH_APPLY = 35;
   enum OP_NOOP = 0;
   enum OP_COVER = 23;
   enum PENDING = 0;

@@ -118,11 +118,11 @@ nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did no
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
 WN_KEEP="vb_" wn_splice "$D/graph.yaml" node-1 "$D/blobs" "localhost:$REG_PORT" || fail "the splice did not apply"
 grep -q "type: volume_files" "$D/graph.yaml" || fail "the node has no volume chain"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 4. run it; wait for the API over TLS =="
 env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_MOUNT_ROOT="$D/mnt" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 for _ in $(seq 60); do
@@ -336,7 +336,7 @@ esac
 r="$(api DELETE /api/v1/namespaces/default/pods/envh)"
 
 echo "== 11. a Pod that keeps its own keys: its vault on its claim, sealed by its Secret =="
-if ! grep -q "pub mod vault" "$ROOT/target/fluxor/fluxor-abi/sdk/contracts/workload.rs" 2>/dev/null; then
+if ! grep -q "pub mod vault" "$ROOT/target/fluxor/fluxor-abi/src/contracts/workload.rs" 2>/dev/null; then
   echo "   SKIP: the pinned Fluxor has no workload vault (contracts::workload::vault, Fluxor FX3 F4) — its CREATE would be refused ENOSYS"
 else
   UID_="$(create "$(pod_json envv nanocloud/envp:1 vault)")"

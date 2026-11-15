@@ -119,7 +119,7 @@ for leftover in ("cert_file", "key_file", "trust.pem", "_key:"):
     if leftover in g:
         sys.exit(f"the graph still renders key material ({leftover})")
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
 
 # This host's device key, as the deb's unit supplies it: the vault seals the
 # authority's and the API's keys under it and keeps them across restarts.
@@ -132,7 +132,7 @@ boot() { # boot [volatile]: without the device key, as a board with no OTP key
   local keys=(FLUXOR_SEAL_KEY="$SEAL" FLUXOR_VAULT_DIR="$D/vault")
   [ "${1:-}" = volatile ] && keys=()
   env -C "$STORE" "${keys[@]}" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   JOIN=""
   for _ in $(seq 240); do
@@ -248,10 +248,10 @@ stop
 NANOCLOUD_PEER_TRUST=authority nc_cli_graph "$STORE" "$D/cli.yaml" || fail "the CLI did not render under authority"
 grep -q "^  - name: certificate_endpoint$" "$D/cli.yaml" || fail "the CLI carries no authority"
 ! grep -q "^  - name: node_pki$" "$D/cli.yaml" || fail "the CLI mints a join"
-nc_build_workload "$ROOT" "$D/cli.yaml" "$D/cli-config.bin" "$D/cli-modules.bin" >/dev/null || fail "the CLI did not build"
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/cli-graph.img" >/dev/null || fail "the CLI did not build"
 rc=0
 env -C "$STORE" FLUXOR_SEAL_KEY="$SEAL" FLUXOR_VAULT_DIR="$D/vault" RUST_LOG=warn timeout 60 "$FLUXOR_RUNTIME" \
-  --config "$D/cli-config.bin" --modules "$D/cli-modules.bin" -- get namespaces >"$D/cli.out" 2>"$D/cli.err" || rc=$?
+  --image "$D/cli-graph.img" -- get namespaces >"$D/cli.out" 2>"$D/cli.err" || rc=$?
 [ "$rc" = 0 ] || { tail -5 "$D/cli.err"; fail "nanocloud get namespaces exited $rc"; }
 grep -qx "kube-system" "$D/cli.out" || fail "the CLI read no namespaces: $(cat "$D/cli.out")"
 echo "   nanocloud get namespaces: $(tr '\n' ' ' <"$D/cli.out")"

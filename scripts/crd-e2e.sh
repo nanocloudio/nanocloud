@@ -83,10 +83,10 @@ rbac_crb "$D/store.log" admins admin ServiceAccount admin default
 put_text "/secrets/default/db" '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"db","namespace":"default"},"data":{"p":"c2VjcmV0"}}'
 grep -q '?=metadata.namespace,metadata.name"' "$GRAPH" || fail "the dialect does not take an unnamed kind's id by key depth"
 cp "$GRAPH" "$D/graph.yaml"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null || fail "graph did not build"
-rbac_settle "$FLUXOR_RUNTIME" "$D/config.bin" "$D/modules.bin" "$D" present '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*'
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null || fail "graph did not build"
+rbac_settle "$FLUXOR_RUNTIME" "$D/graph.img" "$D" present '/rbac-g/system:serviceaccount:default:admin/*|*|*|*|*'
 
-env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+env -C "$D" RUST_LOG=warn "$FLUXOR_RUNTIME" --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 100); do
   python3 -c "import socket;socket.create_connection(('127.0.0.1',$PORT),timeout=0.2).close()" 2>/dev/null && break

@@ -189,16 +189,29 @@ for line in kube_wire.splitlines():
     m = re.match(r"    to: (\S+)$", line)
     if m and frm: pairs.append((frm, m.group(1))); frm = None
 edges = "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs if kept(a.split(".")[0]) and kept(b.split(".")[0]))
+# The node keeps its own lease, as the render gives a node that runs Pods
+# (fluxor-worker.yaml `nl_self`/`nl_renew`). Without it the plane takes the
+# node out of service 30 s after it last saw the Node change.
+wk = open(f"{root}/packaging/debian/fluxor-worker.yaml").read()
+lease = wk[wk.index("  - name: nl_self\n"):wk.index("\nwiring:")]
+facts = f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux","kubernetes.io/hostname":"{node}"'
+for k, v in (("__NODE_NAME__", node), ("__NODE_FACTS__", facts),
+             ("__NODE_ADDRESS__", "127.0.0.1"),
+             ("__NODE_CAPACITY__", '"cpu":"4","memory":"4Gi","pods":"110"')):
+    if k not in lease: sys.exit(f"no {k} in fluxor-worker.yaml's lease")
+    lease = lease.replace(k, v)
 mods, wiring = g.split("\nwiring:\n", 1)
 g = (mods.rstrip("\n") + "\n  # ── The pod plane: fluxor-podlifecycle.yaml, its graph-pod slice ──\n"
-     + kept_mods.rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n" + edges
+     + kept_mods.rstrip("\n") + "\n  # ── The node's lease ──\n" + lease.rstrip("\n")
+     + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n" + edges
+     + "  - from: nl_self.record_out\n    to: nl_renew.request_in\n"
      + "\nworkload_modules:\n  - tls\n  - loam_volume\n  - stateful_probe\n")
 open(out, "w").write(g)
 PY2
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 5. run; wait for the API over TLS =="
-env -C "$STORE" RUST_LOG=info "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+env -C "$STORE" RUST_LOG=info "$FLUXOR_RUNTIME" --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 api() { # api <method> <path> [json-body] -> "<status>|<body>"

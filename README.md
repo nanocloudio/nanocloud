@@ -664,8 +664,8 @@ make publish   # fluxor publish
 
 Each lifecycle target delegates to its `fluxor` verb, which reads this
 project's shape from `fluxor.toml`. There is no cargo crate: the modules are
-`no_std` PIC sources that compile against the SDK `fluxor sync` materialises
-under `target/fluxor/fluxor-abi/sdk/`. `make lint` is therefore the source-tree
+`no_std` PIC sources that link the SDK crates `fluxor sync` stages under
+`target/fluxor/` (`fluxor-abi`, `fluxor-rt`, `fluxor-sdk`). `make lint` is therefore the source-tree
 hygiene suite, which needs no build; formatting and clippy compile the PIC
 sources per target, so they run as `make ci` phases.
 

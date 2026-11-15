@@ -258,18 +258,33 @@ plan nanocloud.podreport {
                v17: ";ltf=", v18: r.ltfw, v19: ";t0=", v20: r.t0w,
                v21: ";trdy=", v22: r.trdyw, v23: ";digest=", v24: r.digest };
     // A graph-backed Pod's cached layer is missing (-2), short (-5), not its
-    // digest (-74) or not the one its pin names (-13).
-    when r.phase == "Restarting" && r.graph != "" && (r.code == "-2" || r.code == "-5" || r.code == "-74" || r.code == "-13") && (r.ltr != "" || r.rs != "") ->
+    // digest (-74) or not the one its pin names (-8, the kernel's ENOEXEC:
+    // the staged bytes are not that module). -13 is NOT one of these any
+    // more — it is the grants refusal below, which fetching cannot mend.
+    when r.phase == "Restarting" && r.graph != "" && (r.code == "-2" || r.code == "-5" || r.code == "-74" || r.code == "-8") && (r.ltr != "" || r.rs != "") ->
       pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,
                v1: "phase=", v2: "Running", v3: ";pod=", v4: r.pod,
                v5: ";rst=", v6: int("0" + r.rst), v7: ";ready=false;started=false;cr=False;crr=ContainersNotReady;st=waiting;why=CorruptImageLayer;msg=a cached image layer is missing, short or not its digest and is fetched again;code=;tr=;tf=;lcode=", v8: r.lcode,
                v9: ";lwhy=", v10: r.lwhy, v11: ";ltr=", v12: r.ltrw,
                v13: ";ltf=", v14: r.ltfw, v15: ";t0=", v16: r.t0w,
                v17: ";trdy=", v18: r.trdyw, v19: ";digest=", v20: r.digest };
-    when r.phase == "Restarting" && r.graph != "" && (r.code == "-2" || r.code == "-5" || r.code == "-74" || r.code == "-13") ->
+    when r.phase == "Restarting" && r.graph != "" && (r.code == "-2" || r.code == "-5" || r.code == "-74" || r.code == "-8") ->
       pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,
                v1: "phase=", v2: "Pending", v3: ";pod=", v4: r.pod,
                v5: ";rst=", v6: int("0" + r.rst), v7: ";ready=false;started=false;cr=False;crr=ContainersNotReady;st=waiting;why=CorruptImageLayer;msg=a cached image layer is missing, short or not its digest and is fetched again;code=;tr=;tf=;lcode=", v8: r.lcode,
+               v9: ";lwhy=", v10: r.lwhy, v11: ";ltr=", v12: r.ltrw,
+               v13: ";ltf=", v14: r.ltfw, v15: ";t0=", v16: r.t0w,
+               v17: ";trdy=", v18: r.trdyw, v19: ";digest=", v20: r.digest };
+    // The node refused the workload itself (-13, the kernel's EACCES): a
+    // module in the image holds a grant that reaches the kernel, which a
+    // tenant may never hold. Nothing about the image is broken and no fetch
+    // can mend it — the image would have to be built with other grants — so
+    // this is a config error and it is said once, not retried as a cache
+    // fault. It used to land on CorruptImageLayer and re-pull every layer.
+    when r.phase == "Restarting" && r.code == "-13" ->
+      pr.St { cid: r.seq, op: PUT, key: "podstatus/", k2: r.key,
+               v1: "phase=", v2: "Pending", v3: ";pod=", v4: r.pod,
+               v5: ";rst=", v6: int("0" + r.rst), v7: ";ready=false;started=false;cr=False;crr=ContainersNotReady;st=waiting;why=CreateContainerConfigError;msg=the image asks for a capability a workload may not hold;code=;tr=;tf=;lcode=", v8: r.lcode,
                v9: ";lwhy=", v10: r.lwhy, v11: ";ltr=", v12: r.ltrw,
                v13: ";ltf=", v14: r.ltfw, v15: ";t0=", v16: r.t0w,
                v17: ";trdy=", v18: r.trdyw, v19: ";digest=", v20: r.digest };

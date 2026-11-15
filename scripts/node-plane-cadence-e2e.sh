@@ -38,7 +38,7 @@ vctx() { awk '/^voluntary_ctxt_switches:/{print $2}' "/proc/$1/status" 2>/dev/nu
 
 echo "== 1. admissibility: build the pod-lifecycle and probe chains on a variable-cadence domain =="
 D="$(mktemp -d /tmp/nc-node-cad-XXXXXX)"
-if ! nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin" >"$D/build.log" 2>&1; then
+if ! nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img" >"$D/build.log" 2>&1; then
   echo "FAIL: the node/liveness plane did not build on an adaptive domain — is every module (store_source/store_effect/decision) still attesting a timer_class?"; tail -20 "$D/build.log"; rm -rf "$D"; exit 1
 fi
 echo "   ok: the whole node plane admitted on domain main (adaptive_flags=3) — the"
@@ -47,7 +47,7 @@ echo "       pod-lifecycle and probe CHAINS, every engine attesting its timer_cl
 echo "== 2. relaxation: boot idle (empty store), measure voluntary context switches =="
 : > "$D/store.log"
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 PID=$!
 sleep "$WARMUP"
 if ! kill -0 "$PID" 2>/dev/null; then

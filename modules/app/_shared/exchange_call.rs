@@ -3,7 +3,9 @@
 // to another module (kagi's typed operations, an HTTP endpoint, wave's HTTP
 // client) and the answer becomes the record the chain goes on with. Mounted
 // by the connectors and by `tests/harness`; the records are the SDK's
-// exchange contract (`abi::contracts::exchange`), which the includer mounts.
+// exchange contract (`abi::contracts::exchange`) under its HTTP binding
+// (`abi::contracts::exchange_http`): a call is a CALL with an HTTP verb, and
+// its answer's status is the HTTP status of the response HEAD.
 //
 // A call is one exchange. Its id is the call's counter (bytes 0..8) and the
 // connector's own request port (bytes 8..12), so two connectors fanned into
@@ -19,6 +21,7 @@
 // than cut (the provider is told with an ABORT, the connector sees a 502).
 
 use abi::contracts::exchange as exch;
+use abi::contracts::exchange_http as exh;
 
 /// The largest answer body a call collects, and the response credit it
 /// grants.
@@ -208,12 +211,12 @@ impl Call {
         self.open = false;
         self.abort_owed = true;
         self.abort_reason = exch::abort::TOO_LARGE;
-        CallEvent::Failed(exch::status::BAD_GATEWAY)
+        CallEvent::Failed(exh::status::BAD_GATEWAY)
     }
 
     /// Take one record from the provider.
     fn take(&mut self, record: &[u8]) -> CallEvent {
-        let Some(rec) = exch::parse_response(record) else {
+        let Ok(rec) = exch::parse_response::<exh::Http>(record) else {
             return CallEvent::Nothing;
         };
         match rec {
@@ -243,7 +246,7 @@ impl Call {
                 // while a re-issue is owed.
                 self.owed = false;
                 self.head = true;
-                self.status = h.status;
+                self.status = exh::status_of(&h);
                 if !self.collect(h.body) {
                     return self.refuse_answer();
                 }
@@ -271,7 +274,7 @@ impl Call {
                     return CallEvent::Nothing;
                 }
                 self.open = false;
-                CallEvent::Failed(exch::status::BAD_GATEWAY)
+                CallEvent::Failed(exh::status::BAD_GATEWAY)
             }
             exch::Record::Credit { .. } | exch::Record::Datagram { .. } => CallEvent::Nothing,
         }
@@ -286,23 +289,25 @@ impl Call {
     }
 }
 
-/// Lay a request HEAD that carries `body` whole, granting `CALL_BODY` of
-/// response credit. The caller's `write` for [`Call::begin`].
+/// Lay a request HEAD — a CALL with HTTP verb `verb` (`exh::method`) and
+/// `meta` (`exch::MetaWriter` fields) — that carries `body` whole, granting
+/// `CALL_BODY` of response credit. The caller's `write` for [`Call::begin`].
 fn call_head(
     id: &exch::ExchangeId,
-    method: u8,
+    verb: u8,
     target: &[u8],
-    headers: &[u8],
+    meta: &[u8],
     body: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    exch::write_request_head(
+    exch::write_request_head::<exh::Http>(
         &exch::RequestHead {
             id: *id,
             flags: 0,
-            method,
+            op: exch::op::CALL,
+            verb,
             target,
-            headers,
+            meta,
             peer: &[],
             resp_credit: CALL_BODY as u32,
             body,

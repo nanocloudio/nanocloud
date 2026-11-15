@@ -55,8 +55,8 @@ hardware_targets = ["bcm2712", "linux"]
 #               is left to the graph's other effectors
 #   answer_in   the graph's effectors' outcomes: those to served requests
 #               are written back, the rest pass by
-# A change under the served prefix rings the relay's own kernel event (the
-# `event` resource): the store writes no channel of the relay's.
+# A change under the served prefix rings the relay's store subscription:
+# the store writes no channel of the relay's.
 # Out:
 #   response_out  the outcomes of relayed effects, as the effector would
 #                 have answered (cid and carry the chain's)
@@ -111,17 +111,12 @@ access = "write"
 requires_contract = "storage.namespace"
 access = "read"
 
-# Every subscription rings the module's one kernel event: the store writes
-# no channel of this module's.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 [observability]
 exempt = "connector — every request and answer it carries is a store record"
 
 # Store subscriptions an instance opens: one (its side's asks or node
-# ops), on its one kernel event.
+# ops).
 [capacities]
 store_subscriptions = 1
 store_subscribers = 1

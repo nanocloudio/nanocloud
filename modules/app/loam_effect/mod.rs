@@ -10,21 +10,18 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 
 #[path = "../../../target/fluxor/loam-common/mechanics/loam_admin_wire.rs"]
 mod admin;
@@ -164,9 +161,8 @@ struct State {
 mod params_def {
     use super::p_u32;
     use super::State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, lease_ttl_ms, u32, 30000
@@ -365,11 +361,14 @@ fn holder(prefix: &[u8], claim: &[u8]) -> [u8; 16] {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
+
+/// `admin_in` carries what `tls.clear_out` writes, one frame of at most this
+/// many bytes, header included.
+pub const NET_IN_ACCEPTS_RECORD: usize = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX;
+/// `admin_out` carries one request fragment per `CMD_SEND`, what
+/// `tls.clear_in` accepts.
+pub const NET_OUT_MAX_RECORD: usize = 8197;
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -416,14 +415,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -432,7 +431,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.admin_out < 0 || s.admin_in < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if s.configured == 0 {
             configure(s, sys);
@@ -442,14 +441,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if s.reply_len != 0 {
             flush_reply(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.busy != 0 {
             pump(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         admit(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 

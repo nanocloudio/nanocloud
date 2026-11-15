@@ -64,10 +64,10 @@ wn_seed_identity
 nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
 wn_splice "$D/graph.yaml" node-1 "$D/blobs" "localhost:$REG_PORT" || fail "the splice did not apply"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 boot() {
   env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" RUST_LOG=info "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   nc_store_ready "$STORE" 60 || fail "the store never answered"
   local r=""

@@ -4,7 +4,8 @@
 // into ONE request envelope for the chain, and the chain's reply envelopes
 // back into the exchange's response. Mounted by `http_chain/mod.rs` and by
 // `tests/harness`; the records are the SDK's exchange contract
-// (`abi::contracts::exchange`, which the includer mounts).
+// (`abi::contracts::exchange`) under its HTTP binding
+// (`abi::contracts::exchange_http`), which the request port declares.
 //
 // Why a module and not the chain itself: a chain record carries its
 // correlation as an integer through every stage and connector, and the
@@ -20,7 +21,10 @@
 //
 //   cid      this module's correlation for the exchange, never 0 or
 //            0xFFFF_FFFF (a reply to 0xFFFF_FFFF is a reply to no one)
-//   method   the exchange method byte (GET 1, POST 3, ...)
+//   method   the request's HTTP verb (`exchange_http::method`: GET 1,
+//            HEAD 2, POST 3, PUT 4, PATCH 5, DELETE 6, OPTIONS 7)
+//   headers  the request's meta as `name: value\r\n` lines, names in lower
+//            case, the binding's own `:` fields left out
 //   flags    0x02 a verified mutual-TLS peer follows the body as
 //            `[len u16][peer]` (the exchange's `peer`); 0x04 the body was
 //            staged and `body` is `sha256:<hex>`
@@ -41,12 +45,14 @@
 // exchange is aborted as too slow rather than holding every other exchange
 // up behind it.
 //
-// Refusals, as the exchange contract names them: 503 when every slot is
-// taken (or the store could not hold the request), 413 for a body past
-// `max_body` or an envelope past one record, 500 when a body could not be
-// staged.
+// The reply's content type and header lines become the response's meta.
+//
+// Refusals, as HTTP statuses: 503 when every slot is taken (or the store
+// could not hold the request), 413 for a body past `max_body` or an envelope
+// past one record, 500 when a body could not be staged.
 
 use abi::contracts::exchange as hx;
+use abi::contracts::exchange_http as hh;
 
 /// Request envelope head.
 const HC_REQ_HEAD: usize = 12;
@@ -64,9 +70,12 @@ const HC_HOLD: u8 = 0x04;
 const HC_REF_LEN: usize = 7 + 64;
 /// The cid no exchange is given: a reply to it is a reply to no one.
 const HC_CID_NONE: u32 = u32::MAX;
-/// The largest content type and header block a response keeps.
+/// The largest content type and header block a reply envelope gives.
 const HC_CT_MAX: usize = 128;
 const HC_HDR_MAX: usize = 512;
+/// The response meta those become, with room for the `retry-after` this
+/// desk adds.
+const HC_META_MAX: usize = HC_CT_MAX + HC_HDR_MAX + 64;
 /// Refusals owed to exchanges that never got a slot.
 const HC_REFUSALS: usize = 16;
 /// How long an exchange may wait for the chain's first reply envelope,
@@ -81,7 +90,8 @@ const HC_ANSWER_MS: u64 = 28_000;
 /// decide in time, which a client retries after `Retry-After`. The write
 /// may still land (as a write whose etcd request timed out may).
 const HC_LATE_CT: &[u8] = b"application/json";
-const HC_LATE_HDRS: &[u8] = b"Retry-After: 1\r\n";
+/// The `retry-after` every 503 this front sends carries.
+const HC_RETRY_AFTER: &[u8] = b"1";
 const HC_LATE_BODY: &[u8] = b"{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"the request could not be decided in time; it may still be applied - retry\",\"reason\":\"ServiceUnavailable\",\"details\":{\"retryAfterSeconds\":1},\"code\":503}";
 
 const HC_FREE: u8 = 0;
@@ -241,10 +251,9 @@ struct HcSlot {
     done: bool,
     status: u16,
     hold: bool,
-    ct: [u8; HC_CT_MAX],
-    ct_len: u8,
-    hdrs: [u8; HC_HDR_MAX],
-    hdrs_len: u16,
+    /// The response's meta: its content type and header fields.
+    meta: [u8; HC_META_MAX],
+    meta_len: u16,
     /// Response body the server has not yet taken.
     stash: HcBytes,
 }
@@ -273,10 +282,8 @@ impl HcSlot {
         done: false,
         status: 0,
         hold: false,
-        ct: [0; HC_CT_MAX],
-        ct_len: 0,
-        hdrs: [0; HC_HDR_MAX],
-        hdrs_len: 0,
+        meta: [0; HC_META_MAX],
+        meta_len: 0,
         stash: HcBytes::EMPTY,
     };
 
@@ -344,6 +351,64 @@ fn hc_content_type_is(h: &[u8], ct: &[u8]) -> bool {
         let v = v.split(|&c| c == b';').next().unwrap_or(&[]).trim_ascii();
         v.eq_ignore_ascii_case(ct)
     })
+}
+
+/// The header lines `meta` reaches the chain as: `name: value\r\n` per
+/// field, the binding's own `:` fields left out. Their length; `None` when a
+/// value holds a CR or LF, which would end the line and smuggle in another.
+fn hc_meta_lines_len(meta: &[u8]) -> Option<usize> {
+    let mut n = 0usize;
+    for (key, val) in hx::meta_fields(meta) {
+        if key.first() == Some(&b':') {
+            continue;
+        }
+        if val.iter().any(|&c| c == b'\r' || c == b'\n') {
+            return None;
+        }
+        n += key.len() + 2 + val.len() + 2;
+    }
+    Some(n)
+}
+
+/// Push `meta` onto `buf` as the header lines [`hc_meta_lines_len`] counts.
+fn hc_push_meta_lines<H: HcHeap>(
+    buf: &mut HcBytes,
+    heap: &mut H,
+    meta: &[u8],
+    limit: usize,
+) -> bool {
+    for (key, val) in hx::meta_fields(meta) {
+        if key.first() == Some(&b':') {
+            continue;
+        }
+        for part in [key, b": ", val, b"\r\n"] {
+            if !buf.push(heap, part, limit) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A reply envelope's content type `ct` and header lines `hdrs` as response
+/// meta in `out`, with the `retry-after` every 503 this front sends carries
+/// (the chain's — a write the store did not decide — as much as its own).
+/// Its length; `None` when it does not fit or a header name is not a key.
+fn hc_reply_meta(status: u16, ct: &[u8], hdrs: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut n = 0usize;
+    if !ct.is_empty() {
+        let mut w = hx::MetaWriter::new(out);
+        w.put(hx::META_CONTENT_TYPE, ct);
+        n = w.finish()?;
+    }
+    n += hh::meta_from_header_lines(hdrs, out.get_mut(n..)?)?;
+    let has_retry = hx::meta_get(out.get(..n)?, b"retry-after").is_some();
+    if status == hh::status::SERVICE_UNAVAILABLE && !has_retry {
+        let mut w = hx::MetaWriter::new(out.get_mut(n..)?);
+        w.put(b"retry-after", HC_RETRY_AFTER);
+        n += w.finish()?;
+    }
+    Some(n)
 }
 
 /// What a record the module is to write to the server stands for, so the
@@ -427,7 +492,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             let waiting = matches!(s.st, HC_STAGE | HC_READY | HC_CHAIN) && !s.head_set;
             if waiting && now.saturating_sub(s.opened_ms) >= HC_ANSWER_MS {
                 s.stash.release(heap);
-                self.refuse(heap, at, hx::status::BUSY);
+                self.refuse(heap, at, hh::status::SERVICE_UNAVAILABLE);
                 if let Some(s) = self.slots.get_mut(at) {
                     s.late = true;
                 }
@@ -496,7 +561,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
 
     /// Take one request-direction record from the server.
     fn take_request<H: HcHeap>(&mut self, heap: &mut H, record: &[u8]) {
-        let Some(rec) = hx::parse_request(record) else {
+        let Ok(rec) = hx::parse_request::<hh::Http>(record) else {
             return;
         };
         match rec {
@@ -511,9 +576,9 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
                 let limit = self.slots[at].parts_len() + self.cfg.max_body as usize;
                 if !self.slots[at].req.push(heap, data, limit) {
                     let status = if self.slots[at].req.len() + data.len() > limit {
-                        hx::status::TOO_LARGE
+                        hh::status::PAYLOAD_TOO_LARGE
                     } else {
-                        hx::status::BUSY
+                        hh::status::SERVICE_UNAVAILABLE
                     };
                     self.refuse(heap, at, status);
                     return;
@@ -544,14 +609,20 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             self.free(heap, at);
         }
         let Some(at) = self.slots.iter().position(|s| s.st == HC_FREE) else {
-            self.queue_refusal(h.id, hx::status::BUSY);
+            self.queue_refusal(h.id, hh::status::SERVICE_UNAVAILABLE);
             return;
         };
-        let parts = h.target.len() + h.headers.len() + h.peer.len();
+        // The meta reaches the chain as header lines, each field's bytes
+        // and `: ` and CRLF.
+        let Some(hdr_len) = hc_meta_lines_len(h.meta) else {
+            self.queue_refusal(h.id, hh::status::BAD_REQUEST);
+            return;
+        };
+        let parts = h.target.len() + hdr_len + h.peer.len();
         // Every part must fit one envelope beside the smallest body; a body
         // past the bound is refused before any of it is held.
         if parts + HC_REQ_HEAD + 2 > HC_ENV_MAX || h.body.len() > self.cfg.max_body as usize {
-            self.queue_refusal(h.id, hx::status::TOO_LARGE);
+            self.queue_refusal(h.id, hh::status::PAYLOAD_TOO_LARGE);
             return;
         }
         let cid = self.new_cid();
@@ -561,18 +632,18 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         s.st = HC_COLLECT;
         s.id = h.id;
         s.cid = cid;
-        s.method = h.method;
+        s.method = h.verb;
         s.target_len = h.target.len() as u16;
-        s.hdr_len = h.headers.len() as u16;
+        s.hdr_len = hdr_len as u16;
         s.peer_len = h.peer.len() as u16;
         s.credit = h.resp_credit;
         s.opened_ms = self.now_ms;
         let ok = s.req.push(heap, h.target, limit)
-            && s.req.push(heap, h.headers, limit)
+            && hc_push_meta_lines(&mut s.req, heap, h.meta, limit)
             && s.req.push(heap, h.peer, limit)
             && s.req.push(heap, h.body, limit);
         if !ok {
-            self.refuse(heap, at, hx::status::BUSY);
+            self.refuse(heap, at, hh::status::SERVICE_UNAVAILABLE);
             return;
         }
         self.taken = self.taken.wrapping_add(1);
@@ -601,7 +672,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         };
         let env = HC_REQ_HEAD + s.target_len as usize + s.hdr_len as usize + body_bytes + peer;
         if env > HC_ENV_MAX || body_bytes > u16::MAX as usize {
-            self.refuse(heap, at, hx::status::TOO_LARGE);
+            self.refuse(heap, at, hh::status::PAYLOAD_TOO_LARGE);
             return;
         }
         let seq = self.next_seq;
@@ -653,7 +724,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         ok = ok && nb.push(heap, peer, limit);
         if !ok || new_h > u16::MAX as usize {
             nb.release(heap);
-            self.refuse(heap, at, hx::status::BUSY);
+            self.refuse(heap, at, hh::status::SERVICE_UNAVAILABLE);
             return false;
         }
         let res = {
@@ -677,7 +748,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             Err(e) => {
                 nb.release(heap);
                 let status = match e {
-                    PbErr::Full => hx::status::TOO_LARGE,
+                    PbErr::Full => hh::status::PAYLOAD_TOO_LARGE,
                     _ => 415,
                 };
                 self.refuse(heap, at, status);
@@ -706,7 +777,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
             return;
         }
         let Some(hex) = hex else {
-            self.refuse(heap, at, hx::status::FAILED);
+            self.refuse(heap, at, hh::status::INTERNAL_SERVER_ERROR);
             return;
         };
         let s = &mut self.slots[at];
@@ -821,24 +892,18 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
                 s.abort = hx::abort::FAILED;
                 return true;
             }
+            // A status the binding does not carry, or header lines that do
+            // not make meta, fail the exchange the same way.
+            let meta = hc_reply_meta(status, ct, hdrs, &mut s.meta);
+            let Some(meta_len) = meta.filter(|_| hh::outcome_of(status).is_some()) else {
+                s.st = HC_ABORT;
+                s.abort = hx::abort::FAILED;
+                return true;
+            };
             s.head_set = true;
             s.status = status;
             s.hold = flags & HC_HOLD != 0;
-            s.ct[..ct.len()].copy_from_slice(ct);
-            s.ct_len = ct.len() as u8;
-            s.hdrs[..hdrs.len()].copy_from_slice(hdrs);
-            s.hdrs_len = hdrs.len() as u16;
-            // Every 503 this front sends says when to ask again: the chain's
-            // (a write the store did not decide) as much as its own.
-            let n = hdrs.len();
-            if status == hx::status::BUSY && hx::header(hdrs, b"retry-after").is_none() {
-                if let Some(d) = s.hdrs.get_mut(n..n + HC_LATE_HDRS.len()) {
-                    for (o, &b) in d.iter_mut().zip(HC_LATE_HDRS) {
-                        *o = b;
-                    }
-                    s.hdrs_len = (n + HC_LATE_HDRS.len()) as u16;
-                }
-            }
+            s.meta_len = meta_len as u16;
         }
         if !s.stash.push(heap, body, stash_max) {
             // The server is not taking this exchange's response as fast as
@@ -861,7 +926,7 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
     fn next_out(&mut self, out: &mut [u8]) -> Option<(HcOut, usize)> {
         if self.queued_len > 0 {
             let (id, status) = self.queued[0];
-            let n = hx::write_response(&id, status, &[], &[], out)?;
+            let n = hh::write_response(&id, status, &[], &[], out)?;
             return Some((HcOut::Queued, n));
         }
         for k in 0..SLOTS {
@@ -882,36 +947,25 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
                 Some((HcOut::Grant(at), n))
             }
             HC_REFUSE if s.late => {
-                let n = hx::write_response_head(
-                    &hx::ResponseHead {
-                        id: s.id,
-                        flags: 0,
-                        status: s.refuse,
-                        content_type: HC_LATE_CT,
-                        headers: HC_LATE_HDRS,
-                        body: HC_LATE_BODY,
-                    },
-                    out,
-                )?;
+                let mut meta = [0u8; 64];
+                let mut w = hx::MetaWriter::new(&mut meta);
+                w.put(hx::META_CONTENT_TYPE, HC_LATE_CT);
+                w.put(b"retry-after", HC_RETRY_AFTER);
+                let m = w.finish()?;
+                let n = hh::write_response(&s.id, s.refuse, meta.get(..m)?, HC_LATE_BODY, out)?;
                 Some((HcOut::Refusal(at), n))
             }
-            HC_REFUSE if s.refuse == hx::status::BUSY => {
+            HC_REFUSE if s.refuse == hh::status::SERVICE_UNAVAILABLE => {
                 // As many exchanges as this desk holds: asked again, later.
-                let n = hx::write_response_head(
-                    &hx::ResponseHead {
-                        id: s.id,
-                        flags: 0,
-                        status: s.refuse,
-                        content_type: &[],
-                        headers: HC_LATE_HDRS,
-                        body: &[],
-                    },
-                    out,
-                )?;
+                let mut meta = [0u8; 32];
+                let mut w = hx::MetaWriter::new(&mut meta);
+                w.put(b"retry-after", HC_RETRY_AFTER);
+                let m = w.finish()?;
+                let n = hh::write_response(&s.id, s.refuse, meta.get(..m)?, &[], out)?;
                 Some((HcOut::Refusal(at), n))
             }
             HC_REFUSE => {
-                let n = hx::write_response(&s.id, s.refuse, &[], &[], out)?;
+                let n = hh::write_response(&s.id, s.refuse, &[], &[], out)?;
                 Some((HcOut::Refusal(at), n))
             }
             HC_ABORT => {
@@ -927,26 +981,17 @@ impl<const SLOTS: usize> HcDesk<SLOTS> {
         let stash = s.stash.bytes();
         let credit = s.credit as usize;
         if !s.head_sent {
-            let ct = s.ct.get(..s.ct_len as usize)?;
-            let hdrs = s.hdrs.get(..s.hdrs_len as usize)?;
-            let room = hx::RECORD_MAX - (hx::HDR + hx::RESP_HEAD_FIXED + ct.len() + hdrs.len());
+            let meta = s.meta.get(..s.meta_len as usize)?;
+            let room = hx::RECORD_MAX - hx::response_body_at(meta.len());
             let n = stash.len().min(credit).min(room);
             let ends = s.done && n == stash.len();
             let mut flags = if ends { 0 } else { hx::flag::MORE };
             if s.hold {
                 flags |= hx::flag::HOLD;
             }
-            let len = hx::write_response_head(
-                &hx::ResponseHead {
-                    id: s.id,
-                    flags,
-                    status: s.status,
-                    content_type: ct,
-                    headers: hdrs,
-                    body: stash.get(..n)?,
-                },
-                out,
-            )?;
+            let mut head = hh::head(s.id, s.status, meta, stash.get(..n)?)?;
+            head.flags = flags;
+            let len = hx::write_response_head::<hh::Http>(&head, out)?;
             return Some((HcOut::Response(at, n, ends), len));
         }
         let n = stash.len().min(credit).min(hx::BODY_MAX);

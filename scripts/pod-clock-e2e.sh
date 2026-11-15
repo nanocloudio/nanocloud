@@ -48,9 +48,9 @@ RUNTIME_PID=""
 REG_PID=""
 cleanup() {
   if [ -n "$RUNTIME_PID" ]; then
-    sudo -n pkill -f "$D/[c]onfig.bin" 2>/dev/null || true
-    for _ in $(seq 20); do pgrep -f "$D/[c]onfig.bin" >/dev/null || break; sleep 0.5; done
-    sudo -n pkill -KILL -f "$D/[c]onfig.bin" 2>/dev/null || true
+    sudo -n pkill -f "$D/[g]raph.img" 2>/dev/null || true
+    for _ in $(seq 20); do pgrep -f "$D/[g]raph.img" >/dev/null || break; sleep 0.5; done
+    sudo -n pkill -KILL -f "$D/[g]raph.img" 2>/dev/null || true
   fi
   sudo -n pkill -f "$D/[r]ootfs" 2>/dev/null || true
   # The server runs pivoted into its image's root, where no path names $D.
@@ -167,15 +167,28 @@ iblocks, ipairs = parts(f"{root}/packaging/debian/fluxor-imagepull.yaml")
 img = "".join(iblocks)
 img = sub('authority: "registry.nanocloud.io:5000"', f'authority: "{registry}"', img)
 img = sub('dir: "/var/lib/nanocloud.io/image/blobs"', f'dir: "{blobs}"', img)
+# The node keeps its own lease, as the render gives a node that runs Pods
+# (fluxor-worker.yaml `nl_self`/`nl_renew`). Without it the plane takes the
+# node out of service 30 s after it last saw the Node change.
+wk = open(f"{root}/packaging/debian/fluxor-worker.yaml").read()
+lease = wk[wk.index("  - name: nl_self\n"):wk.index("\nwiring:")]
+facts = f'"kubernetes.io/arch":"arm64","kubernetes.io/os":"linux","kubernetes.io/hostname":"{node}"'
+for k, v in (("__NODE_NAME__", node), ("__NODE_FACTS__", facts),
+             ("__NODE_ADDRESS__", "127.0.0.1"),
+             ("__NODE_CAPACITY__", '"cpu":"4","memory":"4Gi","pods":"110"')):
+    if k not in lease: sys.exit(f"no {k} in fluxor-worker.yaml's lease")
+    lease = lease.replace(k, v)
 # Endpoints come with the control plane (its Service plane).
 mods, wiring = g.split("\nwiring:\n", 1)
 g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane ──\n" + kube.rstrip("\n") + "\n"
-     + img.rstrip("\n") + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
-     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs))
+     + img.rstrip("\n") + "\n  # ── The node's lease ──\n" + lease.rstrip("\n")
+     + "\n\nwiring:\n" + wiring.rstrip("\n") + "\n"
+     + "".join(f"  - from: {a}\n    to: {b}\n" for a, b in pairs + ipairs)
+     + "  - from: nl_self.record_out\n    to: nl_renew.request_in\n")
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 echo "== 4. the clock shim: CLOCK_REALTIME from the host's boot, adjtimex unsynchronised, until \$D/clock says 1 =="
 cat >"$D/clk.c" <<'CEOF'
@@ -226,7 +239,7 @@ echo "== 6. boot it, its clock unset =="
 T_BOOT="$(date +%s)"
 sudo -n env -C "$STORE" LD_PRELOAD="$D/clk.so" NC_CLOCK_FILE="$D/clock" FLUXOR_SEAL_KEY=0123456789abcdef \
   FLUXOR_OWNER_ROOT="$D/owners" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 90 || fail "the store never answered"
 pod() { nc_store_get "$STORE" /pods/default/clk; }

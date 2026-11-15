@@ -5,21 +5,18 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::storage::namespace::{self as ns, changes};
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 include!("../_shared/json.rs");
 include!("../_shared/pathmod.rs");
 include!("../_shared/jsonpatch.rs");
@@ -89,6 +86,9 @@ const TABLE_SPEC: usize = 2048;
 const DOC_SCHEMA_MAX: usize = 2048;
 /// `paths` fields land at 4..=18; 19 on are the record's own.
 const MAX_PATHS: usize = 15;
+/// Subscriptions one source holds: its prefix and one per extra watch,
+/// which the composer counts at most 15 of (`[capacities]`).
+const MAX_SUBS: usize = 16;
 /// `ints` land at 50..=56; 57 is the key remainder and 58 the clock.
 const MAX_INTS: usize = 7;
 const FRAME_BUF: usize = 8192;
@@ -120,12 +120,13 @@ const MAX_CURSOR: usize = 255;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// The kernel event every subscription of this source rings
-    /// (`store_event`), or -1: the store signals it on a change under a
-    /// watched prefix and writes no channel of ours.
-    event: i32,
+    /// Every subscription of this source (`store_subscribe`), -1 where
+    /// none: each rings when something under its prefix changes, and the
+    /// store writes no channel of ours.
+    subs: [Sub; MAX_SUBS],
     /// The first subscription's handle (-1: none): the one a watch's
-    /// `CHANGES` read names, so the store rings it again after an `EAGAIN`.
+    /// `CHANGES` read goes through, so the store rings it again after an
+    /// `EAGAIN`.
     sub: i32,
     record_out: i32,
     resolved: u8,
@@ -547,10 +548,6 @@ struct State {
     /// CHANGES calls this step and their time (the events phase's reads).
     st_chg_us: u32,
     st_chgs: u16,
-    /// A TAKE_RUNG that failed after the event was polled: its rung bits are
-    /// still set, so the store will not signal again for them — asked again
-    /// each step until it answers.
-    take_owed: u8,
     /// Since boot: store calls by kind and their time, rings, scans — the
     /// heartbeat ([`hb_line`]) a board run reads a source's cost from.
     c_lists: u32,
@@ -639,10 +636,9 @@ mod params_def {
     use super::p_u32;
     use super::ptr_copy;
     use super::State;
-    use super::SCHEMA_MAX;
     use super::{LIST_BUF, MAX_PATHS_SPEC, MAX_PREFIX, PATHS_TEXT};
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, prefix, str, 0
@@ -1092,20 +1088,15 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) ->
     if w.get() {
         return None;
     }
-    let mut garg = [0u8; MAX_KEY];
-    if key.len() > garg.len() {
+    if key.len() > MAX_KEY {
         return None;
     }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
+    let h = obj_get(sys, key);
     if h < 0 {
         w.absent(sys, b"GET", key, h);
         return None;
     }
-    let mut rarg = [0u8; 20];
-    rarg[8..12].copy_from_slice(&(dst.len() as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
+    let n = range_get(sys, h, 0, dst);
     // A value the buffer cannot hold is REFUSED, never read as a prefix of
     // itself: a projection over a cut document reads whatever the cut left
     // (a label set missing its tail, a spec without its last container) as
@@ -1114,18 +1105,13 @@ unsafe fn get_value(sys: &SyscallTable, key: &[u8], dst: &mut [u8], w: &Wait) ->
     let mut cut = false;
     if n >= 0 && n as usize == dst.len() {
         let mut probe = [0u8; 1];
-        let mut parg = [0u8; 20];
-        parg[0..8].copy_from_slice(&(dst.len() as u64).to_le_bytes());
-        parg[8..12].copy_from_slice(&1u32.to_le_bytes());
-        parg[12..20].copy_from_slice(&(probe.as_mut_ptr() as u64).to_le_bytes());
-        let pr = (sys.provider_call)(h, OBJ_RANGE_GET, parg.as_mut_ptr(), 20);
+        let pr = range_get(sys, h, dst.len() as u64, &mut probe);
         cut = pr > 0;
         if pr < 0 {
             w.refused_open(sys, b"RANGE_GET", key, pr);
         }
     }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    obj_close(sys, h);
     // A refused read of an open handle is never absence.
     if n < 0 {
         w.refused_open(sys, b"RANGE_GET", key, n);
@@ -1184,28 +1170,24 @@ fn sub_covered(one: &[u8], skip: usize, watches: &[u8]) -> bool {
     false
 }
 
-/// Create this source's subscription event (`kernel_abi::event::CREATE`):
-/// the event fd, or a negative errno. Every subscription it opens names it.
-unsafe fn store_event(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
-}
-
-/// storage.namespace SUBSCRIBE: ring `event` on every change under `prefix`
-/// (`namespace::subscribe`). The handle — the same one again for the same
-/// prefix and event, so a subscribe run again leaks nothing — or the
-/// store's "not yet" ([`not_yet`]: nothing was made, asked again next step),
+/// storage.namespace SUBSCRIBE on `prefix` (`namespace::subscribe`): the
+/// subscription handle, which rings on every change under it; or the
+/// store's "not yet" ([`not_yet`]: nothing was made, asked again next step);
 /// or a refusal, said at ERROR.
-unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8], event: i32) -> i32 {
-    let mut arg = [0u8; MAX_KEY + 16];
-    let req = ns::subscribe::Request {
-        prefix,
-        event,
-        flags: 0,
-    };
+unsafe fn store_subscribe(sys: &SyscallTable, prefix: &[u8]) -> i32 {
+    let mut arg = [0u8; ns::subscribe::arg_len(MAX_KEY)];
+    let req = ns::subscribe::Request { prefix, flags: 0 };
     let Some(len) = ns::subscribe::encode(&mut arg, &req) else {
         return -22;
     };
-    let rc = (sys.provider_call)(-1, ns::SUBSCRIBE, arg.as_mut_ptr(), len);
+    let rc = (sys.provider_call)(
+        -1,
+        ns::SUBSCRIBE,
+        arg.as_mut_ptr(),
+        len,
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 && !not_yet(rc) {
         // The store's subscription capacity is spent (or the prefix is
         // refused): this source still scans once, but a change here will
@@ -1435,64 +1417,101 @@ unsafe fn trace_line(s: &State) {
     dev_log(&*s.syscalls, 3, b.as_ptr(), n);
 }
 
-/// `TAKE_RUNG` handles one answer holds.
-const TAKE_BATCH: usize = 16;
+/// One subscription this source holds: its handle (-1: none), the prefix it
+/// watches, and the revision its feed rests at — where the read that takes
+/// its next ring starts.
+#[derive(Clone, Copy)]
+struct Sub {
+    h: i32,
+    at: u64,
+    plen: u8,
+    prefix: [u8; MAX_PREFIX],
+}
 
-/// `event::POLL` this source's event and, when it fired, ask `TAKE_RUNG`
-/// which of its subscriptions rang (clearing their rung bits): how many
-/// were named. Non-zero means a pass is owed. The store keeps one rung bit
-/// per subscription and signals only when it was clear, so a burst of
-/// changes is one ring — and a pass dropped on a failure is never rung
-/// again for them.
-unsafe fn store_take(sys: &SyscallTable, event: i32, owed: &mut u8) -> u32 {
-    if event < 0 {
-        return 0;
+const SUB_NONE: Sub = Sub {
+    h: -1,
+    at: 0,
+    plen: 0,
+    prefix: [0; MAX_PREFIX],
+};
+
+impl Sub {
+    fn new(h: i32, prefix: &[u8]) -> Sub {
+        let mut s = SUB_NONE;
+        let n = prefix.len().min(MAX_PREFIX);
+        s.prefix[..n].copy_from_slice(&prefix[..n]);
+        s.plen = n as u8;
+        s.h = h;
+        s
     }
-    if *owed == 0 {
-        let fired = (sys.provider_call)(
-            event,
-            abi::kernel_abi::event::POLL,
+}
+
+/// `HANDLE_POLL` each subscription in `subs` for `POLL_IN`, which takes the
+/// kernel's ring, and read each that rang through its handle
+/// ([`take_ring`]), which takes the store's: the store rings a subscription
+/// once until it is read, so a ring not read would be the last. How many
+/// rang: non-zero means a pass is owed, and it starts after the reads. A
+/// burst of changes is one ring, so a pass dropped on a failure is never
+/// rung again for them: the caller keeps it owed.
+unsafe fn store_rang(sys: &SyscallTable, subs: &mut [Sub]) -> u32 {
+    let mut rang = 0u32;
+    for s in subs.iter_mut() {
+        if s.h < 0 {
+            continue;
+        }
+        let mut events = [abi::kernel_abi::poll::IN as u8];
+        let rc = (sys.provider_call)(
+            s.h,
+            abi::kernel_abi::HANDLE_POLL,
+            events.as_mut_ptr(),
+            events.len(),
             core::ptr::null_mut(),
             0,
         );
-        if fired <= 0 {
-            return 0;
+        if rc > 0 && rc as u32 & abi::kernel_abi::poll::IN != 0 {
+            rang += 1;
+            take_ring(sys, s);
         }
     }
-    // Polled (or owed from a take that failed): the take is asked until it
-    // answers — its rung bits stay set until then, so the store will not
-    // signal again for them.
-    *owed = 1;
-    let mut named = 0u32;
-    // A take whose handles did not fit says `more`: taken again here, a few
-    // times; past that the store signals the event again for the next step.
-    for _ in 0..4 {
-        let mut out = [0u8; ns::take::HEAD_LEN + 4 * TAKE_BATCH];
-        let req = ns::take::Request {
-            event,
-            out_ptr: out.as_mut_ptr() as u64,
-            out_cap: out.len() as u32,
-        };
-        let mut arg = [0u8; ns::take::REQUEST_LEN];
-        let Some(len) = ns::take::encode(&mut arg, &req) else {
-            break;
-        };
-        let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
-        if n < 0 {
-            // Still owed: asked again next step. A pass is owed too — the
-            // ring happened — so the caller scans.
-            return named.max(1);
-        }
-        let Some((more, handles)) = ns::take::decode(out.get(..n as usize).unwrap_or(&[])) else {
-            return named.max(1);
-        };
-        named += handles.count() as u32;
-        if !more {
-            *owed = 0;
-            break;
-        }
+    rang
+}
+
+/// One `CHANGES` page of `s`'s prefix, read through its handle from where
+/// its feed rests. The records are not this read's business — the pass
+/// reads the prefix itself — only where the feed now rests: the page's
+/// `safe_rev`, or, on a page that says LOST (the rest point is one the
+/// store cannot answer from), the revision the page was read at. A read the
+/// store answers `EAGAIN` it rings again once it can answer.
+unsafe fn take_ring(sys: &SyscallTable, s: &mut Sub) {
+    let token = changes::revision_token(s.at);
+    let mut arg = [0u8; changes::arg_len(MAX_PREFIX, changes::REVISION_TOKEN_LEN)];
+    let req = changes::Request {
+        prefix: &s.prefix[..s.plen as usize],
+        token: &token,
+    };
+    let Some(len) = changes::encode_request(&mut arg, &req) else {
+        return;
+    };
+    let mut page = [0u8; 512];
+    let rc = (sys.provider_call)(
+        s.h,
+        ns::CHANGES,
+        arg.as_mut_ptr(),
+        len,
+        page.as_mut_ptr(),
+        page.len(),
+    );
+    let Some(p) = page
+        .get(..rc.max(0) as usize)
+        .and_then(changes::decode_page)
+    else {
+        return;
+    };
+    if p.lost {
+        s.at = trailer_revision(&arg[..len]);
+    } else if p.safe_rev > s.at {
+        s.at = p.safe_rev;
     }
-    named
 }
 
 /// One page of a storage.namespace LIST, RAW: `out` is handed to the provider
@@ -1541,32 +1560,16 @@ unsafe fn list_page_fenced(
     if w.get() {
         return (0, 0);
     }
-    let mut larg = [0u8; MAX_KEY + MAX_CURSOR + 32];
-    if 2 + prefix.len() + 2 + cursor_in.len() + 8 + 4 + 8 + 2 > larg.len() {
+    let mut larg = [0u8; ns::list::arg_len(MAX_KEY, MAX_CURSOR)];
+    let req = ns::list::Request {
+        prefix,
+        cursor: cursor_in,
+    };
+    let Some(p) = ns::list::encode_request(&mut larg, &req) else {
         return (0, 0);
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    larg[p..p + 2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    larg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    larg[p..p + 2].copy_from_slice(&(cursor_in.len() as u16).to_le_bytes());
-    p += 2;
-    if !cursor_in.is_empty() {
-        larg[p..p + cursor_in.len()].copy_from_slice(cursor_in);
-        p += cursor_in.len();
-    }
-    larg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
+    };
     let cap = cap.clamp(64, out.len());
-    larg[p..p + 4].copy_from_slice(&(cap as u32).to_le_bytes());
-    p += 4;
-    larg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    larg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p);
+    let n = (sys.provider_call)(-1, NS_LIST, larg.as_mut_ptr(), p, out.as_mut_ptr(), cap);
     if n < 0 {
         // Not yet — or refused, which a listing never answers for "empty":
         // no page, no fence, and not the end. The pass waits and asks
@@ -1574,7 +1577,7 @@ unsafe fn list_page_fenced(
         w.refused_open(sys, b"LIST", prefix, n);
         return (0, 0);
     }
-    *fence_out = fence_revision(&fence);
+    *fence_out = trailer_revision(&larg[..p]);
     let n = (n as usize).min(cap);
     // Find the trailing record to lift the cursor out; entries are consumed
     // by the caller, in place.
@@ -4352,11 +4355,7 @@ unsafe fn emit_page(s: &mut State) -> u32 {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: ARENA_BYTES }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -4388,9 +4387,9 @@ pub unsafe extern "C" fn module_new(
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         // `record_out` is output port 0, handed over directly rather than
-        // resolved by index. No input: a change rings the source's own kernel
-        // event, created at the first step.
-        s.event = -1;
+        // resolved by index. No input: a change rings one of the source's
+        // own subscriptions, made at the first step.
+        s.subs = [SUB_NONE; MAX_SUBS];
         s.sub = -1;
         s.record_out = out_chan;
         s.resolved = 0;
@@ -4479,7 +4478,6 @@ pub unsafe extern "C" fn module_new(
         s.st_chgs = 0;
         s.st_phase = 0;
         s.st_slow = 0;
-        s.take_owed = 0;
         s.c_lists = 0;
         s.c_gets = 0;
         s.c_chgs = 0;
@@ -4559,17 +4557,17 @@ const SLOW_LOG_MAX: u32 = 64;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         // ONE `&mut State` for the whole step, reborrowed into the body: a
         // second one taken from `state` while this is live would alias it,
         // and the body writes the very counters this reads back afterwards.
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         let t0 = dev_micros(sys);
@@ -4595,10 +4593,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-unsafe fn step_body(s: &mut State) -> i32 {
+unsafe fn step_body(s: &mut State) -> StepReturn {
     unsafe {
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
 
@@ -4609,25 +4607,16 @@ unsafe fn step_body(s: &mut State) -> i32 {
             if s.related_cut != 0 {
                 let m = b"[store_source] FAULT: `related` longer than its room - REFUSED, a record would miss its last fields";
                 dev_log(sys, 1, m.as_ptr(), m.len());
-                return -22;
+                return StepReturn::error(-22);
             }
             if entries(&s.paths[..s.paths_len as usize]) > MAX_PATHS
                 || entries(&s.ints[..s.ints_len as usize]) > MAX_INTS
             {
                 let m = b"[store_source] FAULT: more than 15 paths or 7 ints - REFUSED, a record has no field for the rest";
                 dev_log(sys, 1, m.as_ptr(), m.len());
-                return -22;
+                return StepReturn::error(-22);
             }
-            if s.event < 0 && s.prefix_len > 0 {
-                // One kernel event for every subscription of this source.
-                s.event = store_event(sys);
-                if s.event < 0 {
-                    let m =
-                        b"[store_source] ERROR no kernel event - changes will NOT wake this source";
-                    dev_log(sys, 1, m.as_ptr(), m.len());
-                }
-            }
-            if s.event >= 0 && s.prefix_len > 0 {
+            if s.prefix_len > 0 && s.subscribed == 0 {
                 // One subscription per prefix that no other of this source's
                 // prefixes covers: its own prefix and its extra watches all
                 // mean the same thing — "something changed, scan again" —
@@ -4636,8 +4625,8 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 // is shared by every module of the node; a watch spelt
                 // coarsely (`/image-`, `/rbac-`) is how a source that reads
                 // a family of prefixes takes one seat instead of five. A
-                // subscribe run again (after a "not yet") answers the same
-                // handle for a prefix already made.
+                // subscribe answered "not yet" made nothing and is asked
+                // again next step.
                 let plen = s.prefix_len as usize;
                 let mut pfx = [0u8; MAX_PREFIX];
                 pfx[..plen].copy_from_slice(&s.prefix[..plen]);
@@ -4647,16 +4636,18 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 let watches = &wspec[..w];
                 s.st_phase = 1;
                 if !sub_covered(&pfx[..plen], usize::MAX, watches) {
-                    s.t_subrc = store_subscribe(sys, &pfx[..plen], s.event);
+                    s.t_subrc = store_subscribe(sys, &pfx[..plen]);
                     if not_yet(s.t_subrc) {
                         // The store cannot take it yet: nothing was made, and
                         // it is asked again next step.
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if s.t_subrc >= 0 {
                         s.sub = s.t_subrc;
+                        s.subs[0] = Sub::new(s.t_subrc, &pfx[..plen]);
                     }
                 }
+                let mut n_subs = 1usize;
                 // Extra watches: changes here re-arm the scan but are never
                 // listed, so a deleted child wakes its parent.
                 for (i, one) in watches.split(|&b| b == b',').enumerate() {
@@ -4666,7 +4657,17 @@ unsafe fn step_body(s: &mut State) -> i32 {
                     if one.starts_with(&pfx[..plen]) || sub_covered(one, i, watches) {
                         continue;
                     }
-                    let rc = store_subscribe(sys, one, s.event);
+                    let Some(slot) = s.subs.get_mut(n_subs) else {
+                        // Past every seat this source keeps: said, and the
+                        // rest wake it only through its timer.
+                        sub_refused_log(sys, one, -12);
+                        continue;
+                    };
+                    let rc = store_subscribe(sys, one);
+                    if rc >= 0 {
+                        *slot = Sub::new(rc, one);
+                        n_subs += 1;
+                    }
                     if s.t_subrc >= 0 && rc < 0 {
                         s.t_subrc = rc;
                     }
@@ -4680,13 +4681,11 @@ unsafe fn step_body(s: &mut State) -> i32 {
             s.dirty = 1; // cold start: emit the current set once
         }
 
-        let mut owed = s.take_owed;
-        if store_take(sys, s.event, &mut owed) > 0 {
+        if store_rang(sys, &mut s.subs) > 0 {
             s.dirty = 1;
             s.t_wakes = s.t_wakes.wrapping_add(1);
             s.hb_work = s.hb_work.wrapping_add(1);
         }
-        s.take_owed = owed;
         let now_ms = dev_millis(sys) as i64;
         if s.hb_at == 0 {
             // Spread over the minute by the prefix, so a node's hundred
@@ -4715,7 +4714,14 @@ unsafe fn step_body(s: &mut State) -> i32 {
             let poll = dev_fd_poll(sys, s.timer_fd, POLL_IN);
             if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                 let mut none = [0u8; 4];
-                (sys.provider_call)(s.timer_fd, TIMER_CANCEL, none.as_mut_ptr(), 0);
+                (sys.provider_call)(
+                    s.timer_fd,
+                    TIMER_CANCEL,
+                    none.as_mut_ptr(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.retry_at = 0;
                 s.dirty = 1;
             }
@@ -4727,12 +4733,12 @@ unsafe fn step_body(s: &mut State) -> i32 {
             s.st_phase = 2;
             if !flush(s) {
                 s.t_stalls = s.t_stalls.wrapping_add(1);
-                return 0;
+                return StepReturn::Continue;
             }
             if s.events != 0 {
                 s.st_phase = 3;
                 events_step(s);
-                return 0;
+                return StepReturn::Continue;
             }
             if s.paging == 0 && s.dirty == 1 {
                 s.dirty = 0;
@@ -4773,7 +4779,7 @@ unsafe fn step_body(s: &mut State) -> i32 {
                 scan_failed(s, rc);
             }
         }
-        0
+        StepReturn::Continue
     }
 }
 
@@ -4829,7 +4835,14 @@ unsafe fn retry_later(s: &mut State) {
         }
     }
     let mut d = (RETRY_MS as u32).to_le_bytes();
-    (sys.provider_call)(s.timer_fd, TIMER_SET, d.as_mut_ptr(), 4);
+    (sys.provider_call)(
+        s.timer_fd,
+        TIMER_SET,
+        d.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// The members of a JSON object: everything between its outer braces, with
@@ -5049,27 +5062,41 @@ unsafe fn store_changes(
     if w.get() {
         return ERR_EAGAIN;
     }
-    let mut arg = [0u8; MAX_KEY + changes::TOKEN_MAX + changes::REQUEST_FIXED_LEN];
-    let mut fence = [0u8; 64];
-    let req = changes::Request {
-        prefix,
-        sub,
-        token,
-        out_ptr: out.as_mut_ptr() as u64,
-        out_cap: out.len().min(u32::MAX as usize) as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: fence.len() as u16,
-    };
+    let mut arg = [0u8; changes::arg_len(MAX_KEY, changes::TOKEN_MAX)];
+    let req = changes::Request { prefix, token };
     let Some(len) = changes::encode_request(&mut arg, &req) else {
         return -22;
     };
-    let n = (sys.provider_call)(-1, ns::CHANGES, arg.as_mut_ptr(), len);
+    let n = (sys.provider_call)(
+        if sub < 0 { -1 } else { sub },
+        ns::CHANGES,
+        arg.as_mut_ptr(),
+        len,
+        out.as_mut_ptr(),
+        out.len(),
+    );
     if n < 0 && n != ERR_ENOMEM {
         w.refused_open(sys, b"CHANGES", prefix, n);
         return n;
     }
-    *fence_rev = fence_revision(&fence);
+    *fence_rev = trailer_revision(&arg[..len]);
     n
+}
+
+/// The revision of the fence a one-shot op's `arg` ends with
+/// (`fence::trailer`): [`fence_revision`] of its encoded bytes.
+fn trailer_revision(arg: &[u8]) -> u64 {
+    use abi::fence::trailer;
+    let Some(t) = arg.get(arg.len().saturating_sub(trailer::LEN)..) else {
+        return 0;
+    };
+    let n = t.len().min(
+        usize::from(u16::from_le_bytes([
+            t.first().copied().unwrap_or(0),
+            t.get(1).copied().unwrap_or(0),
+        ])) + 2,
+    );
+    fence_revision(t.get(2..n).unwrap_or(&[]))
 }
 
 /// The revision of an encoded `ViewConsistent` fence (`fluxor fence.rs`:
@@ -5360,26 +5387,24 @@ unsafe fn purge_page(s: &mut State) -> bool {
 
 /// storage.object DELETE `key` unconditionally.
 unsafe fn delete_value(sys: &SyscallTable, key: &[u8]) -> WriteAnswer {
-    let mut arg = [0u8; MAX_KEY + 32];
-    if 2 + key.len() + 2 + 8 + 2 > arg.len() {
+    use abi::contracts::storage::object::{delete, precondition};
+    let mut arg = [0u8; delete::arg_len(MAX_KEY, 0)];
+    let req = delete::Request {
+        key,
+        precondition: precondition::ANY,
+        etag: &[],
+    };
+    let Some(n) = delete::encode_request(&mut arg, &req) else {
         return WriteAnswer::Decided(-22);
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    // The precondition PAIR `[precondition:u8][etag_len:u8]`: ANY, none.
-    arg[p] = 0;
-    p += 1;
-    arg[p] = 0;
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    write_answer((sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p))
+    };
+    write_answer((sys.provider_call)(
+        -1,
+        OBJ_DELETE,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    ))
 }
 
 /// Append `part` at `*at` in `out`; false when it does not fit. Sequential
@@ -5756,12 +5781,10 @@ unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8], w: &Wait) -
     if w.get() {
         return Val::Missing;
     }
-    let mut garg = [0u8; MAX_KEY];
-    if key.len() > garg.len() {
+    if key.len() > MAX_KEY {
         return Val::Missing;
     }
-    garg[..key.len()].copy_from_slice(key);
-    let h = (sys.provider_call)(-1, OBJ_GET, garg.as_mut_ptr(), key.len());
+    let h = obj_get(sys, key);
     if h < 0 {
         w.absent(sys, b"GET", key, h);
         return Val::Missing;
@@ -5784,8 +5807,7 @@ unsafe fn read_value(sys: &SyscallTable, key: &[u8], raw: &mut [u8], w: &Wait) -
             out = read_heap(sys, h, key, w);
         }
     }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    obj_close(sys, h);
     if wait < 0 {
         w.refused_open(sys, b"RANGE_GET", key, wait);
     }
@@ -5834,11 +5856,36 @@ unsafe fn too_big(sys: &SyscallTable, w: &Wait, key: &[u8]) {
 
 /// `RANGE_GET` at `off` into `dst`: bytes copied, or the provider's error.
 unsafe fn range_get(sys: &SyscallTable, h: i32, off: u64, dst: &mut [u8]) -> i32 {
-    let mut rarg = [0u8; 20];
-    rarg[0..8].copy_from_slice(&off.to_le_bytes());
-    rarg[8..12].copy_from_slice(&(dst.len() as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20)
+    let mut arg = abi::contracts::storage::object::range_get::encode(off);
+    (sys.provider_call)(
+        h,
+        OBJ_RANGE_GET,
+        arg.as_mut_ptr(),
+        arg.len(),
+        dst.as_mut_ptr(),
+        dst.len(),
+    )
+}
+
+/// storage.object GET of `key`: the read handle, or the provider's errno.
+unsafe fn obj_get(sys: &SyscallTable, key: &[u8]) -> i32 {
+    let mut arg = [0u8; MAX_KEY + 2];
+    let Some(n) = abi::contracts::storage::object::key::encode(&mut arg, key) else {
+        return -22;
+    };
+    (sys.provider_call)(-1, OBJ_GET, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
+}
+
+/// storage.object CLOSE of read handle `h`.
+unsafe fn obj_close(sys: &SyscallTable, h: i32) {
+    (sys.provider_call)(
+        h,
+        OBJ_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// The whole value behind an open handle, on the heap, the buffer doubled as
@@ -7095,12 +7142,26 @@ unsafe fn ev_arm(s: &mut State, sys: &SyscallTable) {
     }
     let mut none = [0u8; 4];
     if next == i64::MAX {
-        (sys.provider_call)(s.timer_fd, TIMER_CANCEL, none.as_mut_ptr(), 0);
+        (sys.provider_call)(
+            s.timer_fd,
+            TIMER_CANCEL,
+            none.as_mut_ptr(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         return;
     }
     let delay = (next - s.scan_now).clamp(1, u32::MAX as i64) as u32;
     let mut d = delay.to_le_bytes();
-    (sys.provider_call)(s.timer_fd, TIMER_SET, d.as_mut_ptr(), 4);
+    (sys.provider_call)(
+        s.timer_fd,
+        TIMER_SET,
+        d.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// store_watch — this source built with `big` — takes a heap arena: a whole
@@ -7113,20 +7174,13 @@ unsafe fn ev_arm(s: &mut State, sys: &SyscallTable) {
     unexpected_cfgs,
     reason = "`big` and `doc_heap` are store_watch's and store_scan's features; this file is also store_source, whose build declares neither"
 )]
-mod arena {
-    #[cfg(feature = "big")]
-    #[no_mangle]
-    #[link_section = ".text.module_arena_size"]
-    pub extern "C" fn module_arena_size() -> u32 {
-        32 << 20
-    }
-    #[cfg(feature = "doc_heap")]
-    #[no_mangle]
-    #[link_section = ".text.module_arena_size"]
-    pub extern "C" fn module_arena_size() -> u32 {
-        4 << 20
-    }
-}
+const ARENA_BYTES: usize = if cfg!(feature = "big") {
+    32 << 20
+} else if cfg!(feature = "doc_heap") {
+    4 << 20
+} else {
+    0
+};
 
 const TIMER_CONTRACT: u32 = abi::registry::timer::ID as u32;
 const TIMER_CREATE: u32 = abi::registry::timer::CREATE;
@@ -7237,12 +7291,26 @@ unsafe fn arm_due(s: &mut State, sys: &SyscallTable) {
     }
     let mut none = [0u8; 4];
     if s.next_due == i64::MAX {
-        (sys.provider_call)(s.timer_fd, TIMER_CANCEL, none.as_mut_ptr(), 0);
+        (sys.provider_call)(
+            s.timer_fd,
+            TIMER_CANCEL,
+            none.as_mut_ptr(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         return;
     }
     let delay = (s.next_due - s.scan_now).clamp(1, u32::MAX as i64) as u32;
     let mut d = delay.to_le_bytes();
-    (sys.provider_call)(s.timer_fd, TIMER_SET, d.as_mut_ptr(), 4);
+    (sys.provider_call)(
+        s.timer_fd,
+        TIMER_SET,
+        d.as_mut_ptr(),
+        4,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// Decimal bytes → u32. A projected count arrives as the scalar token.

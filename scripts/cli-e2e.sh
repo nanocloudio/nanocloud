@@ -65,12 +65,12 @@ echo "== 2. build config + module table (cli stack expands cli_in/cli_out) =="
 # The applet runs as this node's replica of the store, in its state
 # directory: the seeded host log is imported through the replica's log.
 nc_cli_graph "$D" "$D/cli.yaml" || fail "the CLI did not render"
-nc_build_workload "$ROOT" "$D/cli.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/cli.yaml" "$D/graph.img"
 
 run() { # run <expected-exit> <args...>
   local want="$1"; shift
   local rc=0
-  env -C "$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+  env -C "$D" "$FLUXOR_RUNTIME" --image "$D/graph.img" \
     -- "$@" >"$D/out.txt" 2>/dev/null || rc=$?
   [ "$rc" = "$want" ] || fail "nanocloud $* — exit $rc, want $want"
 }
@@ -170,7 +170,7 @@ echo "== 15. nanocloud exec -it <id> -- <cmd> (opens a pty session; live-runner 
 # ctl) then streams; we time-box it and assert the ctl was written. The full pty
 # round-trip (stdin<->pty<->stdout) is proven in sandbox-runner-e2e.
 timeout 4 env -C "$D" "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" \
+  --image "$D/graph.img" \
   -- exec -it pod-uid-1 -- /bin/sh </dev/null >/dev/null 2>&1 || true
 CTL="$(nc_replica_get "$D" /tty/pod-uid-1/cli/ctl)"
 case "$CTL" in
@@ -217,23 +217,23 @@ echo "   exported $(wc -l < "$D/out.txt") objects"
 echo "== 20. nanocloud watch <resource> (stream a listing; kubectl get -w semantics) =="
 # watch runs until killed; time-box it and assert it emitted the initial snapshot.
 timeout 4 env -C "$D" "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" -- watch pods </dev/null >"$D/watch.txt" 2>/dev/null || true
+  --image "$D/graph.img" -- watch pods </dev/null >"$D/watch.txt" 2>/dev/null || true
 grep -q "^---- pods ----" "$D/watch.txt" || fail "watch did not emit a snapshot header: $(cat "$D/watch.txt")"
 grep -qx "web-0" "$D/watch.txt" || fail "watch snapshot missing web-0"
 echo "   watch streamed the pods snapshot"
 
 echo "== 21. nanocloud bundle apply (round-trip: export | apply into a fresh store) =="
-env -C "$D" "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" \
+env -C "$D" "$FLUXOR_RUNTIME" --image "$D/graph.img" \
   -- bundle export </dev/null >"$D/bundle.txt" 2>/dev/null || true
 D2="$(mktemp -d /tmp/nc-cli-restore-XXXXXX)"; trap 'rm -rf "$D" "$D2"' EXIT
 # A fresh node: its own replica, its own store.
 nc_cli_graph "$D2" "$D2/cli.yaml" || fail "the second CLI did not render"
-nc_build_workload "$ROOT" "$D2/cli.yaml" "$D2/config.bin" "$D2/modules.bin"
-env -C "$D2" "$FLUXOR_RUNTIME" --config "$D2/config.bin" --modules "$D2/modules.bin" \
+nc_build_workload "$ROOT" "$D2/cli.yaml" "$D2/graph.img"
+env -C "$D2" "$FLUXOR_RUNTIME" --image "$D2/graph.img" \
   -- bundle apply <"$D/bundle.txt" >"$D2/apply.txt" 2>/dev/null || true
 grep -q "applied [1-9]" "$D2/apply.txt" || fail "bundle apply did not apply objects: $(cat "$D2/apply.txt")"
 # the restored store now serves the same pods.
-env -C "$D2" "$FLUXOR_RUNTIME" --config "$D2/config.bin" --modules "$D2/modules.bin" \
+env -C "$D2" "$FLUXOR_RUNTIME" --image "$D2/graph.img" \
   -- get pods </dev/null >"$D2/pods.txt" 2>/dev/null || true
 grep -qx "web-0" "$D2/pods.txt" || fail "restored store missing web-0: $(cat "$D2/pods.txt")"
 echo "   $(cat "$D2/apply.txt" | tr -d '\n') → restored store serves web-0"

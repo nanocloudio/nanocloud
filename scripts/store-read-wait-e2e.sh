@@ -190,12 +190,12 @@ g = (mods.rstrip("\n") + "\n  # ── The pod plane: fluxor-podlifecycle.yaml, 
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
 PY2
-nc_build_workload "$BUILD_ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
-grep -aq "FAULT INJECTION ON" "$D/modules.bin" || fail "the built graph does not carry the store that knows the fault knob"
+nc_build_workload "$BUILD_ROOT" "$D/graph.yaml" "$D/graph.img"
+grep -aq "FAULT INJECTION ON" "$D/graph.img" || fail "the built graph does not carry the store that knows the fault knob"
 
 echo "== 3. run it; wait for the API over TLS =="
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 60 || fail "the store never answered"
 api() { # api <method> <path> [json-body] -> "<status>|<body>"

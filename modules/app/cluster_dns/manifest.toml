@@ -64,6 +64,8 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
+# Frame bytes, header included (`module_facts!` NET_IN_ACCEPTS_RECORD).
+accepts_record = 1483
 required = true
 
 [[ports]]
@@ -71,6 +73,9 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 buffer_size = 16384
+# A 512-byte datagram, its address prefix and header (`module_facts!`
+# NET_OUT_MAX_RECORD).
+max_record = 576
 required = true
 
 # Read: the Services and the endpoint rows answered. Written: `/cluster-dns`,

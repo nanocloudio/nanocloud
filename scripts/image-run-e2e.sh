@@ -304,7 +304,7 @@ ${CHAIN_WIRE}
 YAML
 
 echo "== 4. build config + module table; seed the image-backed pods =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 # No `cmd=`: argv must come from the image config the pull brings.
 # Where assembly runs, for this test (the packaged paths otherwise).
 wal_put "/config/image" "script=$D/assemble-image.sh;rootfs=$D/rootfs;blobs=$D/blobcache"
@@ -332,7 +332,7 @@ terminal() { # terminal <uid>: Succeeded / Failed / ""
 }
 run_until_done() { # run_until_done <uid>... — the graph (as root: pivot_root) until each terminates
   sudo -n env FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   local i u left
   for i in $(seq 1 240); do

@@ -7,20 +7,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/store.rs");
 include!("../_shared/json.rs");
 include!("../_shared/exchange_call.rs");
@@ -212,7 +209,6 @@ struct State {
 mod params_def {
     use super::State;
     use super::PARAM_MAX;
-    use super::SCHEMA_MAX;
     use super::{p_u32, p_u8};
 
     unsafe fn set(dst: &mut [u8; PARAM_MAX], dlen: &mut u8, d: *const u8, len: usize) {
@@ -223,7 +219,7 @@ mod params_def {
         *dlen = n as u8;
     }
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, subject, str, 0
@@ -391,11 +387,7 @@ fn spki_of(cert: &[u8]) -> Option<&[u8]> {
 
 // ---- module ABI ----
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -489,14 +481,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -511,7 +503,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.id_req_in < 0 || s.id_cert_out < 0 || s.response_in < 0 || s.request_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         flush_chain(s, sys);
         take_requests(s, sys);
@@ -539,7 +531,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.join != 0 {
             join_step(s, sys);
         }
-        0
+        StepReturn::Continue
     }
 }
 
@@ -605,7 +597,7 @@ unsafe fn ask_certificate(s: &mut State, sys: &SyscallTable) {
     let port = s.request_out;
     let body = &body[..at];
     if s.call.begin(port, |id, out| {
-        call_head(id, 3, b"/pki/certificate", b"", body, out)
+        call_head(id, exh::method::POST, b"/pki/certificate", b"", body, out)
     }) {
         s.point_owed = 0;
         s.cur = 0;
@@ -633,7 +625,7 @@ unsafe fn ask_extra(s: &mut State, sys: &SyscallTable, k: usize) {
     let port = s.request_out;
     let body = &body[..at];
     if s.call.begin(port, |id, out| {
-        call_head(id, 3, b"/pki/certificate", b"", body, out)
+        call_head(id, exh::method::POST, b"/pki/certificate", b"", body, out)
     }) {
         s.extra[k].point_owed = 0;
         s.cur = (k + 1) as u8;
@@ -856,21 +848,11 @@ unsafe fn remote_step(s: &mut State, sys: &SyscallTable) {
         s.point_owed = 0;
         s.r_phase = R_SPEC;
     }
-    let mut hdr = [0u8; TOKEN_MAX + 96];
-    let mut h = 0usize;
-    let hparts: [&[u8]; 3] = [
-        b"authorization: Bearer ",
-        &s.bearer[..s.bearer_len as usize],
-        b"\r\n",
-    ];
-    for p in hparts {
-        h = put(&mut hdr, h, p).unwrap_or(h);
-    }
     let mut path = [0u8; PARAM_MAX + 8];
     let mut pl = put(&mut path, 0, &s.remote[..s.remote_len as usize]).unwrap_or(0);
     let mut body = [0u8; 160];
     let mut bl = 0usize;
-    let method = match s.r_phase {
+    let (verb, patch) = match s.r_phase {
         R_SPEC => {
             let parts: [&[u8]; 3] = [
                 b"{\"spec\":{\"publicKey\":\"",
@@ -880,31 +862,32 @@ unsafe fn remote_step(s: &mut State, sys: &SyscallTable) {
             for p in parts {
                 bl = put(&mut body, bl, p).unwrap_or(bl);
             }
-            h = put(
-                &mut hdr,
-                h,
-                b"content-type: application/merge-patch+json\r\n",
-            )
-            .unwrap_or(h);
-            6
+            (exh::method::PATCH, true)
         }
         R_CLEAR => {
             pl = put(&mut path, pl, b"/status").unwrap_or(pl);
             bl = put(&mut body, 0, b"{\"status\":{\"publicKey\":null}}").unwrap_or(0);
-            h = put(
-                &mut hdr,
-                h,
-                b"content-type: application/merge-patch+json\r\n",
-            )
-            .unwrap_or(h);
-            6
+            (exh::method::PATCH, true)
         }
-        _ => 1,
+        _ => (exh::method::GET, false),
+    };
+    // The request's meta: the bearer credential, and a patch's content type.
+    let mut meta = [0u8; TOKEN_MAX + 96];
+    let mut w = exch::MetaWriter::new(&mut meta);
+    w.begin(b"authorization");
+    w.push(b"Bearer ");
+    w.push(&s.bearer[..s.bearer_len as usize]);
+    w.end();
+    if patch {
+        w.put(exch::META_CONTENT_TYPE, b"application/merge-patch+json");
+    }
+    let Some(ml) = w.finish() else {
+        return;
     };
     let port = s.request_out;
-    let (hdr, path, body) = (&hdr[..h], &path[..pl], &body[..bl]);
+    let (meta, path, body) = (&meta[..ml], &path[..pl], &body[..bl]);
     if s.call
-        .begin(port, |id, out| call_head(id, method, path, hdr, body, out))
+        .begin(port, |id, out| call_head(id, verb, path, meta, body, out))
     {
         flush_call(s, sys);
     }

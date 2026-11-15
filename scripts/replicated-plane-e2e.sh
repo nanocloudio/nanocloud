@@ -256,12 +256,12 @@ store_put /pods/default/web "$POD_WEB"
 store_put /pods/default/far "$POD_FAR"
 
 for r in $REPLICAS; do
-  nc_build_workload "$ROOT" "$D/$r/graph.yaml" "$D/$r/config.bin" "$D/$r/modules.bin" >/dev/null \
+  nc_build_workload "$ROOT" "$D/$r/graph.yaml" "$D/$r/graph.img" >/dev/null \
     || fail "the $r graph did not build"
 done
 start() { # start <replica>
   env -C "$D/$1" RUST_LOG="${NC_LOG:-warn}" "$FLUXOR_RUNTIME" \
-    --config "$D/$1/config.bin" --modules "$D/$1/modules.bin" >>"$D/$1/run.log" 2>&1 &
+    --image "$D/$1/graph.img" >>"$D/$1/run.log" 2>&1 &
   PID[$1]=$!
 }
 # What a replica holds at <key> (the store's own name), read from it.

@@ -36,19 +36,19 @@ plan nanocloud.apiplane {
 
   // ---- wire vocabularies, named rather than restated ----
 
-  // the exchange method byte (fluxor's `contracts/exchange.rs`)
+  // the request's HTTP verb (fluxor's `contracts/exchange_http.rs`)
   enum M_GET = 1;
   enum M_POST = 3;
-  enum M_PUT = 5;
-  enum M_PATCH = 6;          // RFC 7386 merge patch
-  enum M_PATCH_JSON = 16;    // RFC 6902 JSON Patch   } kube.plan `mpatch` folds a
-  enum M_PATCH_SMP = 26;     // strategic merge        } PATCH's Content-Type into
-  enum M_PATCH_APPLY = 36;   // server-side apply      } its method
+  enum M_PUT = 4;
+  enum M_PATCH = 5;          // RFC 7386 merge patch
+  enum M_PATCH_JSON = 15;    // RFC 6902 JSON Patch   } kube.plan `mpatch` folds a
+  enum M_PATCH_SMP = 25;     // strategic merge        } PATCH's Content-Type into
+  enum M_PATCH_APPLY = 35;   // server-side apply      } its method
   enum OP_PATCH_MERGE = 13;
   enum OP_PATCH_JSON = 14;
   enum OP_PATCH_SMP = 15;
   enum OP_APPLY = 16;
-  enum M_DELETE = 7;
+  enum M_DELETE = 6;
 
   // store_effect ops
   enum OP_NOOP = 0;

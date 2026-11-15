@@ -75,9 +75,9 @@ RUNTIME_PID=""
 RPORT=6380
 cleanup() {
   if [ -n "$RUNTIME_PID" ]; then
-    sudo -n pkill -f "$D/[c]onfig.bin" 2>/dev/null || true
-    for _ in $(seq 20); do pgrep -f "$D/[c]onfig.bin" >/dev/null || break; sleep 0.5; done
-    sudo -n pkill -KILL -f "$D/[c]onfig.bin" 2>/dev/null || true
+    sudo -n pkill -f "$D/[g]raph.img" 2>/dev/null || true
+    for _ in $(seq 20); do pgrep -f "$D/[g]raph.img" >/dev/null || break; sleep 0.5; done
+    sudo -n pkill -KILL -f "$D/[g]raph.img" 2>/dev/null || true
   fi
   # The Pod's server, whatever outlived the node.
   sudo -n pkill -f "$D/[w]ww" 2>/dev/null || true
@@ -167,7 +167,7 @@ wiring = wiring.rstrip("\n") + (
 open(out, "w").write(mods + "\nwiring:\n" + wiring)
 PY
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" || fail "the single node's graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" || fail "the single node's graph did not build"
 
 echo "== 3. the node, as root, in a network namespace of its own ($NODE_IP) =="
 sudo -n ip netns add "$NS"
@@ -183,7 +183,7 @@ printf 'nameserver %s\nsearch default.svc.cluster.local svc.cluster.local cluste
   | sudo -n tee "/etc/netns/$NS/resolv.conf" >/dev/null
 WN_NO_NODE=1 wn_seed_identity
 $NSX env -C "$STORE" FLUXOR_INSTANCE="$TAG" FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_VAULT_DIR="$STORE/vault" RUST_LOG=info \
-  "$FLUXOR_RUNTIME" --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  "$FLUXOR_RUNTIME" --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 api() { # api <method> <path> [json-body] -> "<status>|<body>", inside the namespace
   $NSX python3 - "$PORT" "$D/token.admin" "$1" "$2" "${3:-}" <<'PY'
@@ -224,7 +224,7 @@ wait_for() { # wait_for <seconds> <what> <cmd...>
   local end=$((SECONDS + secs))
   until "$@"; do
     [ "$SECONDS" -lt "$end" ] || fail "$what (after ${secs}s)"
-    pgrep -f "$D/[c]onfig.bin" >/dev/null || fail "the node exited"
+    pgrep -f "$D/[g]raph.img" >/dev/null || fail "the node exited"
     sleep 1
   done
 }

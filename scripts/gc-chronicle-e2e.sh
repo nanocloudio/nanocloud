@@ -179,9 +179,9 @@ wiring:
 YAML
 
 echo "== 3. run =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 5
 kill "$RUNTIME_PID" 2>/dev/null || true
@@ -237,7 +237,7 @@ echo "== 7. the cascade: delete the Deployment, and both tiers below it go =="
 store_put "/pods/default/api-1-0" '{"metadata":{"name":"api-1-0","namespace":"default","ownerReferences":[{"kind":"ReplicaSet","name":"api-1"}]},"spec":{}}'
 store_del "/deployments.apps/default/api"
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >>"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 sleep 5
 kill "$RUNTIME_PID" 2>/dev/null || true

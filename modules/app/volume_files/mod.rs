@@ -2,20 +2,17 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::platform::linux::host_mount as hm;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 const OBJ_PUT: u32 = abi::registry::storage_object::PUT;
 const OBJ_GET: u32 = abi::registry::storage_object::GET;
@@ -88,7 +85,7 @@ struct State {
     /// The mount root (`host_mount::ROOT`), absolute; 0 until asked.
     mroot: [u8; 128],
     mroot_len: u8,
-    /// `host_mount::PRIV` (-1 until asked).
+    /// `host_mount::CAPS` (-1 until asked).
     privs: i32,
     gc_ms: u32,
     /// The request held while it is served.
@@ -142,7 +139,7 @@ struct State {
     nag: ReadNag,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     1, root, str, 0
@@ -159,11 +156,7 @@ define_params! {
         => |s, d, len| { s.gc_ms = p_u32(d, len, 0, 30_000); };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -232,19 +225,19 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         step(s, sys);
         heartbeat(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 
@@ -259,7 +252,14 @@ unsafe fn step(s: &mut State, sys: &SyscallTable) {
         return link_step(s, sys);
     }
     if s.job == J_HM || s.job == J_SWEEP {
-        let rc = (sys.provider_call)(-1, s.hm_op, s.hm.as_mut_ptr(), s.hm_len);
+        let rc = (sys.provider_call)(
+            -1,
+            s.hm_op,
+            core::ptr::null_mut(),
+            0,
+            s.hm.as_mut_ptr(),
+            s.hm_len,
+        );
         if later(rc) {
             return;
         }
@@ -556,7 +556,14 @@ unsafe fn mkdirs(sys: &SyscallTable, path: &[u8]) -> bool {
             for (d, &b) in buf.iter_mut().zip(path.iter()) {
                 *d = b;
             }
-            if later((sys.provider_call)(-1, FS_MKDIR, buf.as_mut_ptr(), end)) {
+            if later((sys.provider_call)(
+                -1,
+                FS_MKDIR,
+                buf.as_mut_ptr(),
+                end,
+                core::ptr::null_mut(),
+                0,
+            )) {
                 return false;
             }
         }
@@ -569,7 +576,14 @@ unsafe fn mkdirs(sys: &SyscallTable, path: &[u8]) -> bool {
 /// made on this node.
 unsafe fn platform(s: &mut State, sys: &SyscallTable) -> bool {
     if s.mroot_len == 0 {
-        let rc = (sys.provider_call)(-1, hm::ROOT, s.mroot.as_mut_ptr(), s.mroot.len());
+        let rc = (sys.provider_call)(
+            -1,
+            hm::ROOT,
+            core::ptr::null_mut(),
+            0,
+            s.mroot.as_mut_ptr(),
+            s.mroot.len(),
+        );
         if rc <= 0 || rc as usize >= s.mroot.len() || s.mroot.first() != Some(&b'/') {
             if !s.said_root {
                 s.said_root = true;
@@ -586,8 +600,20 @@ unsafe fn platform(s: &mut State, sys: &SyscallTable) -> bool {
         s.mroot_len = n as u8;
     }
     if s.privs < 0 {
-        let p = (sys.provider_call)(-1, hm::PRIV, core::ptr::null_mut(), 0);
-        s.privs = p.max(0);
+        let mut caps = [0u8; 4];
+        let rc = (sys.provider_call)(
+            -1,
+            hm::CAPS,
+            caps.as_mut_ptr(),
+            caps.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        s.privs = if rc == 0 {
+            (u32::from_le_bytes(caps) & i32::MAX as u32) as i32
+        } else {
+            0
+        };
     }
     true
 }
@@ -635,7 +661,14 @@ unsafe fn link_step(s: &mut State, sys: &SyscallTable) {
     if put_at(&mut arg, p, b"/..data").is_none() {
         return prepared(s, sys, false);
     }
-    let rc = (sys.provider_call)(-1, FS_READLINK, arg.as_mut_ptr(), arg.len());
+    let rc = (sys.provider_call)(
+        -1,
+        FS_READLINK,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return;
     }
@@ -953,7 +986,7 @@ unsafe fn run(s: &mut State, sys: &SyscallTable) {
             if cached(s, ckey, s.digest) {
                 return finish(s, sys, true);
             }
-            if s.privs & hm::PRIV_SYS_ADMIN == 0 {
+            if s.privs as u32 & hm::caps::SYS_ADMIN == 0 {
                 if !s.said_memory {
                     s.said_memory = true;
                     let m = b"[volume_files] no CAP_SYS_ADMIN: a memory-backed emptyDir cannot be mounted";
@@ -1154,7 +1187,7 @@ unsafe fn source(
         flags |= hm::P_READ_ONLY;
     }
     if v.kind == b's' {
-        if s.privs & hm::PRIV_SYS_ADMIN != 0 {
+        if s.privs as u32 & hm::caps::SYS_ADMIN != 0 {
             flags |= hm::P_MEMORY;
         } else if !s.said_memory {
             s.said_memory = true;
@@ -1223,7 +1256,7 @@ unsafe fn projected(
         flags |= hm::P_READ_ONLY;
     }
     if v.kind == b'p' {
-        if s.privs & hm::PRIV_SYS_ADMIN != 0 {
+        if s.privs as u32 & hm::caps::SYS_ADMIN != 0 {
             flags |= hm::P_MEMORY;
         } else if !s.said_memory {
             s.said_memory = true;
@@ -1633,14 +1666,28 @@ unsafe fn sweep(s: &mut State, sys: &SyscallTable) -> bool {
     ) else {
         return false;
     };
-    let dh = (sys.provider_call)(-1, FS_OPENDIR, root.as_mut_ptr(), rl);
+    let dh = (sys.provider_call)(
+        -1,
+        FS_OPENDIR,
+        root.as_mut_ptr(),
+        rl,
+        core::ptr::null_mut(),
+        0,
+    );
     if dh < 0 {
         return false;
     }
     let st = Store::plain(sys, &s.nag);
     let mut buf = [0u8; 1024];
     loop {
-        let got = (sys.provider_call)(dh, FS_READDIR, buf.as_mut_ptr(), buf.len());
+        let got = (sys.provider_call)(
+            dh,
+            FS_READDIR,
+            core::ptr::null_mut(),
+            0,
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
         if got <= 0 {
             break;
         }
@@ -1676,7 +1723,7 @@ unsafe fn sweep(s: &mut State, sys: &SyscallTable) -> bool {
         }
     }
     let mut z = [0u8; 4];
-    (sys.provider_call)(dh, FS_CLOSE, z.as_mut_ptr(), 0);
+    (sys.provider_call)(dh, FS_CLOSE, z.as_mut_ptr(), 0, core::ptr::null_mut(), 0);
     // A sweep whose reads were not all answered (or were refused) removes
     // nothing: it is taken again next time.
     if st.stopped() {

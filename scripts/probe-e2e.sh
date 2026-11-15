@@ -112,7 +112,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. materialize sleeper bundles + the probe matrix =="
 mkdir -p "$D/slp"
@@ -157,7 +157,7 @@ store_put "/pod-probes/pod-startfail" "sp_cmd=/bin/false;sp_period=1;sp_timeout=
 
 echo "== 3. run the pipeline (probe cadence ~1s; liveness kill + backoff ~4s) =="
 FLUXOR_STORE_DIR="$D" RUST_LOG="${RUST_LOG:-warn}" timeout 14 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. readiness: /probe-status/pod-ready flips ready 0→1 =="
 PR="$(store_last /probe-status/pod-ready)"

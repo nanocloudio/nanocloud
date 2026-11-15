@@ -82,11 +82,11 @@ PY
 SEAL="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 run() { # run <seconds>
   FLUXOR_SEAL_KEY="$SEAL" FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout "$1" "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 || true
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 || true
 }
 
 echo "== 1. build the config + module table from the packaged graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. alice holds a P-256 key and names its public half; bob names none =="
 openssl ecparam -name prime256v1 -genkey -noout -out "$D/alice.key" 2>/dev/null

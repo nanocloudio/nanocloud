@@ -7,7 +7,7 @@
 #   fluxor-abi.sh [project-root]
 set -eu
 ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-PIN="$ROOT/target/fluxor/fluxor-abi/sdk/abi_surface_srcpin.rs"
+PIN="$ROOT/target/fluxor/fluxor-abi/src/abi_surface/srcpin.rs"
 [ -r "$PIN" ] || { echo "fluxor-abi.sh: no $PIN (fluxor sync)" >&2; exit 1; }
 sed -n '/ABI_SURFACE_DIGEST/,/\];/p' "$PIN" | grep -o '0x[0-9a-f][0-9a-f]' \
     | head -4 | sed 's/^0x//' | tr -d '\n'

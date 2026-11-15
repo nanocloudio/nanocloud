@@ -72,7 +72,9 @@ hardware_targets = ["bcm2712", "linux"]
 # | 1   | root  | str  | pods    | Where the Pods' directories live, relative to the mount root |
 # | 2   | gc_ms | u32  | 30000   | How often gone Pods' directories are removed |
 timer_class = "wall_clock"
-permissions = ["platform_raw"]
+# PROJECT, REMOVE_TREE and GROUP_TREE change the host's mount tree. ROOT and
+# CAPS come with the claimed `host_mount`.
+grants = ["host_mount.mount"]
 
 [[ports]]
 name = "request_in"

@@ -139,7 +139,7 @@ assert re.search(r'^    verify_hostname: "registry.nanocloud.io"$', g, re.M)
 print("   scoped: every image record (" + ", ".join(sorted(keys)) + ") under " + ",".join(scoped))
 print(f"   fetch_tls trusts {ca.group(1)} (read at runtime) as registry.nanocloud.io")
 PY
-nc_build_workload "$ROOT" "$D/worker.yaml" "$D/worker-config.bin" "$D/worker-modules.bin" \
+nc_build_workload "$ROOT" "$D/worker.yaml" "$D/worker-graph.img" \
   || fail "the worker's graph, with its pull, did not build"
 echo "   the worker's graph builds ($(grep -c '^  - name: ' "$D/worker.yaml") modules)"
 
@@ -173,7 +173,7 @@ PY
 echo "$RPORT" >"$STORE/read.port"
 sed -i 's|announce_path: "/authn-keys/sa"|announce_path: "/authn-keys/node"|' "$D/graph.yaml"
 echo "   $(grep -c '^  - name: ' "$D/graph.yaml") modules"
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" || fail "the single node's graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" || fail "the single node's graph did not build"
 
 echo "== 4. a registry over TLS (registry.nanocloud.io under a test CA) serving a workload image =="
 cat >"$D/probe.yaml" <<'YAML'
@@ -238,7 +238,7 @@ echo "   https://registry.nanocloud.io:$REG_PORT (dialled at 127.0.0.1) serves n
 echo "== 5. the node runs: it registers itself, is Ready, and runs the Pod scheduled onto it =="
 WN_NO_NODE=1 wn_seed_identity
 env -C "$STORE" FLUXOR_OWNER_ROOT="$D/owners" FLUXOR_VAULT_DIR="$STORE/vault" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 90 || fail "the store never answered"
 r=""

@@ -82,9 +82,9 @@ PY
 # chronicle-param-drift-e2e.sh).
 python3 "$ROOT/scripts/extract-fixture.py" "$D/graph.yaml" - ds_ >/dev/null
 run() { # run <seconds>
-  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+  nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   RUNTIME_PID=$!
   sleep "$1"
   kill "$RUNTIME_PID" 2>/dev/null || true

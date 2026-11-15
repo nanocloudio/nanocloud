@@ -26,7 +26,7 @@ plan nanocloud.pdb {
   enum GET = 1;
   enum PATCH = 5;
   enum COUNT = 12;
-  enum M_DELETE = 7;
+  enum M_DELETE = 6;
 
   // ---- status ----
   message pd.Pdb {

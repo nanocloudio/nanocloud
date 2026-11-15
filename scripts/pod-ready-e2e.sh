@@ -67,9 +67,9 @@ RUNTIME_PID=""
 REG_PID=""
 cleanup() {
   if [ -n "$RUNTIME_PID" ]; then
-    sudo -n pkill -f "$D/[c]onfig.bin" 2>/dev/null || true
-    for _ in $(seq 20); do pgrep -f "$D/[c]onfig.bin" >/dev/null || break; sleep 0.5; done
-    sudo -n pkill -KILL -f "$D/[c]onfig.bin" 2>/dev/null || true
+    sudo -n pkill -f "$D/[g]raph.img" 2>/dev/null || true
+    for _ in $(seq 20); do pgrep -f "$D/[g]raph.img" >/dev/null || break; sleep 0.5; done
+    sudo -n pkill -KILL -f "$D/[g]raph.img" 2>/dev/null || true
   fi
   sudo -n pkill -f "$D/[r]ootfs" 2>/dev/null || true
   # The server runs pivoted into its image's root, where no path names $D.
@@ -208,11 +208,11 @@ g = (mods.rstrip("\n") + "\n  # ── The kubelet, its image plane ──\n" + 
 open(out, "w").write(g)
 print(f"   spliced: {g.count(chr(10) + '  - name:')} modules")
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" >/dev/null
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" >/dev/null
 
 echo "== 4. run it as root =="
 sudo -n env -C "$STORE" FLUXOR_SEAL_KEY=0123456789abcdef FLUXOR_OWNER_ROOT="$D/owners" RUST_LOG=info "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+  --image "$D/graph.img" >"$D/run.log" 2>&1 &
 RUNTIME_PID=$!
 nc_store_ready "$STORE" 90 || fail "the store never answered"
 r=""

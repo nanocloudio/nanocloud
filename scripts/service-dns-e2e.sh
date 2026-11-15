@@ -96,7 +96,7 @@ PY
 boot() {
   PID=""
   env FLUXOR_STORE_DIR="$D" RUST_LOG=info "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >>"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >>"$D/run.log" 2>&1 &
   PID=$!
   for _ in $(seq 100); do
     grep -q "\[cluster_dns\] serving" "$D/run.log" && return 0
@@ -132,7 +132,7 @@ assert g.count("    port: 53\n") == 1
 g = g.replace("    port: 53\n", f"    port: {port}\n    upstream: \"127.0.0.1\"\n    upstream_port: {up}\n    address: \"127.0.0.1\"\n")
 open(out, "w").write(g)
 PY
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin" || fail "graph did not build"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img" || fail "graph did not build"
 
 echo "== 2. a Service, a headless Service with two ready backends, one with none =="
 np_put "/services/default/web" '{"metadata":{"name":"web","namespace":"default"},"spec":{"selector":{"app":"web"},"clusterIP":"10.96.0.10","ports":[{"name":"http","port":80,"targetPort":8080},{"name":"dns","port":53,"protocol":"UDP"}]}}'

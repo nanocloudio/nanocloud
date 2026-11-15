@@ -79,13 +79,13 @@ echo "== 1. render the graph for this node: its replica of the store, a node cer
 nc_controlplane_graph "$STORE" "$D/graph.yaml" || fail "the control plane did not render"
 
 echo "== 1b. build the config + module table from the control-plane graph =="
-nc_build_workload "$ROOT" "$D/graph.yaml" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$D/graph.yaml" "$D/graph.img"
 
 echo "== 2. spawn the graph exactly as ControlPlaneRuntime::ensure_running does =="
 # The store directory is the runtime's working directory (the graph's lattice
 # store is the sole writer); pidfile in state_root.
 env -C "$STORE" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$STATE/control-plane.log" 2>&1 &
+  --image "$D/graph.img" >"$STATE/control-plane.log" 2>&1 &
 RUNTIME_PID=$!
 echo "$RUNTIME_PID" >"$STATE/control-plane.pid"
 

@@ -72,7 +72,7 @@ PY
 }
 
 echo "== 1. build the config + module table from the packaged graph =="
-nc_build_workload "$ROOT" "$GRAPH" "$D/config.bin" "$D/modules.bin"
+nc_build_workload "$ROOT" "$GRAPH" "$D/graph.img"
 
 echo "== 2. project 2 ready nodes, 1 not-ready node, 4 unbound + 1 pre-bound pod =="
 store_put "/nodes/node-1" '{"metadata":{"name":"node-1"},"status":{"ready":true}}'
@@ -86,7 +86,7 @@ store_put "/pods/default/pod-z" '{"metadata":{"name":"pod-z"},"spec":{"nodeName"
 
 echo "== 3. run the scheduler =="
 FLUXOR_STORE_DIR="$D" RUST_LOG=warn timeout 2.5 "$FLUXOR_RUNTIME" \
-  --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 || true
+  --image "$D/graph.img" >"$D/run.log" 2>&1 || true
 
 echo "== 4. verify the least-loaded spread (byte-ordered ties → lower node) =="
 has() { local v="$1"; shift; for w in "$@"; do case "$v" in *"$w"*) ;; *) return 1;; esac; done; }

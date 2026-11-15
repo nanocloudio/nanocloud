@@ -8,21 +8,18 @@
 #![no_std]
 #![allow(
     dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "mounts shared cores (modules/app/_shared, kagi-common, wire sources) whole and \
+              uses a subset of each"
 )]
 
 use core::convert::TryInto;
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../_shared/store.rs");
 include!("../_shared/k8s_proto_schema.rs");
 include!("../_shared/k8s_proto.rs");
@@ -112,9 +109,8 @@ mod params_def {
     use super::p_u32;
     use super::State;
     use super::MAX_PREFIX;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         // The largest request body, KiB (413 past it).
@@ -151,21 +147,9 @@ impl HcHeap for Arena<'_> {
     }
 }
 
-mod arena {
-    #[no_mangle]
-    #[link_section = ".text.module_arena_size"]
-    pub extern "C" fn module_arena_size() -> u32 {
-        super::ARENA
-    }
-}
+fluxor_rt::module_facts! { state: State, arena: ARENA }
 
 // ---- module ABI ----
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -235,14 +219,14 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         let sys = &*s.syscalls;
         if s.resolved == 0 {
@@ -251,7 +235,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.record_out < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let late = s.desk.tick(&mut Arena(sys), dev_millis(sys));
         if late > 0 {
@@ -265,7 +249,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         to_chain(s, sys);
         from_chain(s, sys);
         to_server(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 

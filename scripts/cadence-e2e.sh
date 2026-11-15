@@ -49,12 +49,12 @@ vctx() { awk '/^voluntary_ctxt_switches:/{print $2}' "/proc/$1/status" 2>/dev/nu
 measure_idle() {
   local graph="$1"
   local D; D="$(mktemp -d /tmp/nc-cadence-XXXXXX)"
-  if ! nc_build_workload "$ROOT" "$graph" "$D/config.bin" "$D/modules.bin" >"$D/build.log" 2>&1; then
+  if ! nc_build_workload "$ROOT" "$graph" "$D/graph.img" >"$D/build.log" 2>&1; then
     echo "FAIL: fluxor build failed for $graph" >&2; tail -20 "$D/build.log" >&2; rm -rf "$D"; return 1
   fi
   : > "$D/store.log"   # empty store => scheduler idles after cold-start
   FLUXOR_STORE_DIR="$D" RUST_LOG=warn "$FLUXOR_RUNTIME" \
-    --config "$D/config.bin" --modules "$D/modules.bin" >"$D/run.log" 2>&1 &
+    --image "$D/graph.img" >"$D/run.log" 2>&1 &
   local pid=$!
   sleep "$WARMUP"
   if ! kill -0 "$pid" 2>/dev/null; then
